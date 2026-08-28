@@ -7243,6 +7243,7 @@ dependencies = [
  "jsonrpsee",
  "libp2p",
  "metrics",
+ "metrics-util",
  "n42-chainspec",
  "n42-consensus",
  "n42-consensus-service",

@@ -72,6 +72,13 @@ struct QmdbBranchState {
     /// block, and lives under the same mutex as `blocks`, so a reader can
     /// never observe it out of step with the ancestry it summarizes.
     cached_tip: Option<CachedTipTree>,
+    /// A block whose delta is already in `blocks` but whose WAL frame is still
+    /// being written and fsynced outside this lock. Commits are serialized, so
+    /// at most one block is ever in flight, and it is always the newest tip.
+    /// Archive readers treat it as absent until it is durable; speculative
+    /// candidates may build on it, exactly as they could build on a block
+    /// whose commit later fails.
+    pending_durable: Option<B256>,
 }
 
 struct CachedTipTree {
@@ -90,6 +97,7 @@ impl std::fmt::Debug for QmdbBranchState {
         f.debug_struct("QmdbBranchState")
             .field("blocks", &self.blocks.len())
             .field("cached_tip", &self.cached_tip)
+            .field("pending_durable", &self.pending_durable)
             .finish()
     }
 }
@@ -118,6 +126,36 @@ struct PersistedQmdbWalRecord {
     block: StoredQmdbBlock,
 }
 
+/// Borrowing twin of [`PersistedQmdbWalRecord`]: bincode encodes a reference
+/// exactly like the owned value, so a commit can frame its WAL record without
+/// cloning the operations it is about to move into `blocks`.
+#[derive(Serialize)]
+struct PersistedQmdbWalRecordRef<'a> {
+    block_hash: B256,
+    block: &'a StoredQmdbBlock,
+}
+
+/// Persistent WAL handle. Appends are serialized through their own mutex,
+/// independent of `state`, so a block's write and fsync never block candidate
+/// computation or archive reads.
+#[derive(Debug)]
+struct QmdbWalFile {
+    file: std::fs::File,
+    /// Length after the last fully written frame; a torn append is rolled
+    /// back to it.
+    len: u64,
+}
+
+/// Test-only WAL fault injection, applied to the next append.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum WalFault {
+    /// Stall inside the append, outside the `state` lock.
+    Delay(std::time::Duration),
+    /// Write half the frame, then fail as an I/O error would.
+    FailWrite,
+}
+
 const QMDB_WAL_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 const QMDB_WAL_CHECKSUM_BYTES: usize = 32;
 
@@ -130,6 +168,13 @@ pub struct Gov5QmdbStateRootStore {
     max_replay_depth: usize,
     persistence_path: Option<PathBuf>,
     state: Mutex<QmdbBranchState>,
+    /// Serializes commits end to end (tree work, insert, WAL append). WAL order
+    /// then equals insertion order and a child can never be published while
+    /// its parent's durability is still in flight.
+    commit: Mutex<()>,
+    wal: Mutex<Option<QmdbWalFile>>,
+    #[cfg(test)]
+    wal_fault: Mutex<Option<WalFault>>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -201,7 +246,12 @@ impl Gov5QmdbStateRootStore {
             state: Mutex::new(QmdbBranchState {
                 cached_tip: None,
                 blocks: HashMap::new(),
+                pending_durable: None,
             }),
+            commit: Mutex::new(()),
+            wal: Mutex::new(None),
+            #[cfg(test)]
+            wal_fault: Mutex::new(None),
         })
     }
 
@@ -245,18 +295,23 @@ impl Gov5QmdbStateRootStore {
                 store.state = Mutex::new(QmdbBranchState {
                     blocks,
                     cached_tip: None,
+                    pending_durable: None,
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 store.persist_checkpoint_locked(&QmdbBranchState {
                     cached_tip: None,
                     blocks: HashMap::new(),
+                    pending_durable: None,
                 })?;
             }
             Err(error) => {
                 return Err(Gov5QmdbStateRootError::Persistence(error.to_string()));
             }
         }
+        // Open once, after recovery has truncated any torn tail, and keep the
+        // handle for the store's lifetime instead of re-opening per block.
+        store.wal = Mutex::new(Some(open_wal_file(&wal_path(&path))?));
         Ok(store)
     }
 
@@ -269,12 +324,32 @@ impl Gov5QmdbStateRootStore {
     }
 
     pub fn retained_block_count(&self) -> Result<usize, Gov5QmdbStateRootError> {
-        Ok(self
+        let state = self
             .state
             .lock()
-            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+        Ok(state
             .blocks
-            .len())
+            .len()
+            .saturating_sub(usize::from(state.pending_durable.is_some())))
+    }
+
+    /// A retained block as archive readers see it: durable, or absent.
+    fn durable_block(state: &QmdbBranchState, block_hash: B256) -> Option<&StoredQmdbBlock> {
+        if state.pending_durable == Some(block_hash) {
+            return None;
+        }
+        state.blocks.get(&block_hash)
+    }
+
+    #[cfg(test)]
+    fn inject_wal_fault(&self, fault: WalFault) {
+        *self.wal_fault.lock().unwrap() = Some(fault);
+    }
+
+    #[cfg(test)]
+    fn wal_in_flight(&self) -> bool {
+        self.state.lock().unwrap().pending_durable.is_some()
     }
 
     /// Compute a candidate from its exact parent branch and publish its delta only after its root
@@ -305,6 +380,10 @@ impl Gov5QmdbStateRootStore {
         result
     }
 
+    /// Commit a block: rebuild its candidate under the `state` lock, publish the
+    /// delta, then write and fsync the WAL frame with the lock released. A
+    /// block whose WAL append fails is rolled back and reported as an error,
+    /// so it is never considered committed.
     pub fn compute_and_commit(
         &self,
         parent_hash: B256,
@@ -313,6 +392,10 @@ impl Gov5QmdbStateRootStore {
         operations: Vec<QmdbOperation>,
     ) -> Result<B256, Gov5QmdbStateRootError> {
         let operation_count = operations.len();
+        let _commit = self
+            .commit
+            .lock()
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
         let lock_started = std::time::Instant::now();
         let mut state = self
             .state
@@ -369,33 +452,52 @@ impl Gov5QmdbStateRootStore {
                 expected: expected_root,
             });
         }
-        state.blocks.insert(
-            block_hash,
-            StoredQmdbBlock {
-                parent_hash,
-                root,
-                operations,
-            },
-        );
+        let stored = StoredQmdbBlock {
+            parent_hash,
+            root,
+            operations,
+        };
+        // Frame the record while the operations are still ours to borrow, so
+        // a record that cannot be encoded never enters `blocks`. The write and
+        // fsync happen after the lock is released.
+        let frame = match self.encode_wal_frame(block_hash, &stored) {
+            Ok(frame) => frame,
+            Err(error) => {
+                metrics::counter!("n42_qmdb_commit_outcomes_total", "outcome" => "wal_error")
+                    .increment(1);
+                metrics::histogram!("n42_qmdb_lock_hold_ms", "operation" => "commit")
+                    .record(lock_acquired.elapsed().as_secs_f64() * 1_000.0);
+                return Err(error);
+            }
+        };
+        state.blocks.insert(block_hash, stored);
+        state.pending_durable = frame.is_some().then_some(block_hash);
+        let mut lock_hold = lock_acquired.elapsed();
+        drop(state);
+
         let wal_started = std::time::Instant::now();
-        if let Err(error) = self.append_wal_block(
-            block_hash,
-            state
-                .blocks
-                .get(&block_hash)
-                .expect("inserted QMDB block is present"),
-        ) {
-            metrics::histogram!("n42_qmdb_wal_append_ms")
-                .record(wal_started.elapsed().as_secs_f64() * 1_000.0);
+        let wal_result = match &frame {
+            Some(frame) => self.append_wal_frame(frame),
+            None => Ok(()),
+        };
+        metrics::histogram!("n42_qmdb_wal_append_ms")
+            .record(wal_started.elapsed().as_secs_f64() * 1_000.0);
+
+        let publish_started = std::time::Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+        state.pending_durable = None;
+        if let Err(error) = wal_result {
             metrics::counter!("n42_qmdb_commit_outcomes_total", "outcome" => "wal_error")
                 .increment(1);
             state.blocks.remove(&block_hash);
+            lock_hold += publish_started.elapsed();
             metrics::histogram!("n42_qmdb_lock_hold_ms", "operation" => "commit")
-                .record(lock_acquired.elapsed().as_secs_f64() * 1_000.0);
+                .record(lock_hold.as_secs_f64() * 1_000.0);
             return Err(error);
         }
-        metrics::histogram!("n42_qmdb_wal_append_ms")
-            .record(wal_started.elapsed().as_secs_f64() * 1_000.0);
         // Cache only now: the root matched, the block is in `blocks`, and the
         // WAL append succeeded, so the tree describes durable committed state.
         // Empty blocks took the fast path and rebuilt nothing; leaving the
@@ -408,10 +510,12 @@ impl Gov5QmdbStateRootStore {
                 tree,
             });
         }
+        lock_hold += publish_started.elapsed();
+        drop(state);
         qualification_abort_at("qmdb_committed");
         metrics::counter!("n42_qmdb_commit_outcomes_total", "outcome" => "committed").increment(1);
         metrics::histogram!("n42_qmdb_lock_hold_ms", "operation" => "commit")
-            .record(lock_acquired.elapsed().as_secs_f64() * 1_000.0);
+            .record(lock_hold.as_secs_f64() * 1_000.0);
         Ok(root)
     }
 
@@ -484,6 +588,11 @@ impl Gov5QmdbStateRootStore {
             cursor = stored.parent_hash;
         }
 
+        metrics::counter!(
+            "n42_qmdb_tip_cache_total",
+            "outcome" => if resumed.is_some() { "hit" } else { "miss" }
+        )
+        .increment(1);
         let (mut tree, base_depth) = match resumed {
             Some(cached) => (cached.tree.clone(), cached.depth),
             None => (QmdbCompatTree::from_snapshot(&self.base_snapshot)?, 0),
@@ -510,25 +619,22 @@ impl Gov5QmdbStateRootStore {
     }
 
     pub fn contains(&self, block_hash: B256) -> Result<bool, Gov5QmdbStateRootError> {
-        Ok(self
+        let state = self
             .state
             .lock()
-            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?
-            .blocks
-            .contains_key(&block_hash))
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+        Ok(Self::durable_block(&state, block_hash).is_some())
     }
 
     pub fn root_for(&self, block_hash: B256) -> Result<Option<B256>, Gov5QmdbStateRootError> {
         if block_hash == self.base_block_hash {
             return Ok(Some(self.base_root));
         }
-        Ok(self
+        let state = self
             .state
             .lock()
-            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?
-            .blocks
-            .get(&block_hash)
-            .map(|block| block.root))
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+        Ok(Self::durable_block(&state, block_hash).map(|block| block.root))
     }
 
     /// Reconstruct an immutable historical snapshot for an exact retained
@@ -542,7 +648,7 @@ impl Gov5QmdbStateRootStore {
             .state
             .lock()
             .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
-        if block_hash != self.base_block_hash && !state.blocks.contains_key(&block_hash) {
+        if block_hash != self.base_block_hash && Self::durable_block(&state, block_hash).is_none() {
             return Ok(None);
         }
         Ok(Some(
@@ -563,7 +669,7 @@ impl Gov5QmdbStateRootStore {
             .state
             .lock()
             .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
-        if block_hash != self.base_block_hash && !state.blocks.contains_key(&block_hash) {
+        if block_hash != self.base_block_hash && Self::durable_block(&state, block_hash).is_none() {
             return Ok(None);
         }
         Ok(self
@@ -595,7 +701,7 @@ impl Gov5QmdbStateRootStore {
                     self.max_replay_depth,
                 ));
             }
-            let Some(block) = state.blocks.get(&cursor) else {
+            let Some(block) = Self::durable_block(&state, cursor) else {
                 return Ok(None);
             };
             distance += 1;
@@ -608,13 +714,11 @@ impl Gov5QmdbStateRootStore {
         if block_hash == self.base_block_hash {
             return Ok(None);
         }
-        Ok(self
+        let state = self
             .state
             .lock()
-            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?
-            .blocks
-            .get(&block_hash)
-            .map(|block| block.parent_hash))
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+        Ok(Self::durable_block(&state, block_hash).map(|block| block.parent_hash))
     }
 
     fn persist_checkpoint_locked(
@@ -636,21 +740,83 @@ impl Gov5QmdbStateRootStore {
         atomic_write(path, &bytes)
     }
 
-    fn append_wal_block(
+    /// Frame a WAL record (`len || payload || blake3`) for `block_hash`, or
+    /// `None` when the store is not persistent.
+    fn encode_wal_frame(
         &self,
         block_hash: B256,
         block: &StoredQmdbBlock,
-    ) -> Result<(), Gov5QmdbStateRootError> {
-        let Some(path) = &self.persistence_path else {
+    ) -> Result<Option<Vec<u8>>, Gov5QmdbStateRootError> {
+        if self.persistence_path.is_none() {
+            return Ok(None);
+        }
+        let payload = bincode::serialize(&PersistedQmdbWalRecordRef { block_hash, block })
+            .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
+        if payload.len() > QMDB_WAL_MAX_RECORD_BYTES {
+            return Err(Gov5QmdbStateRootError::Persistence(format!(
+                "QMDB WAL record is {} bytes, exceeding {}",
+                payload.len(),
+                QMDB_WAL_MAX_RECORD_BYTES
+            )));
+        }
+        let payload_len = u32::try_from(payload.len()).map_err(|_| {
+            Gov5QmdbStateRootError::Persistence("QMDB WAL record exceeds u32 length".into())
+        })?;
+        let checksum = blake3::hash(&payload);
+        let mut frame = Vec::with_capacity(4 + payload.len() + QMDB_WAL_CHECKSUM_BYTES);
+        frame.extend_from_slice(&payload_len.to_le_bytes());
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(checksum.as_bytes());
+        Ok(Some(frame))
+    }
+
+    /// Append one framed record through the persistent handle and make it
+    /// durable. The append only extends the file, so `sync_data` suffices: it
+    /// flushes the data plus the size change needed to read it back. A failed
+    /// or torn write is rolled back to the previous length.
+    fn append_wal_frame(&self, frame: &[u8]) -> Result<(), Gov5QmdbStateRootError> {
+        let mut guard = self
+            .wal
+            .lock()
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+        let Some(wal) = guard.as_mut() else {
             return Ok(());
         };
-        append_wal_record(
-            &wal_path(path),
-            &PersistedQmdbWalRecord {
-                block_hash,
-                block: block.clone(),
-            },
-        )
+        #[cfg(test)]
+        let injected = self.apply_wal_fault(wal, frame);
+        #[cfg(not(test))]
+        let injected: Option<std::io::Error> = None;
+        let write_result = match injected {
+            Some(error) => Err(error),
+            None => wal.file.write_all(frame).and_then(|()| {
+                let fsync_started = std::time::Instant::now();
+                let synced = wal.file.sync_data();
+                metrics::histogram!("n42_qmdb_wal_fsync_ms")
+                    .record(fsync_started.elapsed().as_secs_f64() * 1_000.0);
+                synced
+            }),
+        };
+        if let Err(error) = write_result {
+            let _ = wal.file.set_len(wal.len);
+            let _ = wal.file.sync_all();
+            return Err(Gov5QmdbStateRootError::Persistence(error.to_string()));
+        }
+        wal.len = wal.len.saturating_add(frame.len() as u64);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn apply_wal_fault(&self, wal: &mut QmdbWalFile, frame: &[u8]) -> Option<std::io::Error> {
+        match self.wal_fault.lock().unwrap().take()? {
+            WalFault::Delay(duration) => {
+                std::thread::sleep(duration);
+                None
+            }
+            WalFault::FailWrite => {
+                let _ = wal.file.write_all(&frame[..frame.len() / 2]);
+                Some(std::io::Error::other("injected QMDB WAL write failure"))
+            }
+        }
     }
 }
 
@@ -658,48 +824,22 @@ fn wal_path(checkpoint_path: &Path) -> PathBuf {
     checkpoint_path.with_extension("wal")
 }
 
-fn append_wal_record(
-    path: &Path,
-    record: &PersistedQmdbWalRecord,
-) -> Result<(), Gov5QmdbStateRootError> {
-    let payload = bincode::serialize(record)
-        .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
-    let payload_len = u32::try_from(payload.len()).map_err(|_| {
-        Gov5QmdbStateRootError::Persistence("QMDB WAL record exceeds u32 length".into())
-    })?;
-    if payload.len() > QMDB_WAL_MAX_RECORD_BYTES {
-        return Err(Gov5QmdbStateRootError::Persistence(format!(
-            "QMDB WAL record is {} bytes, exceeding {}",
-            payload.len(),
-            QMDB_WAL_MAX_RECORD_BYTES
-        )));
-    }
+fn open_wal_file(path: &Path) -> Result<QmdbWalFile, Gov5QmdbStateRootError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
     }
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .read(true)
         .append(true)
         .open(path)
         .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
-    let original_len = file
+    let len = file
         .metadata()
         .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?
         .len();
-    let checksum = blake3::hash(&payload);
-    let write_result = file
-        .write_all(&payload_len.to_le_bytes())
-        .and_then(|()| file.write_all(&payload))
-        .and_then(|()| file.write_all(checksum.as_bytes()))
-        .and_then(|()| file.sync_all());
-    if let Err(error) = write_result {
-        let _ = file.set_len(original_len);
-        let _ = file.sync_all();
-        return Err(Gov5QmdbStateRootError::Persistence(error.to_string()));
-    }
-    Ok(())
+    Ok(QmdbWalFile { file, len })
 }
 
 fn load_wal(
@@ -1516,6 +1656,305 @@ mod tests {
                 last_import.as_secs_f64() * 1000.0,
                 last_import.as_secs_f64() / 8.0 * 100.0,
             );
+        }
+    }
+    fn persistent_store(
+        base: &Gov5QmdbStateRootStore,
+        snapshot: &QmdbSnapshot,
+        path: &Path,
+    ) -> Gov5QmdbStateRootStore {
+        Gov5QmdbStateRootStore::persistent(
+            base.base_block_hash(),
+            base.base_root(),
+            snapshot.clone(),
+            64,
+            path.to_path_buf(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn borrowed_wal_record_encodes_identically_to_the_owned_record() {
+        let block = StoredQmdbBlock {
+            parent_hash: B256::repeat_byte(0x31),
+            root: B256::repeat_byte(0x32),
+            operations: vec![operation(2, 2), operation(3, 0)],
+        };
+        let block_hash = B256::repeat_byte(0x33);
+        let owned = bincode::serialize(&PersistedQmdbWalRecord {
+            block_hash,
+            block: block.clone(),
+        })
+        .unwrap();
+        let borrowed = bincode::serialize(&PersistedQmdbWalRecordRef {
+            block_hash,
+            block: &block,
+        })
+        .unwrap();
+        assert_eq!(owned, borrowed);
+        let decoded: PersistedQmdbWalRecord = bincode::deserialize(&borrowed).unwrap();
+        assert_eq!(decoded.block_hash, block_hash);
+        assert_eq!(decoded.block, block);
+    }
+
+    /// A block whose WAL append fails must not be committed: it leaves the
+    /// in-memory graph, the cached tip and the file exactly as they were, and
+    /// a store reopened from disk does not know it. A retry then succeeds.
+    #[test]
+    fn wal_append_failure_rolls_back_the_insert() {
+        let (base, snapshot) = store();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-failure.bin");
+        let persistent = persistent_store(&base, &snapshot, &path);
+
+        let first_ops = vec![operation(2, 2)];
+        let first = B256::repeat_byte(0x21);
+        let first_root = expected_root(&snapshot, std::slice::from_ref(&first_ops));
+        persistent
+            .compute_and_commit(base.base_block_hash(), first, first_root, first_ops.clone())
+            .unwrap();
+        let wal = wal_path(&path);
+        let durable_len = std::fs::metadata(&wal).unwrap().len();
+
+        let second_ops = vec![operation(3, 3)];
+        let second = B256::repeat_byte(0x22);
+        let second_root = expected_root(&snapshot, &[first_ops.clone(), second_ops.clone()]);
+        persistent.inject_wal_fault(WalFault::FailWrite);
+        let error = persistent
+            .compute_and_commit(first, second, second_root, second_ops.clone())
+            .unwrap_err();
+        assert!(
+            matches!(error, Gov5QmdbStateRootError::Persistence(_)),
+            "unexpected error: {error:?}"
+        );
+
+        assert!(!persistent.contains(second).unwrap());
+        assert_eq!(persistent.root_for(second).unwrap(), None);
+        assert_eq!(persistent.parent_for(second).unwrap(), None);
+        assert_eq!(persistent.retained_block_count().unwrap(), 1);
+        assert!(!persistent.wal_in_flight());
+        {
+            let state = persistent.state.lock().unwrap();
+            assert!(!state.blocks.contains_key(&second));
+            assert_eq!(
+                state.cached_tip.as_ref().map(|tip| tip.block_hash),
+                Some(first),
+                "the cached tip must still describe the last durable block"
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(&wal).unwrap().len(),
+            durable_len,
+            "the torn frame must be rolled back on disk"
+        );
+        let reopened = persistent_store(&base, &snapshot, &path);
+        assert_eq!(reopened.root_for(first).unwrap(), Some(first_root));
+        assert_eq!(reopened.root_for(second).unwrap(), None);
+        drop(reopened);
+
+        assert_eq!(
+            persistent
+                .compute_and_commit(first, second, second_root, second_ops)
+                .unwrap(),
+            second_root
+        );
+        assert!(persistent.contains(second).unwrap());
+        drop(persistent);
+        let reopened = persistent_store(&base, &snapshot, &path);
+        assert_eq!(reopened.root_for(second).unwrap(), Some(second_root));
+    }
+
+    /// The WAL write and fsync run with the `state` lock released: while a
+    /// commit is stalled inside its append, a candidate on top of the pending
+    /// block and archive reads of durable blocks proceed immediately, and the
+    /// pending block stays invisible to archive readers until it is durable.
+    #[test]
+    fn wal_append_does_not_hold_the_state_lock() {
+        const DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
+        let (base, snapshot) = store();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-delay.bin");
+        let persistent = Arc::new(persistent_store(&base, &snapshot, &path));
+
+        let first_ops = vec![operation(2, 2)];
+        let first = B256::repeat_byte(0x21);
+        let first_root = expected_root(&snapshot, std::slice::from_ref(&first_ops));
+        persistent
+            .compute_and_commit(base.base_block_hash(), first, first_root, first_ops.clone())
+            .unwrap();
+
+        let second_ops = vec![operation(3, 3)];
+        let second = B256::repeat_byte(0x22);
+        let second_root = expected_root(&snapshot, &[first_ops.clone(), second_ops.clone()]);
+        persistent.inject_wal_fault(WalFault::Delay(DELAY));
+        let committer = Arc::clone(&persistent);
+        let commit_started = std::time::Instant::now();
+        let commit = std::thread::spawn(move || {
+            committer.compute_and_commit(first, second, second_root, second_ops)
+        });
+        let wait_started = std::time::Instant::now();
+        while !persistent.wal_in_flight() {
+            assert!(
+                wait_started.elapsed() < std::time::Duration::from_secs(5),
+                "commit never reached its WAL append"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let third_ops = vec![operation(4, 4)];
+        let reads_started = std::time::Instant::now();
+        let candidate = persistent.compute_candidate(second, &third_ops).unwrap();
+        assert!(!persistent.contains(second).unwrap());
+        assert_eq!(persistent.root_for(second).unwrap(), None);
+        assert_eq!(persistent.root_for(first).unwrap(), Some(first_root));
+        assert!(persistent.snapshot_for(first).unwrap().is_some());
+        let reads_elapsed = reads_started.elapsed();
+        assert!(
+            reads_elapsed < DELAY / 4,
+            "reads were blocked behind the WAL append for {reads_elapsed:?}"
+        );
+
+        assert_eq!(commit.join().unwrap().unwrap(), second_root);
+        assert!(
+            commit_started.elapsed() >= DELAY,
+            "the injected stall must have been inside the commit"
+        );
+        assert!(persistent.contains(second).unwrap());
+        assert_eq!(persistent.root_for(second).unwrap(), Some(second_root));
+        assert_eq!(
+            candidate,
+            expected_root(&snapshot, &[first_ops, vec![operation(3, 3)], third_ops]),
+            "a candidate built on the in-flight block must equal the cold reconstruction"
+        );
+    }
+
+    #[test]
+    fn tip_cache_metric_counts_resumed_and_cold_reconstructions() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (store, snapshot) = store();
+        let first_ops = vec![operation(2, 2)];
+        let first = B256::repeat_byte(0x21);
+        let first_root = expected_root(&snapshot, std::slice::from_ref(&first_ops));
+        // Cold: nothing is cached yet.
+        store
+            .compute_and_commit(
+                store.base_block_hash(),
+                first,
+                first_root,
+                first_ops.clone(),
+            )
+            .unwrap();
+        // Hit: the candidate resumes from the committed tip.
+        store.compute_candidate(first, &[operation(3, 3)]).unwrap();
+        // Miss: a sibling branch off the base cannot use the tip.
+        store
+            .compute_candidate(store.base_block_hash(), &[operation(4, 4)])
+            .unwrap();
+
+        let outcomes: HashMap<String, u64> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == "n42_qmdb_tip_cache_total")
+            .map(|(key, _, _, value)| {
+                let outcome = key
+                    .key()
+                    .labels()
+                    .find(|label| label.key() == "outcome")
+                    .map(|label| label.value().to_string())
+                    .unwrap();
+                let DebugValue::Counter(count) = value else {
+                    panic!("counter expected");
+                };
+                (outcome, count)
+            })
+            .collect();
+        assert_eq!(outcomes.get("hit"), Some(&1));
+        assert_eq!(outcomes.get("miss"), Some(&2));
+    }
+
+    /// Measurement, not a gate: how long a commit holds the shared `state`
+    /// mutex versus how long its WAL append and fsync take. Run with
+    /// `--ignored --nocapture` on a persistent store so the WAL path is live.
+    #[test]
+    #[ignore = "measurement, not a correctness gate"]
+    fn qmdb_commit_lock_hold_vs_wal_append() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        const BLOCKS: usize = 200;
+        const OPS_PER_BLOCK: usize = 32;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (base, snapshot) = store();
+        let dir = tempfile::tempdir().unwrap();
+        let persistent = Gov5QmdbStateRootStore::persistent(
+            base.base_block_hash(),
+            base.base_root(),
+            snapshot,
+            DEFAULT_QMDB_REPLAY_DEPTH,
+            dir.path().join("qmdb-lock-hold.bin"),
+        )
+        .unwrap();
+        let mut parent = persistent.base_block_hash();
+        let started = std::time::Instant::now();
+        for block in 0..BLOCKS {
+            let operations: Vec<QmdbOperation> = (0..OPS_PER_BLOCK)
+                .map(|k| {
+                    let mut key = [0u8; 32];
+                    key[..8].copy_from_slice(&((block * OPS_PER_BLOCK + k) as u64).to_le_bytes());
+                    QmdbOperation {
+                        key,
+                        value: Some(vec![(block % 251) as u8; 32]),
+                    }
+                })
+                .collect();
+            let block_hash = B256::from(blake3::hash(&block.to_le_bytes()).as_bytes());
+            let root = persistent.compute_candidate(parent, &operations).unwrap();
+            persistent
+                .compute_and_commit(parent, block_hash, root, operations)
+                .unwrap();
+            parent = block_hash;
+        }
+        let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        let mut rows = Vec::new();
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            let DebugValue::Histogram(samples) = value else {
+                continue;
+            };
+            let name = key.key().name().to_string();
+            let labels: Vec<String> = key
+                .key()
+                .labels()
+                .map(|label| format!("{}={}", label.key(), label.value()))
+                .collect();
+            let mut sorted: Vec<f64> = samples.into_iter().map(|v| v.into_inner()).collect();
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            let n = sorted.len();
+            let mean = sorted.iter().sum::<f64>() / n.max(1) as f64;
+            let p50 = sorted[n / 2];
+            let p99 = sorted[(n * 99 / 100).min(n - 1)];
+            let max = sorted[n - 1];
+            rows.push(format!(
+                "{name}{{{}}}: n={n} mean={mean:.3}ms p50={p50:.3}ms p99={p99:.3}ms max={max:.3}ms",
+                labels.join(",")
+            ));
+        }
+        rows.sort();
+        println!(
+            "qmdb commit lock-hold measurement: {BLOCKS} blocks x {OPS_PER_BLOCK} ops in {total_ms:.1}ms"
+        );
+        for row in rows {
+            println!("  {row}");
         }
     }
 }
