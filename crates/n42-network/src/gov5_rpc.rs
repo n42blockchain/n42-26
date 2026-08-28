@@ -776,6 +776,9 @@ fn encode_framed_payload(payload: &[u8], max_decoded: usize) -> io::Result<Vec<u
     Ok(encoded)
 }
 
+/// Error text of a framed payload refused at its declared length.
+const FRAMED_PAYLOAD_OVER_LIMIT: &str = "Gov5 framed payload exceeds decoded size limit";
+
 async fn read_framed_payload<T>(
     io: &mut T,
     max_wire: usize,
@@ -802,7 +805,7 @@ where
     if declared_len > max_decoded {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Gov5 framed payload exceeds decoded size limit",
+            FRAMED_PAYLOAD_OVER_LIMIT,
         ));
     }
 
@@ -953,7 +956,11 @@ where
         )
         .await
         .map_err(|error| {
-            if error.kind() == io::ErrorKind::InvalidData && remaining < MAX_GOV5_RANGE_BLOCK_SIZE
+            // Only the declared-length refusal is a budget refusal; a corrupt
+            // or over-sized single chunk keeps its own message.
+            if error.kind() == io::ErrorKind::InvalidData
+                && remaining < MAX_GOV5_RANGE_BLOCK_SIZE
+                && error.to_string() == FRAMED_PAYLOAD_OVER_LIMIT
             {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1878,6 +1885,92 @@ mod tests {
         assert_eq!(blocks.len() as u64, missing - 1);
         assert_eq!(blocks[0], stored[&1]);
         assert_eq!(blocks.last().unwrap(), &stored[&(missing - 1)]);
+    }
+
+    /// Each batch is read from its own consistent view, so a reorg between
+    /// two batches can hand the second batch a block that is canonical now
+    /// but does not descend from the last block served. The parent-linkage
+    /// check truncates the stream at the batch boundary with a clean end,
+    /// exactly as a mid-batch break would.
+    #[test]
+    fn bodies_by_range_truncates_a_reorg_at_a_batch_boundary() {
+        let first_batch = GOV5_RANGE_BATCH_BLOCKS;
+        let total = 2 * GOV5_RANGE_BATCH_BLOCKS;
+        let mut parent = B256::repeat_byte(9);
+        let mut old_chain = HashMap::new();
+        for number in 1..=first_batch {
+            let (hash, block) = range_block(number, parent);
+            old_chain.insert(number, block);
+            parent = hash;
+        }
+        // The view the second batch sees: numbers 1..=32 still resolve, but
+        // 33 onward belong to a chain that forked below the served tip.
+        let mut new_chain = old_chain.clone();
+        let mut parent = B256::repeat_byte(0x77);
+        for number in first_batch + 1..=total {
+            let (hash, block) = range_block(number, parent);
+            new_chain.insert(number, block);
+            parent = hash;
+        }
+        let views = Arc::new(std::sync::Mutex::new(vec![
+            Arc::new(new_chain),
+            Arc::new(old_chain.clone()),
+        ]));
+        let reader_views = Arc::clone(&views);
+        let reader = Gov5CanonicalBlockReader::new_ranged(
+            move || Ok(total),
+            move |numbers| {
+                // Each batch takes the next view: the first batch the old
+                // chain, the second the reorged one.
+                let view = reader_views
+                    .lock()
+                    .unwrap()
+                    .pop()
+                    .expect("no more than two batches are read");
+                let mut rlps = Vec::new();
+                for number in numbers {
+                    match view.get(&number) {
+                        Some(block) => rlps.push(block.clone()),
+                        None => break,
+                    }
+                }
+                Ok(rlps)
+            },
+        );
+        let response = Gov5BodiesByRangeResponse::Stream {
+            request: Gov5BodiesByRangeRequest {
+                start: 1,
+                count: total,
+                step: 1,
+            },
+            fork_digest: [1, 2, 3, 4],
+            reader,
+        };
+        let protocol = StreamProtocol::new(GOV5_BODIES_BY_RANGE_PROTOCOL);
+        let mut wire = futures::io::Cursor::new(Vec::new());
+        futures::executor::block_on(
+            Gov5BodiesByRangeCodec.write_response(&protocol, &mut wire, response),
+        )
+        .unwrap();
+        assert!(
+            views.lock().unwrap().is_empty(),
+            "both batches must have been read"
+        );
+        let mut wire = futures::io::Cursor::new(wire.into_inner());
+        let Gov5BodiesByRangeResponse::Blocks(decoded) =
+            futures::executor::block_on(Gov5BodiesByRangeCodec.read_response(&protocol, &mut wire))
+                .unwrap()
+        else {
+            panic!("expected block response, not an error frame");
+        };
+        assert_eq!(
+            decoded.len() as u64,
+            first_batch,
+            "only the linked prefix is served"
+        );
+        for (offset, chunk) in decoded.iter().enumerate() {
+            assert_eq!(chunk.rlp, old_chain[&(offset as u64 + 1)]);
+        }
     }
 
     #[test]
