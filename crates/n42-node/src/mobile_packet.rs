@@ -12,7 +12,9 @@ use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::{ConfigureEvm, execute::Executor};
 use reth_primitives_traits::{BlockBody, NodePrimitives};
 use reth_provider::BlockHashReader;
-use reth_storage_api::{BlockReader, StateProviderFactory, TransactionVariant};
+use reth_storage_api::{
+    BlockNumReader, BlockReader, StateProviderBox, StateProviderFactory, TransactionVariant,
+};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc,
@@ -236,6 +238,65 @@ pub async fn mobile_packet_loop<P>(
     info!("mobile packet generation loop stopped (channel closed)");
 }
 
+/// Which state a witness was generated against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WitnessStateSource {
+    /// The parent is the canonical head: the tip state provider serves reads
+    /// from the in-memory overlay without per-key history lookups.
+    Tip,
+    /// Any other parent: the historical provider at that block.
+    Historical,
+}
+
+impl WitnessStateSource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Tip => "tip",
+            Self::Historical => "historical",
+        }
+    }
+}
+
+fn canonical_head<P>(provider: &P) -> Option<B256>
+where
+    P: BlockNumReader + BlockHashReader,
+{
+    let number = provider.best_block_number().ok()?;
+    provider.block_hash(number).ok().flatten()
+}
+
+/// Pick the parent state a witness executes against.
+///
+/// When `parent_hash` is the canonical head, `latest()` is the same state as
+/// `history_by_block_hash(parent_hash)` but skips the block-number lookup,
+/// the canonical check and the historical overlay setup. The head is read
+/// again after `latest()` was taken: if it moved in between, the tip state
+/// could already include a child block, so the historical path is used.
+fn parent_state_provider<P>(
+    provider: &P,
+    parent_hash: B256,
+) -> Result<(StateProviderBox, WitnessStateSource), MobilePacketError>
+where
+    P: StateProviderFactory + BlockNumReader + BlockHashReader,
+{
+    if canonical_head(provider) == Some(parent_hash) {
+        let latest = provider
+            .latest()
+            .map_err(|e| MobilePacketError::StateProvider(e.to_string()))?;
+        if canonical_head(provider) == Some(parent_hash) {
+            metrics::counter!("n42_mobile_witness_state_source_total", "source" => "tip")
+                .increment(1);
+            return Ok((latest, WitnessStateSource::Tip));
+        }
+    }
+    let state = provider
+        .history_by_block_hash(parent_hash)
+        .map_err(|e| MobilePacketError::StateProvider(e.to_string()))?;
+    metrics::counter!("n42_mobile_witness_state_source_total", "source" => "historical")
+        .increment(1);
+    Ok((state, WitnessStateSource::Historical))
+}
+
 /// Generates a V2 stream packet and broadcasts it.
 ///
 /// Flow: fetch block → get parent state → wrap with ReadLogDatabase → execute
@@ -264,9 +325,7 @@ where
             .ok_or(MobilePacketError::BlockNotFound(block_hash))?;
 
         let parent_hash = recovered_block.header().parent_hash();
-        let state_provider = provider
-            .history_by_block_hash(parent_hash)
-            .map_err(|e| MobilePacketError::StateProvider(e.to_string()))?;
+        let (state_provider, state_source) = parent_state_provider(provider, parent_hash)?;
 
         let inner_db = reth_revm::database::StateProviderDatabase::new(&state_provider);
         let logged_db = ReadLogDatabase::new(inner_db);
@@ -334,6 +393,7 @@ where
 
         debug!(
             block_number,
+            state_source = state_source.label(),
             read_log_entries = read_log_count,
             read_log_bytes = packet.read_log_data.len(),
             bytecodes = packet.bytecodes.len(),
@@ -421,6 +481,61 @@ where
 mod tests {
     use super::*;
     use alloy_primitives::{B256, Bytes};
+
+    #[test]
+    fn witness_state_source_uses_the_tip_only_for_the_canonical_head() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use reth_provider::test_utils::MockEthProvider;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let provider = MockEthProvider::default();
+        let older = B256::repeat_byte(0x11);
+        let head = B256::repeat_byte(0x22);
+        for (number, hash) in [(6u64, older), (7, head)] {
+            provider.add_block(
+                hash,
+                reth_ethereum_primitives::Block {
+                    header: alloy_consensus::Header {
+                        number,
+                        ..Default::default()
+                    },
+                    body: Default::default(),
+                },
+            );
+        }
+        assert_eq!(canonical_head(&provider), Some(head));
+
+        let (_, source) = parent_state_provider(&provider, head).unwrap();
+        assert_eq!(source, WitnessStateSource::Tip);
+        let (_, source) = parent_state_provider(&provider, older).unwrap();
+        assert_eq!(source, WitnessStateSource::Historical);
+        let (_, source) = parent_state_provider(&provider, B256::repeat_byte(0x33)).unwrap();
+        assert_eq!(source, WitnessStateSource::Historical);
+
+        let counts: HashMap<String, u64> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == "n42_mobile_witness_state_source_total")
+            .map(|(key, _, _, value)| {
+                let source = key
+                    .key()
+                    .labels()
+                    .find(|label| label.key() == "source")
+                    .map(|label| label.value().to_string())
+                    .unwrap();
+                let DebugValue::Counter(count) = value else {
+                    panic!("counter expected");
+                };
+                (source, count)
+            })
+            .collect();
+        assert_eq!(counts.get("tip"), Some(&1));
+        assert_eq!(counts.get("historical"), Some(&2));
+    }
 
     #[test]
     fn test_code_cache_insert_and_contains() {

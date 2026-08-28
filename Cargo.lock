@@ -9962,6 +9962,7 @@ dependencies = [
  "libc",
  "metrics",
  "page_size",
+ "parking_lot",
  "quanta",
  "reth-db-api",
  "reth-fs-util",
@@ -9974,6 +9975,7 @@ dependencies = [
  "rustc-hash 2.1.3",
  "strum 0.27.2",
  "sysinfo 0.38.4",
+ "tempfile",
  "thiserror 2.0.19",
  "tracing",
 ]
@@ -9984,11 +9986,13 @@ version = "2.4.1"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
+ "arbitrary",
  "arrayvec",
  "bytes",
  "derive_more 2.1.1",
  "metrics",
  "modular-bitfield",
+ "proptest",
  "reth-codecs",
  "reth-db-models",
  "reth-ethereum-primitives",
@@ -10036,6 +10040,7 @@ version = "2.4.1"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
+ "arbitrary",
  "bytes",
  "modular-bitfield",
  "reth-codecs",
@@ -11315,6 +11320,7 @@ dependencies = [
  "reth-db",
  "reth-db-api",
  "reth-errors",
+ "reth-ethereum-engine-primitives",
  "reth-ethereum-primitives",
  "reth-execution-types",
  "reth-fs-util",
@@ -11336,6 +11342,7 @@ dependencies = [
  "rocksdb",
  "smallvec",
  "strum 0.27.2",
+ "tokio",
  "tracing",
 ]
 
@@ -11370,6 +11377,7 @@ name = "reth-prune-types"
 version = "2.4.1"
 dependencies = [
  "alloy-primitives",
+ "arbitrary",
  "derive_more 2.1.1",
  "modular-bitfield",
  "reth-codecs",
