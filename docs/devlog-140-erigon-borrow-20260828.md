@@ -233,3 +233,51 @@ head 已经是该块本身，父块走 historical；只有 newPayload 完成而 
 六项全部落地并通过各自 crate 的测试、clippy（`-D warnings`）与 fmt；n42-node 182、
 n42-network 196、n42-consensus-service 212（lib）、n42-parallel-evm 17、n42-node-bin 17
 个测试全绿。分支已推送，未合并到 `main`。
+
+## 合并前评审补充（2026-08-28）
+
+对上面六项逐 hunk 复核后，在分支上追加了以下修正与测试（每项一个提交）：
+
+### QMDB WAL
+
+- **回滚失败后毒化句柄**（`append_wal_frame`）：撕裂帧的 `set_len`/`sync_all` 回滚一旦失败，
+  `QmdbWalFile::len` 就不再描述文件——下一次成功追加会落在垃圾之后，之后再一次回滚会切进已
+  落盘的帧。现在句柄记录 `poisoned` 原因，后续 `compute_and_commit` 一律以 `Persistence` 失败
+  （读、候选计算不受影响），重开 store 时 `load_wal` 截掉撕裂尾后恢复。原先的每块重开实现存在
+  同样问题，不是本分支引入的回归。新增 `n42_qmdb_wal_poisoned_total` 计数与
+  `wal_rollback_failure_poisons_the_handle_until_reopen` 测试（含重开恢复与恢复后继续提交）。
+- **`sync_data` 的判定**：保留 `fdatasync`。POSIX 要求 `fdatasync` 刷出"读回数据所需的元数据"，
+  文件尺寸扩展属于此类；ext4 与 XFS 都会在 `fdatasync` 中记录尺寸变更的日志，只有时间戳之类
+  不刷。新建 WAL 的目录项此前从未 fsync 过（旧实现也没有），现在在 `open_wal_file` 里对父目录
+  做一次 `sync_all`，所以首次追加也不需要 `sync_all`。理由写在 `append_wal_frame` 的文档注释里。
+- 锁序复核：`commit → state`、`wal` 单独且从不在持有 `state` 时获取；`compute_candidate` 只取
+  `state`。没有反向路径，无死锁。并发提交由 `commit` 串行，WAL 顺序等于插入顺序。
+
+### 手机 witness tip 状态
+
+- **原"头再比一次"的检查关不住窗口**：`best_block_number()` 读 chain-info tracker，`latest()` 读
+  内存块表；reth engine tree 先 `update_chain` 再 `set_canonical_head`，两者之间 tracker 仍报父块
+  而 `latest()` 已含子块，前后两次读 tracker 都通过。现在改为向拿到的 state provider 本身核对：
+  `block_hash(parent_number) == parent_hash` 且 `block_hash(parent_number + 1) == None`，不满足
+  走 historical 并计 `source="tip_moved"`。测试
+  `witness_state_source_falls_back_when_the_tip_state_is_ahead_of_the_head` 用一个 tracker 落后
+  一块的 provider 复现该窗口。
+
+### Snappy 帧格式
+
+- 新增 `frame_codec_matches_snap_over_random_inputs`：600 轮随机长度（0--300 KiB，强制覆盖
+  0--4 B 与 64 KiB 倍数 ±3）× {噪声, 混合, 高重复} 内容，断言与 `FrameEncoder` 逐字节相同、
+  `FrameDecoder` 能解我们的帧、我们的解码器能解 `FrameEncoder` 按随机写入切分产出的帧、
+  超限一字节即拒绝。
+- 新增 `crc32c_matches_snap_checksums_on_random_data`：以单块帧头部里 snap 写入的 masked CRC 为
+  oracle，校验查表实现与 SSE4.2 实现（运行时检测到时直接调用）。
+- 复核结论：分块规则（64 KiB、压缩不足 1/8 存原文）、stream identifier、LE 长度、masked CRC-32C
+  与 snap 一致，也与 golang/snappy 的 reader 校验一致（未压缩块 ≤ 65536+4，压缩块 ≤ 76490+4，
+  0x02--0x7f 拒绝，0x80--0xfe 跳过），保留手写实现。
+
+### gov5 range
+
+- 新增 `bodies_by_range_truncates_a_reorg_at_a_batch_boundary`：第二批来自重组后的视图，首块
+  不链接到第一批末块时流在批边界干净截断（无错误帧，客户端得到 32 块）。
+- `read_range_response` 只在 `read_framed_payload` 因声明长度超限而拒绝时才把错误改写为
+  "超出预算"，损坏块保留原错误文本。
