@@ -769,6 +769,27 @@ topic/genesis 下 ID 必须不同的性质测试。此处顺序以向量和 Go �
 `genesis || topic || data`，不是 `topic || genesis || data`；测试失败信息也明确禁止按错误注释
 改回 SHA-256。
 
+### 2026-08-28 同步审计：完成队列与直推摘要去重
+
+本轮只做静态审计和轻量测试，没有运行重负载压测。发现并修复两处可证明的额外工作：
+
+1. CommitQC 为提前取得执行 lineage，会 drain eager-import 完成通道；旧实现克隆可能很大的
+   `StateDiff` 后再 `try_send` 回同一个 256 深度通道。并发 producer 抢满通道时完成事件会丢失，
+   同步 FCU rescue 直接 drain 时还会跳过 H2 的认证后置动作。现在 state diff 只移动一次，轻量字段
+   就地完成投票/抓取退休和三态推进，所有 ready lifecycle 最后只做一次有序 drive，不再回灌通道。
+2. QUIC v3 的不可变 `Arc<Vec<u8>>` 原来在 leader 端每个 peer 由 service 和 codec 各计算一次
+   BLAKE3，receiver codec 验证后 service 又计算一次。6-peer、15 MiB envelope 对应 leader 每块
+   180 MiB 总摘要扫描，其中相对一次必要计算的重复扫描为 165 MiB。现在以 Weak 身份缓存同一 Arc
+   的 transfer ID，跨 fanout/重试只计算一次；receiver 保留 codec 的完整摘要校验，之后只重查
+   manifest 结构。
+
+新增观测量：`n42_block_direct_digest_computations_total`、
+`n42_block_direct_digest_computed_bytes_total`、
+`n42_block_direct_digest_cache_hits_total` 和
+`n42_block_direct_digest_rehash_avoided_bytes_total{site}`。上述字节数是按代码路径计算的静态值，
+不是 TPS 提升声明；下一轮一分钟 A/B 应同时比较 hash bytes、swarm poll 延迟、build→broadcast 和
+commit cadence。
+
 ## 验收结果
 
 round38 对原验收条件的结果：

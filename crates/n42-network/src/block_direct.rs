@@ -287,10 +287,17 @@ impl request_response::Codec for BlockDirectCodec {
                 || manifest.chunk_size as usize != block_direct_chunk_size()
                 || manifest.chunk_count as usize
                     != data.len().div_ceil(manifest.chunk_size as usize)
-                || blake3::hash(data.as_slice()).as_bytes() != &manifest.transfer_id
             {
                 return Err(invalid_data("invalid outbound block direct transfer"));
             }
+            // The network service computes the digest once for the immutable
+            // Arc and reuses it across fanout and retries. The receiver verifies
+            // these exact bytes before constructing `BlockDirectFrame::Transfer`.
+            metrics::counter!(
+                "n42_block_direct_digest_rehash_avoided_bytes_total",
+                "site" => "outbound_codec",
+            )
+            .increment(data.len() as u64);
             io.write_all(&u32::MAX.to_be_bytes()).await?;
             io.write_all(&manifest.transfer_id).await?;
             io.write_all(&manifest.total_len.to_be_bytes()).await?;
@@ -443,6 +450,39 @@ mod tests {
         assert!(
             matches!(decoded, BlockDirectFrame::Transfer { manifest: decoded_manifest, data: decoded } if decoded_manifest == manifest && decoded.as_slice() == data.as_slice())
         );
+    }
+
+    #[tokio::test]
+    async fn transfer_receiver_still_rejects_digest_mismatch() {
+        let chunk_size = block_direct_chunk_size();
+        let data = Arc::new(vec![0x5a; chunk_size + 17]);
+        let manifest = BlockDirectManifest {
+            transfer_id: [0x11; 32],
+            total_len: data.len() as u64,
+            chunk_size: chunk_size as u32,
+            chunk_count: 2,
+        };
+        let mut writer = futures::io::Cursor::new(Vec::new());
+        let mut codec = BlockDirectCodec;
+        let protocol = StreamProtocol::new(BLOCK_DIRECT_PROTOCOL);
+        codec
+            .write_request(
+                &protocol,
+                &mut writer,
+                BlockDirectRequest {
+                    frame: BlockDirectFrame::Transfer { manifest, data },
+                },
+            )
+            .await
+            .expect("sender trusts its prepared immutable digest");
+
+        let mut reader = futures::io::Cursor::new(writer.into_inner());
+        let error = codec
+            .read_request(&protocol, &mut reader)
+            .await
+            .expect_err("receiver must verify the transfer digest");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("digest mismatch"));
     }
 
     #[tokio::test]

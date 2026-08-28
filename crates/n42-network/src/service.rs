@@ -5,7 +5,7 @@ use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, Swarm};
 use n42_primitives::ConsensusMessage;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::interval;
@@ -97,7 +97,39 @@ struct PendingBlockDirectRequest {
 #[derive(Debug)]
 struct QueuedBlockDirect {
     data: Arc<Vec<u8>>,
+    /// Digest of `data`, computed once and shared across peer fanout/retries.
+    transfer_id: Option<[u8; 32]>,
     attempt: u8,
+}
+
+#[derive(Debug, Default)]
+struct BlockDirectDigestCache {
+    last: Option<(Weak<Vec<u8>>, [u8; 32])>,
+}
+
+impl BlockDirectDigestCache {
+    fn transfer_id(&mut self, data: &Arc<Vec<u8>>) -> [u8; 32] {
+        if let Some((cached, transfer_id)) = &self.last
+            && cached
+                .upgrade()
+                .is_some_and(|cached| Arc::ptr_eq(&cached, data))
+        {
+            metrics::counter!("n42_block_direct_digest_cache_hits_total").increment(1);
+            metrics::counter!(
+                "n42_block_direct_digest_rehash_avoided_bytes_total",
+                "site" => "peer_fanout",
+            )
+            .increment(data.len() as u64);
+            return *transfer_id;
+        }
+
+        let transfer_id = *blake3::hash(data.as_slice()).as_bytes();
+        self.last = Some((Arc::downgrade(data), transfer_id));
+        metrics::counter!("n42_block_direct_digest_computations_total").increment(1);
+        metrics::counter!("n42_block_direct_digest_computed_bytes_total")
+            .increment(data.len() as u64);
+        transfer_id
+    }
 }
 
 #[derive(Debug)]
@@ -873,6 +905,9 @@ pub struct NetworkService {
     /// substream. It preserves every intermediate block instead of coalescing
     /// to the latest hash, and is bounded to the request-timeout horizon.
     queued_block_direct_by_peer: HashMap<PeerId, VecDeque<QueuedBlockDirect>>,
+    /// One-entry identity cache: fanout commands for a block share the same Arc,
+    /// so its transfer digest is calculated once rather than once per peer.
+    block_direct_digest_cache: BlockDirectDigestCache,
     pending_gov5_block_requests: HashMap<libp2p::request_response::OutboundRequestId, B256>,
     /// Hash-level de-duplication keeps a stream of QCs for the same missing
     /// ancestry from creating an unbounded request-response storm.
@@ -1220,6 +1255,7 @@ impl NetworkService {
             outbound_block_direct_transfers: HashMap::new(),
             inbound_block_direct_transfers: HashMap::new(),
             queued_block_direct_by_peer: HashMap::new(),
+            block_direct_digest_cache: BlockDirectDigestCache::default(),
             pending_gov5_block_requests: HashMap::new(),
             pending_gov5_block_hashes: HashSet::new(),
             recent_gov5_block_requests: HashMap::new(),
@@ -2345,7 +2381,9 @@ impl NetworkService {
             return;
         }
 
-        let transfer_id = *blake3::hash(data.as_slice()).as_bytes();
+        let transfer_id = queued
+            .transfer_id
+            .expect("large direct block digest is prepared before queueing");
         let chunk_count = bytes.div_ceil(chunk_size) as u32;
         let manifest = BlockDirectManifest {
             transfer_id,
@@ -2379,13 +2417,23 @@ impl NetworkService {
     }
 
     fn enqueue_or_dispatch_block_direct(&mut self, peer: PeerId, data: Arc<Vec<u8>>) {
+        let transfer_id = (data.len() > block_direct_chunk_size()
+            && data.len() <= MAX_BLOCK_DIRECT_SIZE)
+            .then(|| self.block_direct_digest_cache.transfer_id(&data));
         let in_flight = self
             .pending_block_direct_requests
             .values()
             .any(|request| request.peer == peer)
             || self.outbound_block_direct_transfers.contains_key(&peer);
         if !in_flight {
-            self.dispatch_block_direct_request(peer, QueuedBlockDirect { data, attempt: 0 });
+            self.dispatch_block_direct_request(
+                peer,
+                QueuedBlockDirect {
+                    data,
+                    transfer_id,
+                    attempt: 0,
+                },
+            );
             return;
         }
 
@@ -2402,7 +2450,11 @@ impl NetworkService {
             );
             return;
         }
-        queue.push_back(QueuedBlockDirect { data, attempt: 0 });
+        queue.push_back(QueuedBlockDirect {
+            data,
+            transfer_id,
+            attempt: 0,
+        });
         let peer_queue_depth = queue.len();
         metrics::counter!("n42_block_direct_queued_total").increment(1);
         let queued_total = self
@@ -2475,9 +2527,8 @@ impl NetworkService {
                     Some(Arc::try_unwrap(data).unwrap_or_else(|shared| (*shared).clone())),
                 )
             }
-            // The codec has already bounded every allocation and verified each
-            // chunk length. Recheck the manifest/digest at the authorization
-            // boundary before exposing the reconstructed envelope.
+            // The codec has already bounded every allocation, verified every
+            // chunk length and checked the digest over this immutable Arc.
             BlockDirectFrame::Transfer { manifest, data } => {
                 let total_len = usize::try_from(manifest.total_len).unwrap_or(usize::MAX);
                 let chunk_size = manifest.chunk_size as usize;
@@ -2486,12 +2537,16 @@ impl NetworkService {
                     && total_len <= MAX_BLOCK_DIRECT_SIZE
                     && (MIN_BLOCK_DIRECT_CHUNK_SIZE..=MAX_BLOCK_DIRECT_CHUNK_SIZE)
                         .contains(&chunk_size)
-                    && manifest.chunk_count as usize == total_len.div_ceil(chunk_size)
-                    && blake3::hash(data.as_slice()).as_bytes() == &manifest.transfer_id;
+                    && manifest.chunk_count as usize == total_len.div_ceil(chunk_size);
                 if !valid {
                     metrics::counter!("n42_block_direct_manifest_rejected_total").increment(1);
                     return (false, None);
                 }
+                metrics::counter!(
+                    "n42_block_direct_digest_rehash_avoided_bytes_total",
+                    "site" => "inbound_dispatch",
+                )
+                .increment(data.len() as u64);
                 metrics::counter!("n42_block_direct_stream_transfers_received_total").increment(1);
                 (
                     true,
@@ -2791,6 +2846,10 @@ impl NetworkService {
                     }
                     queue.push_front(QueuedBlockDirect {
                         data: pending.data,
+                        transfer_id: match pending.frame {
+                            PendingBlockDirectFrame::Complete => None,
+                            PendingBlockDirectFrame::Transfer { transfer_id } => Some(transfer_id),
+                        },
                         attempt: next_attempt,
                     });
                     metrics::counter!("n42_block_direct_retries_total").increment(1);
@@ -4011,6 +4070,33 @@ impl NetworkService {
 mod tests {
     use super::*;
     use crate::transport::deterministic_validator_peer_id;
+
+    #[test]
+    fn block_direct_digest_cache_reuses_arc_without_retaining_it() {
+        let mut cache = BlockDirectDigestCache::default();
+        let data = Arc::new(vec![0x42; 4096]);
+
+        let first = cache.transfer_id(&data);
+        let second = cache.transfer_id(&data);
+
+        assert_eq!(first, second);
+        assert_eq!(Arc::strong_count(&data), 1, "cache must retain only a Weak");
+        let cached = cache
+            .last
+            .as_ref()
+            .and_then(|(weak, _)| weak.upgrade())
+            .expect("live Arc remains cache-addressable");
+        assert!(Arc::ptr_eq(&cached, &data));
+
+        let replacement = Arc::new(vec![0x24; 4096]);
+        assert_ne!(cache.transfer_id(&replacement), first);
+        let cached = cache
+            .last
+            .as_ref()
+            .and_then(|(weak, _)| weak.upgrade())
+            .expect("replacement Arc remains cache-addressable");
+        assert!(Arc::ptr_eq(&cached, &replacement));
+    }
 
     /// Creates a test handle with both normal and priority channels.
     /// Returns (handle, normal_rx, priority_rx).

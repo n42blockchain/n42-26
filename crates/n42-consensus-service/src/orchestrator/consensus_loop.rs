@@ -401,17 +401,21 @@ impl ConsensusService {
         // multi-megabyte payload again on the commit path.
         let mut eager_completions = Vec::new();
         let mut current_completion_seen = false;
-        while let Ok(completion) = self.eager_import_done_rx.try_recv() {
-            let (hash, _, parent_hash, block_number, has_staking_target, state_diff) = &completion;
-            self.record_validated_execution_metadata(
-                *hash,
-                *parent_hash,
-                *block_number,
-                *has_staking_target,
-                state_diff.clone(),
+        while let Ok((hash, block_ts, parent_hash, block_number, has_staking_target, state_diff)) =
+            self.eager_import_done_rx.try_recv()
+        {
+            current_completion_seen |= hash == block_hash;
+            self.record_eager_import_completion(
+                hash,
+                block_ts,
+                parent_hash,
+                block_number,
+                has_staking_target,
+                state_diff,
             );
-            current_completion_seen |= *hash == block_hash;
-            eager_completions.push(completion);
+            // The large state diff has moved into recent execution metadata.
+            // Keep only the small fields needed for authenticated post-processing.
+            eager_completions.push((hash, block_number, has_staking_target));
         }
         // Never sleep in the consensus output handler. The lifecycle below
         // retains the CommitQC at `Committed` until the matching completion
@@ -423,14 +427,6 @@ impl ConsensusService {
             "outcome" => if current_completion_seen { "immediate_hit" } else { "async" }
         )
         .increment(1);
-        // Preserve the existing finalization/rescue semantics. These events
-        // still need the ordinary eager-completion handler after we borrow
-        // their validated metadata for lineage construction.
-        for completion in eager_completions {
-            if self.eager_import_done_tx.try_send(completion).is_err() {
-                warn!(target: "n42::cl::consensus_loop", "failed to requeue eager-import completion after metadata prefetch");
-            }
-        }
         // A prepared block can survive a timeout as LockedQC and become an
         // execution ancestor of the next block that obtains a CommitQC. Reth
         // then advances by more than one block for a single consensus commit.
@@ -775,6 +771,14 @@ impl ConsensusService {
         let staking_done_at = Instant::now();
 
         self.enqueue_async_commit(view, block_hash, commit_qc, execution_ready);
+        // Complete the authenticated H2/vote and committed-lifecycle actions
+        // for messages prefetched above. They are deliberately not requeued:
+        // requeueing could lose a completion when concurrent producers refill
+        // the bounded channel, while cloning a potentially large StateDiff.
+        for (hash, block_number, has_staking_target) in eager_completions {
+            self.finish_eager_import_completion(hash, block_number, has_staking_target)
+                .await;
+        }
         if !execution_ready {
             let timeout_tx = self.commit_execution_timeout_tx.clone();
             tokio::spawn(async move {
@@ -1108,27 +1112,29 @@ impl ConsensusService {
         // (new_payload only, no FCU) completed during the FCU round-trip. If so, retry
         // FCU — the block should now be in the engine tree and FCU will succeed.
         let finalized = if !finalized {
-            let mut found_match = false;
+            let mut found_match = self.eager_execution_validated.contains(&block_hash);
+            let mut eager_completions = Vec::new();
             while let Ok((hash, ts, parent_hash, block_number, has_staking_target, state_diff)) =
                 self.eager_import_done_rx.try_recv()
             {
-                self.record_validated_execution_metadata(
+                self.record_eager_import_completion(
                     hash,
+                    ts,
                     parent_hash,
                     block_number,
                     has_staking_target,
                     state_diff,
                 );
-                self.record_eager_execution_validated(hash);
-                if ts > 0 {
-                    self.last_committed_timestamp = self.last_committed_timestamp.max(ts);
-                }
-                if let Some(timing) = self.pipeline_timings.get_mut(&hash) {
-                    timing.import_complete = Some(Instant::now());
-                }
                 if hash == block_hash {
                     found_match = true;
                 }
+                eager_completions.push((hash, block_number, has_staking_target));
+            }
+            // A synchronous FCU rescue must not consume H2 completion events
+            // without their vote/fetch and lifecycle post-processing.
+            for (hash, block_number, has_staking_target) in eager_completions {
+                self.finish_eager_import_completion(hash, block_number, has_staking_target)
+                    .await;
             }
             if found_match {
                 if let Some(index) = self
@@ -1784,11 +1790,7 @@ impl ConsensusService {
         }
     }
 
-    /// Called when an eager import task (leader or follower) completes successfully.
-    /// The block is now in reth's engine tree (via new_payload only, no FCU).
-    /// We record this so finalize_committed_block knows the block is pre-validated
-    /// and its FCU will succeed immediately (Case A).
-    pub(super) async fn handle_eager_import_done(
+    fn record_eager_import_completion(
         &mut self,
         hash: B256,
         block_ts: u64,
@@ -1797,11 +1799,6 @@ impl ConsensusService {
         has_staking_target: bool,
         state_diff: Option<n42_execution::state_diff::StateDiff>,
     ) {
-        // Record the pre-imported block hash. When finalize_committed_block runs,
-        // it will find this block already in reth's engine tree, making FCU instant.
-        // We do NOT update head_block_hash here — that should only change via FCU
-        // in finalize_committed_block, to avoid canonical chain reorgs from
-        // speculative blocks that consensus may not ultimately commit.
         if block_ts > 0 {
             self.last_committed_timestamp = self.last_committed_timestamp.max(block_ts);
         }
@@ -1815,9 +1812,16 @@ impl ConsensusService {
             has_staking_target,
             state_diff,
         );
-        debug!(target: "n42::cl::consensus_loop", %hash, "eager import done: block in engine tree (awaiting consensus commit)");
-
         self.record_eager_execution_validated(hash);
+    }
+
+    async fn finish_eager_import_completion(
+        &mut self,
+        hash: B256,
+        block_number: u64,
+        has_staking_target: bool,
+    ) {
+        debug!(target: "n42::cl::consensus_loop", %hash, "eager import done: block in engine tree (awaiting consensus commit)");
 
         // Gov5-compatible votes are execution attestations. Only a successful
         // reth new_payload result reaches this callback, so this is the first
@@ -1855,8 +1859,38 @@ impl ConsensusService {
             // promote it with the exact hash accepted by new_payload.
             self.enqueue_async_commit(view, hash, commit_qc, true);
             self.mark_async_commit_execution_ready(hash);
-            self.drive_async_commits().await;
         }
+    }
+
+    /// Called when an eager import task (leader or follower) completes successfully.
+    /// The block is now in reth's engine tree (via new_payload only, no FCU).
+    /// We record this so finalize_committed_block knows the block is pre-validated
+    /// and its FCU will succeed immediately (Case A).
+    pub(super) async fn handle_eager_import_done(
+        &mut self,
+        hash: B256,
+        block_ts: u64,
+        parent_hash: B256,
+        block_number: u64,
+        has_staking_target: bool,
+        state_diff: Option<n42_execution::state_diff::StateDiff>,
+    ) {
+        // Record the pre-imported block hash. When finalize_committed_block runs,
+        // it will find this block already in reth's engine tree, making FCU instant.
+        // We do NOT update head_block_hash here — that should only change via FCU
+        // in finalize_committed_block, to avoid canonical chain reorgs from
+        // speculative blocks that consensus may not ultimately commit.
+        self.record_eager_import_completion(
+            hash,
+            block_ts,
+            parent_hash,
+            block_number,
+            has_staking_target,
+            state_diff,
+        );
+        self.finish_eager_import_completion(hash, block_number, has_staking_target)
+            .await;
+        self.drive_async_commits().await;
     }
 
     /// Drains validated staking classifications strictly in execution-block
