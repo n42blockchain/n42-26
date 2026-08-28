@@ -156,8 +156,14 @@ where
         });
     }
 
+    metrics::histogram!("n42_parallel_evm_rounds").record(round as f64);
     if !scheduler.all_done() {
         warn!(target: "n42::parallel_evm", round, num_txs, "did not converge, falling back to sequential");
+        metrics::counter!(
+            "n42_parallel_evm_sequential_fallback_total",
+            "reason" => "non_convergence"
+        )
+        .increment(1);
         return sequential_execute(txs, base_db, &cfg_env, &block_env);
     }
 
@@ -770,6 +776,109 @@ mod differential_tests {
             ..Default::default()
         };
         (db, txs, block)
+    }
+
+    /// The process-wide recorder Block-STM workers report into. Worker threads
+    /// belong to rayon, so a thread-local recorder would never see their
+    /// counters; a global one can only be installed once per process.
+    fn global_snapshotter() -> &'static metrics_util::debugging::Snapshotter {
+        static SNAPSHOTTER: std::sync::OnceLock<metrics_util::debugging::Snapshotter> =
+            std::sync::OnceLock::new();
+        SNAPSHOTTER.get_or_init(|| {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::set_global_recorder(recorder).expect("no other global recorder in tests");
+            snapshotter
+        })
+    }
+
+    /// One snapshot of every counter, keyed by name. A snapshot drains the
+    /// debugging recorder, so all three counters must come from the same call.
+    fn global_counters() -> BTreeMap<String, u64> {
+        let mut counters = BTreeMap::new();
+        for (key, _, _, value) in global_snapshotter().snapshot().into_vec() {
+            if let metrics_util::debugging::DebugValue::Counter(count) = value {
+                *counters.entry(key.key().name().to_string()).or_default() += count;
+            }
+        }
+        counters
+    }
+
+    /// Every tx CALLs the same counter contract, so each one SLOADs the slot
+    /// its predecessor SSTOREd: an optimistic parallel schedule must abort and
+    /// re-execute at least once per block, and the counters must say so.
+    #[test]
+    fn forced_conflict_increments_the_reexecution_counter() {
+        if rayon::current_num_threads() < 2 {
+            eprintln!("skipping: Block-STM needs at least two lanes to conflict");
+            return;
+        }
+        const TXS: u64 = 32;
+        const ROUNDS: usize = 8;
+        // Drain whatever earlier tests recorded; the snapshot resets the counters.
+        let _ = global_counters();
+
+        for seed in 0..ROUNDS as u64 {
+            let (db, txs, block) = mixed_block(seed, TXS, 0);
+            // Retarget every tx at one shared counter so the conflict is certain.
+            let counter = addr(0xC000_0000);
+            let mut db = db;
+            db.insert_account_info(
+                counter,
+                AccountInfo {
+                    balance: U256::ZERO,
+                    nonce: 1,
+                    code_hash: counter_code().hash_slow(),
+                    code: Some(counter_code()),
+                    ..Default::default()
+                },
+            );
+            let txs: Vec<TxEnv> = txs
+                .into_iter()
+                .map(|tx| {
+                    TxEnv::builder()
+                        .caller(tx.caller)
+                        .kind(TxKind::Call(counter))
+                        .value(U256::ZERO)
+                        .gas_limit(100_000)
+                        .gas_price(7)
+                        .nonce(0)
+                        .build()
+                        .unwrap()
+                })
+                .collect();
+            let cfg = CfgEnv::default();
+            let seq = sequential_execute(&txs, &db, &cfg, &block).unwrap();
+            let par = parallel_execute(&txs, &db, cfg, block).unwrap();
+            assert_eq!(fingerprint(&seq), fingerprint(&par), "seed={seed}");
+            assert_eq!(
+                par.state_changes[&counter].storage[&U256::ZERO].present_value,
+                U256::from(TXS)
+            );
+        }
+
+        let counters = global_counters();
+        let counter = |name: &str| counters.get(name).copied().unwrap_or(0);
+        let executions = counter("n42_parallel_evm_executions_total");
+        let reexecutions = counter("n42_parallel_evm_reexecutions_total");
+        let failures = counter("n42_parallel_evm_validation_failures_total");
+        eprintln!(
+            "forced conflict: {ROUNDS} blocks x {TXS} txs: executions={executions} reexecutions={reexecutions} validation_failures={failures}"
+        );
+        assert!(
+            executions >= ROUNDS as u64 * TXS,
+            "every tx executes at least once: {executions}"
+        );
+        assert!(
+            reexecutions >= 1,
+            "a forced conflict must abort at least once"
+        );
+        // Other tests may run concurrently and share the process-wide recorder,
+        // so the window can only be compared as a whole.
+        assert_eq!(
+            failures, reexecutions,
+            "every validation failure is exactly one abort_and_reschedule"
+        );
     }
 
     /// Run one randomized block through sequential (reference) and parallel

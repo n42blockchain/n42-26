@@ -185,6 +185,11 @@ impl Scheduler {
     /// every higher-indexed tx (it may have read this one's stale writes) and
     /// rewinds the validation cursor to this index.
     pub fn abort_and_reschedule(&self, tx_idx: TxIdx) {
+        // One re-execution per abort of the failing tx itself. Higher txs
+        // re-marked REDO below are counted when their own Execute task runs
+        // (`n42_parallel_evm_executions_total`), so this counter is the number
+        // of validation-driven aborts, comparable to Erigon's `reexecutions`.
+        metrics::counter!("n42_parallel_evm_reexecutions_total").increment(1);
         let prev_self = self.status[tx_idx].swap(STATUS_REDO, Ordering::SeqCst);
         self.redo.push(tx_idx);
 
@@ -246,6 +251,31 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    #[test]
+    fn abort_and_reschedule_counts_one_reexecution_per_abort() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let scheduler = Scheduler::new(4);
+        for idx in 0..4 {
+            scheduler.finish_execution(idx);
+        }
+        scheduler.abort_and_reschedule(1);
+        scheduler.abort_and_reschedule(0);
+
+        let reexecutions =
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(key, _, _, value)| {
+                    (key.key().name() == "n42_parallel_evm_reexecutions_total").then_some(value)
+                });
+        assert_eq!(reexecutions, Some(DebugValue::Counter(2)));
+    }
 
     #[test]
     fn abort_and_reschedule_only_decrements_currently_validated_txs_once() {

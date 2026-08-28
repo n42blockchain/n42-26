@@ -48,6 +48,7 @@ pub(crate) fn worker_loop<DB>(
 
         match task {
             Task::Execute(tx_idx) => {
+                metrics::counter!("n42_parallel_evm_executions_total").increment(1);
                 mv.clear_tx(tx_idx);
 
                 let output = execute_single_tx(
@@ -85,6 +86,7 @@ pub(crate) fn worker_loop<DB>(
                 if valid {
                     scheduler.finish_validation(tx_idx);
                 } else {
+                    metrics::counter!("n42_parallel_evm_validation_failures_total").increment(1);
                     scheduler.abort_and_reschedule(tx_idx);
                 }
             }

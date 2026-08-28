@@ -7351,6 +7351,7 @@ dependencies = [
  "alloy-primitives",
  "dashmap",
  "metrics",
+ "metrics-util",
  "mimalloc",
  "parking_lot",
  "rayon",

@@ -27,6 +27,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 mimalloc = "0.1"
 [[example]]
 name = "parallel_profile"
