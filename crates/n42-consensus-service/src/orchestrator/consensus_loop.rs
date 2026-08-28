@@ -2320,7 +2320,7 @@ impl ConsensusService {
         block_hash: B256,
         exec_bytes: &[u8],
     ) -> Option<n42_execution::state_diff::StateDiff> {
-        let decompressed = match zstd::bulk::decompress(
+        let decompressed = match super::zstd_decompress_pooled(
             exec_bytes,
             super::MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE,
         ) {
@@ -2386,7 +2386,10 @@ impl ConsensusService {
                 return None;
             }
         };
-        match zstd::bulk::decompress(exec_bytes, super::MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE) {
+        match super::zstd_decompress_pooled(
+            exec_bytes,
+            super::MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE,
+        ) {
             Ok(bundle_json) => Some(bundle_json),
             Err(error) => {
                 warn!(

@@ -1,10 +1,8 @@
 use alloy_primitives::B256;
 use futures::prelude::*;
 use libp2p::{StreamProtocol, request_response};
-use snap::read::FrameDecoder;
-use snap::write::FrameEncoder;
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io;
 use std::sync::Arc;
 
 /// Gov5's reliable leader-to-peer block push protocol.
@@ -383,9 +381,7 @@ fn decode_status_ssz(encoded: &[u8]) -> io::Result<Gov5Status> {
 
 fn encode_status(status: Gov5Status, response: bool) -> io::Result<Vec<u8>> {
     let payload = encode_status_ssz(status);
-    let mut frame = FrameEncoder::new(Vec::new());
-    frame.write_all(&payload)?;
-    let compressed = frame.into_inner().map_err(io::Error::other)?;
+    let compressed = crate::snappy_pool::frame_encode(&payload)?;
     let mut encoded = Vec::with_capacity(1 + 10 + compressed.len());
     if response {
         encoded.push(0);
@@ -425,10 +421,7 @@ fn decode_status(encoded: &[u8], response: bool) -> io::Result<Gov5Status> {
             "gov5 Status payload is missing",
         )
     })?;
-    let mut decoded = Vec::with_capacity(declared_len);
-    FrameDecoder::new(compressed)
-        .take((declared_len + 1) as u64)
-        .read_to_end(&mut decoded)?;
+    let decoded = crate::snappy_pool::frame_decode(compressed, declared_len)?;
     if decoded.len() != declared_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -499,10 +492,9 @@ where
         framed.resize(start + chunk_len, 0);
         io.read_exact(&mut framed[start..]).await?;
 
-        let mut decoded = Vec::with_capacity(declared_len);
-        FrameDecoder::new(framed.as_slice())
-            .take((declared_len + 1) as u64)
-            .read_to_end(&mut decoded)?;
+        // Chunks are complete at this point, so a partial frame decodes to
+        // its prefix; the stream is done once that prefix is the declaration.
+        let decoded = crate::snappy_pool::frame_decode(framed.as_slice(), declared_len)?;
         if decoded.len() == declared_len {
             encoded.extend_from_slice(&framed);
             let status = decode_status(&encoded, response)?;
@@ -556,15 +548,12 @@ fn decode_chunked_block(encoded: &[u8]) -> io::Result<Vec<u8>> {
     let frame = encoded
         .get(5 + prefix_len..)
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing gov5 Snappy frame"))?;
-    let mut decoded = Vec::with_capacity(declared_len);
     // Cap the decompressed stream at the declaration, as the Status paths do.
     // The wire frame is bounded, but Snappy expansion is not: a ~1 MiB frame of
-    // minimal chunks expands to several GiB, and reading it to the end would
-    // exhaust memory before the length check below ever runs. Reading one byte
-    // past the declaration is enough to still detect an over-long payload.
-    FrameDecoder::new(frame)
-        .take((declared_len + 1) as u64)
-        .read_to_end(&mut decoded)?;
+    // minimal chunks expands to several GiB, and decoding it to the end would
+    // exhaust memory before the length check below ever runs. The pooled frame
+    // decoder refuses the first chunk that would cross the declaration.
+    let decoded = crate::snappy_pool::frame_decode(frame, declared_len)?;
     if decoded.len() != declared_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -585,9 +574,7 @@ fn encode_chunked_block(rlp: &[u8], fork_digest: [u8; 4]) -> io::Result<Vec<u8>>
         ));
     }
 
-    let mut frame = FrameEncoder::new(Vec::new());
-    frame.write_all(rlp)?;
-    let compressed = frame.into_inner().map_err(io::Error::other)?;
+    let compressed = crate::snappy_pool::frame_encode(rlp)?;
 
     let mut encoded = Vec::with_capacity(5 + 10 + compressed.len());
     encoded.push(0);
@@ -604,9 +591,7 @@ fn encode_framed_payload(payload: &[u8], max_decoded: usize) -> io::Result<Vec<u
             "Gov5 framed payload exceeds decoded size limit",
         ));
     }
-    let mut frame = FrameEncoder::new(Vec::new());
-    frame.write_all(payload)?;
-    let compressed = frame.into_inner().map_err(io::Error::other)?;
+    let compressed = crate::snappy_pool::frame_encode(payload)?;
     let mut encoded = Vec::with_capacity(10 + compressed.len());
     encode_uvarint(payload.len(), &mut encoded);
     encoded.extend_from_slice(&compressed);
@@ -715,10 +700,7 @@ where
         }
     }
 
-    let mut decoded = Vec::with_capacity(declared_len);
-    FrameDecoder::new(&encoded[prefix_len..])
-        .take((declared_len + 1) as u64)
-        .read_to_end(&mut decoded)?;
+    let decoded = crate::snappy_pool::frame_decode(&encoded[prefix_len..], declared_len)?;
     if decoded.len() != declared_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1126,7 +1108,10 @@ mod tests {
     use alloy_primitives::{Bytes, U256, keccak256};
     use alloy_rlp::{Encodable, Header as RlpHeader};
     use libp2p::request_response::Codec;
+    use snap::read::FrameDecoder;
+    use snap::write::FrameEncoder;
     use std::collections::HashMap;
+    use std::io::{Read, Write};
     use std::{pin::Pin, task::Poll};
 
     struct NoEof {

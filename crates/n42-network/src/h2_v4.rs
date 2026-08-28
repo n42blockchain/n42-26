@@ -101,8 +101,7 @@ pub fn decode_envelope(
 
 pub fn encode_gossip(envelope: &H2V4Envelope) -> Result<Vec<u8>, H2V4Error> {
     let wire = encode_envelope(envelope)?;
-    snap::raw::Encoder::new()
-        .compress_vec(&wire)
+    crate::snappy_pool::raw_compress(&wire)
         .map_err(|error| H2V4Error::InvalidSnappy(error.to_string()))
 }
 
@@ -112,8 +111,7 @@ pub fn decode_gossip(data: &[u8], expected: H2V4ChainIdentity) -> Result<H2V4Env
     if len > HEADER_SIZE + MAX_WIRE_SIZE {
         return Err(H2V4Error::InvalidLength);
     }
-    let wire = snap::raw::Decoder::new()
-        .decompress_vec(data)
+    let wire = crate::snappy_pool::raw_decompress(data)
         .map_err(|error| H2V4Error::InvalidSnappy(error.to_string()))?;
     decode_envelope(&wire, expected)
 }

@@ -1939,7 +1939,7 @@ impl NetworkService {
                         return;
                     }
                 };
-                match snap::raw::Decoder::new().decompress_vec(&message.data) {
+                match crate::snappy_pool::raw_decompress(&message.data) {
                     Ok(rlp) if rlp.len() == decoded_len => {
                         metrics::counter!("n42_gov5_blocks_observed_total").increment(1);
                         if let Err(error) = self.retain_gov5_served_block(&rlp) {
@@ -3718,7 +3718,7 @@ impl NetworkService {
                     "direct-pushed gov5 leader block"
                 );
 
-                match snap::raw::Encoder::new().compress_vec(&rlp) {
+                match crate::snappy_pool::raw_compress(&rlp) {
                     Ok(data) => {
                         metrics::counter!("n42_h2_v4_blocks_sent_total").increment(1);
                         self.gossipsub_publish(

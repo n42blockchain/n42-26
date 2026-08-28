@@ -104,11 +104,51 @@ enum LeaderBuildWaitMode {
     Scheduled,
 }
 
+thread_local! {
+    // One zstd context per thread. `zstd::bulk::compress`/`decompress` build
+    // and tear down a `ZSTD_CCtx`/`ZSTD_DCtx` (window buffers included) on
+    // every call; a reused context is reset per frame and produces the same
+    // bytes for the same level (see `pooled_zstd_matches_one_shot`).
+    static ZSTD_COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
+        const { std::cell::RefCell::new(None) };
+    static ZSTD_DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// zstd-compress `payload` at `level` with this thread's pooled context.
+pub fn zstd_compress_pooled(payload: &[u8], level: i32) -> std::io::Result<Vec<u8>> {
+    ZSTD_COMPRESSOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(zstd::bulk::Compressor::new(level)?);
+        }
+        let compressor = slot.as_mut().expect("compressor was just created");
+        // The level is process-wide in practice (`payload_zstd_level` is
+        // cached), but keep the context honest if a caller passes another.
+        compressor.set_compression_level(level)?;
+        compressor.compress(payload)
+    })
+}
+
+/// zstd-decompress `data` into at most `capacity` bytes with this thread's
+/// pooled context.
+pub fn zstd_decompress_pooled(data: &[u8], capacity: usize) -> std::io::Result<Vec<u8>> {
+    ZSTD_DECOMPRESSOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(zstd::bulk::Decompressor::new()?);
+        }
+        slot.as_mut()
+            .expect("decompressor was just created")
+            .decompress(data, capacity)
+    })
+}
+
 /// Compress a block-data component with zstd. Production keeps level 3; throughput
 /// qualification can choose a faster level through `N42_ZSTD_LEVEL`.
 pub fn compress_payload(payload: &[u8]) -> Vec<u8> {
     let level = payload_zstd_level();
-    zstd::bulk::compress(payload, level).unwrap_or_else(|e| {
+    zstd_compress_pooled(payload, level).unwrap_or_else(|e| {
         tracing::warn!(target: "n42::cl", len = payload.len(), error = %e, "zstd compression failed, sending uncompressed");
         payload.to_vec()
     })
@@ -145,7 +185,7 @@ fn payload_zstd_level() -> i32 {
 /// Backward-compatible with old nodes that sent uncompressed JSON.
 pub fn decompress_payload(data: &[u8]) -> std::io::Result<Vec<u8>> {
     if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
-        zstd::bulk::decompress(data, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE)
+        zstd_decompress_pooled(data, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     } else {
         Ok(data.to_vec())
@@ -8316,5 +8356,117 @@ mod tests {
                     (key.key().name() == "n42_eager_import_rescued_total").then_some(value)
                 });
         assert_eq!(rescued, Some(DebugValue::Counter(1)));
+    }
+    /// Block-like bytes for codec tests: runs of repeated values mixed with
+    /// noise, so zstd sees both matches and literals.
+    fn codec_sample(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let run = (state % 64) as usize + 1;
+            let byte = (state >> 32) as u8;
+            if state & 1 == 0 {
+                out.extend(std::iter::repeat_n(byte, run.min(len - out.len())));
+            } else {
+                for offset in 0..run.min(len - out.len()) {
+                    out.push(
+                        byte.wrapping_mul(31)
+                            .wrapping_add(offset as u8 ^ (state as u8)),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn pooled_zstd_matches_one_shot() {
+        let level = payload_zstd_level();
+        for len in [0usize, 1, 100, 4_096, 131_072, 1 << 20, 3 << 20] {
+            let payload = codec_sample(len, len as u64);
+            let one_shot = zstd::bulk::compress(&payload, level).unwrap();
+            // Twice: the second call exercises the reused context.
+            for round in 0..2 {
+                let pooled = compress_payload(&payload);
+                assert_eq!(pooled, one_shot, "len {len} round {round}");
+                assert_eq!(
+                    decompress_payload(&pooled).unwrap(),
+                    payload,
+                    "len {len} round {round}"
+                );
+            }
+            assert_eq!(
+                zstd_decompress_pooled(&one_shot, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE).unwrap(),
+                zstd::bulk::decompress(&one_shot, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE).unwrap()
+            );
+        }
+        // A different level on the same thread must not leak the previous one.
+        let payload = codec_sample(1 << 20, 99);
+        assert_eq!(
+            zstd_compress_pooled(&payload, 1).unwrap(),
+            zstd::bulk::compress(&payload, 1).unwrap()
+        );
+        assert_eq!(
+            zstd_compress_pooled(&payload, level).unwrap(),
+            zstd::bulk::compress(&payload, level).unwrap()
+        );
+    }
+
+    /// Timing only. `cargo test -p n42-consensus-service zstd_pool_bench --release -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement, not a correctness gate"]
+    fn zstd_pool_bench() {
+        let level = payload_zstd_level();
+        for (label, len) in [
+            ("16 KiB", 16usize << 10),
+            ("1 MiB", 1usize << 20),
+            ("12 MiB", 12usize << 20),
+        ] {
+            let payload = codec_sample(len, len as u64);
+            let iterations: u32 = if len > (4 << 20) {
+                10
+            } else if len >= (1 << 20) {
+                50
+            } else {
+                2_000
+            };
+            let compressed = zstd::bulk::compress(&payload, level).unwrap();
+
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(zstd::bulk::compress(&payload, level).unwrap());
+            }
+            let old_compress = started.elapsed() / iterations;
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(zstd_compress_pooled(&payload, level).unwrap());
+            }
+            let new_compress = started.elapsed() / iterations;
+
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(
+                    zstd::bulk::decompress(&compressed, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE)
+                        .unwrap(),
+                );
+            }
+            let old_decompress = started.elapsed() / iterations;
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(
+                    zstd_decompress_pooled(&compressed, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE)
+                        .unwrap(),
+                );
+            }
+            let new_decompress = started.elapsed() / iterations;
+            println!(
+                "zstd level {level} {label} ({} -> {} bytes, {iterations} iterations):\n  compress   {old_compress:?} -> {new_compress:?}\n  decompress {old_decompress:?} -> {new_decompress:?}",
+                payload.len(),
+                compressed.len()
+            );
+        }
     }
 }
