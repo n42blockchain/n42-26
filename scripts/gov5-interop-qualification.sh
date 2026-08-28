@@ -3,25 +3,19 @@ set -euo pipefail
 
 runtime="${N42_QUAL_RUNTIME:-/Users/jieliu/Documents/n42/live-interop-20260721/runtime-11-production-qualification}"
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-genesis_hash="0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec"
-genesis_artifact_sha256="561808693c76b356e51f8f5961304e68f3167943c17145bda056612041dca687"
-rust_peer="12D3KooWBMkhLsvbQUWSva1tFiKNmWztd6oqvpaG1DGFqriT9DXi"
-gov_peers=(
-  "16Uiu2HAm9yzV5dzXsgu65UzkbtTnnDBTM79UZ76sjQ5pGnwqymFw"
-  "16Uiu2HAmL4ab3Ad9uv3HSjCmgWCFqVGsSCV3RRSL3oBAPVob6fc6"
-  "16Uiu2HAmE7rfc94zw4ihnUXa33nPWtq5neEKqUfFVETdNWxWeBWH"
-  "16Uiu2HAmLH7DBmQWGYD4bEeSDMHdWYii5oC22JPCvEJThRiNynq1"
-  "16Uiu2HAkveKXRpp42ohX9sJLi1Yi4JbS2em86FZj1WM2FPJCnfDm"
-  "16Uiu2HAkw6rzcvsWjpcWpBoWnDuWuSg9NAGXaS7A3VsWU3mWQuEC"
-)
-gov_addresses=(
-  "0xaa5f0ebd2c0b4a7c35aa9e7f0de765f7c0fffa51"
-  "0xa5e99142c567fe398b483726927571b1040aadfd"
-  "0x9464b8be1aa0e960ad4839298522eae0d5bbe71d"
-  "0xa1de4e1c742e47bf805adf07538123b0ddda8dc5"
-  "0xb9ef2bad950b795ed889de3aa0208365550cc86a"
-  "0x853b2026deebc83fb79ac7d0c48efea595c22578"
-)
+# Chain identity and validator bindings default to the pinned macOS
+# runtime-11 committee. A regenerated committee (for example the Linux
+# mixed fleet in docs/devlog-141) overrides every value through the
+# N42_QUAL_* variables below; the procedure itself is unchanged.
+genesis_hash="${N42_QUAL_GENESIS_HASH:-0xb71c28109836f120453d097c38819a55b14c49abcc92713037fb9b11201392ec}"
+genesis_artifact_sha256="${N42_QUAL_GENESIS_SHA256:-561808693c76b356e51f8f5961304e68f3167943c17145bda056612041dca687}"
+rust_peer="${N42_QUAL_RUST_PEER:-12D3KooWBMkhLsvbQUWSva1tFiKNmWztd6oqvpaG1DGFqriT9DXi}"
+read -r -a gov_peers <<<"${N42_QUAL_GOV_PEERS:-16Uiu2HAm9yzV5dzXsgu65UzkbtTnnDBTM79UZ76sjQ5pGnwqymFw 16Uiu2HAmL4ab3Ad9uv3HSjCmgWCFqVGsSCV3RRSL3oBAPVob6fc6 16Uiu2HAmE7rfc94zw4ihnUXa33nPWtq5neEKqUfFVETdNWxWeBWH 16Uiu2HAmLH7DBmQWGYD4bEeSDMHdWYii5oC22JPCvEJThRiNynq1 16Uiu2HAkveKXRpp42ohX9sJLi1Yi4JbS2em86FZj1WM2FPJCnfDm 16Uiu2HAkw6rzcvsWjpcWpBoWnDuWuSg9NAGXaS7A3VsWU3mWQuEC}"
+read -r -a gov_addresses <<<"${N42_QUAL_GOV_ADDRESSES:-0xaa5f0ebd2c0b4a7c35aa9e7f0de765f7c0fffa51 0xa5e99142c567fe398b483726927571b1040aadfd 0x9464b8be1aa0e960ad4839298522eae0d5bbe71d 0xa1de4e1c742e47bf805adf07538123b0ddda8dc5 0xb9ef2bad950b795ed889de3aa0208365550cc86a 0x853b2026deebc83fb79ac7d0c48efea595c22578}"
+if test "${#gov_peers[@]}" -ne 6 || test "${#gov_addresses[@]}" -ne 6; then
+  echo "N42_QUAL_GOV_PEERS and N42_QUAL_GOV_ADDRESSES must each list exactly six values" >&2
+  exit 2
+fi
 
 require_file() {
   test -f "$1" || {
@@ -92,6 +86,13 @@ start_gov_node() {
       )
     fi
   done
+  # Optional operator-supplied flags (for example "--log.file gov.json" on a
+  # diagnostic restart). Empty by default so the qualified argument set is
+  # unchanged unless explicitly extended.
+  if test -n "${N42_GOV_EXTRA_ARGS:-}"; then
+    read -r -a gov_extra_args <<<"$N42_GOV_EXTRA_ARGS"
+    args+=("${gov_extra_args[@]}")
+  fi
   if test "${N42_GOV_FOREGROUND:-0}" = "1"; then
     echo "$$" >"$pid_file"
     exec "$gov_binary" "${args[@]}" \
