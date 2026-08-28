@@ -867,13 +867,27 @@ impl ObserverOrchestrator {
                 .as_ref()
                 .filter(|catchup| catchup.discovery_complete)
                 .map(|catchup| &catchup.pending_hashes);
-            let eviction_index = protected
-                .and_then(|protected| {
-                    self.gov5_live_order
-                        .iter()
-                        .position(|hash| !protected.contains(hash))
-                })
-                .unwrap_or(0);
+            let eviction_index = match protected {
+                Some(protected) => self
+                    .gov5_live_order
+                    .iter()
+                    .position(|hash| !protected.contains(hash)),
+                None => Some(0),
+            };
+            let Some(eviction_index) = eviction_index else {
+                // Every cached block belongs to the authenticated lineage the
+                // catch-up still has to apply. Evicting one would force a
+                // re-fetch of a block we already hold, so let the cache run
+                // over its soft cap until the catch-up drains it.
+                metrics::counter!("n42_gov5_live_cache_over_cap_total").increment(1);
+                tracing::debug!(
+                    target: "n42::observer",
+                    cached = self.gov5_live_order.len(),
+                    cap = MAX_GOV5_LIVE_PENDING,
+                    "gov5 live cache holds only protected lineage; skipping eviction"
+                );
+                break;
+            };
             if let Some(evicted) = self.gov5_live_order.remove(eviction_index) {
                 self.gov5_live_blocks.remove(&evicted);
             }
@@ -1984,6 +1998,72 @@ mod tests {
                     .contains_key(&numbered_hash(number))
             );
         }
+    }
+
+    /// When every cached block is protected, the old code evicted index 0
+    /// anyway (`unwrap_or(0)`), throwing away the oldest block of the very
+    /// lineage the catch-up was about to apply and forcing a re-fetch.
+    #[test]
+    fn test_gov5_live_cache_keeps_everything_when_all_entries_are_protected() {
+        let block_count = MAX_GOV5_LIVE_PENDING + 3;
+        let head = numbered_hash(0);
+        let mut catchup = Gov5FinalizedCatchup::new(
+            numbered_hash(block_count as u64),
+            block_count as u64,
+            PeerId::random(),
+        );
+        for number in (1..=block_count as u64).rev() {
+            catchup
+                .record_block(
+                    Gov5LineageEntry {
+                        hash: numbered_hash(number),
+                        parent_hash: numbered_hash(number - 1),
+                        number,
+                    },
+                    head,
+                )
+                .unwrap();
+        }
+        assert!(catchup.discovery_complete);
+
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (priority_tx, _priority_rx) = mpsc::channel(1);
+        let network = NetworkHandle::new(command_tx, priority_tx);
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let execution = Arc::new(CatchupExecutionLayer::default());
+        let mut observer = ObserverOrchestrator::new(network, event_rx, execution, head);
+        observer.gov5_finalized_catchup = Some(catchup);
+        for number in 1..=block_count as u64 {
+            let hash = numbered_hash(number);
+            observer.gov5_live_order.push_back(hash);
+            observer.gov5_live_blocks.insert(
+                hash,
+                PendingGov5LiveBlock {
+                    execution_data: test_execution_data(numbered_hash(number - 1), hash, number),
+                    parent_hash: numbered_hash(number - 1),
+                    number,
+                    executed: false,
+                },
+            );
+        }
+
+        observer.trim_gov5_live_cache();
+
+        assert_eq!(observer.gov5_live_blocks.len(), block_count);
+        assert_eq!(observer.gov5_live_order.len(), block_count);
+        assert_eq!(
+            observer.gov5_live_order.front().copied(),
+            Some(numbered_hash(1)),
+            "the oldest protected block must survive"
+        );
+
+        // Once the catch-up no longer protects the lineage, trimming resumes
+        // from the front as before.
+        observer.gov5_finalized_catchup = None;
+        observer.trim_gov5_live_cache();
+        assert_eq!(observer.gov5_live_blocks.len(), MAX_GOV5_LIVE_PENDING);
+        assert!(!observer.gov5_live_blocks.contains_key(&numbered_hash(1)));
+        assert!(observer.gov5_live_blocks.contains_key(&numbered_hash(4)));
     }
 
     #[test]

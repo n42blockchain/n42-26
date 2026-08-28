@@ -30,6 +30,12 @@ pub const MAX_GOV5_RANGE_BLOCKS: u64 = 1024;
 pub const MAX_GOV5_RANGE_BLOCK_SIZE: usize = 64 * 1024 * 1024;
 const MAX_GOV5_RANGE_WIRE_SIZE: usize =
     MAX_GOV5_RANGE_BLOCK_SIZE + (MAX_GOV5_RANGE_BLOCK_SIZE / 6) + 1024;
+/// Decoded-bytes budget for one whole bodies-by-range response. Each chunk is
+/// bounded at 64 MiB and a response at 1024 chunks, so per-chunk limits alone
+/// let a peer make one response materialize 64 GiB. Reuse the finalized-range
+/// materialization cap so both catch-up paths hold the same amount in memory.
+pub const MAX_GOV5_RANGE_RESPONSE_BYTES: usize =
+    crate::finalized_range::MAX_MATERIALIZED_FINALIZED_RANGE_BYTES;
 const GOV5_RANGE_REQUEST_SSZ_LEN: usize = 52;
 type Gov5BestBlockNumber = dyn Fn() -> Result<u64, String> + Send + Sync;
 type Gov5BlockRlpByNumber = dyn Fn(u64) -> Result<Option<Vec<u8>>, String> + Send + Sync;
@@ -730,6 +736,68 @@ fn encode_range_error(code: u8, message: &str) -> io::Result<Vec<u8>> {
     Ok(encoded)
 }
 
+/// Read one bodies-by-range response, refusing it once the decoded chunks
+/// together exceed `response_budget` bytes.
+async fn read_range_response<T>(
+    io: &mut T,
+    response_budget: usize,
+) -> io::Result<Gov5BodiesByRangeResponse>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let mut blocks = Vec::new();
+    let mut decoded_total = 0usize;
+    loop {
+        let mut status = [0u8; 1];
+        match io.read(&mut status).await? {
+            0 => return Ok(Gov5BodiesByRangeResponse::Blocks(blocks)),
+            1 if status[0] == 0 => {}
+            1 => {
+                let message =
+                    read_framed_payload(io, MAX_SNAPPY_FRAME_SIZE, MAX_GOV5_BLOCK_SIZE).await?;
+                return Ok(Gov5BodiesByRangeResponse::Error {
+                    code: status[0],
+                    message: String::from_utf8_lossy(&message).into_owned(),
+                });
+            }
+            _ => unreachable!("one-byte read buffer"),
+        }
+        if blocks.len() >= MAX_GOV5_RANGE_BLOCKS as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Gov5 peer served more than 1024 range blocks",
+            ));
+        }
+        let mut fork_digest = [0u8; 4];
+        io.read_exact(&mut fork_digest).await?;
+        // Bound the next chunk by whatever budget is left, so an over-budget
+        // chunk is refused from its declared length rather than after it has
+        // been decoded.
+        let remaining = response_budget.saturating_sub(decoded_total);
+        let rlp = read_framed_payload(
+            io,
+            MAX_GOV5_RANGE_WIRE_SIZE,
+            MAX_GOV5_RANGE_BLOCK_SIZE.min(remaining),
+        )
+        .await
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::InvalidData && remaining < MAX_GOV5_RANGE_BLOCK_SIZE
+            {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Gov5 range response exceeds the {response_budget}-byte decoded budget: {error}"
+                    ),
+                )
+            } else {
+                error
+            }
+        })?;
+        decoded_total = decoded_total.saturating_add(rlp.len());
+        blocks.push(Gov5RangeBlockChunk { fork_digest, rlp });
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Gov5BodiesByRangeCodec;
 
@@ -754,34 +822,7 @@ impl request_response::Codec for Gov5BodiesByRangeCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let mut blocks = Vec::new();
-        loop {
-            let mut status = [0u8; 1];
-            match io.read(&mut status).await? {
-                0 => return Ok(Gov5BodiesByRangeResponse::Blocks(blocks)),
-                1 if status[0] == 0 => {}
-                1 => {
-                    let message =
-                        read_framed_payload(io, MAX_SNAPPY_FRAME_SIZE, MAX_GOV5_BLOCK_SIZE).await?;
-                    return Ok(Gov5BodiesByRangeResponse::Error {
-                        code: status[0],
-                        message: String::from_utf8_lossy(&message).into_owned(),
-                    });
-                }
-                _ => unreachable!("one-byte read buffer"),
-            }
-            if blocks.len() >= MAX_GOV5_RANGE_BLOCKS as usize {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Gov5 peer served more than 1024 range blocks",
-                ));
-            }
-            let mut fork_digest = [0u8; 4];
-            io.read_exact(&mut fork_digest).await?;
-            let rlp = read_framed_payload(io, MAX_GOV5_RANGE_WIRE_SIZE, MAX_GOV5_RANGE_BLOCK_SIZE)
-                .await?;
-            blocks.push(Gov5RangeBlockChunk { fork_digest, rlp });
-        }
+        read_range_response(io, MAX_GOV5_RANGE_RESPONSE_BYTES).await
     }
 
     async fn write_request<T>(
@@ -1531,6 +1572,63 @@ mod tests {
         };
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].rlp, block_10);
+    }
+
+    /// Per-chunk limits alone let a peer push 1024 x 64 MiB through one
+    /// response. The whole response has a decoded budget; the chunk that
+    /// would cross it is refused from its declared length.
+    #[test]
+    fn bodies_by_range_response_is_bounded_as_a_whole() {
+        let mut parent = B256::repeat_byte(9);
+        let mut blocks = Vec::new();
+        for number in 1..=4u64 {
+            let (hash, block) = range_block(number, parent);
+            blocks.push(Gov5RangeBlockChunk {
+                fork_digest: [1, 2, 3, 4],
+                rlp: block,
+            });
+            parent = hash;
+        }
+        let total: usize = blocks.iter().map(|chunk| chunk.rlp.len()).sum();
+        let protocol = StreamProtocol::new(GOV5_BODIES_BY_RANGE_PROTOCOL);
+        let mut wire = futures::io::Cursor::new(Vec::new());
+        futures::executor::block_on(Gov5BodiesByRangeCodec.write_response(
+            &protocol,
+            &mut wire,
+            Gov5BodiesByRangeResponse::Blocks(blocks.clone()),
+        ))
+        .unwrap();
+        let wire = wire.into_inner();
+
+        let mut exact = futures::io::Cursor::new(wire.clone());
+        let Gov5BodiesByRangeResponse::Blocks(decoded) =
+            futures::executor::block_on(read_range_response(&mut exact, total)).unwrap()
+        else {
+            panic!("expected block response");
+        };
+        assert_eq!(decoded.len(), 4, "a response exactly on budget is accepted");
+
+        let mut short = futures::io::Cursor::new(wire.clone());
+        let error = futures::executor::block_on(read_range_response(&mut short, total - 1))
+            .expect_err("one byte over budget must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("decoded budget"),
+            "unexpected error: {error}"
+        );
+
+        let mut production = futures::io::Cursor::new(wire);
+        assert!(
+            futures::executor::block_on(
+                Gov5BodiesByRangeCodec.read_response(&protocol, &mut production)
+            )
+            .is_ok(),
+            "the production budget ({MAX_GOV5_RANGE_RESPONSE_BYTES} bytes) admits a small response"
+        );
+        assert_eq!(
+            MAX_GOV5_RANGE_RESPONSE_BYTES,
+            crate::finalized_range::MAX_MATERIALIZED_FINALIZED_RANGE_BYTES
+        );
     }
 
     #[test]
