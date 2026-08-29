@@ -3,6 +3,7 @@ pub mod blob_port;
 mod components;
 pub mod el;
 pub mod engine_validator;
+pub mod eof_guard;
 pub mod exec_cache;
 pub mod ingest;
 pub mod mobile_bridge;

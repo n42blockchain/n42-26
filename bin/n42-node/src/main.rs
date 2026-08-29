@@ -156,6 +156,22 @@ fn activate_gov5_pos_execution(chain: &mut ChainSpec) {
     debug_assert!(chain.is_paris_active_at_block(0));
 }
 
+/// gov5 runs Prague from its `pectraTime` (EIP-2935 history storage, the
+/// EIP-7002/7251 end-of-block system calls, EIP-7702), which the chain-94
+/// genesis file carries under a name reth does not read. The QMDB root of every
+/// gov5 block includes those writes, so a member that recomputes roots must run
+/// the same fork: `N42_GOV5_PRAGUE_TIME=<unix seconds>` activates it. Recorded
+/// chain-94 blocks 13,560,376..13,565,343 reproduce their roots only with it.
+fn apply_gov5_prague_time(chain: &mut ChainSpec) -> Option<u64> {
+    let prague_time = env_parse::<u64>("N42_GOV5_PRAGUE_TIME")?;
+    chain.hardforks.insert(
+        EthereumHardfork::Prague,
+        ForkCondition::Timestamp(prague_time),
+    );
+    chain.genesis.config.prague_time = Some(prague_time);
+    Some(prague_time)
+}
+
 fn resolve_observer_genesis_hash(
     local_genesis_hash: B256,
     configured_hash: Option<&str>,
@@ -441,6 +457,202 @@ fn load_gov5_genesis_execution_bootstrap(
         base_block_number: store_base_number,
         base_block_hash: store_base_hash,
         base_root: store_base_root,
+        genesis_header: genesis_entry.header().clone(),
+        execution_genesis,
+        execution_profile,
+    })
+}
+
+/// Establish a gov5 applied head as the execution base from a leaf-form (v2)
+/// QMDB export — the only snapshot a fleet node that reclaims dead entry rows
+/// can write (chain 94: 63 M slots, 6 M live). The split commitment is
+/// rebuilt (every twig's leaves folded against its frozen leaf root, every
+/// live entry against its leaf, the upper root against the header), bound to
+/// the chain (chain id, genesis, the genesis allocation's leaf prefix in twig
+/// zero) and, when the caller names one, to an expected (block, hash, root).
+/// Once verified the tree is written back next to the branch checkpoint in
+/// its hollow form (sealed twigs as leaf root plus bits, ~ 700 MB for chain
+/// 94), and later starts read that file instead of the export.
+#[allow(clippy::too_many_arguments)]
+fn load_gov5_leaf_form_execution_bootstrap(
+    leaf_form_path: Option<&Path>,
+    genesis_range_path: &Path,
+    genesis: &Genesis,
+    chain_id: u64,
+    genesis_hash: B256,
+    expected: Option<(u64, B256, B256)>,
+    branch_state_path: &Path,
+    max_replay_depth: usize,
+) -> eyre::Result<QmdbExecutionBootstrap> {
+    use n42_node::qmdb_state_root::{QmdbBaseIdentity, base_file_path};
+    use n42_twig_core::hash_leaf;
+
+    let base_file = base_file_path(branch_state_path);
+    let (source, from_base_file) = if base_file.is_file() {
+        (base_file.clone(), true)
+    } else {
+        let path = leaf_form_path.ok_or_else(|| {
+            eyre::eyre!(
+                "no QMDB base file at {} and N42_GOV5_QMDB_LEAF_FORM is not set",
+                base_file.display()
+            )
+        })?;
+        (path.to_path_buf(), false)
+    };
+    let started = std::time::Instant::now();
+    let (tree, header) = Gov5QmdbStateRootStore::read_base_file(&source).map_err(|error| {
+        eyre::eyre!(
+            "failed to load QMDB leaf form {}: {error}",
+            source.display()
+        )
+    })?;
+    if header.chain_id != chain_id || B256::from(header.genesis_hash) != genesis_hash {
+        return Err(eyre::eyre!(
+            "QMDB leaf form {} belongs to chain {} / genesis {}, not chain {chain_id} / {genesis_hash}",
+            source.display(),
+            header.chain_id,
+            B256::from(header.genesis_hash)
+        ));
+    }
+    let base_block_hash = B256::from(header.block_hash);
+    let base_root = B256::from(header.root);
+    if let Some((block, hash, root)) = expected
+        && (header.block_number != block || base_block_hash != hash || base_root != root)
+    {
+        return Err(eyre::eyre!(
+            "QMDB leaf form {} is block {} ({base_block_hash}, root {base_root}); expected block {block} ({hash}, root {root})",
+            source.display(),
+            header.block_number
+        ));
+    }
+
+    let range_file = File::open(genesis_range_path).map_err(|error| {
+        eyre::eyre!(
+            "failed to open Gov5 genesis range {}: {error}",
+            genesis_range_path.display()
+        )
+    })?;
+    let range = decode_finalized_range_stream(BufReader::new(range_file), chain_id, genesis_hash)
+        .map_err(|error| eyre::eyre!("failed to verify Gov5 genesis range: {error}"))?;
+    let genesis_entry = range
+        .entries()
+        .first()
+        .filter(|entry| entry.number() == 0 && entry.block_hash() == genesis_hash)
+        .ok_or_else(|| {
+            eyre::eyre!("Gov5 genesis range must start with the configured block zero")
+        })?;
+    let header_genesis_tree = gov5_qmdb_genesis_tree(genesis)
+        .map_err(|error| eyre::eyre!("failed to build Gov5 QMDB genesis state: {error}"))?;
+    let header_genesis_root = B256::from(header_genesis_tree.root());
+    if header_genesis_root != genesis_entry.state_root() {
+        return Err(eyre::eyre!(
+            "configured genesis alloc produces QMDB root {header_genesis_root}, but authenticated Gov5 block zero commits {}",
+            genesis_entry.state_root()
+        ));
+    }
+    let replay_execution_genesis = gov5_replay_execution_genesis(genesis);
+    let replay_genesis_tree =
+        gov5_qmdb_genesis_tree(&replay_execution_genesis).map_err(|error| {
+            eyre::eyre!("failed to build Gov5 replay-v2 execution genesis state: {error}")
+        })?;
+    // The leaf hashes of twig zero are frozen forever, so the first slots of
+    // the export identify the allocation the chain was seeded from, exactly
+    // as the positional prefix did for the v1 snapshot. A base file written
+    // by this node carries no twig-zero leaves; the check ran when the export
+    // it came from was verified.
+    let prefix_matches = |snapshot: &n42_twig_core::qmdb_compat::QmdbSnapshot| -> bool {
+        header.genesis_prefix_leaves.len() >= snapshot.entries.len()
+            && snapshot
+                .entries
+                .iter()
+                .zip(&header.genesis_prefix_leaves)
+                .all(|(entry, leaf)| hash_leaf(&entry.key, &entry.value) == *leaf)
+    };
+    let (execution_genesis, execution_profile) = if header.genesis_prefix_leaves.is_empty() {
+        if !from_base_file {
+            return Err(eyre::eyre!(
+                "QMDB leaf form {} carries no twig-zero leaves; the genesis prefix cannot be checked",
+                source.display()
+            ));
+        }
+        // The profile was resolved when the export was verified; the fleet
+        // profile is recorded by the persisted execution genesis.
+        let profile =
+            std::env::var("N42_GOV5_QMDB_EXECUTION_PROFILE").unwrap_or_else(|_| "native".into());
+        match profile.as_str() {
+            "replay-v2" => (replay_execution_genesis, "replay-v2"),
+            _ => (genesis.clone(), "native"),
+        }
+    } else if prefix_matches(&replay_genesis_tree.snapshot()) {
+        (replay_execution_genesis, "replay-v2")
+    } else if prefix_matches(&header_genesis_tree.snapshot()) {
+        (genesis.clone(), "native")
+    } else {
+        return Err(eyre::eyre!(
+            "QMDB leaf form matches neither the native nor replay-v2 authenticated genesis prefix"
+        ));
+    };
+    let store = Gov5QmdbStateRootStore::persistent_from_leaf_tree(
+        base_block_hash,
+        base_root,
+        tree,
+        max_replay_depth,
+        branch_state_path.to_path_buf(),
+    )
+    .map_err(|error| eyre::eyre!("failed to initialize QMDB leaf-form store: {error}"))?
+    .with_identity(QmdbBaseIdentity {
+        chain_id,
+        genesis_hash,
+        block_number: header.block_number,
+    });
+    let (live, next_slot, twigs) = store
+        .tree_stats()
+        .map_err(|error| eyre::eyre!("QMDB store: {error}"))?;
+    info!(
+        target: "n42::cli",
+        source = %source.display(),
+        from_base_file,
+        block = header.block_number,
+        %base_block_hash,
+        %base_root,
+        live,
+        next_slot,
+        twigs,
+        execution_profile,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "QMDB split commitment rebuilt from the leaf form and verified against its root"
+    );
+    if !from_base_file {
+        let written = std::time::Instant::now();
+        match store.write_base_file() {
+            Ok(Some((at, number))) => info!(
+                target: "n42::cli",
+                path = %base_file.display(),
+                block = number,
+                %at,
+                elapsed_ms = written.elapsed().as_millis() as u64,
+                "QMDB base file written; later starts read it instead of the export"
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                warn!(target: "n42::cli", %error, "QMDB base file could not be written; the export stays required")
+            }
+        }
+    }
+    Ok(QmdbExecutionBootstrap {
+        store: Arc::new(store),
+        checkpoint: QmdbPortableVerification {
+            chain_id,
+            genesis_hash: genesis_hash.0,
+            block_number: header.block_number,
+            block_hash: header.block_hash,
+            root: header.root,
+            next_slot: header.next_slot,
+            live_count: header.live,
+        },
+        base_block_number: header.block_number,
+        base_block_hash,
+        base_root,
         genesis_header: genesis_entry.header().clone(),
         execution_genesis,
         execution_profile,
@@ -1169,6 +1381,11 @@ fn main() {
                 "checkpoint-start participant mode cannot replay the same finalized bootstrap"
             ));
         }
+        let leaf_form_env = std::env::var("N42_GOV5_QMDB_LEAF_FORM").ok();
+        let leaf_form_base_present = n42_node::qmdb_state_root::base_file_path(
+            &data_dir.join("gov5_qmdb_branches.bin"),
+        )
+        .is_file();
         let qmdb_execution = if env_bool("N42_GOV5_QMDB_EXECUTION")
             || bootstrap_bundle.is_some()
         {
@@ -1184,6 +1401,62 @@ fn main() {
                     "N42_GOV5_QMDB_EXECUTION requires observer or H2-v4 participant mode and N42_GOV5_HEADER_PROFILE=1"
                 ));
             }
+            if bootstrap_bundle.is_none() && (leaf_form_env.is_some() || leaf_form_base_present) {
+                // Checkpoint-anchored execution with a locally rebuilt split
+                // commitment: the leaf-form export of a fleet node's applied
+                // head, or the base file a previous start wrote from it.
+                let genesis_range = std::env::var("N42_GOV5_GENESIS_BOOTSTRAP").map_err(|_| {
+                    eyre::eyre!(
+                        "N42_GOV5_GENESIS_BOOTSTRAP is required with N42_GOV5_QMDB_LEAF_FORM"
+                    )
+                })?;
+                let expected = match (
+                    env_parse::<u64>("N42_QMDB_BOOTSTRAP_BLOCK"),
+                    env_parse::<B256>("N42_QMDB_BOOTSTRAP_BLOCK_HASH"),
+                    env_parse::<B256>("N42_QMDB_BOOTSTRAP_ROOT"),
+                ) {
+                    (Some(block), Some(hash), Some(root)) => Some((block, hash, root)),
+                    (None, None, None) => None,
+                    _ => {
+                        return Err(eyre::eyre!(
+                            "N42_QMDB_BOOTSTRAP_BLOCK, _BLOCK_HASH and _ROOT must be set together"
+                        ));
+                    }
+                };
+                let max_replay_depth =
+                    env_parse("N42_QMDB_REPLAY_DEPTH").unwrap_or(DEFAULT_QMDB_REPLAY_DEPTH);
+                let loaded = load_gov5_leaf_form_execution_bootstrap(
+                    leaf_form_env.as_deref().map(Path::new),
+                    Path::new(&genesis_range),
+                    &builder.config().chain.genesis,
+                    builder.config().chain.chain.id(),
+                    interop_genesis,
+                    expected,
+                    &data_dir.join("gov5_qmdb_branches.bin"),
+                    max_replay_depth,
+                )?;
+                let chain = Arc::make_mut(&mut builder.config_mut().chain);
+                chain.genesis = loaded.execution_genesis.clone();
+                chain.genesis_header =
+                    SealedHeader::new(loaded.genesis_header.clone(), interop_genesis);
+                activate_gov5_pos_execution(chain);
+                if let Some(prague_time) = apply_gov5_prague_time(chain) {
+                    info!(target: "n42::cli", prague_time, "Prague activated for gov5 execution (N42_GOV5_PRAGUE_TIME)");
+                }
+                info!(
+                    target: "n42::cli",
+                    genesis_range,
+                    base_block = loaded.base_block_number,
+                    base_hash = %loaded.base_block_hash,
+                    base_root = %loaded.base_root,
+                    execution_profile = loaded.execution_profile,
+                    slots = loaded.checkpoint.next_slot,
+                    live = loaded.checkpoint.live_count,
+                    archive_floor = loaded.base_block_number,
+                    "prepared Gov5 checkpoint-anchored QMDB Engine Tree execution base (leaf form); state roots are recomputed"
+                );
+                Some(loaded)
+            } else {
             let (
                 path,
                 genesis_range,
@@ -1241,6 +1514,9 @@ fn main() {
             chain.genesis_header =
                 SealedHeader::new(loaded.genesis_header.clone(), interop_genesis);
             activate_gov5_pos_execution(chain);
+            if let Some(prague_time) = apply_gov5_prague_time(chain) {
+                info!(target: "n42::cli", prague_time, "Prague activated for gov5 execution (N42_GOV5_PRAGUE_TIME)");
+            }
             info!(
                 target: "n42::cli",
                 path,
@@ -1257,6 +1533,7 @@ fn main() {
                 "prepared Gov5 block-zero QMDB Engine Tree execution base"
             );
             Some(loaded)
+            }
         } else {
             None
         };
@@ -1309,6 +1586,9 @@ fn main() {
             chain.genesis_header =
                 SealedHeader::new(genesis_entry.header().clone(), interop_genesis);
             activate_gov5_pos_execution(chain);
+            if let Some(prague_time) = apply_gov5_prague_time(chain) {
+                info!(target: "n42::cli", prague_time, "Prague activated for gov5 execution (N42_GOV5_PRAGUE_TIME)");
+            }
             warn!(
                 target: "n42::cli",
                 base_block,
@@ -2869,6 +3149,23 @@ fn main() {
                     if trusted_state_root_base.is_some() {
                         orchestrator = orchestrator.with_leader_disabled();
                     }
+                    // gov5's committee-evidence link: a leader must stamp
+                    // parentBeaconRoot = Blake3(parent evidence). The pool is the
+                    // one the consensus validator derived (shared per process).
+                    if header_profile == N42HeaderProfile::Gov5H2
+                        && let Some(config) = n42_consensus::CommitteePoolConfig::from_genesis(
+                            &full_node.provider.chain_spec().genesis,
+                        )?
+                    {
+                        let pool = n42_consensus::shared_committee_pool(&config)?;
+                        info!(
+                            target: "n42::cli",
+                            pool_size = config.pool_size,
+                            committee_size = config.committee_size,
+                            "gov5 committee pool wired into the block builder: proposals carry the committee-evidence root"
+                        );
+                        orchestrator = orchestrator.with_committee_pool(pool);
+                    }
                     if env_bool("N42_GOV5_LEGACY_SIGNING") {
                         info!(
                             target: "n42::cli",
@@ -3119,6 +3416,7 @@ mod observer_identity_tests {
                     })
                     .collect(),
             },
+            leaf_form: None,
         }
     }
 
@@ -3131,6 +3429,7 @@ mod observer_identity_tests {
                 value: vec![0x01],
                 active: true,
             }],
+            leaf_form: None,
         };
         let replay = n42_twig_core::qmdb_compat::QmdbSnapshot {
             next_slot: 2,
@@ -3142,6 +3441,7 @@ mod observer_identity_tests {
                     active: true,
                 },
             ],
+            leaf_form: None,
         };
 
         let native_portable = portable_with_entries(&native.entries);

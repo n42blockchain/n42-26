@@ -8,6 +8,7 @@
 )]
 
 mod adapter;
+pub mod committee_pool;
 pub mod error;
 pub mod extra_data;
 pub mod gov5_native_header;
@@ -23,6 +24,10 @@ pub use adapter::{
     N42Consensus, N42HeaderProfile, N42HeaderProfileError, ValidatorSetResolver,
     validate_gov5_h2_header, validate_gov5_header_extra, validate_gov5_interop_header,
     validate_gov5_replay_v2_header,
+};
+pub use committee_pool::{
+    CommitteeLinkError, CommitteePoolConfig, CommitteePoolConfigError, CommitteePoolError,
+    ConsensusEvidence as CommitteeConsensusEvidence, SimulatedCommitteePool, shared_committee_pool,
 };
 pub use error::ConsensusError as N42ConsensusError;
 pub use gov5_native_header::{

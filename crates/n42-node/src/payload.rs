@@ -384,11 +384,21 @@ mod sender_sharded_tests {
 #[derive(Clone, Debug)]
 pub struct N42PayloadBuilder {
     consensus_state: Arc<SharedConsensusState>,
+    eof_guard: bool,
 }
 
 impl N42PayloadBuilder {
     pub fn new(consensus_state: Arc<SharedConsensusState>) -> Self {
-        Self { consensus_state }
+        Self {
+            consensus_state,
+            eof_guard: false,
+        }
+    }
+
+    /// Never build a block that carries EOF code (gov5 profile; see [`crate::eof_guard`]).
+    pub const fn with_eof_guard(mut self, enabled: bool) -> Self {
+        self.eof_guard = enabled;
+        self
     }
 }
 
@@ -423,6 +433,7 @@ where
                 .with_gas_limit(gas_limit)
                 .with_max_blobs_per_block(conf.max_blobs_per_block()),
             consensus_state: self.consensus_state,
+            eof_guard: self.eof_guard,
         })
     }
 }
@@ -441,6 +452,8 @@ pub struct N42InnerPayloadBuilder<Pool, Client, Evm> {
     base_config: EthereumBuilderConfig,
     #[allow(dead_code)]
     consensus_state: Arc<SharedConsensusState>,
+    /// Skip EOF initcode transactions and refuse a built block that carries one.
+    eof_guard: bool,
 }
 
 impl<Pool, Client, Evm> PayloadBuilder for N42InnerPayloadBuilder<Pool, Client, Evm>
@@ -472,16 +485,36 @@ where
             self.base_config.clone(),
             args,
             |attributes| {
-                if sender_sharded_drain_enabled() {
+                let best = if sender_sharded_drain_enabled() {
                     Box::new(sender_sharded_transactions(
                         self.pool.pending_transactions(),
                         attributes,
                     )) as Box<_>
                 } else {
                     self.pool.best_transactions_with_attributes(attributes)
+                };
+                if self.eof_guard {
+                    Box::new(crate::eof_guard::EofFilteringTransactions::new(best)) as Box<_>
+                } else {
+                    best
                 }
             },
         );
+        let result = match result {
+            Ok(BuildOutcome::Better {
+                payload,
+                cached_reads,
+            }) if self.eof_guard => {
+                match crate::eof_guard::check_built_block(payload.recovered_block()) {
+                    Ok(()) => Ok(BuildOutcome::Better {
+                        payload,
+                        cached_reads,
+                    }),
+                    Err(error) => Err(PayloadBuilderError::Other(Box::new(error))),
+                }
+            }
+            other => other,
+        };
 
         let elapsed_ms = build_start.elapsed().as_millis() as u64;
         let outcome = match &result {

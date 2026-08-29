@@ -631,6 +631,7 @@ mod tests {
                     })
                     .collect(),
             },
+            leaf_form: None,
         }
         .encode()
         .unwrap();

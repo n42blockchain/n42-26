@@ -765,6 +765,12 @@ pub struct ConsensusService {
     /// that a consensus-authenticated body is retried even if no failure event
     /// can be emitted for a command that was suppressed before transmission.
     h2_v4_fetch_requested_at: HashMap<B256, (Instant, PeerId)>,
+    /// Round-robin cursor over connected peers for the gov5 execution pull
+    /// (see `state_mgmt::initiate_gov5_execution_pull`).
+    gov5_execution_pull_rounds: u64,
+    /// When the last gov5 execution pull was issued; throttles the per-view
+    /// re-arm to one pull per fetch deadline.
+    gov5_execution_pull_last_at: Option<Instant>,
     /// Recently delivered block hashes. This mirrors the network-layer
     /// fulfillment tombstones because request commands are fire-and-forget:
     /// a network-side suppression cannot otherwise stop this orchestrator from
@@ -974,6 +980,11 @@ pub struct ConsensusService {
     /// (observed on chain 94: 3,151 dropped inbound streams in 40 s, then no
     /// block bodies for 20 minutes). Intentional resends run at 2 s and 12 s.
     recent_h2_broadcasts: std::sync::Mutex<HashMap<[u8; 32], Instant>>,
+    /// gov5's simulated committee pool when the chain's genesis enables one.
+    /// A leader then stamps `parentBeaconRoot = Blake3(parent evidence)` into
+    /// the payload it builds, as gov5's `Prepare` does; without the parent's
+    /// native header the build is refused rather than stamped wrongly.
+    committee_pool: Option<Arc<n42_consensus::SimulatedCommitteePool>>,
     /// The member cannot seal a gov5 block (no local QMDB root); never start a
     /// payload build, let the view time out like an absent validator.
     leader_disabled: bool,
@@ -2544,6 +2555,8 @@ impl ConsensusService {
             h2_v4_catchup_active: false,
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
+            gov5_execution_pull_rounds: 0,
+            gov5_execution_pull_last_at: None,
             h2_v4_fetch_fulfilled_at: HashMap::new(),
             network,
             consensus_event_rx: None,
@@ -2625,6 +2638,7 @@ impl ConsensusService {
             pending_vote_resend: None,
             recent_h2_broadcasts: std::sync::Mutex::new(HashMap::new()),
             leader_disabled: false,
+            committee_pool: None,
             pipeline_timings: HashMap::new(),
             last_commit_instant: None,
             last_commit_view: None,
@@ -2795,6 +2809,8 @@ impl ConsensusService {
             h2_v4_catchup_active: false,
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
+            gov5_execution_pull_rounds: 0,
+            gov5_execution_pull_last_at: None,
             h2_v4_fetch_fulfilled_at: HashMap::new(),
             network,
             consensus_event_rx: Some(consensus_event_rx),
@@ -2876,6 +2892,7 @@ impl ConsensusService {
             pending_vote_resend: None,
             recent_h2_broadcasts: std::sync::Mutex::new(HashMap::new()),
             leader_disabled: false,
+            committee_pool: None,
             pipeline_timings: HashMap::new(),
             last_commit_instant: None,
             last_commit_view: None,
@@ -2917,6 +2934,14 @@ impl ConsensusService {
     ) -> Self {
         self.engine.enable_h2_v4_signing(identity);
         self.h2_v4_identity = Some(identity);
+        self
+    }
+
+    /// Stamps gov5's committee-evidence root into every payload this node
+    /// builds (`parentBeaconRoot = Blake3(parent evidence)`); the execution
+    /// side verifies the same link on import.
+    pub fn with_committee_pool(mut self, pool: Arc<n42_consensus::SimulatedCommitteePool>) -> Self {
+        self.committee_pool = Some(pool);
         self
     }
 
@@ -6500,6 +6525,268 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "sync_started_at should belong to the replacement request"
         );
+    }
+
+    // === gov5 execution pull (devlog-142 stall follow-up) ===
+
+    /// Both network channels: `RequestSync` travels on the ordinary command
+    /// channel, `RequestGov5BlockByHash` on the priority channel.
+    struct TestNetworkRx {
+        cmd_rx: mpsc::Receiver<NetworkCommand>,
+        prx: mpsc::Receiver<NetworkCommand>,
+    }
+
+    fn gov5_lag_orchestrator(
+        gov5: bool,
+    ) -> (ConsensusService, TestNetworkRx, libp2p::PeerId, B256) {
+        let (engine, output_rx) = make_test_engine();
+        let (network, cmd_rx, prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        if gov5 {
+            orch = orch.with_h2_v4_participant(test_h2_identity());
+        }
+        let peer = libp2p::PeerId::random();
+        orch.connected_peers.insert(peer);
+        // Execution validated view 10 at head 0xAA; the fleet committed view 12
+        // whose body never reached this member (`pending_data=false`).
+        orch.execution_validated_head_view = 10;
+        orch.head_block_hash = B256::repeat_byte(0xAA);
+        orch.head_block_number = 13_562_197;
+        let committed_hash = B256::repeat_byte(0xC1);
+        orch.async_commit_states.insert(
+            12,
+            AsyncCommitState {
+                view: 12,
+                block_hash: committed_hash,
+                commit_qc: QuorumCertificate::genesis(),
+                stage: AsyncCommitStage::Committed,
+                finalize_in_flight: false,
+                committed_at: Instant::now(),
+            },
+        );
+        (orch, TestNetworkRx { cmd_rx, prx }, peer, committed_hash)
+    }
+
+    fn drain_commands(rx: &mut TestNetworkRx) -> Vec<NetworkCommand> {
+        let mut out = Vec::new();
+        while let Ok(command) = rx.cmd_rx.try_recv() {
+            out.push(command);
+        }
+        while let Ok(command) = rx.prx.try_recv() {
+            out.push(command);
+        }
+        out
+    }
+
+    fn counter_value(
+        snapshotter: &metrics_util::debugging::Snapshotter,
+        name: &str,
+        label: (&str, &str),
+    ) -> u64 {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(key, _, _, value)| {
+                let key = key.key();
+                (key.name() == name
+                    && key
+                        .labels()
+                        .any(|l| l.key() == label.0 && l.value() == label.1))
+                .then(|| match value {
+                    DebugValue::Counter(count) => count,
+                    _ => 0,
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    /// The commit-execution deadline (the trigger seen in the 06:27 stall)
+    /// must pull the committed block by hash from a gov5 peer, not fan out an
+    /// N42 state-sync that no gov5 member answers.
+    #[tokio::test(flavor = "current_thread")]
+    async fn gov5_execution_lag_pulls_by_hash_and_never_requests_state_sync() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let (mut orch, mut cmd_rx, peer, committed_hash) = gov5_lag_orchestrator(true);
+
+        orch.handle_commit_execution_timeout(12, committed_hash);
+
+        assert!(
+            !orch.sync_in_flight,
+            "gov5 members must never own an N42 state-sync request"
+        );
+        assert!(orch.sync_requested_peers.is_empty());
+        assert!(
+            orch.h2_v4_fetch_requested_at.contains_key(&committed_hash),
+            "the committed block is tracked as an authenticated gov5 fetch"
+        );
+        let commands = drain_commands(&mut cmd_rx);
+        assert_eq!(commands.len(), 1, "exactly one pull: {commands:?}");
+        match &commands[0] {
+            NetworkCommand::RequestGov5BlockByHash {
+                peer: requested_peer,
+                block_hash,
+            } => {
+                assert_eq!(*requested_peer, peer);
+                assert_eq!(*block_hash, committed_hash);
+            }
+            other => panic!("expected a gov5 block-by-hash pull, got {other:?}"),
+        }
+        assert_eq!(
+            counter_value(
+                &snapshotter,
+                "n42_gov5_execution_pull_started_total",
+                ("reason", "execution_catchup"),
+            ),
+            1
+        );
+    }
+
+    /// Without the gov5 profile the pre-existing recovery is untouched: the
+    /// deadline fans out the N42 execution catch-up request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn standard_profile_execution_lag_still_uses_state_sync() {
+        let (mut orch, mut cmd_rx, _peer, committed_hash) = gov5_lag_orchestrator(false);
+
+        orch.handle_commit_execution_timeout(12, committed_hash);
+
+        assert!(
+            orch.sync_in_flight,
+            "standard profile keeps the state-sync fan-out"
+        );
+        assert!(orch.h2_v4_fetch_requested_at.is_empty());
+        let commands = drain_commands(&mut cmd_rx);
+        assert!(
+            matches!(commands.as_slice(), [NetworkCommand::RequestSync { .. }]),
+            "expected one state-sync request, got {commands:?}"
+        );
+    }
+
+    /// Every sync entry point (execution catch-up, state sync, the per-view
+    /// re-arm) converges on one outstanding pull per target hash.
+    #[tokio::test(flavor = "current_thread")]
+    async fn gov5_execution_pull_is_not_duplicated_while_in_flight() {
+        let (mut orch, mut cmd_rx, _peer, committed_hash) = gov5_lag_orchestrator(true);
+
+        assert!(orch.initiate_gov5_execution_pull("execution_catchup"));
+        orch.initiate_execution_catchup_sync(10, 12);
+        orch.initiate_sync(10, 12);
+        assert!(
+            orch.initiate_gov5_execution_pull("state_sync"),
+            "still in flight"
+        );
+        orch.rearm_gov5_execution_pull();
+        orch.handle_view_changed(13).await;
+
+        assert!(!orch.sync_in_flight);
+        assert_eq!(orch.h2_v4_fetch_requested_at.len(), 1);
+        assert_eq!(
+            orch.gov5_execution_pull_rounds, 1,
+            "one peer draw for one pull"
+        );
+        let commands = drain_commands(&mut cmd_rx);
+        let pulls = commands
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    NetworkCommand::RequestGov5BlockByHash { block_hash, .. } if *block_hash == committed_hash
+                )
+            })
+            .count();
+        assert_eq!(
+            pulls, 1,
+            "one network pull for one in-flight target: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, NetworkCommand::RequestSync { .. })),
+            "no state-sync under the gov5 profile: {commands:?}"
+        );
+    }
+
+    /// The pull targets the newest authenticated block above the execution
+    /// head (its ancestry walk covers everything below it), and nothing is
+    /// pulled once execution has caught up.
+    #[tokio::test(flavor = "current_thread")]
+    async fn gov5_execution_pull_targets_newest_authenticated_block_and_stops_when_caught_up() {
+        let (mut orch, mut cmd_rx, _peer, committed_hash) = gov5_lag_orchestrator(true);
+        let newer_hash = B256::repeat_byte(0xC5);
+        orch.h2_v4_block_views.insert(newer_hash, 15);
+        // Parent sentinels (view 0) are never a target.
+        orch.h2_v4_block_views.insert(B256::repeat_byte(0xC4), 0);
+        assert_eq!(orch.gov5_execution_pull_target(), Some((newer_hash, 15)));
+
+        orch.initiate_execution_catchup_sync(10, 15);
+        let commands = drain_commands(&mut cmd_rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [NetworkCommand::RequestGov5BlockByHash { block_hash, .. }] if *block_hash == newer_hash
+            ),
+            "newest authenticated block is pulled: {commands:?}"
+        );
+        assert!(!orch.h2_v4_fetch_requested_at.contains_key(&committed_hash));
+
+        // Execution reaches the fleet's head: nothing above it, no pull.
+        orch.h2_v4_fetch_requested_at.clear();
+        orch.execution_validated_head_view = 15;
+        assert_eq!(orch.gov5_execution_pull_target(), None);
+        orch.gov5_execution_pull_last_at = None;
+        assert!(!orch.initiate_gov5_execution_pull("execution_catchup"));
+        orch.rearm_gov5_execution_pull();
+        assert!(drain_commands(&mut cmd_rx).is_empty());
+    }
+
+    /// A pull whose fetch retired without moving the execution head is
+    /// re-issued on a later view change, throttled to one per fetch deadline
+    /// and rotated to the next peer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn gov5_execution_pull_rearms_on_view_change_after_the_fetch_retired() {
+        let (mut orch, mut cmd_rx, first_peer, committed_hash) = gov5_lag_orchestrator(true);
+        let second_peer = libp2p::PeerId::random();
+        orch.connected_peers.insert(second_peer);
+
+        orch.handle_commit_execution_timeout(12, committed_hash);
+        let first = drain_commands(&mut cmd_rx);
+        assert_eq!(first.len(), 1);
+
+        // The fetch retired (deadline retry exhausted / body discarded) but
+        // execution is still behind; within the throttle nothing happens.
+        orch.h2_v4_fetch_requested_at.clear();
+        orch.handle_view_changed(13).await;
+        assert!(
+            drain_commands(&mut cmd_rx).is_empty(),
+            "throttled inside the fetch deadline"
+        );
+
+        orch.gov5_execution_pull_last_at =
+            Some(Instant::now() - H2_V4_FETCH_RETRY_TIMEOUT - Duration::from_millis(1));
+        orch.handle_view_changed(14).await;
+        let second = drain_commands(&mut cmd_rx);
+        let peers_used: Vec<_> = first
+            .iter()
+            .chain(second.iter())
+            .filter_map(|command| match command {
+                NetworkCommand::RequestGov5BlockByHash { peer, block_hash }
+                    if *block_hash == committed_hash =>
+                {
+                    Some(*peer)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(peers_used.len(), 2, "re-armed exactly once: {second:?}");
+        assert_ne!(
+            peers_used[0], peers_used[1],
+            "the re-arm rotates to the other peer"
+        );
+        assert!(peers_used.contains(&first_peer) && peers_used.contains(&second_peer));
+        assert!(!orch.sync_in_flight);
     }
 
     #[test]

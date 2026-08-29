@@ -13,6 +13,7 @@ use reth_primitives_traits::{Block, RecoveredBlock, SealedBlock, SealedHeader};
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use crate::committee_pool::SimulatedCommitteePool;
 use crate::gov5_native_receipts_root;
 use crate::gov5_rewards::{gov5_native_rewards_root, gov5_withdrawals_to_rewards};
 use crate::validator::ValidatorSet;
@@ -200,6 +201,11 @@ pub struct N42Consensus<C = ChainSpec> {
     validator_set_resolver: Option<ValidatorSetResolver>,
     /// Chain-specific header encoding. Defaults to standard Ethereum semantics.
     header_profile: N42HeaderProfile,
+    /// gov5's simulated committee pool when the chain's genesis enables one:
+    /// every header's `parentBeaconRoot` must then be `Blake3(parent evidence)`.
+    committee_pool: Option<Arc<SimulatedCommitteePool>>,
+    /// The fork schedule, for the Prague fill-in of gov5 headers.
+    chain_spec: Arc<C>,
 }
 
 impl<C> std::fmt::Debug for N42Consensus<C> {
@@ -211,6 +217,7 @@ impl<C> std::fmt::Debug for N42Consensus<C> {
                 &self.validator_set_resolver.is_some(),
             )
             .field("header_profile", &self.header_profile)
+            .field("has_committee_pool", &self.committee_pool.is_some())
             .finish()
     }
 }
@@ -219,14 +226,39 @@ impl<C> N42Consensus<C>
 where
     C: EthChainSpec + EthereumHardforks,
 {
+    /// [`normalized_gov5_header`] plus the Prague fill-in for the live H2 shape.
+    ///
+    /// gov5 runs Prague (`pectraTime`: EIP-2935, the 7002/7251 system calls,
+    /// EIP-7702) but its miner never stamps `requestsHash`; the wire header
+    /// carries the `0x80` placeholder, decoded as `None`. Chain 94 produces no
+    /// execution requests, so for the inner Ethereum rules the empty requests
+    /// hash stands in — reth then compares it with the hash of the (empty)
+    /// requests execution produced, exactly the check gov5 skips. The original
+    /// sealed header remains hash-authenticated; only the temporary copy is
+    /// filled in.
+    fn normalize_header(&self, header: &Header) -> Result<Header, N42HeaderProfileError> {
+        let mut normalized = normalized_gov5_header(header)?;
+        if validate_gov5_replay_v2_header(header).is_err()
+            && normalized.requests_hash.is_none()
+            && self
+                .chain_spec
+                .is_prague_active_at_timestamp(header.timestamp)
+        {
+            normalized.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
+        }
+        Ok(normalized)
+    }
+
     /// Create a new N42 consensus adapter (without validator set).
     /// QC verification is skipped until `set_validator_set` is called.
     pub fn new(chain_spec: Arc<C>) -> Self {
         Self {
-            inner: EthBeaconConsensus::new(chain_spec),
+            inner: EthBeaconConsensus::new(chain_spec.clone()),
+            chain_spec,
             validator_set: Arc::new(ArcSwapOption::empty()),
             validator_set_resolver: None,
             header_profile: N42HeaderProfile::Ethereum,
+            committee_pool: None,
         }
     }
 
@@ -254,10 +286,12 @@ where
         validator_set_resolver: Option<ValidatorSetResolver>,
     ) -> Self {
         Self {
-            inner: EthBeaconConsensus::new(chain_spec),
+            inner: EthBeaconConsensus::new(chain_spec.clone()),
+            chain_spec,
             validator_set,
             validator_set_resolver,
             header_profile: N42HeaderProfile::Ethereum,
+            committee_pool: None,
         }
     }
 
@@ -265,6 +299,19 @@ where
     pub const fn with_header_profile(mut self, header_profile: N42HeaderProfile) -> Self {
         self.header_profile = header_profile;
         self
+    }
+
+    /// Enforces gov5's committee-evidence link (`parentBeaconRoot ==
+    /// Blake3(parent evidence)`) on every header validated under the Gov5
+    /// profile. Inert under the Ethereum profile.
+    pub fn with_committee_pool(mut self, pool: Arc<SimulatedCommitteePool>) -> Self {
+        self.committee_pool = Some(pool);
+        self
+    }
+
+    /// The committee pool the link check uses, when one is configured.
+    pub fn committee_pool(&self) -> Option<&Arc<SimulatedCommitteePool>> {
+        self.committee_pool.as_ref()
     }
 
     /// Sets or updates the validator set.
@@ -321,6 +368,13 @@ where
             let senders = block.senders().to_vec();
             let mut normalized = block.clone().into_block();
             normalized.header.receipts_root = ethereum_root;
+            if normalized.header.requests_hash.is_none()
+                && self
+                    .chain_spec
+                    .is_prague_active_at_timestamp(normalized.header.timestamp)
+            {
+                normalized.header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
+            }
             let normalized = RecoveredBlock::new_unhashed(normalized, senders);
             return <EthBeaconConsensus<C> as FullConsensus<EthPrimitives>>::validate_block_post_execution(
                 &self.inner,
@@ -350,8 +404,9 @@ where
         header: &SealedHeader<Header>,
     ) -> Result<(), ConsensusError> {
         if self.header_profile == N42HeaderProfile::Gov5H2 {
-            let mut normalized =
-                normalized_gov5_header(header.header()).map_err(ConsensusError::other)?;
+            let mut normalized = self
+                .normalize_header(header.header())
+                .map_err(ConsensusError::other)?;
             let mut normalized_body = body.clone();
             if validate_gov5_replay_v2_header(header.header()).is_ok() {
                 normalized_body.withdrawals = None;
@@ -378,8 +433,9 @@ where
     ) -> Result<(), ConsensusError> {
         if self.header_profile == N42HeaderProfile::Gov5H2 {
             let mut normalized = block.clone().into_block();
-            normalized.header =
-                normalized_gov5_header(block.header()).map_err(ConsensusError::other)?;
+            normalized.header = self
+                .normalize_header(block.header())
+                .map_err(ConsensusError::other)?;
             if validate_gov5_replay_v2_header(block.header()).is_ok() {
                 normalized.body.withdrawals = None;
             } else {
@@ -401,8 +457,9 @@ where
 {
     fn validate_header(&self, header: &SealedHeader<Header>) -> Result<(), ConsensusError> {
         if self.header_profile == N42HeaderProfile::Gov5H2 {
-            let normalized =
-                normalized_gov5_header(header.header()).map_err(ConsensusError::other)?;
+            let normalized = self
+                .normalize_header(header.header())
+                .map_err(ConsensusError::other)?;
             return self
                 .inner
                 .validate_header(&SealedHeader::seal_slow(normalized));
@@ -431,12 +488,40 @@ where
                     block_number: header.number,
                 });
             }
-            let mut header =
-                normalized_gov5_header(header.header()).map_err(ConsensusError::other)?;
+            // gov5's committee-evidence link (`hotstuff/adapter.go VerifyHeader`):
+            // the child's parentBeaconRoot must be Blake3 of the parent's simulated
+            // committee evidence, rebuilt from the parent actually being extended
+            // (its number, gov5 hash and native receipts root), never from a
+            // by-number store. Genesis has no evidence; its child carries zero.
+            if let Some(pool) = &self.committee_pool {
+                pool.verify_parent_link(
+                    header.number,
+                    header.parent_beacon_block_root,
+                    parent.number,
+                    &parent.hash(),
+                    &parent.receipts_root,
+                )
+                .map_err(|error| {
+                    metrics::counter!("n42_gov5_committee_evidence_link_broken_total").increment(1);
+                    tracing::error!(
+                        target: "n42::consensus",
+                        number = header.number,
+                        block_hash = %header.hash(),
+                        parent_hash = %parent.hash(),
+                        %error,
+                        "REJECTING gov5 header: committee-evidence link broken"
+                    );
+                    ConsensusError::other(error)
+                })?;
+            }
+            let mut header = self
+                .normalize_header(header.header())
+                .map_err(ConsensusError::other)?;
             let parent = if parent.number == 0 {
                 parent.header().clone()
             } else {
-                normalized_gov5_header(parent.header()).map_err(ConsensusError::other)?
+                self.normalize_header(parent.header())
+                    .map_err(ConsensusError::other)?
             };
             // The inner Ethereum validator must compare like-for-like normalized headers. The
             // authenticated outer parent link was checked above; rewriting only this temporary
@@ -614,6 +699,80 @@ mod tests {
         assert!(matches!(
             gov5.validate_header_against_parent(&forged, &parent),
             Err(ConsensusError::ParentHashMismatch(_))
+        ));
+    }
+
+    /// A live gov5 header under Prague carries no requests hash (the `0x80`
+    /// placeholder); the inner rules see the empty requests hash instead, and
+    /// post-execution then checks it against the requests execution produced.
+    #[test]
+    fn gov5_prague_header_without_requests_hash_is_accepted_when_no_requests_were_produced() {
+        let chain_spec = reth_chainspec::MAINNET.clone();
+        // Mainnet's Prague timestamp, which is also gov5's `pectraTime`.
+        let prague = 1_746_612_311_u64;
+        assert!(chain_spec.is_prague_active_at_timestamp(prague));
+        assert!(!chain_spec.is_prague_active_at_timestamp(prague - 1));
+        let gov5 = N42Consensus::new(chain_spec).with_header_profile(N42HeaderProfile::Gov5H2);
+        let valid_extra = [b"N42H".as_slice(), &[0_u8; 8], &[0_u8; 96]].concat();
+        let mut header = Header {
+            ommers_hash: B256::ZERO,
+            difficulty: U256::ZERO,
+            extra_data: valid_extra.into(),
+            base_fee_per_gas: Some(0),
+            timestamp: prague + 12,
+            number: 13_560_376,
+            gas_limit: 30_000_000,
+            withdrawals_root: Some(keccak256([])),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(B256::ZERO),
+            requests_hash: None,
+            ..Default::default()
+        };
+        gov5.validate_header(&SealedHeader::seal_slow(header.clone()))
+            .unwrap();
+        assert_eq!(
+            gov5.normalize_header(&header).unwrap().requests_hash,
+            Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH)
+        );
+        // Before Prague nothing is filled in.
+        header.timestamp = prague - 1;
+        assert_eq!(gov5.normalize_header(&header).unwrap().requests_hash, None);
+
+        // Post-execution: an empty request list matches; a produced request does not.
+        let receipt = EthereumReceipt {
+            tx_type: TxType::Legacy,
+            success: true,
+            cumulative_gas_used: 21_000,
+            logs: Vec::new(),
+        };
+        let native_root = gov5_native_receipts_root(std::slice::from_ref(&receipt));
+        header.timestamp = prague + 12;
+        header.receipts_root = native_root;
+        header.gas_used = 21_000;
+        let block = RecoveredBlock::new_unhashed(
+            EthBlock {
+                header,
+                body: Default::default(),
+            },
+            Vec::new(),
+        );
+        let result = BlockExecutionResult {
+            receipts: vec![receipt],
+            gas_used: 21_000,
+            ..Default::default()
+        };
+        gov5.validate_block_post_execution(&block, &result, None, None)
+            .unwrap();
+        let with_request = BlockExecutionResult {
+            requests: alloy_eips::eip7685::Requests::new(vec![alloy_primitives::Bytes::from(
+                vec![1u8; 20],
+            )]),
+            ..result
+        };
+        assert!(matches!(
+            gov5.validate_block_post_execution(&block, &with_request, None, None),
+            Err(ConsensusError::BodyRequestsHashDiff(_))
         ));
     }
 

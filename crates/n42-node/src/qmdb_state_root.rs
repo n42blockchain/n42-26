@@ -1,14 +1,22 @@
 //! Branch-safe, correctness-first QMDB state-root tracking for Gov5 Engine imports.
 //!
-//! The store retains per-block operation deltas and reconstructs branch candidates from an
-//! authenticated base snapshot. Empty state transitions use their authenticated parent's root
-//! directly, and crash-safe deltas are appended to a checksummed WAL. It never mutates a canonical
-//! global tree before the candidate's header root has matched.
+//! The store keeps one split QMDB commitment ([`QmdbLeafTree`]: sealed twigs as leaf root plus
+//! bits, the open twig in full, the live entries by key) and moves it along the block graph
+//! in place. A candidate is priced by applying its operations under an undo record, reading
+//! the root and reverting; a committed block leaves the tree at itself and keeps its undo
+//! record so the tree can walk back to a sibling's parent. Nothing is ever cloned per block.
+//! Per-block operation deltas are retained (and appended to a checksummed WAL) so every
+//! retained block can be reached again from the authenticated base, and the tree itself is
+//! written out in leaf form as a new base every `N42_QMDB_REBASE_BLOCKS` commits.
 
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::ExecutionData;
 use n42_twig_core::qmdb_compat::{
-    QmdbCompatTree, QmdbOperation, QmdbOperationError, QmdbProof, QmdbSnapshot, QmdbSnapshotError,
+    BlockUndo, QmdbCompatTree, QmdbOperation, QmdbOperationError, QmdbProof, QmdbSnapshot,
+    QmdbSnapshotError, QmdbUndoError,
+};
+use n42_twig_core::qmdb_leaf_tree::{
+    QmdbLeafFormHeader, QmdbLeafFormIoError, QmdbLeafTree, QmdbLeafTreeError,
 };
 use reth_engine_tree::tree::state_root_strategy::{
     LazyHashedPostState, PreparedStateRootJob, StateRootJob, StateRootJobContext,
@@ -25,17 +33,22 @@ use reth_storage_overlay::OverlayManager;
 use reth_trie::updates::TrieUpdates;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 use crate::{
     engine_validator::{N42EngineValidator, N42EngineValidatorBuilder},
     node::N42Node,
-    qmdb_state::gov5_qmdb_operations_from_output,
+    qmdb_state::{
+        gov5_qmdb_operations_with_restored, gov5_restored_slots_key, with_gov5_prague_system_caller,
+    },
 };
 
 /// Maximum ancestry replay accepted by the bounded interoperability strategy.
@@ -48,6 +61,14 @@ use crate::{
 /// fail-closed testing or a larger audited bound for longer archive horizons.
 pub const DEFAULT_QMDB_REPLAY_DEPTH: usize = 1_048_576;
 
+/// Undo records kept behind the tree's position. The tree can walk back this
+/// many committed blocks without a rebuild; a sibling deeper than that is
+/// reached from the base by replaying the retained operations instead.
+const RETAINED_UNDO_RECORDS: usize = 8_192;
+
+/// Committed blocks between two background rewrites of the base file.
+pub const DEFAULT_QMDB_REBASE_BLOCKS: u64 = 20_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredQmdbBlock {
     parent_hash: B256,
@@ -55,23 +76,28 @@ struct StoredQmdbBlock {
     operations: Vec<QmdbOperation>,
 }
 
-// In-memory only: persistence goes through `PersistedQmdbBranchState`, and
-// the cached tree is a derived accelerator that must never be written out.
+/// One undo record on the tree's path: the block it reverts and the block
+/// the tree stands at after reverting it.
+struct AppliedUndo {
+    block_hash: B256,
+    parent_hash: B256,
+    undo: BlockUndo,
+}
+
+// In-memory only: persistence goes through `PersistedQmdbBranchState` and the
+// base file; the tree is a derived accelerator whose position is transient.
 struct QmdbBranchState {
     blocks: HashMap<B256, StoredQmdbBlock>,
-    /// The most recently committed block's reconstructed tree.
-    ///
-    /// Without it every non-empty block replays its whole ancestry from the
-    /// base snapshot, so importing block N costs O(N) and a run costs O(N^2).
-    /// Measured at 32 writes/block: 15ms at depth 300, 31ms at 600, 68ms at
-    /// 1200 — linear, and on track to consume an 8s slot after roughly two
-    /// weeks at that rate. Resuming from the committed tip turns sequential
-    /// import into one block's work plus a tree clone.
-    ///
-    /// Only ever holds a tree whose root was verified against the stored
-    /// block, and lives under the same mutex as `blocks`, so a reader can
-    /// never observe it out of step with the ancestry it summarizes.
-    cached_tip: Option<CachedTipTree>,
+    /// The one tree, moved in place along the graph.
+    tree: QmdbLeafTree,
+    /// The block the tree currently represents (the base, or a block in
+    /// `blocks`).
+    tree_at: B256,
+    /// Parent edges from the base to `tree_at`.
+    tree_depth: usize,
+    /// Undo records of the blocks applied to reach `tree_at`, oldest first.
+    /// Popping the newest moves the tree to that block's parent.
+    applied: VecDeque<AppliedUndo>,
     /// A block whose delta is already in `blocks` but whose WAL frame is still
     /// being written and fsynced outside this lock. Commits are serialized, so
     /// at most one block is ever in flight, and it is always the newest tip.
@@ -81,42 +107,27 @@ struct QmdbBranchState {
     pending_durable: Option<B256>,
 }
 
-struct CachedTipTree {
-    block_hash: B256,
-    /// Blocks between the base snapshot and `block_hash`, so a resumed
-    /// reconstruction still measures depth from the base and keeps the
-    /// `max_replay_depth` bound fail-closed.
-    depth: usize,
-    tree: QmdbCompatTree,
-}
-
 // Hand-written so the tree's contents never land in a log line; its identity
 // and depth are the only parts worth seeing.
 impl std::fmt::Debug for QmdbBranchState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QmdbBranchState")
             .field("blocks", &self.blocks.len())
-            .field("cached_tip", &self.cached_tip)
+            .field("tree_at", &self.tree_at)
+            .field("tree_depth", &self.tree_depth)
+            .field("applied", &self.applied.len())
             .field("pending_durable", &self.pending_durable)
             .finish()
     }
 }
 
-impl std::fmt::Debug for CachedTipTree {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CachedTipTree")
-            .field("block_hash", &self.block_hash)
-            .field("depth", &self.depth)
-            .finish_non_exhaustive()
-    }
-}
-
+/// The checkpoint file: the base's identity and every retained block. The
+/// base tree itself lives next to it in leaf form (`<path>.base.qmdb`).
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedQmdbBranchState {
     version: u32,
     base_block_hash: B256,
     base_root: B256,
-    base_snapshot: QmdbSnapshot,
     blocks: HashMap<B256, StoredQmdbBlock>,
 }
 
@@ -166,15 +177,28 @@ enum WalFault {
 
 const QMDB_WAL_MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
 const QMDB_WAL_CHECKSUM_BYTES: usize = 32;
+const PERSISTED_BRANCH_STATE_VERSION: u32 = 2;
+
+/// What a leaf-form base file identifies itself as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QmdbBaseIdentity {
+    pub chain_id: u64,
+    pub genesis_hash: B256,
+    pub block_number: u64,
+}
 
 /// Thread-safe QMDB candidate store rooted at one authenticated checkpoint.
 #[derive(Debug)]
 pub struct Gov5QmdbStateRootStore {
     base_block_hash: B256,
     base_root: B256,
-    base_snapshot: QmdbSnapshot,
+    /// Chain identity and base height, written into the base file's header.
+    identity: QmdbBaseIdentity,
     max_replay_depth: usize,
     persistence_path: Option<PathBuf>,
+    rebase_every: u64,
+    commits_since_rebase: AtomicU64,
+    rebase_in_flight: Arc<AtomicBool>,
     state: Mutex<QmdbBranchState>,
     /// Serializes commits end to end (tree work, insert, WAL append). WAL order
     /// then equals insertion order and a child can never be published while
@@ -189,6 +213,8 @@ pub struct Gov5QmdbStateRootStore {
 pub enum Gov5QmdbStateRootError {
     #[error("QMDB base snapshot is invalid: {0}")]
     InvalidBaseSnapshot(#[from] QmdbSnapshotError),
+    #[error("QMDB base leaf form is invalid: {0}")]
+    InvalidBaseLeafForm(#[from] QmdbLeafTreeError),
     #[error("QMDB base root mismatch: rebuilt {got}, expected {expected}")]
     BaseRootMismatch { got: B256, expected: B256 },
     #[error("QMDB parent {0} is not descended from the configured base checkpoint")]
@@ -209,12 +235,54 @@ pub enum Gov5QmdbStateRootError {
     },
     #[error("QMDB block mutation is invalid: {0}")]
     InvalidOperations(#[from] QmdbOperationError),
+    #[error("QMDB tree could not be reverted: {0}")]
+    Undo(#[from] QmdbUndoError),
     #[error("QMDB state-root store lock is poisoned")]
     LockPoisoned,
     #[error("QMDB branch-state persistence failed: {0}")]
     Persistence(String),
     #[error("persisted QMDB branch state does not match the authenticated base")]
     PersistedBaseMismatch,
+}
+
+impl From<QmdbLeafFormIoError> for Gov5QmdbStateRootError {
+    fn from(error: QmdbLeafFormIoError) -> Self {
+        Self::Persistence(error.to_string())
+    }
+}
+
+/// Where the leaf-form base file of a checkpoint lives.
+pub fn base_file_path(checkpoint_path: &Path) -> PathBuf {
+    let mut name = checkpoint_path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(".base.qmdb");
+    checkpoint_path.with_file_name(name)
+}
+
+/// Turns a positional snapshot into the split tree, checking its root.
+fn leaf_tree_from_snapshot(
+    snapshot: &QmdbSnapshot,
+    expected_root: B256,
+) -> Result<QmdbLeafTree, Gov5QmdbStateRootError> {
+    let full = QmdbCompatTree::from_snapshot(snapshot)?;
+    let rebuilt = B256::from(full.root());
+    if rebuilt != expected_root {
+        return Err(Gov5QmdbStateRootError::BaseRootMismatch {
+            got: rebuilt,
+            expected: expected_root,
+        });
+    }
+    let mut tree = QmdbLeafTree::from_leaf_form(&full.leaf_form())?;
+    let split = B256::from(tree.root());
+    if split != expected_root {
+        return Err(Gov5QmdbStateRootError::BaseRootMismatch {
+            got: split,
+            expected: expected_root,
+        });
+    }
+    Ok(tree)
 }
 
 impl Gov5QmdbStateRootStore {
@@ -238,7 +306,18 @@ impl Gov5QmdbStateRootStore {
         base_snapshot: QmdbSnapshot,
         max_replay_depth: usize,
     ) -> Result<Self, Gov5QmdbStateRootError> {
-        let rebuilt = B256::from(QmdbCompatTree::from_snapshot(&base_snapshot)?.root());
+        let tree = leaf_tree_from_snapshot(&base_snapshot, base_root)?;
+        Self::from_leaf_tree(base_block_hash, base_root, tree, max_replay_depth)
+    }
+
+    /// A store around an already verified split tree standing at the base.
+    pub fn from_leaf_tree(
+        base_block_hash: B256,
+        base_root: B256,
+        mut tree: QmdbLeafTree,
+        max_replay_depth: usize,
+    ) -> Result<Self, Gov5QmdbStateRootError> {
+        let rebuilt = B256::from(tree.root());
         if rebuilt != base_root {
             return Err(Gov5QmdbStateRootError::BaseRootMismatch {
                 got: rebuilt,
@@ -248,12 +327,26 @@ impl Gov5QmdbStateRootStore {
         Ok(Self {
             base_block_hash,
             base_root,
-            base_snapshot,
+            identity: QmdbBaseIdentity {
+                chain_id: 0,
+                genesis_hash: B256::ZERO,
+                block_number: 0,
+            },
             max_replay_depth,
             persistence_path: None,
+            rebase_every: std::env::var("N42_QMDB_REBASE_BLOCKS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_QMDB_REBASE_BLOCKS),
+            commits_since_rebase: AtomicU64::new(0),
+            rebase_in_flight: Arc::new(AtomicBool::new(false)),
             state: Mutex::new(QmdbBranchState {
-                cached_tip: None,
                 blocks: HashMap::new(),
+                tree,
+                tree_at: base_block_hash,
+                tree_depth: 0,
+                applied: VecDeque::new(),
                 pending_durable: None,
             }),
             commit: Mutex::new(()),
@@ -261,6 +354,12 @@ impl Gov5QmdbStateRootStore {
             #[cfg(test)]
             wal_fault: Mutex::new(None),
         })
+    }
+
+    /// Records the chain identity and base height written into base files.
+    pub fn with_identity(mut self, identity: QmdbBaseIdentity) -> Self {
+        self.identity = identity;
+        self
     }
 
     /// Opens a crash-safe branch store. Existing state must be bound to the
@@ -273,45 +372,46 @@ impl Gov5QmdbStateRootStore {
         max_replay_depth: usize,
         path: PathBuf,
     ) -> Result<Self, Gov5QmdbStateRootError> {
-        let mut store = Self::with_max_replay_depth(
-            base_block_hash,
-            base_root,
-            base_snapshot,
-            max_replay_depth,
-        )?;
+        let tree = leaf_tree_from_snapshot(&base_snapshot, base_root)?;
+        Self::persistent_from_leaf_tree(base_block_hash, base_root, tree, max_replay_depth, path)
+    }
+
+    /// Like [`Self::persistent`], around a verified split tree at the base.
+    pub fn persistent_from_leaf_tree(
+        base_block_hash: B256,
+        base_root: B256,
+        tree: QmdbLeafTree,
+        max_replay_depth: usize,
+        path: PathBuf,
+    ) -> Result<Self, Gov5QmdbStateRootError> {
+        let mut store = Self::from_leaf_tree(base_block_hash, base_root, tree, max_replay_depth)?;
         store.persistence_path = Some(path.clone());
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let persisted: PersistedQmdbBranchState = bincode::deserialize(&bytes)
                     .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
-                if persisted.version != 1
+                if persisted.version != PERSISTED_BRANCH_STATE_VERSION
                     || persisted.base_block_hash != store.base_block_hash
                     || persisted.base_root != store.base_root
-                    || persisted.base_snapshot != store.base_snapshot
                 {
                     return Err(Gov5QmdbStateRootError::PersistedBaseMismatch);
                 }
                 let mut blocks = persisted.blocks;
                 load_wal(&wal_path(&path), &mut blocks)?;
+                let state = store
+                    .state
+                    .get_mut()
+                    .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
                 validate_persisted_blocks(
+                    &mut state.tree,
                     store.base_block_hash,
-                    store.base_root,
-                    &store.base_snapshot,
                     store.max_replay_depth,
-                    &blocks,
+                    &mut blocks,
                 )?;
-                store.state = Mutex::new(QmdbBranchState {
-                    blocks,
-                    cached_tip: None,
-                    pending_durable: None,
-                });
+                state.blocks = blocks;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                store.persist_checkpoint_locked(&QmdbBranchState {
-                    cached_tip: None,
-                    blocks: HashMap::new(),
-                    pending_durable: None,
-                })?;
+                store.persist_checkpoint_locked(&HashMap::new())?;
             }
             Err(error) => {
                 return Err(Gov5QmdbStateRootError::Persistence(error.to_string()));
@@ -321,6 +421,29 @@ impl Gov5QmdbStateRootStore {
         // handle for the store's lifetime instead of re-opening per block.
         store.wal = Mutex::new(Some(open_wal_file(&wal_path(&path))?));
         Ok(store)
+    }
+
+    /// Reads a leaf-form base file and its header, checking the root it
+    /// claims. The caller binds the header's block to its chain.
+    pub fn read_base_file(
+        path: &Path,
+    ) -> Result<(QmdbLeafTree, QmdbLeafFormHeader), Gov5QmdbStateRootError> {
+        let file = std::fs::File::open(path).map_err(|error| {
+            Gov5QmdbStateRootError::Persistence(format!(
+                "failed to open QMDB base {}: {error}",
+                path.display()
+            ))
+        })?;
+        let (mut tree, header) =
+            QmdbLeafTree::read_leaf_form_v2(std::io::BufReader::with_capacity(1 << 20, file))?;
+        let rebuilt = B256::from(tree.root());
+        if rebuilt != B256::from(header.root) {
+            return Err(Gov5QmdbStateRootError::BaseRootMismatch {
+                got: rebuilt,
+                expected: B256::from(header.root),
+            });
+        }
+        Ok((tree, header))
     }
 
     pub const fn base_block_hash(&self) -> B256 {
@@ -342,6 +465,19 @@ impl Gov5QmdbStateRootStore {
             .saturating_sub(usize::from(state.pending_durable.is_some())))
     }
 
+    /// Live entries and append cursor of the tree, for start-up logging.
+    pub fn tree_stats(&self) -> Result<(usize, u64, usize), Gov5QmdbStateRootError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+        Ok((
+            state.tree.len(),
+            state.tree.next_slot(),
+            state.tree.twig_count(),
+        ))
+    }
+
     /// A retained block as archive readers see it: durable, or absent.
     fn durable_block(state: &QmdbBranchState, block_hash: B256) -> Option<&StoredQmdbBlock> {
         if state.pending_durable == Some(block_hash) {
@@ -360,6 +496,12 @@ impl Gov5QmdbStateRootStore {
         self.state.lock().unwrap().pending_durable.is_some()
     }
 
+    #[cfg(test)]
+    fn tree_position(&self) -> (B256, usize, usize) {
+        let state = self.state.lock().unwrap();
+        (state.tree_at, state.tree_depth, state.applied.len())
+    }
+
     /// Compute a candidate from its exact parent branch and publish its delta only after its root
     /// equals the hash-authenticated header commitment. A mismatch leaves the store unchanged.
     pub fn compute_candidate(
@@ -368,18 +510,16 @@ impl Gov5QmdbStateRootStore {
         operations: &[QmdbOperation],
     ) -> Result<B256, Gov5QmdbStateRootError> {
         let lock_started = std::time::Instant::now();
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
         let lock_acquired = std::time::Instant::now();
         metrics::histogram!("n42_qmdb_lock_wait_ms", "operation" => "candidate")
             .record(lock_acquired.duration_since(lock_started).as_secs_f64() * 1_000.0);
-        // Speculative: the caller may never commit this block, so the rebuilt
-        // tree is dropped rather than cached.
         let compute_started = std::time::Instant::now();
         let result = self
-            .compute_candidate_locked(&state, parent_hash, operations)
+            .compute_candidate_locked(&mut state, parent_hash, operations)
             .map(|(root, _)| root);
         metrics::histogram!("n42_qmdb_candidate_compute_ms", "operation" => "candidate")
             .record(compute_started.elapsed().as_secs_f64() * 1_000.0);
@@ -388,10 +528,11 @@ impl Gov5QmdbStateRootStore {
         result
     }
 
-    /// Commit a block: rebuild its candidate under the `state` lock, publish the
+    /// Commit a block: price its candidate under the `state` lock, publish the
     /// delta, then write and fsync the WAL frame with the lock released. A
-    /// block whose WAL append fails is rolled back and reported as an error,
-    /// so it is never considered committed.
+    /// block whose WAL append fails is rolled back — from `blocks` and from
+    /// the tree — and reported as an error, so it is never considered
+    /// committed.
     pub fn compute_and_commit(
         &self,
         parent_hash: B256,
@@ -436,10 +577,10 @@ impl Gov5QmdbStateRootStore {
         }
 
         let compute_started = std::time::Instant::now();
-        let candidate = self.compute_candidate_locked(&state, parent_hash, &operations);
+        let candidate = self.compute_candidate_locked(&mut state, parent_hash, &operations);
         metrics::histogram!("n42_qmdb_candidate_compute_ms", "operation" => "commit")
             .record(compute_started.elapsed().as_secs_f64() * 1_000.0);
-        let (root, rebuilt) = match candidate {
+        let (root, undo) = match candidate {
             Ok(candidate) => candidate,
             Err(error) => {
                 metrics::counter!("n42_qmdb_commit_outcomes_total", "outcome" => "compute_error")
@@ -478,6 +619,35 @@ impl Gov5QmdbStateRootStore {
                 return Err(error);
             }
         };
+        // Leave the tree at the new block: re-apply the priced operations
+        // (the candidate was reverted) and keep the undo record.
+        if let Some(undo) = undo {
+            let reapplied = match state
+                .tree
+                .apply_sorted_ops_recorded(stored.operations.iter().cloned())
+            {
+                Ok((reapplied_root, undo)) => {
+                    debug_assert_eq!(B256::from(reapplied_root), root);
+                    undo
+                }
+                Err(error) => {
+                    metrics::counter!("n42_qmdb_commit_outcomes_total", "outcome" => "compute_error")
+                        .increment(1);
+                    return Err(error.into());
+                }
+            };
+            debug_assert_eq!(undo.prev_next_slot, reapplied.prev_next_slot);
+            Self::push_applied(&mut state, block_hash, parent_hash, reapplied);
+        } else {
+            // Empty block: the tree's contents are its parent's; only the
+            // position moves.
+            let undo = BlockUndo {
+                prev_next_slot: state.tree.next_slot(),
+                entries: Vec::new(),
+                appended_keys: Vec::new(),
+            };
+            Self::push_applied(&mut state, block_hash, parent_hash, undo);
+        }
         state.blocks.insert(block_hash, stored);
         state.pending_durable = frame.is_some().then_some(block_hash);
         let mut lock_hold = lock_acquired.elapsed();
@@ -501,22 +671,14 @@ impl Gov5QmdbStateRootStore {
             metrics::counter!("n42_qmdb_commit_outcomes_total", "outcome" => "wal_error")
                 .increment(1);
             state.blocks.remove(&block_hash);
+            // The tree still stands at the failed block: step back off it.
+            if state.tree_at == block_hash {
+                Self::pop_applied(&mut state)?;
+            }
             lock_hold += publish_started.elapsed();
             metrics::histogram!("n42_qmdb_lock_hold_ms", "operation" => "commit")
                 .record(lock_hold.as_secs_f64() * 1_000.0);
             return Err(error);
-        }
-        // Cache only now: the root matched, the block is in `blocks`, and the
-        // WAL append succeeded, so the tree describes durable committed state.
-        // Empty blocks took the fast path and rebuilt nothing; leaving the
-        // older tip cached is correct, since replaying an empty block over it
-        // costs nothing.
-        if let Some((tree, parent_depth)) = rebuilt {
-            state.cached_tip = Some(CachedTipTree {
-                block_hash,
-                depth: parent_depth.saturating_add(1),
-                tree,
-            });
         }
         lock_hold += publish_started.elapsed();
         drop(state);
@@ -524,63 +686,119 @@ impl Gov5QmdbStateRootStore {
         metrics::counter!("n42_qmdb_commit_outcomes_total", "outcome" => "committed").increment(1);
         metrics::histogram!("n42_qmdb_lock_hold_ms", "operation" => "commit")
             .record(lock_hold.as_secs_f64() * 1_000.0);
+        self.maybe_rebase_in_background();
         Ok(root)
     }
 
-    /// Returns the candidate root, plus the rebuilt tree when one was built.
-    ///
-    /// The tree comes back so `compute_and_commit` can cache it instead of
-    /// throwing away the work and rebuilding on the next block. The
-    /// empty-block fast path builds no tree and returns `None`.
-    #[allow(clippy::type_complexity)]
+    fn push_applied(
+        state: &mut QmdbBranchState,
+        block_hash: B256,
+        parent_hash: B256,
+        undo: BlockUndo,
+    ) {
+        debug_assert_eq!(state.tree_at, parent_hash);
+        state.applied.push_back(AppliedUndo {
+            block_hash,
+            parent_hash,
+            undo,
+        });
+        while state.applied.len() > RETAINED_UNDO_RECORDS {
+            state.applied.pop_front();
+        }
+        state.tree_at = block_hash;
+        state.tree_depth = state.tree_depth.saturating_add(1);
+    }
+
+    /// Reverts the newest applied block; the tree then stands at its parent.
+    fn pop_applied(state: &mut QmdbBranchState) -> Result<(), Gov5QmdbStateRootError> {
+        let applied = state
+            .applied
+            .pop_back()
+            .ok_or(Gov5QmdbStateRootError::MissingParent(state.tree_at))?;
+        debug_assert_eq!(applied.block_hash, state.tree_at);
+        state.tree.apply_undo(&applied.undo)?;
+        state.tree_at = applied.parent_hash;
+        state.tree_depth = state.tree_depth.saturating_sub(1);
+        Ok(())
+    }
+
+    /// Returns the candidate root and, for a non-empty candidate, the undo
+    /// record of its (already reverted) application. The tree is left at
+    /// `parent_hash`.
     fn compute_candidate_locked(
         &self,
-        state: &QmdbBranchState,
+        state: &mut QmdbBranchState,
         parent_hash: B256,
         operations: &[QmdbOperation],
-    ) -> Result<(B256, Option<(QmdbCompatTree, usize)>), Gov5QmdbStateRootError> {
-        // Applying no operations cannot alter a QMDB root. Avoid replaying the entire ancestry
-        // for the common empty-block case when the total retained graph proves the configured
-        // depth cannot have been exceeded. Once the graph is larger than that bound, fall back to
-        // exact ancestry reconstruction so heavily branched stores still fail closed correctly.
+    ) -> Result<(B256, Option<BlockUndo>), Gov5QmdbStateRootError> {
+        // Applying no operations cannot alter a QMDB root. Avoid walking the
+        // graph for the common empty-block case when the total retained graph
+        // proves the configured depth cannot have been exceeded. Once the
+        // graph is larger than that bound, fall back to exact ancestry
+        // reconstruction so heavily branched stores still fail closed.
         if operations.is_empty() && state.blocks.len() <= self.max_replay_depth {
-            return if parent_hash == self.base_block_hash {
-                Ok((self.base_root, None))
+            let root = if parent_hash == self.base_block_hash {
+                self.base_root
             } else {
                 state
                     .blocks
                     .get(&parent_hash)
-                    .map(|block| (block.root, None))
-                    .ok_or(Gov5QmdbStateRootError::MissingParent(parent_hash))
+                    .map(|block| block.root)
+                    .ok_or(Gov5QmdbStateRootError::MissingParent(parent_hash))?
             };
+            // The committer wants the tree at the parent all the same.
+            self.move_tree_to(state, parent_hash)?;
+            return Ok((root, None));
         }
-        let (mut tree, parent_depth) = self.reconstruct_tree_locked(state, parent_hash)?;
-        let root = B256::from(tree.apply_sorted_ops(operations.iter().cloned())?);
-        Ok((root, Some((tree, parent_depth))))
+        let parent_depth = self.move_tree_to(state, parent_hash)?;
+        if parent_depth.saturating_add(1) > self.max_replay_depth.saturating_add(1) {
+            return Err(Gov5QmdbStateRootError::ReplayDepthExceeded(
+                self.max_replay_depth,
+            ));
+        }
+        let (root, undo) = state
+            .tree
+            .apply_sorted_ops_recorded(operations.iter().cloned())?;
+        state.tree.apply_undo(&undo)?;
+        Ok((B256::from(root), Some(undo)))
     }
 
-    /// Rebuilds the tree at `block_hash` and reports its depth from the base.
+    /// Moves the tree to `target` — the base or a retained block — and
+    /// reports the target's depth from the base.
     ///
-    /// Walks back to whichever comes first: the cached tip or the base
-    /// snapshot. Resuming from the cache skips re-verifying ancestors that
-    /// were already verified when they were committed — the stored operations
-    /// they would replay cannot have changed, since `blocks` is append-only
-    /// and lives under this same lock. Ancestry the cache does not cover is
-    /// replayed and root-checked exactly as before.
-    fn reconstruct_tree_locked(
+    /// Walks the target's ancestry back to the nearest block the tree can
+    /// reach by reverting (its current position or any parent on its applied
+    /// path), reverts down to it, then replays the retained operations
+    /// forward, root-checking each block against what was stored when it was
+    /// committed. Every step is bounded by `max_replay_depth`.
+    fn move_tree_to(
         &self,
-        state: &QmdbBranchState,
-        block_hash: B256,
-    ) -> Result<(QmdbCompatTree, usize), Gov5QmdbStateRootError> {
-        let mut lineage = Vec::new();
-        let mut cursor = block_hash;
-        let mut resumed = None;
-        while cursor != self.base_block_hash {
-            if let Some(cached) = state.cached_tip.as_ref()
-                && cached.block_hash == cursor
-            {
-                resumed = Some(cached);
-                break;
+        state: &mut QmdbBranchState,
+        target: B256,
+    ) -> Result<usize, Gov5QmdbStateRootError> {
+        if target == state.tree_at {
+            metrics::counter!("n42_qmdb_tip_cache_total", "outcome" => "hit").increment(1);
+            return Ok(state.tree_depth);
+        }
+        metrics::counter!("n42_qmdb_tip_cache_total", "outcome" => "miss").increment(1);
+        // Blocks the tree can stand at by popping `n` applied records.
+        let mut reachable: HashMap<B256, usize> = HashMap::with_capacity(state.applied.len() + 1);
+        reachable.insert(state.tree_at, 0);
+        for (pops, applied) in state.applied.iter().rev().enumerate() {
+            reachable.entry(applied.parent_hash).or_insert(pops + 1);
+        }
+        let mut lineage: Vec<B256> = Vec::new();
+        let mut cursor = target;
+        let pops = loop {
+            if let Some(pops) = reachable.get(&cursor) {
+                break *pops;
+            }
+            if cursor == self.base_block_hash {
+                // The base fell off the applied path; the tree cannot return
+                // there without a rebuild from its base file.
+                return Err(Gov5QmdbStateRootError::ReplayDepthExceeded(
+                    self.max_replay_depth,
+                ));
             }
             // Also bounds a cycle in `blocks`: the walk cannot run forever.
             if lineage.len() >= self.max_replay_depth {
@@ -592,38 +810,43 @@ impl Gov5QmdbStateRootStore {
                 .blocks
                 .get(&cursor)
                 .ok_or(Gov5QmdbStateRootError::MissingParent(cursor))?;
-            lineage.push((cursor, stored));
+            lineage.push(cursor);
             cursor = stored.parent_hash;
-        }
-
-        metrics::counter!(
-            "n42_qmdb_tip_cache_total",
-            "outcome" => if resumed.is_some() { "hit" } else { "miss" }
-        )
-        .increment(1);
-        let (mut tree, base_depth) = match resumed {
-            Some(cached) => (cached.tree.clone(), cached.depth),
-            None => (QmdbCompatTree::from_snapshot(&self.base_snapshot)?, 0),
         };
-        // Depth is measured from the base whether or not the walk was resumed,
-        // so the bound rejects the same set of ancestries either way.
-        let depth = base_depth.saturating_add(lineage.len());
-        if depth > self.max_replay_depth {
+        metrics::histogram!("n42_qmdb_tree_moves", "direction" => "revert").record(pops as f64);
+        metrics::histogram!("n42_qmdb_tree_moves", "direction" => "replay")
+            .record(lineage.len() as f64);
+        for _ in 0..pops {
+            Self::pop_applied(state)?;
+        }
+        debug_assert_eq!(state.tree_at, cursor);
+        let depth = state.tree_depth.saturating_add(lineage.len());
+        if depth > self.max_replay_depth.saturating_add(1) {
             return Err(Gov5QmdbStateRootError::ReplayDepthExceeded(
                 self.max_replay_depth,
             ));
         }
-        for (hash, stored) in lineage.into_iter().rev() {
-            let root = B256::from(tree.apply_sorted_ops(stored.operations.iter().cloned())?);
+        for hash in lineage.into_iter().rev() {
+            let QmdbBranchState { blocks, tree, .. } = state;
+            let stored = blocks
+                .get(&hash)
+                .ok_or(Gov5QmdbStateRootError::MissingParent(hash))?;
+            let (root, undo) = tree.apply_sorted_ops_recorded(stored.operations.iter().cloned())?;
+            let root = B256::from(root);
             if root != stored.root {
+                // Put the tree back where it was before failing.
+                let stored_root = stored.root;
+                tree.apply_undo(&undo)?;
                 return Err(Gov5QmdbStateRootError::StoredRootDivergence {
                     block_hash: hash,
                     got: root,
-                    stored: stored.root,
+                    stored: stored_root,
                 });
             }
+            let parent_hash = stored.parent_hash;
+            Self::push_applied(state, hash, parent_hash, undo);
         }
-        Ok((tree, depth))
+        Ok(state.tree_depth)
     }
 
     pub fn contains(&self, block_hash: B256) -> Result<bool, Gov5QmdbStateRootError> {
@@ -645,45 +868,46 @@ impl Gov5QmdbStateRootStore {
         Ok(Self::durable_block(&state, block_hash).map(|block| block.root))
     }
 
-    /// Reconstruct an immutable historical snapshot for an exact retained
-    /// block. Unknown hashes return `None`; corrupt retained ancestry fails
-    /// closed instead of serving an unauthenticated state.
+    /// Reconstruct an immutable historical snapshot, in leaf form, for an
+    /// exact retained block. Unknown hashes return `None`; corrupt retained
+    /// ancestry fails closed instead of serving an unauthenticated state.
     pub fn snapshot_for(
         &self,
         block_hash: B256,
     ) -> Result<Option<QmdbSnapshot>, Gov5QmdbStateRootError> {
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
         if block_hash != self.base_block_hash && Self::durable_block(&state, block_hash).is_none() {
             return Ok(None);
         }
-        Ok(Some(
-            self.reconstruct_tree_locked(&state, block_hash)?
-                .0
-                .snapshot(),
-        ))
+        self.move_tree_to(&mut state, block_hash)?;
+        Ok(Some(QmdbSnapshot {
+            next_slot: state.tree.next_slot(),
+            entries: Vec::new(),
+            leaf_form: Some(state.tree.leaf_form()),
+        }))
     }
 
     /// Generate a gov5-compatible QMDB membership proof at an exact retained
-    /// historical block. `None` covers an unknown block or an absent key.
+    /// historical block. `None` covers an unknown block, an absent key, and a
+    /// key whose leaf sits in a sealed twig (the split tree holds no leaf
+    /// siblings there).
     pub fn proof_for(
         &self,
         block_hash: B256,
         key: [u8; 32],
     ) -> Result<Option<QmdbProof>, Gov5QmdbStateRootError> {
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
         if block_hash != self.base_block_hash && Self::durable_block(&state, block_hash).is_none() {
             return Ok(None);
         }
-        Ok(self
-            .reconstruct_tree_locked(&state, block_hash)?
-            .0
-            .prove(&key))
+        self.move_tree_to(&mut state, block_hash)?;
+        Ok(state.tree.prove(&key))
     }
 
     /// Returns the number of parent edges from the authenticated base to an
@@ -729,19 +953,104 @@ impl Gov5QmdbStateRootStore {
         Ok(Self::durable_block(&state, block_hash).map(|block| block.parent_hash))
     }
 
+    /// Writes the tree, standing at a durable committed block, as a new base
+    /// file. The next open of this checkpoint starts from that block and
+    /// replays only the retained blocks above it. The file is written from a
+    /// copy of the tree taken under the lock, so imports continue meanwhile;
+    /// returns the block the base was taken at.
+    pub fn write_base_file(&self) -> Result<Option<(B256, u64)>, Gov5QmdbStateRootError> {
+        let Some(path) = &self.persistence_path else {
+            return Ok(None);
+        };
+        let (tree, at, depth) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+            if state.pending_durable.is_some() && state.pending_durable == Some(state.tree_at) {
+                return Ok(None);
+            }
+            (state.tree.clone(), state.tree_at, state.tree_depth)
+        };
+        let root = self
+            .root_for(at)?
+            .ok_or(Gov5QmdbStateRootError::MissingParent(at))?;
+        let block_number = self.identity.block_number.saturating_add(depth as u64);
+        write_base_file(path, &tree, self.identity, block_number, at, root)?;
+        Ok(Some((at, block_number)))
+    }
+
+    fn maybe_rebase_in_background(&self) {
+        if self.persistence_path.is_none() {
+            return;
+        }
+        let commits = self.commits_since_rebase.fetch_add(1, Ordering::Relaxed) + 1;
+        if commits < self.rebase_every {
+            return;
+        }
+        if self
+            .rebase_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.commits_since_rebase.store(0, Ordering::Relaxed);
+        let (tree, at, depth) = match self.state.lock() {
+            Ok(state) => (state.tree.clone(), state.tree_at, state.tree_depth),
+            Err(_) => {
+                self.rebase_in_flight.store(false, Ordering::Release);
+                return;
+            }
+        };
+        let root = match self.root_for(at) {
+            Ok(Some(root)) => root,
+            _ => {
+                self.rebase_in_flight.store(false, Ordering::Release);
+                return;
+            }
+        };
+        let path = self.persistence_path.clone().expect("checked above");
+        let identity = self.identity;
+        let in_flight = self.rebase_in_flight.clone();
+        let block_number = identity.block_number.saturating_add(depth as u64);
+        std::thread::Builder::new()
+            .name("qmdb-rebase".into())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                match write_base_file(&path, &tree, identity, block_number, at, root) {
+                    Ok(()) => tracing::info!(
+                        target: "n42::qmdb",
+                        block_number,
+                        %at,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        live = tree.len(),
+                        "QMDB base file rewritten in the background"
+                    ),
+                    Err(error) => tracing::error!(
+                        target: "n42::qmdb",
+                        %error,
+                        "QMDB base file rewrite failed; the previous base stays in use"
+                    ),
+                }
+                in_flight.store(false, Ordering::Release);
+            })
+            .map(|_| ())
+            .unwrap_or_else(|_| self.rebase_in_flight.store(false, Ordering::Release));
+    }
+
     fn persist_checkpoint_locked(
         &self,
-        state: &QmdbBranchState,
+        blocks: &HashMap<B256, StoredQmdbBlock>,
     ) -> Result<(), Gov5QmdbStateRootError> {
         let Some(path) = &self.persistence_path else {
             return Ok(());
         };
         let persisted = PersistedQmdbBranchState {
-            version: 1,
+            version: PERSISTED_BRANCH_STATE_VERSION,
             base_block_hash: self.base_block_hash,
             base_root: self.base_root,
-            base_snapshot: self.base_snapshot.clone(),
-            blocks: state.blocks.clone(),
+            blocks: blocks.clone(),
         };
         let bytes = bincode::serialize(&persisted)
             .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
@@ -867,6 +1176,40 @@ impl Gov5QmdbStateRootStore {
     }
 }
 
+fn write_base_file(
+    checkpoint_path: &Path,
+    tree: &QmdbLeafTree,
+    identity: QmdbBaseIdentity,
+    block_number: u64,
+    block_hash: B256,
+    root: B256,
+) -> Result<(), Gov5QmdbStateRootError> {
+    let path = base_file_path(checkpoint_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
+    }
+    let tmp = path.with_extension("qmdb.tmp");
+    let file = std::fs::File::create(&tmp)
+        .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
+    let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+    tree.write_leaf_form_v2(
+        &mut writer,
+        identity.chain_id,
+        &identity.genesis_hash.0,
+        block_number,
+        &block_hash.0,
+        &root.0,
+    )?;
+    writer
+        .into_inner()
+        .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?
+        .sync_all()
+        .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
+    std::fs::rename(&tmp, &path)
+        .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))
+}
+
 fn wal_path(checkpoint_path: &Path) -> PathBuf {
     checkpoint_path.with_extension("wal")
 }
@@ -975,78 +1318,108 @@ fn qualification_abort_at(point: &str) {
     }
 }
 
+/// Replays every retained block over the base tree, depth first, reverting
+/// each branch on the way back, and checks each stored root. Blocks that do
+/// not descend from the base (retained below a base that has since moved
+/// forward) are dropped from `blocks` with a warning; a block whose ancestry
+/// is missing or cyclic is an error. The tree is left at the base.
 fn validate_persisted_blocks(
+    tree: &mut QmdbLeafTree,
     base_block_hash: B256,
-    base_root: B256,
-    base_snapshot: &QmdbSnapshot,
     max_replay_depth: usize,
-    blocks: &HashMap<B256, StoredQmdbBlock>,
+    blocks: &mut HashMap<B256, StoredQmdbBlock>,
 ) -> Result<(), Gov5QmdbStateRootError> {
     let mut children: HashMap<B256, Vec<B256>> = HashMap::new();
-    for (hash, block) in blocks {
+    for (hash, block) in blocks.iter() {
         children.entry(block.parent_hash).or_default().push(*hash);
     }
-    let mut validated = HashMap::from([(base_block_hash, (base_root, 0usize))]);
-    let mut queue = VecDeque::from([base_block_hash]);
-    while let Some(parent_hash) = queue.pop_front() {
-        let (parent_root, parent_depth) = validated[&parent_hash];
-        for hash in children.remove(&parent_hash).unwrap_or_default() {
-            let block = &blocks[&hash];
-            let depth = parent_depth.checked_add(1).ok_or_else(|| {
-                Gov5QmdbStateRootError::Persistence("QMDB ancestry depth overflow".into())
-            })?;
-            // Candidate computation replays the parent and then applies the child's operations,
-            // so a stored child may be one level beyond the parent replay bound.
-            if depth > max_replay_depth.saturating_add(1) {
-                return Err(Gov5QmdbStateRootError::Persistence(format!(
-                    "QMDB block {hash} exceeds replay depth {max_replay_depth}"
-                )));
+    let mut validated: HashSet<B256> = HashSet::with_capacity(blocks.len());
+    // (block, depth, remaining children, undo of this block on the tree)
+    let mut stack: Vec<(B256, usize, Vec<B256>, Option<BlockUndo>)> = vec![(
+        base_block_hash,
+        0,
+        children.remove(&base_block_hash).unwrap_or_default(),
+        None,
+    )];
+    while let Some(frame) = stack.last_mut() {
+        let Some(child) = frame.2.pop() else {
+            let (_, _, _, undo) = stack.pop().expect("frame exists");
+            if let Some(undo) = undo {
+                tree.apply_undo(&undo)?;
             }
-            let computed = if block.operations.is_empty() {
-                parent_root
-            } else {
-                let mut lineage = Vec::new();
-                let mut cursor = parent_hash;
-                while cursor != base_block_hash {
-                    if lineage.len() >= max_replay_depth {
-                        return Err(Gov5QmdbStateRootError::Persistence(format!(
-                            "QMDB parent {parent_hash} exceeds replay depth {max_replay_depth}"
-                        )));
+            continue;
+        };
+        let depth = frame.1.checked_add(1).ok_or_else(|| {
+            Gov5QmdbStateRootError::Persistence("QMDB ancestry depth overflow".into())
+        })?;
+        // Candidate computation replays the parent and then applies the
+        // child's operations, so a stored child may be one level beyond the
+        // parent replay bound.
+        if depth > max_replay_depth.saturating_add(1) {
+            return Err(Gov5QmdbStateRootError::Persistence(format!(
+                "QMDB block {child} exceeds replay depth {max_replay_depth}"
+            )));
+        }
+        let block = &blocks[&child];
+        let (root, undo) = tree.apply_sorted_ops_recorded(block.operations.iter().cloned())?;
+        let root = B256::from(root);
+        if root != block.root {
+            return Err(Gov5QmdbStateRootError::Persistence(format!(
+                "QMDB stored root diverged for block {child}: got {root}, stored {}",
+                block.root
+            )));
+        }
+        validated.insert(child);
+        let grandchildren = children.remove(&child).unwrap_or_default();
+        stack.push((child, depth, grandchildren, Some(undo)));
+    }
+    if validated.len() != blocks.len() {
+        // Anything not reached from the base: below a base that moved on
+        // (harmless, dropped) or an orphan/cycle (refused).
+        let unreachable: Vec<B256> = blocks
+            .keys()
+            .filter(|hash| !validated.contains(*hash))
+            .copied()
+            .collect();
+        let orphaned = unreachable
+            .iter()
+            .filter(|hash| {
+                let mut cursor = **hash;
+                let mut steps = 0usize;
+                loop {
+                    let Some(block) = blocks.get(&cursor) else {
+                        // Ancestry leaves the retained set without reaching
+                        // the base: below the base, or truly missing. A block
+                        // below the base has an ancestor chain that ends at a
+                        // hash we never retained; treat as droppable.
+                        return false;
+                    };
+                    if block.parent_hash == base_block_hash {
+                        return true;
                     }
-                    let stored = blocks.get(&cursor).ok_or_else(|| {
-                        Gov5QmdbStateRootError::Persistence(format!(
-                            "QMDB block {hash} has missing ancestor {cursor}"
-                        ))
-                    })?;
-                    lineage.push(stored);
-                    cursor = stored.parent_hash;
+                    cursor = block.parent_hash;
+                    steps += 1;
+                    if steps > max_replay_depth {
+                        return true;
+                    }
                 }
-                let mut tree = QmdbCompatTree::from_snapshot(base_snapshot)?;
-                for stored in lineage.into_iter().rev() {
-                    tree.apply_sorted_ops(stored.operations.iter().cloned())?;
-                }
-                B256::from(tree.apply_sorted_ops(block.operations.iter().cloned())?)
-            };
-            if computed != block.root {
-                return Err(Gov5QmdbStateRootError::Persistence(format!(
-                    "QMDB stored root diverged for block {hash}: got {computed}, stored {}",
-                    block.root
-                )));
-            }
-            validated.insert(hash, (block.root, depth));
-            queue.push_back(hash);
+            })
+            .count();
+        if orphaned > 0 {
+            return Err(Gov5QmdbStateRootError::Persistence(format!(
+                "{orphaned} retained QMDB blocks have missing or cyclic ancestry"
+            )));
+        }
+        tracing::warn!(
+            target: "n42::qmdb",
+            dropped = unreachable.len(),
+            "dropping retained QMDB blocks below the current base"
+        );
+        for hash in unreachable {
+            blocks.remove(&hash);
         }
     }
-    if validated.len() == blocks.len().saturating_add(1) {
-        Ok(())
-    } else {
-        Err(Gov5QmdbStateRootError::Persistence(format!(
-            "{} retained QMDB blocks have missing or cyclic ancestry",
-            blocks
-                .len()
-                .saturating_sub(validated.len().saturating_sub(1))
-        )))
-    }
+    Ok(())
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Gov5QmdbStateRootError> {
@@ -1069,11 +1442,23 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Gov5QmdbStateRootError>
 #[derive(Debug, Clone)]
 pub struct Gov5QmdbStateRootStrategy {
     store: Arc<Gov5QmdbStateRootStore>,
+    /// The chain's fork schedule: a Prague block writes the system caller's
+    /// leaf (see [`crate::qmdb_state::with_gov5_prague_system_caller`]).
+    chain_spec: Option<Arc<reth_chainspec::ChainSpec>>,
 }
 
 impl Gov5QmdbStateRootStrategy {
     pub const fn new(store: Arc<Gov5QmdbStateRootStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            chain_spec: None,
+        }
+    }
+
+    /// Decides Prague per block; without a chain spec no block is Prague.
+    pub fn with_chain_spec(mut self, chain_spec: Arc<reth_chainspec::ChainSpec>) -> Self {
+        self.chain_spec = Some(chain_spec);
+        self
     }
 }
 
@@ -1088,6 +1473,7 @@ where
         Ok(PreparedStateRootJob::new(
             Box::new(Gov5QmdbStateRootJob {
                 store: self.store.clone(),
+                chain_spec: self.chain_spec.clone(),
             }),
             None,
         ))
@@ -1097,6 +1483,7 @@ where
 #[derive(Debug)]
 struct Gov5QmdbStateRootJob {
     store: Arc<Gov5QmdbStateRootStore>,
+    chain_spec: Option<Arc<reth_chainspec::ChainSpec>>,
 }
 
 impl StateRootJob<EthPrimitives> for Gov5QmdbStateRootJob {
@@ -1110,7 +1497,20 @@ impl StateRootJob<EthPrimitives> for Gov5QmdbStateRootJob {
         output: Arc<BlockExecutionOutput<Receipt>>,
         _hashed_state: &LazyHashedPostState,
     ) -> ProviderResult<StateRootJobOutcome> {
-        let operations = gov5_qmdb_operations_from_output(&output);
+        // gov5 rewrites every slot the block's journal marked dirty, including
+        // one changed and restored within the block, which revm drops from
+        // the bundle; the executor wrapper recorded those for this block.
+        let restored =
+            n42_execution::restored_slots_for(gov5_restored_slots_key(block)).unwrap_or_default();
+        let mut operations = gov5_qmdb_operations_with_restored(&output.state, &restored);
+        if self.chain_spec.as_ref().is_some_and(|chain_spec| {
+            reth_chainspec::EthereumHardforks::is_prague_active_at_timestamp(
+                chain_spec.as_ref(),
+                block.timestamp,
+            )
+        }) {
+            with_gov5_prague_system_caller(&mut operations);
+        }
         if std::env::var_os("N42_QMDB_TRACE_OPERATIONS").is_some() {
             for operation in &operations {
                 tracing::info!(
@@ -1196,6 +1596,7 @@ pub struct N42EngineTreeValidatorBuilder {
     inner: BasicEngineValidatorBuilder<N42EngineValidatorBuilder>,
     qmdb_store: Option<Arc<Gov5QmdbStateRootStore>>,
     trusted_state_root: bool,
+    eof_guard: bool,
 }
 
 impl std::fmt::Debug for N42EngineTreeValidatorBuilder {
@@ -1205,6 +1606,7 @@ impl std::fmt::Debug for N42EngineTreeValidatorBuilder {
             .field("inner", &self.inner)
             .field("has_qmdb_store", &self.qmdb_store.is_some())
             .field("trusted_state_root", &self.trusted_state_root)
+            .field("eof_guard", &self.eof_guard)
             .finish()
     }
 }
@@ -1218,7 +1620,16 @@ impl N42EngineTreeValidatorBuilder {
             inner: BasicEngineValidatorBuilder::new(payload_validator),
             qmdb_store,
             trusted_state_root: false,
+            eof_guard: false,
         }
+    }
+
+    /// Refuse every executed block that carries EOF code; see [`crate::eof_guard`].
+    /// Only the gov5 strategies are wrapped: reth's default job carries execution
+    /// hooks a wrapper cannot re-attach, and on a standard chain reth's own rules apply.
+    pub const fn with_eof_guard(mut self, enabled: bool) -> Self {
+        self.eof_guard = enabled;
+        self
     }
 
     /// Take proposers' state roots on trust; see [`Gov5TrustedStateRootStrategy`].
@@ -1248,17 +1659,29 @@ where
             .inner
             .build_tree_validator(ctx, tree_config, overlay_manager)
             .await?;
+        let guard = |strategy: Arc<dyn StateRootStrategy<EthPrimitives, Node::Provider, Node::Evm>>| -> Arc<dyn StateRootStrategy<EthPrimitives, Node::Provider, Node::Evm>> {
+            if self.eof_guard {
+                Arc::new(crate::eof_guard::EofGuardedStateRootStrategy::new(strategy))
+            } else {
+                strategy
+            }
+        };
         let Some(store) = self.qmdb_store else {
             if self.trusted_state_root {
-                let strategy: Arc<dyn StateRootStrategy<EthPrimitives, Node::Provider, Node::Evm>> =
-                    Arc::new(Gov5TrustedStateRootStrategy);
-                return Ok(validator.with_state_root_strategy(strategy));
+                return Ok(validator
+                    .with_state_root_strategy(guard(Arc::new(Gov5TrustedStateRootStrategy))));
+            }
+            if self.eof_guard {
+                tracing::warn!(
+                    target: "n42::eof_guard",
+                    "EOF guard requested without a gov5 state-root strategy: imported blocks are not screened for EOF code"
+                );
             }
             return Ok(validator);
         };
-        let strategy: Arc<dyn StateRootStrategy<EthPrimitives, Node::Provider, Node::Evm>> =
-            Arc::new(Gov5QmdbStateRootStrategy::new(store));
-        Ok(validator.with_state_root_strategy(strategy))
+        let strategy =
+            Gov5QmdbStateRootStrategy::new(store).with_chain_spec(ctx.config.chain.clone());
+        Ok(validator.with_state_root_strategy(guard(Arc::new(strategy))))
     }
 }
 
@@ -1858,9 +2281,8 @@ mod tests {
             let state = persistent.state.lock().unwrap();
             assert!(!state.blocks.contains_key(&second));
             assert_eq!(
-                state.cached_tip.as_ref().map(|tip| tip.block_hash),
-                Some(first),
-                "the cached tip must still describe the last durable block"
+                state.tree_at, first,
+                "the tree must step back to the last durable block"
             );
         }
         assert_eq!(
@@ -2032,7 +2454,7 @@ mod tests {
         let first_ops = vec![operation(2, 2)];
         let first = B256::repeat_byte(0x21);
         let first_root = expected_root(&snapshot, std::slice::from_ref(&first_ops));
-        // Cold: nothing is cached yet.
+        // Hit: the tree stands at the base, which is the parent.
         store
             .compute_and_commit(
                 store.base_block_hash(),
@@ -2041,9 +2463,9 @@ mod tests {
                 first_ops.clone(),
             )
             .unwrap();
-        // Hit: the candidate resumes from the committed tip.
+        // Hit: the candidate builds on the committed tip the tree stands at.
         store.compute_candidate(first, &[operation(3, 3)]).unwrap();
-        // Miss: a sibling branch off the base cannot use the tip.
+        // Miss: a sibling branch off the base makes the tree step back.
         store
             .compute_candidate(store.base_block_hash(), &[operation(4, 4)])
             .unwrap();
@@ -2066,8 +2488,110 @@ mod tests {
                 (outcome, count)
             })
             .collect();
-        assert_eq!(outcomes.get("hit"), Some(&1));
-        assert_eq!(outcomes.get("miss"), Some(&2));
+        assert_eq!(outcomes.get("hit"), Some(&2));
+        assert_eq!(outcomes.get("miss"), Some(&1));
+    }
+
+    /// The in-place tree walks to any retained block and back: siblings,
+    /// deeper forks, and a return to the base, each time with the root the
+    /// cold reconstruction gives, and it never forgets its way back.
+    #[test]
+    fn the_tree_walks_the_graph_in_place_and_returns_to_the_base() {
+        let (store, snapshot) = store();
+        let base = store.base_block_hash();
+        let a_ops = vec![operation(2, 2), operation(3, 3)];
+        let b_ops = vec![operation(2, 9), operation(4, 4)];
+        let c_ops = vec![operation(3, 7)];
+        let a = B256::repeat_byte(0xA1);
+        let b = B256::repeat_byte(0xB1);
+        let c = B256::repeat_byte(0xC1);
+        let a_root = expected_root(&snapshot, std::slice::from_ref(&a_ops));
+        let b_root = expected_root(&snapshot, &[a_ops.clone(), b_ops.clone()]);
+        let c_root = expected_root(&snapshot, &[a_ops.clone(), c_ops.clone()]);
+        store
+            .compute_and_commit(base, a, a_root, a_ops.clone())
+            .unwrap();
+        store
+            .compute_and_commit(a, b, b_root, b_ops.clone())
+            .unwrap();
+        assert_eq!(store.tree_position(), (b, 2, 2));
+        // A sibling of b: the tree steps back to a, prices, and stays at a.
+        assert_eq!(store.compute_candidate(a, &c_ops).unwrap(), c_root);
+        assert_eq!(store.tree_position(), (a, 1, 1));
+        store
+            .compute_and_commit(a, c, c_root, c_ops.clone())
+            .unwrap();
+        assert_eq!(store.tree_position(), (c, 2, 2));
+        // Back to b's branch (revert c, replay b) and to the base.
+        assert_eq!(
+            store.compute_candidate(b, &[operation(5, 5)]).unwrap(),
+            expected_root(
+                &snapshot,
+                &[a_ops.clone(), b_ops.clone(), vec![operation(5, 5)]]
+            )
+        );
+        assert_eq!(store.tree_position(), (b, 2, 2));
+        assert_eq!(
+            store.compute_candidate(base, &[operation(6, 6)]).unwrap(),
+            expected_root(&snapshot, &[vec![operation(6, 6)]])
+        );
+        assert_eq!(store.tree_position(), (base, 0, 0));
+        // And forward again to c, replaying two retained blocks.
+        assert_eq!(store.compute_candidate(c, &[]).unwrap(), c_root);
+        assert_eq!(store.tree_position(), (c, 2, 2));
+        assert_eq!(store.root_for(b).unwrap(), Some(b_root));
+    }
+
+    /// A base file written from the tree restores to the same root and
+    /// carries the block it was taken at.
+    #[test]
+    fn a_base_file_round_trips_the_tree_at_the_committed_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("branches.bin");
+        let (_, snapshot) = store();
+        let base = B256::repeat_byte(0x10);
+        let base_root = B256::from(QmdbCompatTree::from_snapshot(&snapshot).unwrap().root());
+        let store = Gov5QmdbStateRootStore::persistent(
+            base,
+            base_root,
+            snapshot.clone(),
+            DEFAULT_QMDB_REPLAY_DEPTH,
+            path.clone(),
+        )
+        .unwrap()
+        .with_identity(QmdbBaseIdentity {
+            chain_id: 94,
+            genesis_hash: B256::repeat_byte(0x42),
+            block_number: 100,
+        });
+        let ops = vec![operation(2, 2)];
+        let first = B256::repeat_byte(0x21);
+        let first_root = expected_root(&snapshot, std::slice::from_ref(&ops));
+        store
+            .compute_and_commit(base, first, first_root, ops)
+            .unwrap();
+        assert_eq!(store.write_base_file().unwrap(), Some((first, 101)));
+        let (mut tree, header) =
+            Gov5QmdbStateRootStore::read_base_file(&base_file_path(&path)).unwrap();
+        assert_eq!(B256::from(tree.root()), first_root);
+        assert_eq!(header.block_number, 101);
+        assert_eq!(B256::from(header.block_hash), first);
+        assert_eq!(header.chain_id, 94);
+        // A store opened on that base checks the root and starts there.
+        let reopened = Gov5QmdbStateRootStore::from_leaf_tree(
+            first,
+            first_root,
+            tree,
+            DEFAULT_QMDB_REPLAY_DEPTH,
+        )
+        .unwrap();
+        assert_eq!(reopened.base_root(), first_root);
+        assert_eq!(
+            reopened
+                .compute_candidate(first, &[operation(3, 3)])
+                .unwrap(),
+            expected_root(&snapshot, &[vec![operation(2, 2)], vec![operation(3, 3)]])
+        );
     }
 
     /// Measurement, not a gate: how long a commit holds the shared `state`

@@ -1489,6 +1489,9 @@ impl ConsensusService {
             .store(0, std::sync::atomic::Ordering::SeqCst);
 
         info!(target: "n42::cl::consensus_loop", new_view, "view changed");
+        // Under the gov5 profiles a lagging execution head is recovered by the
+        // hash-bound block pull; re-arm it while the lag persists.
+        self.rearm_gov5_execution_pull();
 
         // ViewChanged fires immediately after BlockCommitted in f=0 configs;
         // preserve pending state if a committed block is awaiting import.

@@ -122,9 +122,10 @@ where
             .node_types::<N>()
             .pool(N42PoolBuilder::default())
             .executor(N42ExecutorBuilder::default())
-            .payload(BasicPayloadServiceBuilder::new(N42PayloadBuilder::new(
-                self.consensus_state.clone(),
-            )))
+            .payload(BasicPayloadServiceBuilder::new(
+                N42PayloadBuilder::new(self.consensus_state.clone())
+                    .with_eof_guard(self.header_profile == N42HeaderProfile::Gov5H2),
+            ))
             .network(EthereumNetworkBuilder::default())
             .consensus({
                 let mut builder =
@@ -145,7 +146,8 @@ where
             validator,
             BasicEngineApiBuilder::default(),
             N42EngineTreeValidatorBuilder::new(validator, self.qmdb_state_root_store.clone())
-                .with_trusted_state_root(self.trusted_state_root),
+                .with_trusted_state_root(self.trusted_state_root)
+                .with_eof_guard(self.header_profile == N42HeaderProfile::Gov5H2),
             rpc_middleware,
             Identity::new(),
         ))

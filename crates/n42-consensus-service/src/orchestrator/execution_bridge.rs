@@ -69,8 +69,28 @@ fn mark_eager_import_valid(guard: &std::sync::atomic::AtomicU64, block_number: u
 }
 
 impl ConsensusService {
+    /// The `parentBeaconRoot` a payload built on `parent` must carry. Without
+    /// a committee pool it is the zero placeholder every node agrees on; with
+    /// one it is gov5's `Blake3(parent committee evidence)`, rebuilt from the
+    /// parent's native header (number, gov5 hash, native receipts root) as
+    /// remembered from the wire. A parent whose native header is unknown
+    /// cannot be stamped and the build must not proceed.
+    pub(super) fn committee_parent_beacon_root(&self, parent: B256) -> Result<B256, String> {
+        let Some(pool) = &self.committee_pool else {
+            return Ok(B256::ZERO);
+        };
+        let header = n42_consensus::remembered_gov5_native_header(&parent)
+            .ok_or_else(|| format!("native header of parent {parent} is not remembered"))?;
+        pool.child_beacon_root(header.header.number, &parent, &header.header.receipts_root)
+            .map_err(|error| format!("committee evidence for parent {parent}: {error}"))
+    }
+
     /// Builds `PayloadAttributes` with timestamp correction and reward withdrawal injection.
-    fn build_payload_attributes(&mut self, slot_timestamp: Option<u64>) -> PayloadAttributes {
+    fn build_payload_attributes(
+        &mut self,
+        slot_timestamp: Option<u64>,
+        parent_beacon_block_root: B256,
+    ) -> PayloadAttributes {
         let mut timestamp = slot_timestamp.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -108,11 +128,13 @@ impl ConsensusService {
             prev_randao: self.prev_randao_cache,
             suggested_fee_recipient: self.fee_recipient,
             withdrawals: Some(withdrawals),
-            // N42 has no beacon chain. B256::ZERO is a deterministic placeholder
-            // that all nodes agree on. EIP-4788 system contract executes with
-            // this value, producing identical state on leader and followers.
-            // None is invalid for Cancun — reth rejects attributes without it.
-            parent_beacon_block_root: Some(B256::ZERO),
+            // N42 has no beacon chain. Without a committee pool B256::ZERO is a
+            // deterministic placeholder that all nodes agree on; with one it is
+            // gov5's committee-evidence root (`committee_parent_beacon_root`).
+            // The EIP-4788 system contract executes with this value, producing
+            // identical state on leader and followers. None is invalid for
+            // Cancun — reth rejects attributes without it.
+            parent_beacon_block_root: Some(parent_beacon_block_root),
             slot_number: None,
             // alloy 2.1: optional EL gas-limit hint. None = use the node's
             // configured gas limit (prior behavior before the field existed).
@@ -222,10 +244,26 @@ impl ConsensusService {
                 "N42_CADENCE: commit->build_start"
             );
         }
+        let parent_beacon_block_root = match self.committee_parent_beacon_root(parent) {
+            Ok(root) => root,
+            Err(error) => {
+                metrics::counter!("n42_gov5_committee_evidence_stamp_failed_total").increment(1);
+                error!(
+                    target: "n42::cl::exec_bridge",
+                    view,
+                    %parent,
+                    %error,
+                    "REFUSING payload build: cannot stamp the committee-evidence root (parentBeaconRoot); the view will time out"
+                );
+                self.next_build_at = None;
+                self.next_slot_timestamp = None;
+                return;
+            }
+        };
         self.building_on_parent = Some(build_context);
         self.build_triggered_at = Some(build_start);
 
-        let attrs = self.build_payload_attributes(slot_timestamp);
+        let attrs = self.build_payload_attributes(slot_timestamp, parent_beacon_block_root);
         let timestamp = attrs.timestamp;
 
         let same_execution_branch = parent == self.head_block_hash;

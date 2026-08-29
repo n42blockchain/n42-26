@@ -69,6 +69,12 @@ impl BlsSecretKey {
     pub fn sign_hash(&self, hash: &B256) -> BlsSignature {
         self.sign(hash.as_slice())
     }
+
+    /// The scalar, big-endian. Needed by the simulated committee pool, which
+    /// sums the scalars of a committee to sign once for all of its members.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
 }
 
 impl Drop for BlsSecretKey {
