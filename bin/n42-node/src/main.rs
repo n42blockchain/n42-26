@@ -1260,9 +1260,69 @@ fn main() {
         } else {
             None
         };
-        if h2_v4_participant && qmdb_execution.is_none() {
+        // Checkpoint-anchored execution without a local QMDB forest: the
+        // execution layer was initialised at a gov5 applied head by
+        // `n42-init-snapshot`, every block is still fully executed, but the
+        // state root is taken from the proposer. The only mode available on
+        // a chain whose slot log the portable snapshot cannot carry.
+        let trusted_state_root_base = if env_bool("N42_GOV5_STATE_ROOT_TRUST") {
+            if qmdb_execution.is_some() {
+                return Err(eyre::eyre!(
+                    "N42_GOV5_STATE_ROOT_TRUST and N42_GOV5_QMDB_EXECUTION are mutually exclusive"
+                ));
+            }
+            if !(observer_mode || h2_v4_participant)
+                || header_profile != N42HeaderProfile::Gov5H2
+            {
+                return Err(eyre::eyre!(
+                    "N42_GOV5_STATE_ROOT_TRUST requires observer or H2-v4 participant mode and N42_GOV5_HEADER_PROFILE=1"
+                ));
+            }
+            if builder.config().prune_config().is_some() {
+                return Err(eyre::eyre!(
+                    "checkpoint-anchored gov5 execution rejects all CLI pruning options"
+                ));
+            }
+            let base_block = required_observer_env::<u64>("N42_GOV5_TRUSTED_BASE_BLOCK")?;
+            let base_hash = required_observer_env::<B256>("N42_GOV5_TRUSTED_BASE_HASH")?;
+            let base_root = required_observer_env::<B256>("N42_GOV5_TRUSTED_BASE_ROOT")?;
+            let genesis_range = std::env::var("N42_GOV5_GENESIS_BOOTSTRAP").map_err(|_| {
+                eyre::eyre!("N42_GOV5_GENESIS_BOOTSTRAP is required with N42_GOV5_STATE_ROOT_TRUST")
+            })?;
+            let range_file = File::open(&genesis_range).map_err(|error| {
+                eyre::eyre!("failed to open Gov5 genesis range {genesis_range}: {error}")
+            })?;
+            let range = decode_finalized_range_stream(
+                BufReader::new(range_file),
+                builder.config().chain.chain.id(),
+                interop_genesis,
+            )
+            .map_err(|error| eyre::eyre!("failed to verify Gov5 genesis range: {error}"))?;
+            let genesis_entry = range
+                .entries()
+                .first()
+                .filter(|entry| entry.number() == 0 && entry.block_hash() == interop_genesis)
+                .ok_or_else(|| {
+                    eyre::eyre!("Gov5 genesis range must start with the configured block zero")
+                })?;
+            let chain = Arc::make_mut(&mut builder.config_mut().chain);
+            chain.genesis_header =
+                SealedHeader::new(genesis_entry.header().clone(), interop_genesis);
+            activate_gov5_pos_execution(chain);
+            warn!(
+                target: "n42::cli",
+                base_block,
+                %base_hash,
+                %base_root,
+                "N42_GOV5_STATE_ROOT_TRUST=1: state roots are taken from proposers; transactions, receipts, gas and rewards are executed and checked, the QMDB root is not"
+            );
+            Some((base_block, base_hash, base_root))
+        } else {
+            None
+        };
+        if h2_v4_participant && qmdb_execution.is_none() && trusted_state_root_base.is_none() {
             return Err(eyre::eyre!(
-                "N42_GOV5_H2_PARTICIPANT requires N42_GOV5_QMDB_EXECUTION=1"
+                "N42_GOV5_H2_PARTICIPANT requires N42_GOV5_QMDB_EXECUTION=1 or N42_GOV5_STATE_ROOT_TRUST=1"
             ));
         }
         let allow_deterministic_validator_peers =
@@ -1460,13 +1520,19 @@ fn main() {
         if let Some(bootstrap) = &qmdb_execution {
             n42_node = n42_node.with_gov5_qmdb_state_root_store(bootstrap.store.clone());
         }
-        let qmdb_execution_base = qmdb_execution.as_ref().map(|bootstrap| {
-            (
-                bootstrap.base_block_number,
-                bootstrap.base_block_hash,
-                bootstrap.base_root,
-            )
-        });
+        if trusted_state_root_base.is_some() {
+            n42_node = n42_node.with_gov5_trusted_state_root();
+        }
+        let qmdb_execution_base = qmdb_execution
+            .as_ref()
+            .map(|bootstrap| {
+                (
+                    bootstrap.base_block_number,
+                    bootstrap.base_block_hash,
+                    bootstrap.base_root,
+                )
+            })
+            .or(trusted_state_root_base);
         let qmdb_execution_store = qmdb_execution
             .as_ref()
             .map(|bootstrap| Arc::clone(&bootstrap.store));
@@ -1492,7 +1558,8 @@ fn main() {
         // output sidecars cannot reconstruct Gov5 blocks (their H2 wire body
         // deliberately carries no Rust compact diff), so enabling a second
         // Twig/JMT tree would create a permanent false gap at every commit.
-        let authoritative_qmdb_execution = qmdb_execution.is_some();
+        let authoritative_qmdb_execution =
+            qmdb_execution.is_some() || trusted_state_root_base.is_some();
         let twig_enabled = !authoritative_qmdb_execution
             && match std::env::var("N42_TWIG") {
                 Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
@@ -1690,7 +1757,31 @@ fn main() {
                         .map(|store| store.root_for(head_block_hash))
                         .transpose()?
                         .flatten();
-                    if persisted_root.is_none() {
+                    if trusted_state_root_base.is_some() {
+                        // No local lineage exists in trusted mode; the base
+                        // must still be canonical below the persisted head.
+                        let base_is_canonical = best_block_number >= base_block_number
+                            && full_node
+                                .provider
+                                .block_hash(base_block_number)?
+                                .is_some_and(|hash| hash == base_block_hash);
+                        if !base_is_canonical {
+                            return Err(eyre::eyre!(
+                                "trusted execution base is block {} ({}) but local Reth head is block {} ({}) and does not build on it",
+                                base_block_number,
+                                base_block_hash,
+                                best_block_number,
+                                head_block_hash,
+                            ));
+                        }
+                        info!(
+                            target: "n42::cli",
+                            best_block = best_block_number,
+                            %head_block_hash,
+                            base_block = base_block_number,
+                            "resuming trusted-root execution above the checkpoint base"
+                        );
+                    } else if persisted_root.is_none() {
                         return Err(eyre::eyre!(
                             "QMDB execution base is block {} ({}, root {}) but local Reth head is block {} ({}) and has no authenticated persisted QMDB lineage",
                             base_block_number,
@@ -2775,6 +2866,13 @@ fn main() {
                         genesis_hash: interop_genesis_hash,
                     };
                     orchestrator = orchestrator.with_h2_v4_participant(identity);
+                    if env_bool("N42_GOV5_LEGACY_SIGNING") {
+                        info!(
+                            target: "n42::cli",
+                            "gov5 legacy signing profile enabled: the fleet runs without hotstuff.interopV4"
+                        );
+                        orchestrator = orchestrator.with_gov5_legacy_signing();
+                    }
                     info!(target: "n42::cli", chain_id = identity.chain_id, genesis_hash = %identity.genesis_hash, validator_index = my_index, "H2-v4 participant bridge enabled");
                 }
 

@@ -15,6 +15,10 @@ name = "n42-bootstrap"
 path = "src/bootstrap_main.rs"
 
 [[bin]]
+name = "n42-init-snapshot"
+path = "src/init_snapshot_main.rs"
+
+[[bin]]
 name = "n42-qmdb-proof-verify"
 path = "src/qmdb_proof_verify_main.rs"
 
@@ -37,6 +41,12 @@ reth-node-core.workspace = true
 reth-rpc-server-types.workspace = true
 reth-storage-api.workspace = true
 reth-provider.workspace = true
+reth-db-common.workspace = true
+reth-db-api.workspace = true
+reth-cli-commands.workspace = true
+reth-cli-runner.workspace = true
+reth-stages-types.workspace = true
+reth-static-file-types.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-transaction-pool.workspace = true
 reth-tasks.workspace = true

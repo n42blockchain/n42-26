@@ -1508,11 +1508,7 @@ impl ConsensusService {
         let block_hash = block.block_hash;
         let block_number = block.header.number;
         let block_timestamp = block.header.timestamp;
-        let execution_data = match crate::replay_import::build_gov5_execution_data(
-            block_hash,
-            &block.header,
-            &block.transactions,
-        ) {
+        let execution_data = match crate::replay_import::build_gov5_gossip_execution_data(&block) {
             Ok(data) => data,
             Err(error) => {
                 error!(target: "n42::interop::h2v4", %source, %block_hash, block_number, view, %error, "could not reconstruct authenticated Gov5 catch-up payload");
@@ -1608,10 +1604,8 @@ impl ConsensusService {
         block: n42_network::Gov5GossipBlock,
         view: u64,
     ) {
-        let mut execution_data = match crate::replay_import::build_gov5_execution_data(
-            block.block_hash,
-            &block.header,
-            &block.transactions,
+        let mut execution_data = match crate::replay_import::build_gov5_gossip_execution_data(
+            &block,
         ) {
             Ok(data) => data,
             Err(error) => {
@@ -2874,6 +2868,14 @@ impl ConsensusService {
     ) -> Self {
         self.engine.enable_h2_v4_signing(identity);
         self.h2_v4_identity = Some(identity);
+        self
+    }
+
+    /// Keeps the H2 transport of [`Self::with_h2_v4_participant`] but signs
+    /// and verifies with gov5's pre-interopV4 domains, for a fleet whose
+    /// chainspec does not set `hotstuff.interopV4`.
+    pub fn with_gov5_legacy_signing(mut self) -> Self {
+        self.engine.enable_gov5_legacy_signing();
         self
     }
 

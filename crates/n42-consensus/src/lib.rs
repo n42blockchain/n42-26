@@ -10,6 +10,8 @@
 mod adapter;
 pub mod error;
 pub mod extra_data;
+pub mod gov5_native_header;
+pub mod gov5_rewards;
 pub mod protocol;
 mod receipt;
 pub mod rotor;
@@ -23,6 +25,14 @@ pub use adapter::{
     validate_gov5_replay_v2_header,
 };
 pub use error::ConsensusError as N42ConsensusError;
+pub use gov5_native_header::{
+    Gov5NativeHeader, Gov5NativeHeaderError, gov5_native_header_rlp, remember_gov5_native_header,
+    remembered_gov5_native_header,
+};
+pub use gov5_rewards::{
+    Gov5Reward, Gov5RewardError, gov5_native_rewards_root, gov5_rewards_to_withdrawals,
+    gov5_withdrawals_to_rewards,
+};
 pub use protocol::quorum::{
     validator_changes_hash, verify_commit_qc, verify_commit_qc_with_profile, verify_qc, verify_tc,
 };

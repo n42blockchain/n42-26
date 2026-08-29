@@ -1,11 +1,13 @@
 use alloy_consensus::{Block, BlockBody, EMPTY_OMMER_ROOT_HASH, Header, TxEnvelope};
-use alloy_primitives::keccak256;
+use alloy_eips::eip4895::Withdrawals;
+use alloy_primitives::{B256, keccak256};
 use alloy_rpc_types_engine::ExecutionData;
 use n42_consensus::{
-    N42HeaderProfile, validate_gov5_h2_header, validate_gov5_header_extra,
+    Gov5NativeHeader, Gov5Reward, N42HeaderProfile, gov5_native_rewards_root,
+    gov5_rewards_to_withdrawals, validate_gov5_h2_header, validate_gov5_header_extra,
     validate_gov5_interop_header, validate_gov5_replay_v2_header,
 };
-use n42_network::{FinalizedRangeVerification, VerifiedFinalizedRange};
+use n42_network::{FinalizedRangeVerification, Gov5GossipBlock, VerifiedFinalizedRange};
 
 /// Side-effect-free Engine API input built exclusively from an authenticated
 /// finalized range. Calling `new_payload` remains a separate, explicit phase.
@@ -35,6 +37,8 @@ pub enum ReplayImportPlanError {
     MissingWithdrawals(u64),
     #[error("finalized block {0} requires execution requests absent from finalized-range v1")]
     MissingRequests(u64),
+    #[error("gov5 block {0} rewards do not match its withdrawals root: {1}")]
+    RewardsRoot(u64, String),
     #[error("finalized block {0} requires a block access list absent from finalized-range v1")]
     MissingBlockAccessList(u64),
     #[error("finalized block {0} could not be reconstructed from its Engine API payload: {1}")]
@@ -77,6 +81,8 @@ pub fn build_replay_execution_plan_with_profile(
             entry.block_hash(),
             entry.header(),
             entry.transactions(),
+            &[],
+            None,
             header_profile,
         )?);
     }
@@ -95,23 +101,87 @@ pub fn build_gov5_execution_data(
     header: &Header,
     transactions: &[TxEnvelope],
 ) -> Result<ExecutionData, ReplayImportPlanError> {
-    build_execution_data(block_hash, header, transactions, N42HeaderProfile::Gov5H2)
+    build_execution_data(
+        block_hash,
+        header,
+        transactions,
+        &[],
+        None,
+        N42HeaderProfile::Gov5H2,
+    )
+}
+
+/// The Engine API payload of a gov5 block received over the wire. Rewards
+/// travel as withdrawals; the block hash is the header's native encoding.
+pub fn build_gov5_gossip_execution_data(
+    block: &Gov5GossipBlock,
+) -> Result<ExecutionData, ReplayImportPlanError> {
+    build_execution_data(
+        block.block_hash,
+        &block.header,
+        &block.transactions,
+        &block.rewards,
+        block.mobile_registry_root,
+        N42HeaderProfile::Gov5H2,
+    )
+}
+
+fn gov5_withdrawals(
+    number: u64,
+    header: &Header,
+    rewards: &[Gov5Reward],
+    replay_v2_header: bool,
+) -> Result<Option<Withdrawals>, ReplayImportPlanError> {
+    let Some(expected_root) = header.withdrawals_root.filter(|_| !replay_v2_header) else {
+        if !rewards.is_empty() {
+            return Err(ReplayImportPlanError::RewardsRoot(
+                number,
+                format!(
+                    "{} rewards on a header without a withdrawals root",
+                    rewards.len()
+                ),
+            ));
+        }
+        return Ok(None);
+    };
+    let rewards_root = gov5_native_rewards_root(rewards);
+    if rewards_root != expected_root {
+        return Err(ReplayImportPlanError::RewardsRoot(
+            number,
+            format!(
+                "{} rewards hash to {rewards_root}, header commits {expected_root}",
+                rewards.len()
+            ),
+        ));
+    }
+    let withdrawals = gov5_rewards_to_withdrawals(rewards)
+        .map_err(|error| ReplayImportPlanError::RewardsRoot(number, error.to_string()))?;
+    Ok(Some(Withdrawals::new(withdrawals)))
 }
 
 fn build_execution_data(
     block_hash: alloy_primitives::B256,
     header: &Header,
     transactions: &[TxEnvelope],
+    rewards: &[Gov5Reward],
+    mobile_registry_root: Option<B256>,
     header_profile: N42HeaderProfile,
 ) -> Result<ExecutionData, ReplayImportPlanError> {
     let number = header.number;
     validate_v1_payload_inputs(number, header, header_profile)?;
+    let replay_v2_shape = header_profile == N42HeaderProfile::Gov5H2
+        && validate_gov5_replay_v2_header(header).is_ok();
+    let withdrawals = if header_profile == N42HeaderProfile::Gov5H2 {
+        gov5_withdrawals(number, header, rewards, replay_v2_shape)?
+    } else {
+        None
+    };
     let block = Block {
         header: header.clone(),
         body: BlockBody {
             transactions: transactions.to_vec(),
             ommers: Vec::new(),
-            withdrawals: None,
+            withdrawals,
         },
     };
     let payload = ExecutionData::from_block_unchecked(block_hash, &block);
@@ -151,15 +221,27 @@ fn build_execution_data(
             ReplayImportPlanError::PayloadReconstruction(number, error.to_string())
         })?;
     }
+    // The Engine payload cannot carry gov5's placeholder fields or the
+    // mobile-registry root, so the identity is the native encoding of the
+    // header we were given, not alloy's re-encoding of the payload.
+    let native_hash = if header_profile == N42HeaderProfile::Gov5H2 {
+        Gov5NativeHeader {
+            header: header.clone(),
+            mobile_registry_root,
+        }
+        .hash()
+    } else {
+        reconstructed.header.hash_slow()
+    };
     if payload.block_hash() != block_hash
         || payload.parent_hash() != header.parent_hash
         || payload.block_number() != number
-        || reconstructed.header.hash_slow() != block_hash
+        || native_hash != block_hash
     {
         return Err(ReplayImportPlanError::PayloadIdentity {
             number,
             expected: block_hash,
-            reconstructed: reconstructed.header.hash_slow(),
+            reconstructed: native_hash,
         });
     }
     Ok(payload)
@@ -187,7 +269,9 @@ fn validate_v1_payload_inputs(
     }
     let replay_v2_header = header_profile == N42HeaderProfile::Gov5H2
         && validate_gov5_replay_v2_header(header).is_ok();
-    if !replay_v2_header && header.withdrawals_root.is_some() {
+    // Live gov5 H2 headers commit their reward list in the withdrawals slot;
+    // the Ethereum profile has no source for withdrawals in this range format.
+    if header_profile != N42HeaderProfile::Gov5H2 && header.withdrawals_root.is_some() {
         return Err(ReplayImportPlanError::MissingWithdrawals(number));
     }
     if !replay_v2_header && header.requests_hash.is_some() {
@@ -207,6 +291,63 @@ fn validate_v1_payload_inputs(
 mod tests {
     use super::*;
     use alloy_primitives::B256;
+
+    #[test]
+    fn gov5_rewards_become_withdrawals_and_must_match_the_committed_root() {
+        // Chain 94 block 13,540,000: coinbase and faucet each receive 1 ETH,
+        // committed as gov5's keccak-concat rewards root.
+        let one_eth = alloy_primitives::U256::from(1_000_000_000_000_000_000u128);
+        let rewards = vec![
+            Gov5Reward {
+                address: "0x301631ce4b15f1a0d62a35d6c421dd5a845e555e"
+                    .parse()
+                    .unwrap(),
+                amount: one_eth,
+            },
+            Gov5Reward {
+                address: "0x42e9819036f61bf665d5f727e8c03121f12f586e"
+                    .parse()
+                    .unwrap(),
+                amount: one_eth,
+            },
+        ];
+        let header = Header {
+            withdrawals_root: Some(
+                "0x29c0690c4c8ecb051f4e54d1f2c59b491aa71147e7011bf1531d686dcc5cb53b"
+                    .parse()
+                    .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let withdrawals = gov5_withdrawals(1, &header, &rewards, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(withdrawals.len(), 2);
+        assert_eq!(withdrawals[0].amount, 1_000_000_000);
+        assert_eq!(withdrawals[1].address, rewards[1].address);
+
+        let wrong_root = Header {
+            withdrawals_root: Some(B256::repeat_byte(0x01)),
+            ..Default::default()
+        };
+        assert!(matches!(
+            gov5_withdrawals(1, &wrong_root, &rewards, false),
+            Err(ReplayImportPlanError::RewardsRoot(1, _))
+        ));
+        assert!(gov5_withdrawals(1, &Header::default(), &rewards, false).is_err());
+        let empty = Header {
+            withdrawals_root: Some(keccak256([])),
+            ..Default::default()
+        };
+        assert!(
+            gov5_withdrawals(1, &empty, &[], false)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        // replay-v2 history carries the empty root but no withdrawals at all.
+        assert!(gov5_withdrawals(1, &empty, &[], true).unwrap().is_none());
+    }
 
     #[test]
     fn v1_payload_profile_accepts_standard_empty_ommers_shape() {

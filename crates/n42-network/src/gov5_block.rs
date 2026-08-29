@@ -2,16 +2,25 @@
 
 use alloy_consensus::{Header, TxEnvelope, proofs::calculate_transaction_root};
 use alloy_eips::{Decodable2718, Encodable2718};
-use alloy_primitives::{B256, Bytes, U256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
 use alloy_rpc_types_engine::ExecutionData;
-use n42_consensus::validate_gov5_interop_header;
+use n42_consensus::{
+    Gov5NativeHeader, Gov5Reward, remember_gov5_native_header, validate_gov5_interop_header,
+};
 
 #[derive(Clone, Debug)]
 pub struct Gov5GossipBlock {
+    /// keccak of the header's exact gov5 encoding, which alloy's re-encoding
+    /// does not reproduce for headers with `0x80` placeholders or a
+    /// mobile-registry root; see [`Gov5NativeHeader`].
     pub block_hash: B256,
     pub header: Header,
     pub transactions: Vec<TxEnvelope>,
+    /// gov5's reward list, committed to in `header.withdrawals_root`.
+    pub rewards: Vec<Gov5Reward>,
+    /// gov5's 23rd header field, carried so the header can be re-encoded.
+    pub mobile_registry_root: Option<B256>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -69,11 +78,7 @@ pub fn attributable_hash(encoded: &[u8]) -> Option<B256> {
     let header_rlp = take_rlp_item(&mut payload)?;
     // Confirm it parses as a header before trusting the hash: otherwise any
     // leading list item would masquerade as one.
-    let mut cursor = header_rlp;
-    Header::decode(&mut cursor).ok()?;
-    if !cursor.is_empty() {
-        return None;
-    }
+    Gov5NativeHeader::decode(header_rlp).ok()?;
     Some(keccak256(header_rlp))
 }
 
@@ -268,11 +273,13 @@ pub fn decode_gov5_block_rlp(encoded: &[u8]) -> Result<Gov5GossipBlock, Gov5Bloc
     }
 
     let header_rlp = take_rlp_item(&mut payload).ok_or(Gov5BlockError::InvalidRlp)?;
-    let mut header_cursor = header_rlp;
-    let header = Header::decode(&mut header_cursor).map_err(|_| Gov5BlockError::InvalidRlp)?;
-    if !header_cursor.is_empty() {
+    let native = Gov5NativeHeader::decode(header_rlp).map_err(|_| Gov5BlockError::InvalidRlp)?;
+    if native.encode() != header_rlp {
+        // The decoder accepted bytes it cannot reproduce; the hash below
+        // would then name a header this node can never re-encode.
         return Err(Gov5BlockError::InvalidRlp);
     }
+    let header = native.header;
     validate_gov5_interop_header(&header)
         .map_err(|error| Gov5BlockError::HeaderProfile(error.to_string()))?;
 
@@ -283,7 +290,8 @@ pub fn decode_gov5_block_rlp(encoded: &[u8]) -> Result<Gov5GossipBlock, Gov5Bloc
     // optional ZK proof. Consume their canonical RLP items so trailing bytes or
     // schema-shifted bodies cannot be mistaken for an execution block.
     take_rlp_list_item(&mut payload).ok_or(Gov5BlockError::InvalidRlp)?;
-    take_rlp_list_item(&mut payload).ok_or(Gov5BlockError::InvalidRlp)?;
+    let rewards_rlp = take_rlp_list_item(&mut payload).ok_or(Gov5BlockError::InvalidRlp)?;
+    let rewards = decode_rewards(rewards_rlp)?;
     if !payload.is_empty() {
         take_rlp_bytes(&mut payload).ok_or(Gov5BlockError::InvalidRlp)?;
     }
@@ -295,11 +303,41 @@ pub fn decode_gov5_block_rlp(encoded: &[u8]) -> Result<Gov5GossipBlock, Gov5Bloc
         return Err(Gov5BlockError::TransactionRootMismatch);
     }
 
+    // Remember the exact encoding: the engine seals the block with this hash
+    // and must be able to prove the header behind it.
+    let block_hash = remember_gov5_native_header(header_rlp);
     Ok(Gov5GossipBlock {
-        block_hash: keccak256(header_rlp),
+        block_hash,
         header,
         transactions,
+        rewards,
+        mobile_registry_root: native.mobile_registry_root,
     })
+}
+
+/// Decodes gov5's `[]*block.Reward` list: `[[address, amount], ...]`.
+fn decode_rewards(encoded: &[u8]) -> Result<Vec<Gov5Reward>, Gov5BlockError> {
+    let mut payload = encoded;
+    let list = RlpHeader::decode(&mut payload).map_err(|_| Gov5BlockError::InvalidRlp)?;
+    if !list.list || list.payload_length != payload.len() {
+        return Err(Gov5BlockError::InvalidRlp);
+    }
+    let mut rewards = Vec::new();
+    while !payload.is_empty() {
+        let item = take_rlp_list_item(&mut payload).ok_or(Gov5BlockError::InvalidRlp)?;
+        let mut cursor = item;
+        let head = RlpHeader::decode(&mut cursor).map_err(|_| Gov5BlockError::InvalidRlp)?;
+        if !head.list || head.payload_length != cursor.len() {
+            return Err(Gov5BlockError::InvalidRlp);
+        }
+        let address = Address::decode(&mut cursor).map_err(|_| Gov5BlockError::InvalidRlp)?;
+        let amount = U256::decode(&mut cursor).map_err(|_| Gov5BlockError::InvalidRlp)?;
+        if !cursor.is_empty() {
+            return Err(Gov5BlockError::InvalidRlp);
+        }
+        rewards.push(Gov5Reward { address, amount });
+    }
+    Ok(rewards)
 }
 
 fn decode_transactions(encoded: &[u8]) -> Result<Vec<TxEnvelope>, Gov5BlockError> {

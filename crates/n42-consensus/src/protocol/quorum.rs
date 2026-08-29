@@ -25,9 +25,21 @@ pub enum ConsensusSigningProfile {
     #[default]
     Native,
     H2V4(H2V4ChainIdentity),
+    /// gov5 with `hotstuff.interopV4` off (`types.go`): Proposal and Vote sign
+    /// `view || block_hash`, CommitVote signs `"commit" || view || block_hash`,
+    /// Timeout and NewView are as in the native profile, all under the
+    /// proof-of-possession ciphersuite gov5's blst wrapper uses for every
+    /// consensus signature. This is what chain 94 runs.
+    Gov5Legacy,
 }
 
 impl ConsensusSigningProfile {
+    /// True for both gov5 profiles: fixed zero changes hash, no dynamic
+    /// validator changes, import evidence retained across views.
+    pub const fn is_gov5(self) -> bool {
+        matches!(self, Self::H2V4(_) | Self::Gov5Legacy)
+    }
+
     pub fn proposal_message(
         self,
         view: ViewNumber,
@@ -49,6 +61,10 @@ impl ConsensusSigningProfile {
                 let _ = validator_changes;
                 h2_v4_proposal_signing_message(identity, view, block_hash, B256::ZERO).to_vec()
             }
+            Self::Gov5Legacy => {
+                let _ = validator_changes;
+                gov5_legacy_signing_message(view, &block_hash).to_vec()
+            }
         }
     }
 
@@ -56,6 +72,7 @@ impl ConsensusSigningProfile {
         match self {
             Self::Native => signing_message(view, &block_hash).to_vec(),
             Self::H2V4(identity) => h2_v4_vote_signing_message(identity, view, block_hash).to_vec(),
+            Self::Gov5Legacy => gov5_legacy_signing_message(view, &block_hash).to_vec(),
         }
     }
 
@@ -67,19 +84,23 @@ impl ConsensusSigningProfile {
                 let _ = changes_hash;
                 h2_v4_commit_signing_message(identity, view, block_hash, B256::ZERO).to_vec()
             }
+            Self::Gov5Legacy => {
+                let _ = changes_hash;
+                gov5_legacy_commit_signing_message(view, &block_hash).to_vec()
+            }
         }
     }
 
     pub fn timeout_message(self, view: ViewNumber) -> Vec<u8> {
         match self {
-            Self::Native => timeout_signing_message(view).to_vec(),
+            Self::Native | Self::Gov5Legacy => timeout_signing_message(view).to_vec(),
             Self::H2V4(identity) => h2_v4_timeout_signing_message(identity, view).to_vec(),
         }
     }
 
     pub fn new_view_message(self, view: ViewNumber) -> Vec<u8> {
         match self {
-            Self::Native => newview_signing_message(view).to_vec(),
+            Self::Native | Self::Gov5Legacy => newview_signing_message(view).to_vec(),
             Self::H2V4(identity) => h2_v4_new_view_signing_message(identity, view).to_vec(),
         }
     }
@@ -87,7 +108,7 @@ impl ConsensusSigningProfile {
     pub fn sign(self, secret_key: &BlsSecretKey, message: &[u8]) -> BlsSignature {
         match self {
             Self::Native => secret_key.sign(message),
-            Self::H2V4(_) => secret_key.sign_h2_v4(message),
+            Self::H2V4(_) | Self::Gov5Legacy => secret_key.sign_h2_v4(message),
         }
     }
 
@@ -99,7 +120,9 @@ impl ConsensusSigningProfile {
     ) -> bool {
         match self {
             Self::Native => public_key.verify_prevalidated(message, signature),
-            Self::H2V4(_) => public_key.verify_h2_v4_prevalidated(message, signature),
+            Self::H2V4(_) | Self::Gov5Legacy => {
+                public_key.verify_h2_v4_prevalidated(message, signature)
+            }
         }
         .is_ok()
     }
@@ -115,7 +138,9 @@ impl ConsensusSigningProfile {
     ) -> Result<(), Vec<usize>> {
         match self {
             Self::Native => batch_verify_with_fallback(messages, signatures, public_keys),
-            Self::H2V4(_) => batch_verify_h2_v4_with_fallback(messages, signatures, public_keys),
+            Self::H2V4(_) | Self::Gov5Legacy => {
+                batch_verify_h2_v4_with_fallback(messages, signatures, public_keys)
+            }
         }
     }
 
@@ -127,12 +152,27 @@ impl ConsensusSigningProfile {
     ) -> bool {
         match self {
             Self::Native => AggregateSignature::verify_aggregate(message, signature, public_keys),
-            Self::H2V4(_) => {
+            Self::H2V4(_) | Self::Gov5Legacy => {
                 AggregateSignature::verify_h2_v4_aggregate(message, signature, public_keys)
             }
         }
         .is_ok()
     }
+}
+
+/// gov5 `SigningMessage(view, blockHash)`: `view (LE u64) || block_hash`, used
+/// for both Proposals and Votes when `interopV4` is off.
+pub fn gov5_legacy_signing_message(view: ViewNumber, block_hash: &B256) -> [u8; 40] {
+    signing_message(view, block_hash)
+}
+
+/// gov5 `CommitSigningMessage(view, blockHash)`: `"commit" || view || block_hash`.
+pub fn gov5_legacy_commit_signing_message(view: ViewNumber, block_hash: &B256) -> [u8; 46] {
+    let mut msg = [0u8; 46];
+    msg[..6].copy_from_slice(b"commit");
+    msg[6..14].copy_from_slice(&view.to_le_bytes());
+    msg[14..].copy_from_slice(block_hash.as_slice());
+    msg
 }
 
 /// Collects votes for a specific view and produces a QuorumCertificate
@@ -1349,6 +1389,50 @@ mod tests {
 
         let collector2 = TimeoutCollector::new(0, 7);
         assert_eq!(collector2.view(), 0);
+    }
+
+    #[test]
+    fn gov5_legacy_profile_uses_gov5_native_domains_under_the_pop_ciphersuite() {
+        // gov5 with interopV4 off (types.go): Proposal and Vote sign
+        // `view || hash`, CommitVote signs `"commit" || view || hash`,
+        // Timeout/NewView are `"timeout"/"newview" || view`; blst signs with
+        // the POP suite, which is the H2-v4 ciphersuite here, not the native one.
+        let view = 11_030u64;
+        let hash = B256::repeat_byte(0x0e);
+        let profile = ConsensusSigningProfile::Gov5Legacy;
+        assert!(profile.is_gov5());
+        assert!(!ConsensusSigningProfile::Native.is_gov5());
+        assert_eq!(
+            profile.vote_message(view, hash),
+            signing_message(view, &hash).to_vec()
+        );
+        assert_eq!(
+            profile.proposal_message(view, hash, &None),
+            signing_message(view, &hash).to_vec()
+        );
+        let commit = profile.commit_message(view, hash, B256::repeat_byte(0x55));
+        assert_eq!(commit.len(), 46);
+        assert_eq!(&commit[..6], b"commit");
+        assert_eq!(&commit[6..14], &view.to_le_bytes());
+        assert_eq!(&commit[14..], hash.as_slice());
+        assert_eq!(
+            profile.timeout_message(view),
+            timeout_signing_message(view).to_vec()
+        );
+        assert_eq!(
+            profile.new_view_message(view),
+            newview_signing_message(view).to_vec()
+        );
+
+        let sk = test_key(0x7a);
+        let message = profile.vote_message(view, hash);
+        let signature = profile.sign(&sk, &message);
+        assert!(profile.verify_single(&sk.public_key(), &message, &signature));
+        assert!(!ConsensusSigningProfile::Native.verify_single(
+            &sk.public_key(),
+            &message,
+            &signature
+        ));
     }
 
     #[test]

@@ -1144,10 +1144,58 @@ impl StateRootJob<EthPrimitives> for Gov5QmdbStateRootJob {
 
 /// Engine-tree validator builder that installs the QMDB strategy only when an authenticated base
 /// store was explicitly supplied. With `None`, it returns Reth's stock validator unchanged.
+/// Accepts the proposer's state root without recomputing it.
+///
+/// Used only for a member whose QMDB forest cannot be rebuilt locally yet
+/// (chain 94's 63 million-slot log is larger than the portable snapshot
+/// format carries). Transactions, receipts, gas and rewards are still fully
+/// executed and checked; the state root alone is taken on trust, and the
+/// node says so at startup.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Gov5TrustedStateRootStrategy;
+
+impl<P, Evm> StateRootStrategy<EthPrimitives, P, Evm> for Gov5TrustedStateRootStrategy
+where
+    Evm: ConfigureEvm<Primitives = EthPrimitives>,
+{
+    fn prepare(
+        &self,
+        _ctx: StateRootJobContext<'_, EthPrimitives, P, Evm>,
+    ) -> ProviderResult<PreparedStateRootJob<EthPrimitives>> {
+        Ok(PreparedStateRootJob::new(
+            Box::new(Gov5TrustedStateRootJob),
+            None,
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct Gov5TrustedStateRootJob;
+
+impl StateRootJob<EthPrimitives> for Gov5TrustedStateRootJob {
+    fn name(&self) -> &'static str {
+        "gov5-trusted"
+    }
+
+    fn finish(
+        &mut self,
+        block: &RecoveredBlock<reth_ethereum_primitives::Block>,
+        _output: Arc<BlockExecutionOutput<Receipt>>,
+        _hashed_state: &LazyHashedPostState,
+    ) -> ProviderResult<StateRootJobOutcome> {
+        metrics::counter!("n42_qmdb_trusted_state_roots_total").increment(1);
+        Ok(StateRootJobOutcome::new(
+            block.state_root,
+            Arc::new(TrieUpdates::default()),
+        ))
+    }
+}
+
 #[derive(Clone)]
 pub struct N42EngineTreeValidatorBuilder {
     inner: BasicEngineValidatorBuilder<N42EngineValidatorBuilder>,
     qmdb_store: Option<Arc<Gov5QmdbStateRootStore>>,
+    trusted_state_root: bool,
 }
 
 impl std::fmt::Debug for N42EngineTreeValidatorBuilder {
@@ -1156,6 +1204,7 @@ impl std::fmt::Debug for N42EngineTreeValidatorBuilder {
             .debug_struct("N42EngineTreeValidatorBuilder")
             .field("inner", &self.inner)
             .field("has_qmdb_store", &self.qmdb_store.is_some())
+            .field("trusted_state_root", &self.trusted_state_root)
             .finish()
     }
 }
@@ -1168,7 +1217,14 @@ impl N42EngineTreeValidatorBuilder {
         Self {
             inner: BasicEngineValidatorBuilder::new(payload_validator),
             qmdb_store,
+            trusted_state_root: false,
         }
+    }
+
+    /// Take proposers' state roots on trust; see [`Gov5TrustedStateRootStrategy`].
+    pub const fn with_trusted_state_root(mut self, trusted: bool) -> Self {
+        self.trusted_state_root = trusted;
+        self
     }
 }
 
@@ -1193,6 +1249,11 @@ where
             .build_tree_validator(ctx, tree_config, overlay_manager)
             .await?;
         let Some(store) = self.qmdb_store else {
+            if self.trusted_state_root {
+                let strategy: Arc<dyn StateRootStrategy<EthPrimitives, Node::Provider, Node::Evm>> =
+                    Arc::new(Gov5TrustedStateRootStrategy);
+                return Ok(validator.with_state_root_strategy(strategy));
+            }
             return Ok(validator);
         };
         let strategy: Arc<dyn StateRootStrategy<EthPrimitives, Node::Provider, Node::Evm>> =

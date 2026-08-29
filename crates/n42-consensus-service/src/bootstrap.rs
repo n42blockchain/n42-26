@@ -442,6 +442,98 @@ mod hex_bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// gov5's persisted HotStuff state (v1 layout: view | timeouts |
+    /// len+lockedQC | committedQC) of qs-node6 on chain 94 at block
+    /// 13,560,375, view 11,031, taken while the node was stopped. The fleet
+    /// runs without `hotstuff.interopV4`, so its QCs verify only under the
+    /// legacy gov5 domains and the POP ciphersuite.
+    const CHAIN94_HOTSTUFF_STATE_HEX: &str = "172b0000000000000000000097000000162b000000000000200000000e37dae9d0cbf1c8e09c335654dc4cae3e18760dade40039e0e693368cc796d760000000b9e4ba533cf17ae8bbed3f81e73d3c80ca7930213c0cac23efec13908cb3b8ed1a93d6af36af4e47c5a1407a2f48f31f119be6302a39814d38251fa2da6e01f6a90ae57ef6a396ff15b1b77b0a002028c2772701527ccf22015b8fdc670be74d0300000007003b162b000000000000200000000e37dae9d0cbf1c8e09c335654dc4cae3e18760dade40039e0e693368cc796d7600000008dca20e36a2d15c3c167a9f0e31850b1314cd616e6b28495cd5a43d227588ac16016bb39c9364b3378d40595d80075b609098a8831c576fc6e0fbd218226af48e1d7a7ef28d739a7afc7332079b2bbaae18ce26f28ff5d91d485edb9243fd0ab03000000070037";
+    const CHAIN94_VALIDATORS: [(&str, &str); 7] = [
+        (
+            "0xd2a316a1cd3a777141cb7e5aace46fb01df90eac",
+            "ae05c725f988dba181cd77d1d5eb2116ac25170fdc428e6e1dd23178d412451824a493ed5776a8ecb222fe6a18b68ab0",
+        ),
+        (
+            "0xf7dc5c92fa9e812eb0c3157492da65457ae5de46",
+            "81bf2bdc42c311f9f175d4cd58f5f79b3ca1ac5f981c6298b475bc08699dc9e22008ac8b649c0c6f336323cb77af06b9",
+        ),
+        (
+            "0xa97ab21a7efbcb7995b67ed39287ba408850a9f1",
+            "a2e796f97370d724573d50140254bfd0bde9dbe6f2432217dd7c7066ac9b44df50c5631453d6d37432e745b67bbc75a6",
+        ),
+        (
+            "0x301631ce4b15f1a0d62a35d6c421dd5a845e555e",
+            "80fceeef24a8aff98dfddb6843c87490cf71e10aa9912876121b00fd5c4a258fd37ee373f586822b769ec0905dbc261f",
+        ),
+        (
+            "0xe5eb05fc41cdad4433f52988f83f78f46bb27e61",
+            "8e172280ea9c9fba26560b2a2f1c4cbb012e5644d490188249fc7e11069ccffc66b049fdd5683c8405252e191f1ebef6",
+        ),
+        (
+            "0x580339c31c60b974ac9f70e2f8307b2b4490f70a",
+            "b93ffa07de1e9a2a2b6e564203c6753b09abfea3010e8404110e80f8678cdc9cd2098c76522248831317ef4829ddee8e",
+        ),
+        (
+            "0x1ccde065f222f44709797be2908fc72b7801eda5",
+            "9825e1ffc2471f5946445de41ee5dfe0d55eaaf7e48c04bbf5f70888d21dea121d044373459424cc44b895c89b18681a",
+        ),
+    ];
+
+    #[test]
+    fn chain94_persisted_commit_qc_verifies_only_under_the_gov5_legacy_profile() {
+        use n42_network::{h2_wire::decode_h2_qc, quorum_certificate_from_h2};
+        let bytes = alloy_primitives::hex::decode(CHAIN94_HOTSTUFF_STATE_HEX).unwrap();
+        let view = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let locked_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let committed = &bytes[16 + locked_len..];
+        let qc = quorum_certificate_from_h2(decode_h2_qc(committed).unwrap()).unwrap();
+        assert_eq!(view, 11_031);
+        assert_eq!(qc.view, 11_030);
+        assert_eq!(
+            qc.block_hash,
+            "0x0e37dae9d0cbf1c8e09c335654dc4cae3e18760dade40039e0e693368cc796d7"
+                .parse::<B256>()
+                .unwrap()
+        );
+        let validators = CHAIN94_VALIDATORS
+            .iter()
+            .map(|(address, key)| ValidatorInfo {
+                address: address.parse().unwrap(),
+                bls_public_key: n42_primitives::BlsPublicKey::from_bytes(
+                    &alloy_primitives::hex::decode(key)
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                )
+                .unwrap(),
+                p2p_peer_id: None,
+            })
+            .collect::<Vec<_>>();
+        let set = ValidatorSet::try_new(&validators, 2).unwrap();
+        verify_commit_qc_with_profile(&qc, &set, &B256::ZERO, ConsensusSigningProfile::Gov5Legacy)
+            .expect("chain-94 commit QC must verify under the legacy gov5 domains");
+        let identity = H2V4ChainIdentity {
+            chain_id: 94,
+            genesis_hash: "0xa2d2ff5d814552bb9a113b68ad7ed2b824fbb52caed42dbe573068845b57be99"
+                .parse()
+                .unwrap(),
+        };
+        assert!(
+            verify_commit_qc_with_profile(
+                &qc,
+                &set,
+                &B256::ZERO,
+                ConsensusSigningProfile::H2V4(identity)
+            )
+            .is_err(),
+            "the fleet does not sign with the chain-bound H2-v4 domains"
+        );
+        assert!(
+            verify_commit_qc_with_profile(&qc, &set, &B256::ZERO, ConsensusSigningProfile::Native)
+                .is_err()
+        );
+    }
     use alloy_consensus::{Header as ConsensusHeader, proofs::calculate_transaction_root};
     use alloy_primitives::Address;
     use alloy_primitives::Bytes;

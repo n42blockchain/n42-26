@@ -55,6 +55,11 @@ n42-zkproof = { path = "crates/n42-zkproof" }
 reth-chainspec = { path = "../reth/crates/chainspec" }
 reth-consensus = { path = "../reth/crates/consensus/consensus" }
 reth-db = { path = "../reth/crates/storage/db" }
+reth-db-common = { path = "../reth/crates/storage/db-common" }
+reth-cli-commands = { path = "../reth/crates/cli/commands" }
+reth-cli-runner = { path = "../reth/crates/cli/runner" }
+reth-stages-types = { path = "../reth/crates/stages/types" }
+reth-static-file-types = { path = "../reth/crates/static-file/types" }
 reth-db-api = { path = "../reth/crates/storage/db-api" }
 reth-ethereum-consensus = { path = "../reth/crates/ethereum/consensus" }
 reth-ethereum-engine-primitives = { path = "../reth/crates/ethereum/engine-primitives" }

@@ -1,5 +1,6 @@
 use alloy_consensus::{
-    EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH, Header, TxReceipt, proofs::calculate_receipt_root,
+    EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH, Header, TxReceipt,
+    proofs::{calculate_receipt_root, calculate_withdrawals_root},
 };
 use alloy_primitives::{B256, Bloom, Bytes, U256, keccak256};
 use arc_swap::ArcSwapOption;
@@ -13,6 +14,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::gov5_native_receipts_root;
+use crate::gov5_rewards::{gov5_native_rewards_root, gov5_withdrawals_to_rewards};
 use crate::validator::ValidatorSet;
 
 /// Header semantics used when reconstructing and validating N42 blocks.
@@ -47,6 +49,8 @@ pub enum N42HeaderProfileError {
     Gov5Difficulty(U256),
     #[error("gov5 replay-v2 header violates its fixed historical shape: {0}")]
     Gov5ReplayV2Shape(&'static str),
+    #[error("gov5 header commits rewards root {committed} but the body's rewards derive {derived}")]
+    Gov5RewardsRoot { committed: B256, derived: B256 },
 }
 
 /// Validates the bounded, hash-authenticated outer shape of gov5 H2 header extra-data.
@@ -139,6 +143,40 @@ fn normalized_gov5_header(header: &Header) -> Result<Header, N42HeaderProfileErr
 }
 
 /// Resolves the validator set that should verify a QC for a given view.
+/// Live gov5 H2 headers commit their reward list (carried in the body as
+/// withdrawals) in the withdrawals-root slot with gov5's keccak-concat
+/// derivation. Check that commitment here and hand reth's own validation the
+/// Ethereum withdrawals root of the same list, so its body-vs-header rule
+/// keeps guarding the body while the gov5 commitment guards the rewards.
+fn normalize_gov5_rewards(
+    header: &mut Header,
+    body: &<EthBlock as reth_primitives_traits::Block>::Body,
+) -> Result<(), N42HeaderProfileError> {
+    match (header.withdrawals_root, body.withdrawals.as_deref()) {
+        (Some(committed), Some(withdrawals)) => {
+            let rewards = gov5_withdrawals_to_rewards(withdrawals);
+            let derived = gov5_native_rewards_root(&rewards);
+            if derived != committed {
+                return Err(N42HeaderProfileError::Gov5RewardsRoot { committed, derived });
+            }
+            header.withdrawals_root = Some(calculate_withdrawals_root(withdrawals));
+        }
+        (Some(committed), None) => {
+            // An empty reward list is committed as keccak("") and the body
+            // then carries no withdrawals at all.
+            if committed != keccak256([]) {
+                return Err(N42HeaderProfileError::Gov5RewardsRoot {
+                    committed,
+                    derived: keccak256([]),
+                });
+            }
+            header.withdrawals_root = Some(EMPTY_ROOT_HASH);
+        }
+        (None, _) => {}
+    }
+    Ok(())
+}
+
 pub type ValidatorSetResolver = Arc<dyn Fn(u64) -> Option<Arc<ValidatorSet>> + Send + Sync>;
 
 /// N42 consensus adapter that integrates with the reth node builder.
@@ -312,11 +350,14 @@ where
         header: &SealedHeader<Header>,
     ) -> Result<(), ConsensusError> {
         if self.header_profile == N42HeaderProfile::Gov5H2 {
-            let normalized =
+            let mut normalized =
                 normalized_gov5_header(header.header()).map_err(ConsensusError::other)?;
             let mut normalized_body = body.clone();
             if validate_gov5_replay_v2_header(header.header()).is_ok() {
                 normalized_body.withdrawals = None;
+            } else {
+                normalize_gov5_rewards(&mut normalized, &normalized_body)
+                    .map_err(ConsensusError::other)?;
             }
             return <EthBeaconConsensus<C> as Consensus<EthBlock>>::validate_body_against_header(
                 &self.inner,
@@ -341,6 +382,10 @@ where
                 normalized_gov5_header(block.header()).map_err(ConsensusError::other)?;
             if validate_gov5_replay_v2_header(block.header()).is_ok() {
                 normalized.body.withdrawals = None;
+            } else {
+                let body = normalized.body.clone();
+                normalize_gov5_rewards(&mut normalized.header, &body)
+                    .map_err(ConsensusError::other)?;
             }
             return self
                 .inner

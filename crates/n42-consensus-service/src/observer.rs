@@ -5,7 +5,7 @@ use crate::exec_cache::ExecutionOutputCache;
 use crate::h2_finality::{verify_h2_v4_decide, verify_h2_v4_shadow_message};
 use crate::orchestrator::bad_block_cache::BadBlockCache;
 use crate::orchestrator::{BlobSidecarBroadcast, BlockDataBroadcast, CommittedBlock};
-use crate::replay_import::build_gov5_execution_data;
+use crate::replay_import::build_gov5_gossip_execution_data;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, PayloadStatusEnum};
 use metrics::{counter, gauge};
@@ -663,11 +663,7 @@ impl ObserverOrchestrator {
         if hash == self.head_block_hash || self.bad_blocks.should_skip(hash, "gov5_live_gossip") {
             return;
         }
-        let execution_data = match build_gov5_execution_data(
-            hash,
-            &block.header,
-            &block.transactions,
-        ) {
+        let execution_data = match build_gov5_gossip_execution_data(&block) {
             Ok(payload) => payload,
             Err(error) => {
                 counter!("n42_gov5_live_blocks_rejected_total", "stage" => "payload").increment(1);
