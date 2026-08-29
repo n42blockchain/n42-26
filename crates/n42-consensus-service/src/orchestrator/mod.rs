@@ -86,6 +86,9 @@ const LEADER_QUORUM_RETRY_MS: u64 = 500;
 /// vote when the collector may have missed the first delivery.
 const DEFAULT_VOTE_RESEND_MS: u64 = 2_000;
 
+/// Minimum spacing between two publishes of a byte-identical H2 message.
+const H2_REBROADCAST_MIN_INTERVAL: Duration = Duration::from_millis(750);
+
 /// A locally signed vote awaiting evidence that the view progressed. Re-sending
 /// the exact bytes is safe because collectors deduplicate by `(view, voter)`.
 #[derive(Clone)]
@@ -961,6 +964,19 @@ pub struct ConsensusService {
     /// Last R1/R2 vote sent in the current view. If direct delivery was lost and
     /// the view has not advanced, retry it periodically to the collector.
     pending_vote_resend: Option<PendingVoteResend>,
+    /// Last H2 publish time per distinct encoded message. An identical
+    /// message is published at most once per `H2_REBROADCAST_MIN_INTERVAL`:
+    /// on the H2 transport every broadcast is a gossip publish plus one direct
+    /// stream to every validator, so any echo between this node and its peers
+    /// (a relayed timeout answered with a timeout, a duplicate that a peer
+    /// re-forwards) amplifies into hundreds of streams per second, exhausts
+    /// request-response capacity on both ends and starves block delivery
+    /// (observed on chain 94: 3,151 dropped inbound streams in 40 s, then no
+    /// block bodies for 20 minutes). Intentional resends run at 2 s and 12 s.
+    recent_h2_broadcasts: std::sync::Mutex<HashMap<[u8; 32], Instant>>,
+    /// The member cannot seal a gov5 block (no local QMDB root); never start a
+    /// payload build, let the view time out like an absent validator.
+    leader_disabled: bool,
     /// Per-block pipeline timing tracker. Populated incrementally as events flow
     /// through the orchestrator. Logged and emitted as metrics at commit time.
     /// Bounded to 32 entries; older entries are evicted.
@@ -1651,6 +1667,27 @@ impl ConsensusService {
         }
     }
 
+    /// Returns true when an identical H2 message was published less than
+    /// `H2_REBROADCAST_MIN_INTERVAL` ago; records the publish otherwise.
+    fn h2_rebroadcast_suppressed(&self, encoded: &[u8]) -> bool {
+        let key = *blake3::hash(encoded).as_bytes();
+        let now = Instant::now();
+        let mut recent = self
+            .recent_h2_broadcasts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(last) = recent.get(&key)
+            && now.duration_since(*last) < H2_REBROADCAST_MIN_INTERVAL
+        {
+            return true;
+        }
+        if recent.len() >= 512 {
+            recent.retain(|_, sent| now.duration_since(*sent) < Duration::from_secs(10));
+        }
+        recent.insert(key, now);
+        false
+    }
+
     fn broadcast_engine_consensus(&self, message: ConsensusMessage) -> Result<(), NetworkError> {
         #[cfg(debug_assertions)]
         let mut message = message;
@@ -1683,6 +1720,14 @@ impl ConsensusService {
                 n42_network::consensus_to_h2_v4(identity, &message).map_err(|error| {
                     NetworkError::Codec(format!("H2-v4 consensus conversion failed: {error}"))
                 })?;
+            let encoded = n42_network::h2_wire::encode_gov5_gossip_message(&envelope.message)
+                .map_err(|error| NetworkError::Codec(format!("H2 encoding failed: {error}")))?;
+            if self.h2_rebroadcast_suppressed(&encoded) {
+                counter!("n42_h2_v4_rebroadcasts_suppressed_total", "kind" => envelope.message.kind().as_str())
+                    .increment(1);
+                debug!(target: "n42::interop::h2v4", kind = envelope.message.kind().as_str(), "suppressed identical H2 rebroadcast");
+                return Ok(());
+            }
             self.network.broadcast_h2_v4(envelope)
         } else {
             self.network.broadcast_consensus(message)
@@ -2578,6 +2623,8 @@ impl ConsensusService {
             tx_forward_buffer: Vec::new(),
             tx_forward_missing_leader_warned_view: None,
             pending_vote_resend: None,
+            recent_h2_broadcasts: std::sync::Mutex::new(HashMap::new()),
+            leader_disabled: false,
             pipeline_timings: HashMap::new(),
             last_commit_instant: None,
             last_commit_view: None,
@@ -2827,6 +2874,8 @@ impl ConsensusService {
             tx_forward_buffer: Vec::new(),
             tx_forward_missing_leader_warned_view: None,
             pending_vote_resend: None,
+            recent_h2_broadcasts: std::sync::Mutex::new(HashMap::new()),
+            leader_disabled: false,
             pipeline_timings: HashMap::new(),
             last_commit_instant: None,
             last_commit_view: None,
@@ -2876,6 +2925,14 @@ impl ConsensusService {
     /// chainspec does not set `hotstuff.interopV4`.
     pub fn with_gov5_legacy_signing(mut self) -> Self {
         self.engine.enable_gov5_legacy_signing();
+        self
+    }
+
+    /// Never build a payload as leader (a member without a local QMDB root
+    /// cannot seal a gov5 block); its leader views time out like an absent
+    /// validator's while it keeps importing and voting.
+    pub fn with_leader_disabled(mut self) -> Self {
+        self.leader_disabled = true;
         self
     }
 
@@ -3148,6 +3205,7 @@ impl ConsensusService {
                     // This handles the case where FCU returned SYNCING earlier and
                     // the leader couldn't propose, causing a permanent stall.
                     if self.engine.is_current_leader()
+                        && !self.leader_disabled
                         && self.next_build_at.is_none()
                         && self.speculative_build_hash.is_none()
                     {

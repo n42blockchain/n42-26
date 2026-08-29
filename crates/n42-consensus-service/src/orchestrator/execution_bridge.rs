@@ -122,6 +122,13 @@ impl ConsensusService {
 
     /// Triggers payload building via fork_choice_updated, then spawns a task to resolve it.
     pub(super) async fn do_trigger_payload_build(&mut self, slot_timestamp: Option<u64>) {
+        if self.leader_disabled {
+            info!(target: "n42::cl::exec_bridge", view = self.engine.current_view(),
+                "leader build skipped: this member cannot seal a gov5 block; the view will time out");
+            self.next_build_at = None;
+            self.next_slot_timestamp = None;
+            return;
+        }
         let el = match &self.el {
             Some(e) => e.clone(),
             None => {

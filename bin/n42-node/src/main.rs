@@ -2866,6 +2866,9 @@ fn main() {
                         genesis_hash: interop_genesis_hash,
                     };
                     orchestrator = orchestrator.with_h2_v4_participant(identity);
+                    if trusted_state_root_base.is_some() {
+                        orchestrator = orchestrator.with_leader_disabled();
+                    }
                     if env_bool("N42_GOV5_LEGACY_SIGNING") {
                         info!(
                             target: "n42::cli",

@@ -255,6 +255,57 @@ root `0x68efb7ecdea7f258…`, receipts root `0xc5d2460186f7233c…` on all six.
   the mobile-registry root; the stored hash is gov5's, and every parent check
   normalises both sides, but `eth_getBlockByHash` on this node shows the alloy view.
 
+## Stall at 06:27 UTC and its fix
+
+After 19 minutes the member stopped executing: its RPC stayed at 13,562,197
+while the fleet went on, and every view committed with `execution_ready=false`
+(`Decide` arrived, no body to execute, no vote). The consensus view kept following
+the fleet; execution did not. The chain of events, from `logs/participant-run1-stalled.log`:
+
+1. Its own leader view 12,913 timed out three times (06:27:06, :18, :30 — the
+   repeat re-broadcast is every 12 s). At the third repeat a **republish storm**
+   started: the same H2 message (gossip id `7e78639e…`) was published ~700 times a
+   second for 6 s (`failed to publish … error=Duplicate`), and a second storm ran
+   06:28:06–12 for view 12,920. On the H2 transport every publish is a gossip
+   message plus one direct `hotstuff_direct` stream to each of six peers, so the
+   peers' answers came back as thousands of inbound streams: **3,151 `Dropping
+   inbound stream because we are at capacity`** in 40 s. The request-response
+   behaviour's queues on both sides were then jammed for the rest of the run:
+   gov5's block pushes never reached the orchestrator again (`ExecuteBlock
+   requested … pending_data=false`), `block_by_hash` fetches timed out 19 times,
+   and the execution head never moved.
+2. The trigger is the timeout relay: on every newly observed Timeout the engine
+   forwards it to the next leader (`SendToValidator`), which in H2 mode is a full
+   fan-out; gov5's rotor re-forwards, the copies come back, and each side answers
+   the other. The code carried a comment describing exactly this loop and
+   deduplicated the relay per sender; that was not enough.
+3. On top of that, the leader view at 06:28:12 (12,927) found reth behind and the
+   build path retried `forkchoice_updated` every 2 s (`did not return payload_id,
+   scheduling retry`), noisy but not the cause; and the execution catch-up chose the
+   N42 state-sync protocol, which no gov5 peer speaks, instead of the gov5 range
+   fetch that works at start-up.
+
+Fix (commit below, binary rebuilt and the member restarted at 07:00:18Z):
+
+- `broadcast_engine_consensus` suppresses a byte-identical H2 publish within
+  750 ms of the previous one (`H2_REBROADCAST_MIN_INTERVAL`, blake3 of the encoded
+  message, bounded map, metric `n42_h2_v4_rebroadcasts_suppressed_total`). The
+  intentional resends (vote every 2 s, timeout every 12 s) are untouched; any echo
+  loop is capped at one publish per message per 750 ms.
+- The timeout relay is skipped under the gov5 profiles (`process_timeout`): gov5
+  members gossip their own timeouts and their next leader forms the TC from those.
+- A trusted-root member never starts a payload build (`with_leader_disabled`,
+  `leader build skipped: this member cannot seal a gov5 block; the view will time
+  out`): no FCU-with-attributes retry loop, no leader recovery timer; its leader
+  views time out once, as an absent validator's do.
+
+After the restart the member caught up 601 blocks (13,562,198 → 13,562,798) from
+gov5 in 20 s, was voting at 07:00:44Z (view 13,654), lag 0 on both RPCs at
+13,562,810; the first 40 s show `dup=0 capacity=0 errors=0`, five leader views
+skipped. Still open: when execution falls behind while the consensus view keeps
+following the fleet, the orchestrator should start the gov5 range fetch rather
+than the state-sync request; today a restart is the recovery.
+
 ## Handing the slot back
 
 ```
