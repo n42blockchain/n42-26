@@ -1875,6 +1875,11 @@ impl ConsensusService {
         has_staking_target: bool,
         state_diff: Option<n42_execution::state_diff::StateDiff>,
     ) {
+        // The engine's extends rule reads the parent of an imported block;
+        // eager import knows it, and the vote this import releases is checked
+        // against it.
+        self.engine.remember_parent(hash, parent_hash);
+
         // Record the pre-imported block hash. When finalize_committed_block runs,
         // it will find this block already in reth's engine tree, making FCU instant.
         // We do NOT update head_block_hash here — that should only change via FCU
