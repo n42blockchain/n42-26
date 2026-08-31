@@ -158,6 +158,15 @@ fn block_direct_queue_depth() -> usize {
     })
 }
 
+fn gov5_direct_source_authorized(
+    peer: PeerId,
+    trusted: bool,
+    routed_validators: &HashMap<PeerId, u32>,
+    authenticated_validators: &HashMap<PeerId, u32>,
+) -> bool {
+    trusted || routed_validators.contains_key(&peer) || authenticated_validators.contains_key(&peer)
+}
+
 fn stale_gov5_block_fetches(
     pending_hashes: &HashSet<B256>,
     recent_requests: &HashMap<B256, (Instant, PeerId)>,
@@ -2886,6 +2895,30 @@ impl NetworkService {
                     },
                 ..
             } => {
+                if !gov5_direct_source_authorized(
+                    peer,
+                    self.reconnection.is_trusted(&peer),
+                    &self.peer_validator_map,
+                    &self.authenticated_peer_validator_map,
+                ) {
+                    metrics::counter!(
+                        "n42_gov5_block_push_rejected_total",
+                        "reason" => "unauthorized"
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        target: "n42::interop::block",
+                        %peer,
+                        bytes = request.rlp.len(),
+                        "rejected Gov5 direct block push from an unbound peer"
+                    );
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .gov5_block_push
+                        .send_response(channel, Gov5BlockPushResponse);
+                    return;
+                }
                 metrics::counter!("n42_gov5_block_push_received_total").increment(1);
                 if let Err(error) = self.retain_gov5_served_block(&request.rlp) {
                     tracing::warn!(
@@ -2940,6 +2973,32 @@ impl NetworkService {
                     },
                 ..
             } => {
+                // Direct request-response streams have no GossipSub peer
+                // scoring or mesh admission. Admit only operator-trusted peers
+                // or PeerIds already bound to the current validator set. A
+                // routed (but not yet BLS-promoted) validator is allowed so its
+                // first valid signed message can establish full authentication.
+                if !gov5_direct_source_authorized(
+                    peer,
+                    self.reconnection.is_trusted(&peer),
+                    &self.peer_validator_map,
+                    &self.authenticated_peer_validator_map,
+                ) {
+                    metrics::counter!("n42_gov5_h2_direct_rejected_total", "reason" => "unauthorized")
+                        .increment(1);
+                    tracing::warn!(
+                        target: "n42::interop::h2v4",
+                        %peer,
+                        bytes = request.data.len(),
+                        "rejected Gov5 direct consensus message from an unbound peer"
+                    );
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .gov5_hotstuff_direct
+                        .send_response(channel, Gov5HotstuffDirectResponse);
+                    return;
+                }
                 match decode_gov5_gossip_message(&request.data) {
                     Ok(message) => {
                         metrics::counter!(
@@ -4070,6 +4129,45 @@ impl NetworkService {
 mod tests {
     use super::*;
     use crate::transport::deterministic_validator_peer_id;
+
+    #[test]
+    fn gov5_direct_requires_trust_or_validator_binding() {
+        let peer = PeerId::random();
+        let other = PeerId::random();
+        let routed = HashMap::from([(peer, 3)]);
+        let authenticated = HashMap::from([(peer, 3)]);
+
+        assert!(!gov5_direct_source_authorized(
+            peer,
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+        ));
+        assert!(gov5_direct_source_authorized(
+            peer,
+            true,
+            &HashMap::new(),
+            &HashMap::new(),
+        ));
+        assert!(gov5_direct_source_authorized(
+            peer,
+            false,
+            &routed,
+            &HashMap::new(),
+        ));
+        assert!(gov5_direct_source_authorized(
+            peer,
+            false,
+            &HashMap::new(),
+            &authenticated,
+        ));
+        assert!(!gov5_direct_source_authorized(
+            other,
+            false,
+            &routed,
+            &authenticated,
+        ));
+    }
 
     #[test]
     fn block_direct_digest_cache_reuses_arc_without_retaining_it() {

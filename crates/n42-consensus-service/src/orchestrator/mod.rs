@@ -1501,9 +1501,12 @@ impl ConsensusService {
         // bootstrap or an earlier run. Re-submitting them to new_payload proves
         // the complete parent chain without issuing a backward FCU.
         if view <= self.execution_validated_head_view {
-            if let Err(error) = self
-                .engine
-                .process_event(n42_consensus::ConsensusEvent::BlockImported(block_hash))
+            if let Err(error) =
+                self.engine
+                    .process_event(n42_consensus::ConsensusEvent::BlockImportedWithParent {
+                        block_hash,
+                        parent_hash: block.header.parent_hash,
+                    })
             {
                 error!(target: "n42::interop::h2v4", %block_hash, view, %error, "could not release execution-gated vote for replayed Gov5 parent");
             }
@@ -1543,10 +1546,12 @@ impl ConsensusService {
                     leader_ready_unix_ms: 0,
                 };
                 self.complete_deferred_finalization(&imported).await;
-                if let Err(error) = self
-                    .engine
-                    .process_event(n42_consensus::ConsensusEvent::BlockImported(block_hash))
-                {
+                if let Err(error) = self.engine.process_event(
+                    n42_consensus::ConsensusEvent::BlockImportedWithParent {
+                        block_hash,
+                        parent_hash: block.header.parent_hash,
+                    },
+                ) {
                     error!(target: "n42::interop::h2v4", %block_hash, view, %error, "could not release execution-gated vote for Gov5 catch-up block");
                 }
                 true
@@ -6032,6 +6037,23 @@ mod tests {
         orch.handle_eager_import_done(first, 1, B256::ZERO, 1, false, None)
             .await;
         assert_eq!(mock_el.fcu_heads(), vec![first, second]);
+    }
+
+    #[tokio::test]
+    async fn execution_ready_marks_every_view_reusing_the_same_block() {
+        let mut orch = make_test_orchestrator_with_state(None);
+        let block_hash = B256::repeat_byte(0xd3);
+        orch.handle_block_committed(1, block_hash, test_commit_qc(1, block_hash), None)
+            .await;
+        orch.handle_block_committed(2, block_hash, test_commit_qc(2, block_hash), None)
+            .await;
+
+        orch.handle_eager_import_done(block_hash, 1, B256::ZERO, 1, false, None)
+            .await;
+
+        assert!(orch.async_commit_states.values().all(|state| {
+            state.block_hash != block_hash || state.stage == AsyncCommitStage::Finalized
+        }));
     }
 
     #[tokio::test]

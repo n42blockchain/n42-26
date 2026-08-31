@@ -895,6 +895,7 @@ impl ConsensusService {
             metrics::counter!("n42_block_data_payload_hash_mismatch_total").increment(1);
             return false;
         }
+        let execution_parent_hash = execution_data.parent_hash();
         if self
             .bad_blocks
             .should_skip(broadcast.block_hash, "sync_import_pre_submit")
@@ -918,8 +919,13 @@ impl ConsensusService {
         {
             Ok(status) => {
                 if matches!(status.status, PayloadStatusEnum::Valid) {
-                    self.handle_valid_import(&broadcast, &engine_handle, &status)
-                        .await;
+                    self.handle_valid_import(
+                        &broadcast,
+                        execution_parent_hash,
+                        &engine_handle,
+                        &status,
+                    )
+                    .await;
                     true
                 } else if matches!(
                     status.status,
@@ -976,6 +982,7 @@ impl ConsensusService {
     async fn handle_valid_import(
         &mut self,
         broadcast: &BlockDataBroadcast,
+        parent_hash: B256,
         engine_handle: &Arc<dyn ExecutionLayer>,
         status: &alloy_rpc_types_engine::PayloadStatus,
     ) {
@@ -1061,7 +1068,10 @@ impl ConsensusService {
 
         if let Err(e) = self
             .engine
-            .process_event(ConsensusEvent::BlockImported(broadcast.block_hash))
+            .process_event(ConsensusEvent::BlockImportedWithParent {
+                block_hash: broadcast.block_hash,
+                parent_hash,
+            })
         {
             error!(target: "n42::cl::exec_bridge", error = %e, "error processing BlockImported");
         }
@@ -1175,6 +1185,7 @@ impl ConsensusService {
                 metrics::counter!("n42_block_data_payload_hash_mismatch_total").increment(1);
                 continue;
             }
+            let retry_parent_hash = retry_exec.parent_hash();
             if self
                 .bad_blocks
                 .should_skip(retry_hash, "syncing_retry_pre_submit")
@@ -1227,9 +1238,12 @@ impl ConsensusService {
                                 retry_hash,
                                 "sync import retry",
                             );
-                            if let Err(e) = self
-                                .engine
-                                .process_event(ConsensusEvent::BlockImported(retry_hash))
+                            if let Err(e) =
+                                self.engine
+                                    .process_event(ConsensusEvent::BlockImportedWithParent {
+                                        block_hash: retry_hash,
+                                        parent_hash: retry_parent_hash,
+                                    })
                             {
                                 error!(target: "n42::cl::exec_bridge", error = %e, "error processing BlockImported for retry");
                             }

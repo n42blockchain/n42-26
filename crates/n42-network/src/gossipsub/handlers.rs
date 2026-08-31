@@ -1,4 +1,4 @@
-use alloy_primitives::{B256, keccak256};
+use alloy_primitives::{B256, Keccak256};
 use libp2p::gossipsub::{self, Message, MessageId, TopicHash};
 use n42_primitives::{CONSENSUS_PROTOCOL_VERSION, ConsensusMessage, VersionedMessage};
 
@@ -59,12 +59,14 @@ pub const MESSAGE_ID_LEN: usize = 20;
 /// said SHA-256, but its `common/hash.Hash` implementation uses a
 /// `crypto.KeccakState`; the cross-client vectors below guard that distinction.
 pub fn message_id_parts(genesis_hash: B256, topic: &str, data: &[u8]) -> [u8; MESSAGE_ID_LEN] {
-    let mut preimage = Vec::with_capacity(B256::len_bytes() + topic.len() + data.len());
-    preimage.extend_from_slice(genesis_hash.as_slice());
-    preimage.extend_from_slice(topic.as_bytes());
-    preimage.extend_from_slice(data);
-
-    let digest = keccak256(preimage);
+    // Absorb the three slices directly. Building a contiguous preimage copied
+    // every block/sidecar payload solely for message-ID calculation, adding a
+    // full message-sized allocation on the GossipSub hot path.
+    let mut hasher = Keccak256::new();
+    hasher.update(genesis_hash);
+    hasher.update(topic);
+    hasher.update(data);
+    let digest = hasher.finalize();
     let mut message_id = [0u8; MESSAGE_ID_LEN];
     message_id.copy_from_slice(&digest[..MESSAGE_ID_LEN]);
     message_id

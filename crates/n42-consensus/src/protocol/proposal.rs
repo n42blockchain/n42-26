@@ -593,12 +593,26 @@ impl ConsensusEngine {
     ///
     /// Native optimistic voting uses this as execution diagnostics. Gov5 H2
     /// participant mode also releases the matching deferred R1 vote here.
-    pub(super) fn on_block_imported(&mut self, block_hash: B256) -> ConsensusResult<()> {
+    pub(super) fn on_block_imported(
+        &mut self,
+        block_hash: B256,
+        parent_hash: Option<B256>,
+    ) -> ConsensusResult<()> {
         if self.imported_blocks.insert(block_hash) {
             if self.imported_block_fifo.len() >= MAX_IMPORTED_BLOCKS {
                 self.evict_oldest_imported_block();
             }
             self.imported_block_fifo.push_back(block_hash);
+        }
+        // Store parent evidence only while the corresponding import evidence
+        // is live. This keeps both caches under the same FIFO bound, including
+        // duplicate/late notifications around eviction.
+        if self.imported_blocks.contains(&block_hash) {
+            if let Some(parent_hash) = parent_hash {
+                self.imported_parents.insert(block_hash, parent_hash);
+            }
+        } else {
+            self.imported_parents.remove(&block_hash);
         }
 
         if matches!(

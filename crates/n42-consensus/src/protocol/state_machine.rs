@@ -130,9 +130,13 @@ pub enum ConsensusEvent {
     /// A block has been executed and is ready for proposal (leader path).
     /// Tuple: (block_hash, tx_root_hash).
     BlockReady(B256, Option<B256>),
-    /// Block data has been imported into the execution layer (follower path).
-    /// Triggers the deferred vote for the pending proposal.
+    /// Block data has been imported without authenticated parent metadata.
+    /// Native optimistic voting uses this after caching a payload.
     BlockImported(B256),
+    /// Block data and its parent have been authenticated by execution. Keeping
+    /// both in one event prevents H2's extends-justify check from racing a
+    /// separate metadata update.
+    BlockImportedWithParent { block_hash: B256, parent_hash: B256 },
 }
 
 /// A vote message whose single-validator BLS signature was verified by the
@@ -837,14 +841,6 @@ impl ConsensusEngine {
             .is_some_and(|index| index == self.leader_index_for_view(view))
     }
 
-    /// Records a block's parent ahead of its `BlockImported`, so the vote that
-    /// import releases can check the proposal extends its justify QC's block.
-    /// Unknown parents are tolerated by that check, so this is advisory — but
-    /// without it the rule cannot refuse anything.
-    pub fn remember_parent(&mut self, block_hash: B256, parent_hash: B256) {
-        self.imported_parents.insert(block_hash, parent_hash);
-    }
-
     pub fn locked_qc(&self) -> &QuorumCertificate {
         self.round_state.locked_qc()
     }
@@ -872,7 +868,9 @@ impl ConsensusEngine {
         let kind = match &event {
             ConsensusEvent::Message(_) => "message",
             ConsensusEvent::BlockReady(..) => "block_ready",
-            ConsensusEvent::BlockImported(_) => "block_imported",
+            ConsensusEvent::BlockImported(_) | ConsensusEvent::BlockImportedWithParent { .. } => {
+                "block_imported"
+            }
         };
         let _span = tracing::info_span!(
             target: "n42.cl.consensus.event",
@@ -886,7 +884,11 @@ impl ConsensusEngine {
             ConsensusEvent::BlockReady(block_hash, tx_root_hash) => {
                 self.on_block_ready(block_hash, tx_root_hash)
             }
-            ConsensusEvent::BlockImported(block_hash) => self.on_block_imported(block_hash),
+            ConsensusEvent::BlockImported(block_hash) => self.on_block_imported(block_hash, None),
+            ConsensusEvent::BlockImportedWithParent {
+                block_hash,
+                parent_hash,
+            } => self.on_block_imported(block_hash, Some(parent_hash)),
         }
     }
 
@@ -2660,8 +2662,7 @@ mod tests {
             enable_test_h2(&mut engine);
             let mut proposal = signed_h2_test_proposal(&engine, 2, block, 2, &sks[2]);
             // Signed under the H2 profile, as the fleet's QCs are.
-            let mut collector =
-                crate::protocol::quorum::VoteCollector::new(1, certified, vs.len());
+            let mut collector = crate::protocol::quorum::VoteCollector::new(1, certified, vs.len());
             let message = engine.signing_profile.vote_message(1, certified);
             for i in [0u32, 1, 2] {
                 collector
@@ -2676,10 +2677,16 @@ mod tests {
                     proposal,
                 )))
                 .expect("the proposal itself is valid");
-            assert_eq!(engine.current_view(), 2, "the justify QC carries the engine to view 2");
-            engine.remember_parent(block, parent);
+            assert_eq!(
+                engine.current_view(),
+                2,
+                "the justify QC carries the engine to view 2"
+            );
             engine
-                .process_event(ConsensusEvent::BlockImported(block))
+                .process_event(ConsensusEvent::BlockImportedWithParent {
+                    block_hash: block,
+                    parent_hash: parent,
+                })
                 .expect("import is reported");
             std::iter::from_fn(|| rx.try_recv().ok()).any(|output| {
                 matches!(
@@ -2729,6 +2736,47 @@ mod tests {
             EngineOutput::SendToValidator(_, ConsensusMessage::Vote(vote))
                 if vote.block_hash == block_hash && vote.view == 1
         )));
+    }
+
+    #[test]
+    fn test_h2_import_before_proposal_still_checks_justify_parent() {
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+        enable_test_h2(&mut engine);
+        let certified = B256::repeat_byte(0xA1);
+        let sibling = B256::repeat_byte(0xB2);
+        let stale_parent = B256::repeat_byte(0x42);
+
+        engine
+            .process_event(ConsensusEvent::BlockImportedWithParent {
+                block_hash: sibling,
+                parent_hash: stale_parent,
+            })
+            .expect("early import should be cached with its parent");
+
+        let mut proposal = signed_h2_test_proposal(&engine, 2, sibling, 2, &sks[2]);
+        let mut collector = crate::protocol::quorum::VoteCollector::new(1, certified, vs.len());
+        let message = engine.signing_profile.vote_message(1, certified);
+        for i in [0u32, 1, 2] {
+            collector
+                .add_vote(i, engine.signing_profile.sign(&sks[i as usize], &message))
+                .unwrap();
+        }
+        proposal.justify_qc = collector
+            .build_qc_with_profile_message(&vs, &message, engine.signing_profile)
+            .unwrap();
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal,
+            )))
+            .expect("the proposal itself is valid");
+
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok()).any(|output| matches!(
+                output,
+                EngineOutput::SendToValidator(_, ConsensusMessage::Vote(_))
+            )),
+            "an early imported sibling must not bypass extends-justify"
+        );
     }
 
     #[test]
@@ -4060,6 +4108,31 @@ mod tests {
         assert_eq!(engine.imported_blocks.len(), 64);
         assert!(engine.imported_blocks.contains(&B256::repeat_byte(0xFF)));
         assert!(!engine.imported_blocks.contains(&B256::repeat_byte(0)));
+    }
+
+    #[test]
+    fn imported_parent_cache_follows_import_evidence_eviction() {
+        let (mut engine, _sks, _, _rx) = make_engine(4, 0);
+
+        for i in 0..=64u8 {
+            engine
+                .process_event(ConsensusEvent::BlockImportedWithParent {
+                    block_hash: B256::repeat_byte(i),
+                    parent_hash: B256::repeat_byte(i.wrapping_sub(1)),
+                })
+                .expect("authenticated import should succeed");
+        }
+
+        assert_eq!(engine.imported_blocks.len(), 64);
+        assert_eq!(engine.imported_parents.len(), 64);
+        assert!(!engine.imported_parents.contains_key(&B256::ZERO));
+        assert!(
+            engine
+                .imported_parents
+                .keys()
+                .all(|hash| engine.imported_blocks.contains(hash)),
+            "parent metadata must never outlive its import evidence"
+        );
     }
 
     /// A deferred H2 vote waits on one specific hash, and catching up imports

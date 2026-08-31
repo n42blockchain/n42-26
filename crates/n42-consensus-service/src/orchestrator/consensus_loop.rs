@@ -415,7 +415,7 @@ impl ConsensusService {
             );
             // The large state diff has moved into recent execution metadata.
             // Keep only the small fields needed for authenticated post-processing.
-            eager_completions.push((hash, block_number, has_staking_target));
+            eager_completions.push((hash, parent_hash, block_number, has_staking_target));
         }
         // Never sleep in the consensus output handler. The lifecycle below
         // retains the CommitQC at `Committed` until the matching completion
@@ -775,9 +775,14 @@ impl ConsensusService {
         // for messages prefetched above. They are deliberately not requeued:
         // requeueing could lose a completion when concurrent producers refill
         // the bounded channel, while cloning a potentially large StateDiff.
-        for (hash, block_number, has_staking_target) in eager_completions {
-            self.finish_eager_import_completion(hash, block_number, has_staking_target)
-                .await;
+        for (hash, parent_hash, block_number, has_staking_target) in eager_completions {
+            self.finish_eager_import_completion(
+                hash,
+                parent_hash,
+                block_number,
+                has_staking_target,
+            )
+            .await;
         }
         if !execution_ready {
             let timeout_tx = self.commit_execution_timeout_tx.clone();
@@ -867,28 +872,29 @@ impl ConsensusService {
     }
 
     fn mark_async_commit_execution_ready(&mut self, block_hash: B256) -> bool {
-        let Some(state) = self
+        let mut matched = false;
+        for state in self
             .async_commit_states
             .values_mut()
-            .find(|state| state.block_hash == block_hash)
-        else {
-            return false;
-        };
-        if state.stage == AsyncCommitStage::Committed {
-            state.stage = AsyncCommitStage::ExecutionReady;
-            counter!("n42_async_commit_transitions_total", "stage" => "execution_ready")
-                .increment(1);
-            histogram!("n42_commit_to_execution_ready_ms")
-                .record(state.committed_at.elapsed().as_secs_f64() * 1_000.0);
-            info!(
-                target: "n42::cl::consensus_loop",
-                view = state.view,
-                %block_hash,
-                elapsed_ms = state.committed_at.elapsed().as_millis() as u64,
-                "N42_COMMIT_STATE: ExecutionReady"
-            );
+            .filter(|state| state.block_hash == block_hash)
+        {
+            matched = true;
+            if state.stage == AsyncCommitStage::Committed {
+                state.stage = AsyncCommitStage::ExecutionReady;
+                counter!("n42_async_commit_transitions_total", "stage" => "execution_ready")
+                    .increment(1);
+                histogram!("n42_commit_to_execution_ready_ms")
+                    .record(state.committed_at.elapsed().as_secs_f64() * 1_000.0);
+                info!(
+                    target: "n42::cl::consensus_loop",
+                    view = state.view,
+                    %block_hash,
+                    elapsed_ms = state.committed_at.elapsed().as_millis() as u64,
+                    "N42_COMMIT_STATE: ExecutionReady"
+                );
+            }
         }
-        true
+        matched
     }
 
     fn mark_async_commit_finalized(&mut self, view: u64, block_hash: B256) {
@@ -1128,13 +1134,18 @@ impl ConsensusService {
                 if hash == block_hash {
                     found_match = true;
                 }
-                eager_completions.push((hash, block_number, has_staking_target));
+                eager_completions.push((hash, parent_hash, block_number, has_staking_target));
             }
             // A synchronous FCU rescue must not consume H2 completion events
             // without their vote/fetch and lifecycle post-processing.
-            for (hash, block_number, has_staking_target) in eager_completions {
-                self.finish_eager_import_completion(hash, block_number, has_staking_target)
-                    .await;
+            for (hash, parent_hash, block_number, has_staking_target) in eager_completions {
+                self.finish_eager_import_completion(
+                    hash,
+                    parent_hash,
+                    block_number,
+                    has_staking_target,
+                )
+                .await;
             }
             if found_match {
                 if let Some(index) = self
@@ -1818,6 +1829,7 @@ impl ConsensusService {
     async fn finish_eager_import_completion(
         &mut self,
         hash: B256,
+        parent_hash: B256,
         block_number: u64,
         has_staking_target: bool,
     ) {
@@ -1834,9 +1846,12 @@ impl ConsensusService {
             // it stays out of this path entirely.
             self.retire_h2_v4_fetch_satisfied_elsewhere(hash).await;
 
-            if let Err(error) = self
-                .engine
-                .process_event(n42_consensus::ConsensusEvent::BlockImported(hash))
+            if let Err(error) =
+                self.engine
+                    .process_event(n42_consensus::ConsensusEvent::BlockImportedWithParent {
+                        block_hash: hash,
+                        parent_hash,
+                    })
             {
                 error!(target: "n42::interop::h2v4", %hash, %error, "failed to release execution-gated H2 vote");
             }
@@ -1875,11 +1890,6 @@ impl ConsensusService {
         has_staking_target: bool,
         state_diff: Option<n42_execution::state_diff::StateDiff>,
     ) {
-        // The engine's extends rule reads the parent of an imported block;
-        // eager import knows it, and the vote this import releases is checked
-        // against it.
-        self.engine.remember_parent(hash, parent_hash);
-
         // Record the pre-imported block hash. When finalize_committed_block runs,
         // it will find this block already in reth's engine tree, making FCU instant.
         // We do NOT update head_block_hash here — that should only change via FCU
@@ -1893,7 +1903,7 @@ impl ConsensusService {
             has_staking_target,
             state_diff,
         );
-        self.finish_eager_import_completion(hash, block_number, has_staking_target)
+        self.finish_eager_import_completion(hash, parent_hash, block_number, has_staking_target)
             .await;
         self.drive_async_commits().await;
     }
