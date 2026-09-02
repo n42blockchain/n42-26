@@ -30,7 +30,8 @@ network comparisons, not production-chain records. Source and raw-data accountin
 | round44 commit-cadence optimized direct-only | 153,197 | binary-v1 + zstd | 12.38 MB strict-window average | 9,192,000 committed tx/60.001320s; +11.83% over round42. Commit-path p95 533→218 ms; direct ACK 348/348. |
 | round46 zero-copy follower decode | 152,410 | binary-v1 + zstd | 12.33 MB strict-window average | 9,145,000 committed tx/60.002453s, also 58 transaction blocks; boundary fill explains the 0.51% delta from round44. Whole-run accounting avoided 8.30 GiB of transaction-body copies; direct ACK 342/342. |
 | round50 async commit + QUIC v3 chunks | 151,870 | binary-v1 + zstd | 14.97 MB full-block average | 9,112,456 committed tx/60.001845s. Async FCU 406 Valid/0 Syncing; 336 large transfers and 1,338 chunks with zero failure/retry/digest/auth errors. Control cpuset remained scheduler-managed. |
-| round52 sender-run deterministic merge | **156,500** | binary-v1 + zstd | 14.96 MB full-block average | **Current strict record:** 9,390,144 committed tx/60.001004s. Sender drain 52.74→19.21 ms versus round51; 420 FCUs all Valid; 348 large transfers/1,380 chunks, all error counters zero. |
+| round52 sender-run deterministic merge | 156,500 | binary-v1 + zstd | 14.96 MB full-block average | 9,390,144 committed tx/60.001004s. Sender drain 52.74→19.21 ms versus round51; 420 FCUs all Valid; 348 large transfers/1,380 chunks, all error counters zero. |
+| round53 clean current-main rerun | **170,547** | binary-v1 + zstd | 14.97 MB full-block average | **Current strict record:** 10,232,976 committed tx/60.001068s; +8.98% over round52. Build→broadcast 641.68 ms; direct failure/retry/digest/auth errors zero. See `docs/devlog-141-one-minute-rerun-20260901.md`. |
 
 Disabling zstd is rejected by the paired isolation runs: the envelope grew to 20,697,396 bytes when
 the payload outer layer was disabled and to 44,864,336 bytes when all block-payload compression was
@@ -93,6 +94,15 @@ and total drain falls from 52.74 to 19.21 ms. Strict TPS improves 4.88% over rou
 the prior round44 record. The run still has about 989 ms inter-block cadence and zero canonical
 parallel-EVM blocks, so its remaining 6.39x gap to 1M is principally execution/assemble/pipeline work,
 not txpool drain, QUIC reliability, CPU capacity, or NVMe bandwidth.
+
+Round53 rebuilds current `main` and reruns the identical controlled shape after two idle gates measured
+99.83% and 99.82% host idle. Strict throughput reaches 170,546.56 TPS, 8.98% above round52;
+build→broadcast falls to 641.68 ms and the heavy-block commit interval falls to 942.63 ms. Aggregate
+node CPU averages 77.61 core equivalents, `/data` NVMe averages 14.08% busy, and every application-level
+direct-push error counter remains zero. A follow-up ordered-snapshot txpool fast path was tested in two
+forms and rejected because its best total drain (21.24 ms) remained slower than the original 20.12 ms;
+the candidate code was reverted. Full data and artifact paths are in
+[`devlog-141-one-minute-rerun-20260901.md`](./devlog-141-one-minute-rerun-20260901.md).
 
 ## Benchmark-Only Upper Bounds
 
