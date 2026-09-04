@@ -198,10 +198,7 @@ impl ConsensusEngine {
 
         // Clear pending block data: similar to Tendermint's "prevote nil".
         self.pending_proposal = None;
-        if !matches!(
-            self.signing_profile,
-            super::quorum::ConsensusSigningProfile::H2V4(_)
-        ) {
+        if !self.signing_profile.is_gov5() {
             self.imported_blocks.clear();
             self.imported_block_fifo.clear();
         }
@@ -277,8 +274,13 @@ impl ConsensusEngine {
         let quorum_size = view_set.quorum_size();
         let next_view = view.saturating_add(1);
         let next_leader = LeaderSelector::leader_for_view(next_view, view_set);
-        let relay_timeout = (timeout.sender != self.my_index && next_leader != self.my_index)
-            .then(|| timeout.clone());
+        // gov5 members gossip every timeout themselves and their next leader
+        // forms the TC from that; relaying through this node's H2 fan-out
+        // (gossip plus a direct stream to every peer) only multiplies copies.
+        let relay_timeout = (timeout.sender != self.my_index
+            && next_leader != self.my_index
+            && !self.signing_profile.is_gov5())
+        .then(|| timeout.clone());
 
         let (has_quorum, timeout_count) = {
             let collector = self

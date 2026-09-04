@@ -12,26 +12,30 @@ use reth_primitives_traits::{
 use reth_storage_errors::any::AnyError;
 use std::sync::Arc;
 
-use crate::evm_factory::N42EvmFactory;
+use crate::{evm_factory::N42EvmFactory, restored_slots::TrackingBlockExecutorFactory};
 
 /// The inner EthEvmConfig type we delegate to (parameterized with N42EvmFactory).
 type InnerConfig = EthEvmConfig<ChainSpec, N42EvmFactory>;
 
 /// N42 EVM configuration wrapping `EthEvmConfig<ChainSpec>`.
-/// All `ConfigureEvm` methods delegate to the inner config.
-/// Provides a distinct type for N42-specific extensions.
+/// All `ConfigureEvm` methods delegate to the inner config, except that every
+/// block executor is wrapped by [`TrackingBlockExecutorFactory`] so the slots
+/// a block changes and restores are recorded for the QMDB root job (see
+/// `restored_slots`). Provides a distinct type for N42-specific extensions.
 #[derive(Debug, Clone)]
 pub struct N42EvmConfig {
     /// Inner Ethereum EVM configuration.
     inner: InnerConfig,
+    /// The inner block executor factory, watched for restored slots.
+    factory: TrackingBlockExecutorFactory<<InnerConfig as ConfigureEvm>::BlockExecutorFactory>,
 }
 
 impl N42EvmConfig {
     /// Creates a new N42 EVM configuration from a chain spec.
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        Self {
-            inner: EthEvmConfig::new_with_evm_factory(chain_spec, N42EvmFactory),
-        }
+        let inner = EthEvmConfig::new_with_evm_factory(chain_spec, N42EvmFactory);
+        let factory = TrackingBlockExecutorFactory::new(inner.block_executor_factory().clone());
+        Self { inner, factory }
     }
 
     /// Returns a reference to the inner `EthEvmConfig`.
@@ -49,11 +53,12 @@ impl ConfigureEvm for N42EvmConfig {
     type Primitives = <InnerConfig as ConfigureEvm>::Primitives;
     type Error = <InnerConfig as ConfigureEvm>::Error;
     type NextBlockEnvCtx = <InnerConfig as ConfigureEvm>::NextBlockEnvCtx;
-    type BlockExecutorFactory = <InnerConfig as ConfigureEvm>::BlockExecutorFactory;
+    type BlockExecutorFactory =
+        TrackingBlockExecutorFactory<<InnerConfig as ConfigureEvm>::BlockExecutorFactory>;
     type BlockAssembler = <InnerConfig as ConfigureEvm>::BlockAssembler;
 
     fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
-        self.inner.block_executor_factory()
+        &self.factory
     }
 
     fn block_assembler(&self) -> &Self::BlockAssembler {

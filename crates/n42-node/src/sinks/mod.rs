@@ -17,6 +17,90 @@ use std::sync::{
 
 pub use n42_consensus_service::sinks::{StakingSink, StateSink, WithdrawalSource, ZkSink};
 
+/// Native Gov5 credits, replacing N42's unrelated mobile/staking withdrawals.
+/// Precomputed from the genesis, so malformed amounts fail at startup.
+pub struct Gov5WithdrawalSource(Vec<Withdrawal>);
+
+impl Gov5WithdrawalSource {
+    pub fn from_genesis(
+        genesis: &alloy_genesis::Genesis,
+        beneficiary: Address,
+    ) -> Result<Self, String> {
+        let config = genesis
+            .config
+            .extra_fields
+            .get("hotstuff")
+            .and_then(serde_json::Value::as_object)
+            .ok_or("native producer requires config.hotstuff")?;
+        let amount = config
+            .get("devBlockReward")
+            .ok_or("native producer requires devBlockReward")?;
+        let amount: U256 = amount
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| amount.to_string())
+            .parse()
+            .map_err(|_| "invalid devBlockReward")?;
+        let faucet: Address = config
+            .get("devFaucetAddress")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("native producer requires devFaucetAddress")?
+            .parse()
+            .map_err(|_| "invalid devFaucetAddress")?;
+        let mut rewards = Vec::new();
+        if !amount.is_zero() {
+            rewards.push(n42_consensus::Gov5Reward {
+                address: beneficiary,
+                amount,
+            });
+            if !faucet.is_zero() {
+                rewards.push(n42_consensus::Gov5Reward {
+                    address: faucet,
+                    amount,
+                });
+            }
+        }
+        n42_consensus::gov5_rewards_to_withdrawals(&rewards)
+            .map(Self)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl WithdrawalSource for Gov5WithdrawalSource {
+    fn withdrawals_for_block(&self, _number: u64) -> Vec<Withdrawal> {
+        self.0.clone()
+    }
+}
+
+#[cfg(test)]
+mod gov5_reward_source_tests {
+    use super::*;
+
+    #[test]
+    fn credits_native_beneficiary_and_faucet_not_mobile_rewards() {
+        let mut genesis = alloy_genesis::Genesis::default();
+        let beneficiary = Address::repeat_byte(0x11);
+        let faucet = Address::repeat_byte(0x22);
+        genesis.config.extra_fields.insert(
+            "hotstuff".into(),
+            serde_json::json!({
+                "devBlockReward": 1_000_000_000_000_000_000_u64,
+                "devFaucetAddress": faucet,
+            }),
+        );
+        let source = Gov5WithdrawalSource::from_genesis(&genesis, beneficiary).unwrap();
+        let rewards = source.withdrawals_for_block(13560376);
+        assert_eq!(rewards.len(), 2);
+        assert_eq!(rewards[0].address, beneficiary);
+        assert_eq!(rewards[1].address, faucet);
+        assert!(rewards.iter().all(|reward| reward.amount == 1_000_000_000));
+        assert_eq!(source.withdrawals_for_block(13560377), rewards);
+        genesis.config.extra_fields.get_mut("hotstuff").unwrap()["devBlockReward"] =
+            serde_json::json!(1);
+        assert!(Gov5WithdrawalSource::from_genesis(&genesis, beneficiary).is_err());
+    }
+}
+
 /// Bound database reads per sampled account. A hot contract can touch tens of
 /// thousands of slots inside one probe interval; sampling remains useful
 /// without letting that fan out into an unbounded exact-state query.

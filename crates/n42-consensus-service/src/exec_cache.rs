@@ -26,8 +26,7 @@ pub trait ExecutionOutputCache: Send + Sync {
     /// `None`; an H2 participant then fails closed for non-empty blocks.
     fn take_gov5_normalization(
         &self,
-        _hash: B256,
-        _parent_hash: B256,
+        _execution: &alloy_rpc_types_engine::ExecutionData,
     ) -> Option<(B256, B256, Vec<u8>)> {
         None
     }

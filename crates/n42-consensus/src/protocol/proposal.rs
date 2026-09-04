@@ -150,12 +150,10 @@ impl ConsensusEngine {
         // Include any pending validator changes so all nodes apply the same
         // changes at CommitQC time (consensus-safe commit-then-activate).
         let validator_changes = self.epoch_manager.pending_changes_for_proposal();
-        if matches!(
-            self.signing_profile,
-            super::quorum::ConsensusSigningProfile::H2V4(_)
-        ) && validator_changes
-            .as_ref()
-            .is_some_and(|changes| !changes.is_empty())
+        if self.signing_profile.is_gov5()
+            && validator_changes
+                .as_ref()
+                .is_some_and(|changes| !changes.is_empty())
         {
             return Err(ConsensusError::H2V4ValidatorChangesUnsupported);
         }
@@ -277,13 +275,11 @@ impl ConsensusEngine {
         }
 
         let pk = view_set.get_public_key(proposal.proposer)?;
-        if matches!(
-            self.signing_profile,
-            super::quorum::ConsensusSigningProfile::H2V4(_)
-        ) && proposal
-            .validator_changes
-            .as_ref()
-            .is_some_and(|changes| !changes.is_empty())
+        if self.signing_profile.is_gov5()
+            && proposal
+                .validator_changes
+                .as_ref()
+                .is_some_and(|changes| !changes.is_empty())
         {
             return Err(ConsensusError::H2V4ValidatorChangesUnsupported);
         }
@@ -425,10 +421,7 @@ impl ConsensusEngine {
         // Gov5's H2 profile is import-gated: an R1 vote attests that this node
         // has executed and validated the proposed payload, not merely seen its
         // hash. Keep the native profile's established optimistic path intact.
-        if matches!(
-            self.signing_profile,
-            super::quorum::ConsensusSigningProfile::H2V4(_)
-        ) {
+        if self.signing_profile.is_gov5() {
             self.pending_proposal = Some(super::state_machine::PendingProposal {
                 view,
                 block_hash: proposal.block_hash,
@@ -615,10 +608,8 @@ impl ConsensusEngine {
             self.imported_parents.remove(&block_hash);
         }
 
-        if matches!(
-            self.signing_profile,
-            super::quorum::ConsensusSigningProfile::H2V4(_)
-        ) && let Some(pending) = self.pending_proposal.as_ref()
+        if self.signing_profile.is_gov5()
+            && let Some(pending) = self.pending_proposal.as_ref()
             && pending.view == self.round_state.current_view()
             && pending.block_hash == block_hash
             && self.round_state.may_vote_in(pending.view)

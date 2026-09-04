@@ -29,6 +29,8 @@ pub struct N42Node {
     pub validator_set_resolver: Option<ValidatorSetResolver>,
     pub header_profile: N42HeaderProfile,
     pub qmdb_state_root_store: Option<Arc<Gov5QmdbStateRootStore>>,
+    /// Accept proposers' state roots without a local QMDB forest.
+    pub trusted_state_root: bool,
 }
 
 impl std::fmt::Debug for N42Node {
@@ -43,6 +45,7 @@ impl std::fmt::Debug for N42Node {
                 "has_qmdb_state_root_store",
                 &self.qmdb_state_root_store.is_some(),
             )
+            .field("trusted_state_root", &self.trusted_state_root)
             .finish()
     }
 }
@@ -54,6 +57,7 @@ impl N42Node {
             validator_set_resolver: None,
             header_profile: N42HeaderProfile::Ethereum,
             qmdb_state_root_store: None,
+            trusted_state_root: false,
         }
     }
 
@@ -74,6 +78,12 @@ impl N42Node {
     /// observer-only until continuous cross-client execution gates pass.
     pub fn with_gov5_qmdb_state_root_store(mut self, store: Arc<Gov5QmdbStateRootStore>) -> Self {
         self.qmdb_state_root_store = Some(store);
+        self
+    }
+
+    /// Take proposers' state roots on trust (no local QMDB forest).
+    pub fn with_gov5_trusted_state_root(mut self) -> Self {
+        self.trusted_state_root = true;
         self
     }
 }
@@ -112,9 +122,10 @@ where
             .node_types::<N>()
             .pool(N42PoolBuilder::default())
             .executor(N42ExecutorBuilder::default())
-            .payload(BasicPayloadServiceBuilder::new(N42PayloadBuilder::new(
-                self.consensus_state.clone(),
-            )))
+            .payload(BasicPayloadServiceBuilder::new(
+                N42PayloadBuilder::new(self.consensus_state.clone())
+                    .with_eof_guard(self.header_profile == N42HeaderProfile::Gov5H2),
+            ))
             .network(EthereumNetworkBuilder::default())
             .consensus({
                 let mut builder =
@@ -134,7 +145,9 @@ where
             EthereumEthApiBuilder::default(),
             validator,
             BasicEngineApiBuilder::default(),
-            N42EngineTreeValidatorBuilder::new(validator, self.qmdb_state_root_store.clone()),
+            N42EngineTreeValidatorBuilder::new(validator, self.qmdb_state_root_store.clone())
+                .with_trusted_state_root(self.trusted_state_root)
+                .with_eof_guard(self.header_profile == N42HeaderProfile::Gov5H2),
             rpc_middleware,
             Identity::new(),
         ))

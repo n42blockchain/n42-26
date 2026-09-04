@@ -15,12 +15,21 @@ name = "n42-bootstrap"
 path = "src/bootstrap_main.rs"
 
 [[bin]]
+name = "n42-init-snapshot"
+path = "src/init_snapshot_main.rs"
+
+[[bin]]
 name = "n42-qmdb-proof-verify"
 path = "src/qmdb_proof_verify_main.rs"
+
+[[bin]]
+name = "n42-qmdb-replay"
+path = "src/qmdb_replay_main.rs"
 
 [dependencies]
 metrics.workspace = true
 n42-node.workspace = true
+n42-execution.workspace = true
 n42-chainspec.workspace = true
 n42-consensus.workspace = true
 n42-consensus-service.workspace = true
@@ -36,11 +45,24 @@ reth-node-builder.workspace = true
 reth-node-core.workspace = true
 reth-rpc-server-types.workspace = true
 reth-storage-api.workspace = true
+reth-provider.workspace = true
+reth-db-common.workspace = true
+reth-db-api.workspace = true
+reth-cli-commands.workspace = true
+reth-cli-runner.workspace = true
+reth-stages-types.workspace = true
+reth-static-file-types.workspace = true
+reth-ethereum-primitives.workspace = true
 reth-transaction-pool.workspace = true
 reth-tasks.workspace = true
 reth-primitives-traits.workspace = true
+reth-evm.workspace = true
+reth-revm.workspace = true
+revm.workspace = true
+blake3.workspace = true
 
 alloy-consensus.workspace = true
+alloy-eips.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-engine.workspace = true

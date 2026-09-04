@@ -1,10 +1,8 @@
 use alloy_primitives::B256;
 use futures::prelude::*;
 use libp2p::{StreamProtocol, request_response};
-use snap::read::FrameDecoder;
-use snap::write::FrameEncoder;
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io;
 use std::sync::Arc;
 
 /// Gov5's reliable leader-to-peer block push protocol.
@@ -32,9 +30,21 @@ pub const MAX_GOV5_RANGE_BLOCKS: u64 = 1024;
 pub const MAX_GOV5_RANGE_BLOCK_SIZE: usize = 64 * 1024 * 1024;
 const MAX_GOV5_RANGE_WIRE_SIZE: usize =
     MAX_GOV5_RANGE_BLOCK_SIZE + (MAX_GOV5_RANGE_BLOCK_SIZE / 6) + 1024;
+/// Decoded-bytes budget for one whole bodies-by-range response. Each chunk is
+/// bounded at 64 MiB and a response at 1024 chunks, so per-chunk limits alone
+/// let a peer make one response materialize 64 GiB. Reuse the finalized-range
+/// materialization cap so both catch-up paths hold the same amount in memory.
+pub const MAX_GOV5_RANGE_RESPONSE_BYTES: usize =
+    crate::finalized_range::MAX_MATERIALIZED_FINALIZED_RANGE_BYTES;
 const GOV5_RANGE_REQUEST_SSZ_LEN: usize = 52;
 type Gov5BestBlockNumber = dyn Fn() -> Result<u64, String> + Send + Sync;
 type Gov5BlockRlpByNumber = dyn Fn(u64) -> Result<Option<Vec<u8>>, String> + Send + Sync;
+type Gov5BlockRlpsByRange =
+    dyn Fn(std::ops::RangeInclusive<u64>) -> Result<Vec<Vec<u8>>, String> + Send + Sync;
+/// Blocks read, validated and encoded per blocking batch while the previous
+/// batch is being written to the peer. One batch is one consistent storage
+/// view on the node side, so the view never spans socket writes.
+const GOV5_RANGE_BATCH_BLOCKS: u64 = 32;
 
 /// A persistent canonical-chain reader installed by the node layer.
 ///
@@ -46,6 +56,9 @@ type Gov5BlockRlpByNumber = dyn Fn(u64) -> Result<Option<Vec<u8>>, String> + Sen
 pub struct Gov5CanonicalBlockReader {
     best_block_number: Arc<Gov5BestBlockNumber>,
     block_rlp_by_number: Arc<Gov5BlockRlpByNumber>,
+    /// Contiguous blocks from the start of the range up to the first missing
+    /// one, all read from one consistent view.
+    block_rlps_by_range: Arc<Gov5BlockRlpsByRange>,
 }
 
 impl fmt::Debug for Gov5CanonicalBlockReader {
@@ -62,9 +75,42 @@ impl Gov5CanonicalBlockReader {
         B: Fn() -> Result<u64, String> + Send + Sync + 'static,
         R: Fn(u64) -> Result<Option<Vec<u8>>, String> + Send + Sync + 'static,
     {
+        let block_rlp_by_number: Arc<Gov5BlockRlpByNumber> = Arc::new(block_rlp_by_number);
+        let per_block = Arc::clone(&block_rlp_by_number);
         Self {
             best_block_number: Arc::new(best_block_number),
-            block_rlp_by_number: Arc::new(block_rlp_by_number),
+            block_rlp_by_number,
+            block_rlps_by_range: Arc::new(move |numbers| {
+                let mut rlps = Vec::new();
+                for number in numbers {
+                    match per_block(number)? {
+                        Some(rlp) => rlps.push(rlp),
+                        None => break,
+                    }
+                }
+                Ok(rlps)
+            }),
+        }
+    }
+
+    /// A reader whose primary source serves whole ranges from one consistent
+    /// view; single-block reads go through the same source.
+    pub fn new_ranged<B, R>(best_block_number: B, block_rlps_by_range: R) -> Self
+    where
+        B: Fn() -> Result<u64, String> + Send + Sync + 'static,
+        R: Fn(std::ops::RangeInclusive<u64>) -> Result<Vec<Vec<u8>>, String>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let block_rlps_by_range: Arc<Gov5BlockRlpsByRange> = Arc::new(block_rlps_by_range);
+        let per_range = Arc::clone(&block_rlps_by_range);
+        Self {
+            best_block_number: Arc::new(best_block_number),
+            block_rlp_by_number: Arc::new(move |number| {
+                Ok(per_range(number..=number)?.into_iter().next())
+            }),
+            block_rlps_by_range,
         }
     }
 
@@ -75,6 +121,136 @@ impl Gov5CanonicalBlockReader {
     pub fn block_rlp_by_number(&self, number: u64) -> Result<Option<Vec<u8>>, String> {
         (self.block_rlp_by_number)(number)
     }
+
+    /// Canonical blocks for `numbers`, in order, stopping at the first block
+    /// that is not (yet) persisted.
+    pub fn block_rlps_by_range(
+        &self,
+        numbers: std::ops::RangeInclusive<u64>,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        (self.block_rlps_by_range)(numbers)
+    }
+}
+
+/// One served batch: wire frames ready to write, the hash the next batch
+/// must link to, and whether serving stops after it.
+struct Gov5RangeBatch {
+    frames: Vec<Vec<u8>>,
+    last_hash: Option<B256>,
+    stop: bool,
+}
+
+/// Read, validate and encode one batch of the requested range. Runs on a
+/// blocking thread when a Tokio runtime is present so the storage reads, the
+/// RLP decode and the Snappy framing stay off the swarm task.
+fn build_gov5_range_batch(
+    reader: &Gov5CanonicalBlockReader,
+    numbers: std::ops::RangeInclusive<u64>,
+    fork_digest: [u8; 4],
+    mut previous_hash: Option<B256>,
+) -> io::Result<Gov5RangeBatch> {
+    let start = *numbers.start();
+    let expected = numbers
+        .end()
+        .checked_sub(start)
+        .and_then(|span| span.checked_add(1))
+        .unwrap_or(0) as usize;
+    let rlps = match reader.block_rlps_by_range(numbers) {
+        Ok(rlps) => rlps,
+        Err(error) => {
+            return Ok(Gov5RangeBatch {
+                frames: vec![encode_range_error(2, &error)?],
+                last_hash: previous_hash,
+                stop: true,
+            });
+        }
+    };
+    let mut frames = Vec::with_capacity(rlps.len() + 1);
+    let mut stop = false;
+    for (offset, rlp) in rlps.into_iter().take(expected).enumerate() {
+        let number = start + offset as u64;
+        if rlp.len() > MAX_GOV5_RANGE_BLOCK_SIZE {
+            frames.push(encode_range_error(2, "block exceeds 64 MiB chunk limit")?);
+            stop = true;
+            break;
+        }
+        let decoded = match crate::gov5_block::decode_gov5_block_rlp(&rlp) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                frames.push(encode_range_error(
+                    2,
+                    &format!("invalid canonical block: {error}"),
+                )?);
+                stop = true;
+                break;
+            }
+        };
+        if decoded.header.number != number {
+            frames.push(encode_range_error(2, "canonical block number mismatch")?);
+            stop = true;
+            break;
+        }
+        if previous_hash.is_some_and(|previous| decoded.header.parent_hash != previous) {
+            // Match gov5: a broken by-number canonical sequence is
+            // truncated at the linked prefix rather than poisoning
+            // the requester with a disjoint block.
+            stop = true;
+            break;
+        }
+        previous_hash = Some(decoded.block_hash);
+        frames.push(encode_range_chunk(&Gov5RangeBlockChunk {
+            fork_digest,
+            rlp,
+        })?);
+    }
+    if !stop && frames.len() < expected {
+        frames.push(encode_range_error(2, "block not found")?);
+        stop = true;
+    }
+    Ok(Gov5RangeBatch {
+        frames,
+        last_hash: previous_hash,
+        stop,
+    })
+}
+
+enum Gov5RangeBatchFuture {
+    Blocking(tokio::task::JoinHandle<io::Result<Gov5RangeBatch>>),
+    Ready(io::Result<Gov5RangeBatch>),
+}
+
+impl Gov5RangeBatchFuture {
+    fn spawn(
+        reader: Gov5CanonicalBlockReader,
+        numbers: std::ops::RangeInclusive<u64>,
+        fork_digest: [u8; 4],
+        previous_hash: Option<B256>,
+    ) -> Self {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => Self::Blocking(handle.spawn_blocking(move || {
+                build_gov5_range_batch(&reader, numbers, fork_digest, previous_hash)
+            })),
+            // No runtime (codec unit tests drive the future directly): do the
+            // work inline.
+            Err(_) => Self::Ready(build_gov5_range_batch(
+                &reader,
+                numbers,
+                fork_digest,
+                previous_hash,
+            )),
+        }
+    }
+
+    async fn wait(self) -> io::Result<Gov5RangeBatch> {
+        match self {
+            Self::Blocking(handle) => handle.await.map_err(io::Error::other)?,
+            Self::Ready(batch) => batch,
+        }
+    }
+}
+
+fn gov5_range_batch(start: u64, end: u64) -> std::ops::RangeInclusive<u64> {
+    start..=end.min(start.saturating_add(GOV5_RANGE_BATCH_BLOCKS - 1))
 }
 
 /// Gov5's SSZ `{StartBlockNumber: H256, Count: uint64, Step: uint64}` request.
@@ -383,9 +559,7 @@ fn decode_status_ssz(encoded: &[u8]) -> io::Result<Gov5Status> {
 
 fn encode_status(status: Gov5Status, response: bool) -> io::Result<Vec<u8>> {
     let payload = encode_status_ssz(status);
-    let mut frame = FrameEncoder::new(Vec::new());
-    frame.write_all(&payload)?;
-    let compressed = frame.into_inner().map_err(io::Error::other)?;
+    let compressed = crate::snappy_pool::frame_encode(&payload)?;
     let mut encoded = Vec::with_capacity(1 + 10 + compressed.len());
     if response {
         encoded.push(0);
@@ -425,10 +599,7 @@ fn decode_status(encoded: &[u8], response: bool) -> io::Result<Gov5Status> {
             "gov5 Status payload is missing",
         )
     })?;
-    let mut decoded = Vec::with_capacity(declared_len);
-    FrameDecoder::new(compressed)
-        .take((declared_len + 1) as u64)
-        .read_to_end(&mut decoded)?;
+    let decoded = crate::snappy_pool::frame_decode(compressed, declared_len)?;
     if decoded.len() != declared_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -499,10 +670,9 @@ where
         framed.resize(start + chunk_len, 0);
         io.read_exact(&mut framed[start..]).await?;
 
-        let mut decoded = Vec::with_capacity(declared_len);
-        FrameDecoder::new(framed.as_slice())
-            .take((declared_len + 1) as u64)
-            .read_to_end(&mut decoded)?;
+        // Chunks are complete at this point, so a partial frame decodes to
+        // its prefix; the stream is done once that prefix is the declaration.
+        let decoded = crate::snappy_pool::frame_decode(framed.as_slice(), declared_len)?;
         if decoded.len() == declared_len {
             encoded.extend_from_slice(&framed);
             let status = decode_status(&encoded, response)?;
@@ -556,15 +726,12 @@ fn decode_chunked_block(encoded: &[u8]) -> io::Result<Vec<u8>> {
     let frame = encoded
         .get(5 + prefix_len..)
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing gov5 Snappy frame"))?;
-    let mut decoded = Vec::with_capacity(declared_len);
     // Cap the decompressed stream at the declaration, as the Status paths do.
     // The wire frame is bounded, but Snappy expansion is not: a ~1 MiB frame of
-    // minimal chunks expands to several GiB, and reading it to the end would
-    // exhaust memory before the length check below ever runs. Reading one byte
-    // past the declaration is enough to still detect an over-long payload.
-    FrameDecoder::new(frame)
-        .take((declared_len + 1) as u64)
-        .read_to_end(&mut decoded)?;
+    // minimal chunks expands to several GiB, and decoding it to the end would
+    // exhaust memory before the length check below ever runs. The pooled frame
+    // decoder refuses the first chunk that would cross the declaration.
+    let decoded = crate::snappy_pool::frame_decode(frame, declared_len)?;
     if decoded.len() != declared_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -585,9 +752,7 @@ fn encode_chunked_block(rlp: &[u8], fork_digest: [u8; 4]) -> io::Result<Vec<u8>>
         ));
     }
 
-    let mut frame = FrameEncoder::new(Vec::new());
-    frame.write_all(rlp)?;
-    let compressed = frame.into_inner().map_err(io::Error::other)?;
+    let compressed = crate::snappy_pool::frame_encode(rlp)?;
 
     let mut encoded = Vec::with_capacity(5 + 10 + compressed.len());
     encoded.push(0);
@@ -604,14 +769,15 @@ fn encode_framed_payload(payload: &[u8], max_decoded: usize) -> io::Result<Vec<u
             "Gov5 framed payload exceeds decoded size limit",
         ));
     }
-    let mut frame = FrameEncoder::new(Vec::new());
-    frame.write_all(payload)?;
-    let compressed = frame.into_inner().map_err(io::Error::other)?;
+    let compressed = crate::snappy_pool::frame_encode(payload)?;
     let mut encoded = Vec::with_capacity(10 + compressed.len());
     encode_uvarint(payload.len(), &mut encoded);
     encoded.extend_from_slice(&compressed);
     Ok(encoded)
 }
+
+/// Error text of a framed payload refused at its declared length.
+const FRAMED_PAYLOAD_OVER_LIMIT: &str = "Gov5 framed payload exceeds decoded size limit";
 
 async fn read_framed_payload<T>(
     io: &mut T,
@@ -639,7 +805,7 @@ where
     if declared_len > max_decoded {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Gov5 framed payload exceeds decoded size limit",
+            FRAMED_PAYLOAD_OVER_LIMIT,
         ));
     }
 
@@ -715,10 +881,7 @@ where
         }
     }
 
-    let mut decoded = Vec::with_capacity(declared_len);
-    FrameDecoder::new(&encoded[prefix_len..])
-        .take((declared_len + 1) as u64)
-        .read_to_end(&mut decoded)?;
+    let decoded = crate::snappy_pool::frame_decode(&encoded[prefix_len..], declared_len)?;
     if decoded.len() != declared_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -748,6 +911,72 @@ fn encode_range_error(code: u8, message: &str) -> io::Result<Vec<u8>> {
     Ok(encoded)
 }
 
+/// Read one bodies-by-range response, refusing it once the decoded chunks
+/// together exceed `response_budget` bytes.
+async fn read_range_response<T>(
+    io: &mut T,
+    response_budget: usize,
+) -> io::Result<Gov5BodiesByRangeResponse>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let mut blocks = Vec::new();
+    let mut decoded_total = 0usize;
+    loop {
+        let mut status = [0u8; 1];
+        match io.read(&mut status).await? {
+            0 => return Ok(Gov5BodiesByRangeResponse::Blocks(blocks)),
+            1 if status[0] == 0 => {}
+            1 => {
+                let message =
+                    read_framed_payload(io, MAX_SNAPPY_FRAME_SIZE, MAX_GOV5_BLOCK_SIZE).await?;
+                return Ok(Gov5BodiesByRangeResponse::Error {
+                    code: status[0],
+                    message: String::from_utf8_lossy(&message).into_owned(),
+                });
+            }
+            _ => unreachable!("one-byte read buffer"),
+        }
+        if blocks.len() >= MAX_GOV5_RANGE_BLOCKS as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Gov5 peer served more than 1024 range blocks",
+            ));
+        }
+        let mut fork_digest = [0u8; 4];
+        io.read_exact(&mut fork_digest).await?;
+        // Bound the next chunk by whatever budget is left, so an over-budget
+        // chunk is refused from its declared length rather than after it has
+        // been decoded.
+        let remaining = response_budget.saturating_sub(decoded_total);
+        let rlp = read_framed_payload(
+            io,
+            MAX_GOV5_RANGE_WIRE_SIZE,
+            MAX_GOV5_RANGE_BLOCK_SIZE.min(remaining),
+        )
+        .await
+        .map_err(|error| {
+            // Only the declared-length refusal is a budget refusal; a corrupt
+            // or over-sized single chunk keeps its own message.
+            if error.kind() == io::ErrorKind::InvalidData
+                && remaining < MAX_GOV5_RANGE_BLOCK_SIZE
+                && error.to_string() == FRAMED_PAYLOAD_OVER_LIMIT
+            {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Gov5 range response exceeds the {response_budget}-byte decoded budget: {error}"
+                    ),
+                )
+            } else {
+                error
+            }
+        })?;
+        decoded_total = decoded_total.saturating_add(rlp.len());
+        blocks.push(Gov5RangeBlockChunk { fork_digest, rlp });
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Gov5BodiesByRangeCodec;
 
@@ -772,34 +1001,7 @@ impl request_response::Codec for Gov5BodiesByRangeCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let mut blocks = Vec::new();
-        loop {
-            let mut status = [0u8; 1];
-            match io.read(&mut status).await? {
-                0 => return Ok(Gov5BodiesByRangeResponse::Blocks(blocks)),
-                1 if status[0] == 0 => {}
-                1 => {
-                    let message =
-                        read_framed_payload(io, MAX_SNAPPY_FRAME_SIZE, MAX_GOV5_BLOCK_SIZE).await?;
-                    return Ok(Gov5BodiesByRangeResponse::Error {
-                        code: status[0],
-                        message: String::from_utf8_lossy(&message).into_owned(),
-                    });
-                }
-                _ => unreachable!("one-byte read buffer"),
-            }
-            if blocks.len() >= MAX_GOV5_RANGE_BLOCKS as usize {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Gov5 peer served more than 1024 range blocks",
-                ));
-            }
-            let mut fork_digest = [0u8; 4];
-            io.read_exact(&mut fork_digest).await?;
-            let rlp = read_framed_payload(io, MAX_GOV5_RANGE_WIRE_SIZE, MAX_GOV5_RANGE_BLOCK_SIZE)
-                .await?;
-            blocks.push(Gov5RangeBlockChunk { fork_digest, rlp });
-        }
+        read_range_response(io, MAX_GOV5_RANGE_RESPONSE_BYTES).await
     }
 
     async fn write_request<T>(
@@ -857,54 +1059,30 @@ impl request_response::Codec for Gov5BodiesByRangeCodec {
                     .start
                     .checked_add(request.count - 1)
                     .expect("validated range cannot overflow");
-                let mut previous_hash = None;
-                for number in request.start..=end {
-                    let rlp = match reader.block_rlp_by_number(number) {
-                        Ok(Some(rlp)) => rlp,
-                        Ok(None) => {
-                            io.write_all(&encode_range_error(2, "block not found")?)
-                                .await?;
-                            break;
-                        }
-                        Err(error) => {
-                            io.write_all(&encode_range_error(2, &error)?).await?;
-                            break;
-                        }
-                    };
-                    if rlp.len() > MAX_GOV5_RANGE_BLOCK_SIZE {
-                        io.write_all(&encode_range_error(2, "block exceeds 64 MiB chunk limit")?)
-                            .await?;
-                        break;
+                // Batches are prepared one ahead on a blocking thread: while
+                // batch k streams to the peer, batch k+1 is already being read
+                // and encoded.
+                let mut next_start = request.start;
+                let mut pending = Some(Gov5RangeBatchFuture::spawn(
+                    reader.clone(),
+                    gov5_range_batch(next_start, end),
+                    fork_digest,
+                    None,
+                ));
+                while let Some(current) = pending.take() {
+                    let batch = current.wait().await?;
+                    next_start = gov5_range_batch(next_start, end).end().saturating_add(1);
+                    if !batch.stop && next_start <= end && next_start != 0 {
+                        pending = Some(Gov5RangeBatchFuture::spawn(
+                            reader.clone(),
+                            gov5_range_batch(next_start, end),
+                            fork_digest,
+                            batch.last_hash,
+                        ));
                     }
-                    let decoded = match crate::gov5_block::decode_gov5_block_rlp(&rlp) {
-                        Ok(decoded) => decoded,
-                        Err(error) => {
-                            io.write_all(&encode_range_error(
-                                2,
-                                &format!("invalid canonical block: {error}"),
-                            )?)
-                            .await?;
-                            break;
-                        }
-                    };
-                    if decoded.header.number != number {
-                        io.write_all(&encode_range_error(2, "canonical block number mismatch")?)
-                            .await?;
-                        break;
+                    for frame in &batch.frames {
+                        io.write_all(frame).await?;
                     }
-                    if previous_hash.is_some_and(|previous| decoded.header.parent_hash != previous)
-                    {
-                        // Match gov5: a broken by-number canonical sequence is
-                        // truncated at the linked prefix rather than poisoning
-                        // the requester with a disjoint block.
-                        break;
-                    }
-                    previous_hash = Some(decoded.block_hash);
-                    io.write_all(&encode_range_chunk(&Gov5RangeBlockChunk {
-                        fork_digest,
-                        rlp,
-                    })?)
-                    .await?;
                 }
             }
         }
@@ -1126,7 +1304,10 @@ mod tests {
     use alloy_primitives::{Bytes, U256, keccak256};
     use alloy_rlp::{Encodable, Header as RlpHeader};
     use libp2p::request_response::Codec;
+    use snap::read::FrameDecoder;
+    use snap::write::FrameEncoder;
     use std::collections::HashMap;
+    use std::io::{Read, Write};
     use std::{pin::Pin, task::Poll};
 
     struct NoEof {
@@ -1546,6 +1727,250 @@ mod tests {
         };
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].rlp, block_10);
+    }
+
+    /// Per-chunk limits alone let a peer push 1024 x 64 MiB through one
+    /// response. The whole response has a decoded budget; the chunk that
+    /// would cross it is refused from its declared length.
+    #[test]
+    fn bodies_by_range_response_is_bounded_as_a_whole() {
+        let mut parent = B256::repeat_byte(9);
+        let mut blocks = Vec::new();
+        for number in 1..=4u64 {
+            let (hash, block) = range_block(number, parent);
+            blocks.push(Gov5RangeBlockChunk {
+                fork_digest: [1, 2, 3, 4],
+                rlp: block,
+            });
+            parent = hash;
+        }
+        let total: usize = blocks.iter().map(|chunk| chunk.rlp.len()).sum();
+        let protocol = StreamProtocol::new(GOV5_BODIES_BY_RANGE_PROTOCOL);
+        let mut wire = futures::io::Cursor::new(Vec::new());
+        futures::executor::block_on(Gov5BodiesByRangeCodec.write_response(
+            &protocol,
+            &mut wire,
+            Gov5BodiesByRangeResponse::Blocks(blocks.clone()),
+        ))
+        .unwrap();
+        let wire = wire.into_inner();
+
+        let mut exact = futures::io::Cursor::new(wire.clone());
+        let Gov5BodiesByRangeResponse::Blocks(decoded) =
+            futures::executor::block_on(read_range_response(&mut exact, total)).unwrap()
+        else {
+            panic!("expected block response");
+        };
+        assert_eq!(decoded.len(), 4, "a response exactly on budget is accepted");
+
+        let mut short = futures::io::Cursor::new(wire.clone());
+        let error = futures::executor::block_on(read_range_response(&mut short, total - 1))
+            .expect_err("one byte over budget must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("decoded budget"),
+            "unexpected error: {error}"
+        );
+
+        let mut production = futures::io::Cursor::new(wire);
+        assert!(
+            futures::executor::block_on(
+                Gov5BodiesByRangeCodec.read_response(&protocol, &mut production)
+            )
+            .is_ok(),
+            "the production budget ({MAX_GOV5_RANGE_RESPONSE_BYTES} bytes) admits a small response"
+        );
+        assert_eq!(
+            MAX_GOV5_RANGE_RESPONSE_BYTES,
+            crate::finalized_range::MAX_MATERIALIZED_FINALIZED_RANGE_BYTES
+        );
+    }
+
+    /// Under a Tokio runtime batches are built on blocking threads, one ahead
+    /// of the batch being written; a ranged reader is asked for whole batches
+    /// and a missing block on a batch boundary still ends the stream with the
+    /// gov5 "block not found" error after the linked prefix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bodies_by_range_pipelines_batches_on_blocking_threads() {
+        let missing = 2 * GOV5_RANGE_BATCH_BLOCKS + 1;
+        let mut parent = B256::repeat_byte(9);
+        let mut stored = HashMap::new();
+        for number in 1..=3 * GOV5_RANGE_BATCH_BLOCKS {
+            let (hash, block) = range_block(number, parent);
+            if number != missing {
+                stored.insert(number, block);
+            }
+            parent = hash;
+        }
+        let stored = Arc::new(stored);
+        let reader_blocks = Arc::clone(&stored);
+        let range_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&range_calls);
+        let reader = Gov5CanonicalBlockReader::new_ranged(
+            || Ok(3 * GOV5_RANGE_BATCH_BLOCKS),
+            move |numbers| {
+                observed_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    numbers.end() - numbers.start() < GOV5_RANGE_BATCH_BLOCKS,
+                    "a batch never exceeds {GOV5_RANGE_BATCH_BLOCKS} blocks: {numbers:?}"
+                );
+                let mut rlps = Vec::new();
+                for number in numbers {
+                    match reader_blocks.get(&number) {
+                        Some(block) => rlps.push(block.clone()),
+                        None => break,
+                    }
+                }
+                Ok(rlps)
+            },
+        );
+        assert_eq!(
+            reader.block_rlp_by_number(1).unwrap(),
+            stored.get(&1).cloned()
+        );
+        assert_eq!(reader.block_rlp_by_number(missing).unwrap(), None);
+
+        let protocol = StreamProtocol::new(GOV5_BODIES_BY_RANGE_PROTOCOL);
+        let response = Gov5BodiesByRangeResponse::Stream {
+            request: Gov5BodiesByRangeRequest {
+                start: 1,
+                count: 3 * GOV5_RANGE_BATCH_BLOCKS,
+                step: 1,
+            },
+            fork_digest: [1, 2, 3, 4],
+            reader,
+        };
+        let mut wire = futures::io::Cursor::new(Vec::new());
+        Gov5BodiesByRangeCodec
+            .write_response(&protocol, &mut wire, response)
+            .await
+            .unwrap();
+        assert!(
+            range_calls.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "three batches were requested"
+        );
+
+        // The linked prefix comes back as blocks; the error frame that ends
+        // the stream is what a gov5 client sees after them.
+        let mut wire = futures::io::Cursor::new(wire.into_inner());
+        let mut blocks = Vec::new();
+        loop {
+            let mut status = [0u8; 1];
+            match wire.read(&mut status).await.unwrap() {
+                0 => panic!("stream must end with the gov5 not-found error"),
+                1 if status[0] == 0 => {}
+                1 => {
+                    let message =
+                        read_framed_payload(&mut wire, MAX_SNAPPY_FRAME_SIZE, MAX_GOV5_BLOCK_SIZE)
+                            .await
+                            .unwrap();
+                    assert_eq!(status[0], 2);
+                    assert_eq!(String::from_utf8_lossy(&message), "block not found");
+                    break;
+                }
+                _ => unreachable!(),
+            }
+            let mut fork_digest = [0u8; 4];
+            wire.read_exact(&mut fork_digest).await.unwrap();
+            blocks.push(
+                read_framed_payload(
+                    &mut wire,
+                    MAX_GOV5_RANGE_WIRE_SIZE,
+                    MAX_GOV5_RANGE_BLOCK_SIZE,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        assert_eq!(blocks.len() as u64, missing - 1);
+        assert_eq!(blocks[0], stored[&1]);
+        assert_eq!(blocks.last().unwrap(), &stored[&(missing - 1)]);
+    }
+
+    /// Each batch is read from its own consistent view, so a reorg between
+    /// two batches can hand the second batch a block that is canonical now
+    /// but does not descend from the last block served. The parent-linkage
+    /// check truncates the stream at the batch boundary with a clean end,
+    /// exactly as a mid-batch break would.
+    #[test]
+    fn bodies_by_range_truncates_a_reorg_at_a_batch_boundary() {
+        let first_batch = GOV5_RANGE_BATCH_BLOCKS;
+        let total = 2 * GOV5_RANGE_BATCH_BLOCKS;
+        let mut parent = B256::repeat_byte(9);
+        let mut old_chain = HashMap::new();
+        for number in 1..=first_batch {
+            let (hash, block) = range_block(number, parent);
+            old_chain.insert(number, block);
+            parent = hash;
+        }
+        // The view the second batch sees: numbers 1..=32 still resolve, but
+        // 33 onward belong to a chain that forked below the served tip.
+        let mut new_chain = old_chain.clone();
+        let mut parent = B256::repeat_byte(0x77);
+        for number in first_batch + 1..=total {
+            let (hash, block) = range_block(number, parent);
+            new_chain.insert(number, block);
+            parent = hash;
+        }
+        let views = Arc::new(std::sync::Mutex::new(vec![
+            Arc::new(new_chain),
+            Arc::new(old_chain.clone()),
+        ]));
+        let reader_views = Arc::clone(&views);
+        let reader = Gov5CanonicalBlockReader::new_ranged(
+            move || Ok(total),
+            move |numbers| {
+                // Each batch takes the next view: the first batch the old
+                // chain, the second the reorged one.
+                let view = reader_views
+                    .lock()
+                    .unwrap()
+                    .pop()
+                    .expect("no more than two batches are read");
+                let mut rlps = Vec::new();
+                for number in numbers {
+                    match view.get(&number) {
+                        Some(block) => rlps.push(block.clone()),
+                        None => break,
+                    }
+                }
+                Ok(rlps)
+            },
+        );
+        let response = Gov5BodiesByRangeResponse::Stream {
+            request: Gov5BodiesByRangeRequest {
+                start: 1,
+                count: total,
+                step: 1,
+            },
+            fork_digest: [1, 2, 3, 4],
+            reader,
+        };
+        let protocol = StreamProtocol::new(GOV5_BODIES_BY_RANGE_PROTOCOL);
+        let mut wire = futures::io::Cursor::new(Vec::new());
+        futures::executor::block_on(
+            Gov5BodiesByRangeCodec.write_response(&protocol, &mut wire, response),
+        )
+        .unwrap();
+        assert!(
+            views.lock().unwrap().is_empty(),
+            "both batches must have been read"
+        );
+        let mut wire = futures::io::Cursor::new(wire.into_inner());
+        let Gov5BodiesByRangeResponse::Blocks(decoded) =
+            futures::executor::block_on(Gov5BodiesByRangeCodec.read_response(&protocol, &mut wire))
+                .unwrap()
+        else {
+            panic!("expected block response, not an error frame");
+        };
+        assert_eq!(
+            decoded.len() as u64,
+            first_batch,
+            "only the linked prefix is served"
+        );
+        for (offset, chunk) in decoded.iter().enumerate() {
+            assert_eq!(chunk.rlp, old_chain[&(offset as u64 + 1)]);
+        }
     }
 
     #[test]

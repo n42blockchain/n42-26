@@ -296,6 +296,119 @@ impl ConsensusService {
         self.initiate_sync(from_view.saturating_sub(1), to_view);
     }
 
+    /// The newest consensus-authenticated block that execution has not
+    /// reached: the target of a gov5 execution pull. Committed blocks still
+    /// waiting for execution come first, then any H2-authenticated hash bound
+    /// to a view above the execution-validated head.
+    pub(super) fn gov5_execution_pull_target(&self) -> Option<(B256, u64)> {
+        let floor = self.execution_validated_head_view;
+        let mut best: Option<(B256, u64)> = None;
+        let mut consider = |hash: B256, view: u64| {
+            if view > floor && hash != B256::ZERO && best.is_none_or(|(_, v)| view > v) {
+                best = Some((hash, view));
+            }
+        };
+        for state in self.async_commit_states.values() {
+            if state.stage == super::AsyncCommitStage::Committed {
+                consider(state.block_hash, state.view);
+            }
+        }
+        for block in &self.committed_blocks {
+            consider(block.block_hash, block.view);
+        }
+        for (hash, view) in &self.h2_v4_block_views {
+            consider(*hash, *view);
+        }
+        best
+    }
+
+    /// Under the gov5 profiles no peer speaks N42 state-sync: the fleet's
+    /// members answer only the hash-bound gov5 block fetch, and the catch-up
+    /// staging walks the authenticated ancestry from a fetched block down to
+    /// the durable execution head (the start-up path). When execution falls
+    /// behind the consensus-followed head this is therefore the recovery: pull
+    /// the newest committed-but-unexecuted block by hash and let the staging
+    /// reconnect it to the execution head. Returns `true` when a pull is now
+    /// in flight for the target (newly started or already outstanding).
+    pub(super) fn initiate_gov5_execution_pull(&mut self, reason: &'static str) -> bool {
+        if self.h2_v4_identity.is_none() {
+            return false;
+        }
+        let Some((target_hash, target_view)) = self.gov5_execution_pull_target() else {
+            debug!(
+                target: "n42::interop::h2v4",
+                reason,
+                execution_validated_head_view = self.execution_validated_head_view,
+                "gov5 execution pull: no authenticated block above the execution head"
+            );
+            return false;
+        };
+        if self.h2_v4_fetch_requested_at.contains_key(&target_hash) {
+            debug!(
+                target: "n42::interop::h2v4",
+                reason,
+                %target_hash,
+                target_view,
+                "gov5 execution pull already in flight"
+            );
+            return true;
+        }
+        let mut peers: Vec<PeerId> = self.connected_peers.iter().copied().collect();
+        if peers.is_empty() {
+            warn!(target: "n42::interop::h2v4", reason, "no connected peers for gov5 execution pull");
+            return false;
+        }
+        peers.sort();
+        let peer = peers[(self.gov5_execution_pull_rounds as usize) % peers.len()];
+        self.gov5_execution_pull_rounds = self.gov5_execution_pull_rounds.wrapping_add(1);
+        self.gov5_execution_pull_last_at = Some(Instant::now());
+        self.request_h2_v4_gov5_block(peer, target_hash);
+        let started = self.h2_v4_fetch_requested_at.contains_key(&target_hash);
+        if started {
+            counter!("n42_gov5_execution_pull_started_total", "reason" => reason).increment(1);
+            info!(
+                target: "n42::interop::h2v4",
+                reason,
+                %peer,
+                %target_hash,
+                target_view,
+                execution_head_number = self.head_block_number,
+                execution_head = %self.head_block_hash,
+                execution_validated_head_view = self.execution_validated_head_view,
+                "gov5 range pull started: execution behind consensus"
+            );
+        } else {
+            // The hash is already held locally (pending data, an unbound or a
+            // staged body) or was fulfilled moments ago: execution is not
+            // waiting on the network for it.
+            debug!(
+                target: "n42::interop::h2v4",
+                reason,
+                %target_hash,
+                target_view,
+                "gov5 execution pull not needed: block body already held locally"
+            );
+        }
+        started
+    }
+
+    /// Re-arms the gov5 execution pull while execution stays behind. Called
+    /// on every view change: a pull whose fetch retired without moving the
+    /// execution head (a peer answered with a body already held, the deadline
+    /// retry ran out of peers) would otherwise never be re-issued.
+    pub(super) fn rearm_gov5_execution_pull(&mut self) {
+        if self.h2_v4_identity.is_none() || self.gov5_execution_pull_target().is_none() {
+            return;
+        }
+        if self
+            .gov5_execution_pull_last_at
+            .is_some_and(|last| last.elapsed() < super::H2_V4_FETCH_RETRY_TIMEOUT)
+        {
+            return;
+        }
+        self.initiate_gov5_execution_pull("view_change_execution_lag");
+    }
+
     /// Requests an execution lineage from every connected peer.
     ///
     /// This is narrower than ordinary consensus catch-up: a committed payload
@@ -304,6 +417,12 @@ impl ConsensusService {
     /// an unready request-response stream; fan-out avoids a full sync timeout
     /// while every response remains QC-verified and idempotent.
     pub(super) fn initiate_execution_catchup_sync(&mut self, local_view: u64, target_view: u64) {
+        if self.h2_v4_identity.is_some() {
+            // gov5 members never answer N42 state-sync; the hash-bound pull
+            // is the only lineage source on that network.
+            self.initiate_gov5_execution_pull("execution_catchup");
+            return;
+        }
         self.expire_stale_sync_request();
         if self.sync_in_flight {
             debug!(
@@ -364,6 +483,12 @@ impl ConsensusService {
     /// network layer explicitly rejects unsupported recipients. Responses
     /// remain range-bound, QC-verified, and idempotent.
     pub(super) fn initiate_sync(&mut self, local_view: u64, target_view: u64) {
+        if self.h2_v4_identity.is_some() {
+            // Consensus state follows the fleet's H2 gossip; only execution
+            // can lag, and only the gov5 block fetch can close that gap.
+            self.initiate_gov5_execution_pull("state_sync");
+            return;
+        }
         self.expire_stale_sync_request();
         if self.sync_in_flight {
             debug!(target: "n42::cl::sync", local_view, target_view, "sync already in flight, skipping");

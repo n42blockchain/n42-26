@@ -12,6 +12,7 @@
 
 mod flat;
 pub mod qmdb_compat;
+pub mod qmdb_leaf_tree;
 mod simd;
 
 use flat::FlatIndex;

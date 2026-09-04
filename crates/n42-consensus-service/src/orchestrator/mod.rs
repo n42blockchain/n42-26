@@ -86,6 +86,9 @@ const LEADER_QUORUM_RETRY_MS: u64 = 500;
 /// vote when the collector may have missed the first delivery.
 const DEFAULT_VOTE_RESEND_MS: u64 = 2_000;
 
+/// Minimum spacing between two publishes of a byte-identical H2 message.
+const H2_REBROADCAST_MIN_INTERVAL: Duration = Duration::from_millis(750);
+
 /// A locally signed vote awaiting evidence that the view progressed. Re-sending
 /// the exact bytes is safe because collectors deduplicate by `(view, voter)`.
 #[derive(Clone)]
@@ -104,11 +107,51 @@ enum LeaderBuildWaitMode {
     Scheduled,
 }
 
+thread_local! {
+    // One zstd context per thread. `zstd::bulk::compress`/`decompress` build
+    // and tear down a `ZSTD_CCtx`/`ZSTD_DCtx` (window buffers included) on
+    // every call; a reused context is reset per frame and produces the same
+    // bytes for the same level (see `pooled_zstd_matches_one_shot`).
+    static ZSTD_COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
+        const { std::cell::RefCell::new(None) };
+    static ZSTD_DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// zstd-compress `payload` at `level` with this thread's pooled context.
+pub fn zstd_compress_pooled(payload: &[u8], level: i32) -> std::io::Result<Vec<u8>> {
+    ZSTD_COMPRESSOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(zstd::bulk::Compressor::new(level)?);
+        }
+        let compressor = slot.as_mut().expect("compressor was just created");
+        // The level is process-wide in practice (`payload_zstd_level` is
+        // cached), but keep the context honest if a caller passes another.
+        compressor.set_compression_level(level)?;
+        compressor.compress(payload)
+    })
+}
+
+/// zstd-decompress `data` into at most `capacity` bytes with this thread's
+/// pooled context.
+pub fn zstd_decompress_pooled(data: &[u8], capacity: usize) -> std::io::Result<Vec<u8>> {
+    ZSTD_DECOMPRESSOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(zstd::bulk::Decompressor::new()?);
+        }
+        slot.as_mut()
+            .expect("decompressor was just created")
+            .decompress(data, capacity)
+    })
+}
+
 /// Compress a block-data component with zstd. Production keeps level 3; throughput
 /// qualification can choose a faster level through `N42_ZSTD_LEVEL`.
 pub fn compress_payload(payload: &[u8]) -> Vec<u8> {
     let level = payload_zstd_level();
-    zstd::bulk::compress(payload, level).unwrap_or_else(|e| {
+    zstd_compress_pooled(payload, level).unwrap_or_else(|e| {
         tracing::warn!(target: "n42::cl", len = payload.len(), error = %e, "zstd compression failed, sending uncompressed");
         payload.to_vec()
     })
@@ -145,7 +188,7 @@ fn payload_zstd_level() -> i32 {
 /// Backward-compatible with old nodes that sent uncompressed JSON.
 pub fn decompress_payload(data: &[u8]) -> std::io::Result<Vec<u8>> {
     if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
-        zstd::bulk::decompress(data, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE)
+        zstd_decompress_pooled(data, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     } else {
         Ok(data.to_vec())
@@ -722,6 +765,12 @@ pub struct ConsensusService {
     /// that a consensus-authenticated body is retried even if no failure event
     /// can be emitted for a command that was suppressed before transmission.
     h2_v4_fetch_requested_at: HashMap<B256, (Instant, PeerId)>,
+    /// Round-robin cursor over connected peers for the gov5 execution pull
+    /// (see `state_mgmt::initiate_gov5_execution_pull`).
+    gov5_execution_pull_rounds: u64,
+    /// When the last gov5 execution pull was issued; throttles the per-view
+    /// re-arm to one pull per fetch deadline.
+    gov5_execution_pull_last_at: Option<Instant>,
     /// Recently delivered block hashes. This mirrors the network-layer
     /// fulfillment tombstones because request commands are fire-and-forget:
     /// a network-side suppression cannot otherwise stop this orchestrator from
@@ -921,6 +970,24 @@ pub struct ConsensusService {
     /// Last R1/R2 vote sent in the current view. If direct delivery was lost and
     /// the view has not advanced, retry it periodically to the collector.
     pending_vote_resend: Option<PendingVoteResend>,
+    /// Last H2 publish time per distinct encoded message. An identical
+    /// message is published at most once per `H2_REBROADCAST_MIN_INTERVAL`:
+    /// on the H2 transport every broadcast is a gossip publish plus one direct
+    /// stream to every validator, so any echo between this node and its peers
+    /// (a relayed timeout answered with a timeout, a duplicate that a peer
+    /// re-forwards) amplifies into hundreds of streams per second, exhausts
+    /// request-response capacity on both ends and starves block delivery
+    /// (observed on chain 94: 3,151 dropped inbound streams in 40 s, then no
+    /// block bodies for 20 minutes). Intentional resends run at 2 s and 12 s.
+    recent_h2_broadcasts: std::sync::Mutex<HashMap<[u8; 32], Instant>>,
+    /// gov5's simulated committee pool when the chain's genesis enables one.
+    /// A leader then stamps `parentBeaconRoot = Blake3(parent evidence)` into
+    /// the payload it builds, as gov5's `Prepare` does; without the parent's
+    /// native header the build is refused rather than stamped wrongly.
+    committee_pool: Option<Arc<n42_consensus::SimulatedCommitteePool>>,
+    /// The member cannot seal a gov5 block (no local QMDB root); never start a
+    /// payload build, let the view time out like an absent validator.
+    leader_disabled: bool,
     /// Per-block pipeline timing tracker. Populated incrementally as events flow
     /// through the orchestrator. Logged and emitted as metrics at commit time.
     /// Bounded to 32 entries; older entries are evicted.
@@ -1468,11 +1535,7 @@ impl ConsensusService {
         let block_hash = block.block_hash;
         let block_number = block.header.number;
         let block_timestamp = block.header.timestamp;
-        let execution_data = match crate::replay_import::build_gov5_execution_data(
-            block_hash,
-            &block.header,
-            &block.transactions,
-        ) {
+        let execution_data = match crate::replay_import::build_gov5_gossip_execution_data(&block) {
             Ok(data) => data,
             Err(error) => {
                 error!(target: "n42::interop::h2v4", %source, %block_hash, block_number, view, %error, "could not reconstruct authenticated Gov5 catch-up payload");
@@ -1573,10 +1636,8 @@ impl ConsensusService {
         block: n42_network::Gov5GossipBlock,
         view: u64,
     ) {
-        let mut execution_data = match crate::replay_import::build_gov5_execution_data(
-            block.block_hash,
-            &block.header,
-            &block.transactions,
+        let mut execution_data = match crate::replay_import::build_gov5_gossip_execution_data(
+            &block,
         ) {
             Ok(data) => data,
             Err(error) => {
@@ -1622,6 +1683,27 @@ impl ConsensusService {
         }
     }
 
+    /// Returns true when an identical H2 message was published less than
+    /// `H2_REBROADCAST_MIN_INTERVAL` ago; records the publish otherwise.
+    fn h2_rebroadcast_suppressed(&self, encoded: &[u8]) -> bool {
+        let key = *blake3::hash(encoded).as_bytes();
+        let now = Instant::now();
+        let mut recent = self
+            .recent_h2_broadcasts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(last) = recent.get(&key)
+            && now.duration_since(*last) < H2_REBROADCAST_MIN_INTERVAL
+        {
+            return true;
+        }
+        if recent.len() >= 512 {
+            recent.retain(|_, sent| now.duration_since(*sent) < Duration::from_secs(10));
+        }
+        recent.insert(key, now);
+        false
+    }
+
     fn broadcast_engine_consensus(&self, message: ConsensusMessage) -> Result<(), NetworkError> {
         #[cfg(debug_assertions)]
         let mut message = message;
@@ -1654,6 +1736,14 @@ impl ConsensusService {
                 n42_network::consensus_to_h2_v4(identity, &message).map_err(|error| {
                     NetworkError::Codec(format!("H2-v4 consensus conversion failed: {error}"))
                 })?;
+            let encoded = n42_network::h2_wire::encode_gov5_gossip_message(&envelope.message)
+                .map_err(|error| NetworkError::Codec(format!("H2 encoding failed: {error}")))?;
+            if self.h2_rebroadcast_suppressed(&encoded) {
+                counter!("n42_h2_v4_rebroadcasts_suppressed_total", "kind" => envelope.message.kind().as_str())
+                    .increment(1);
+                debug!(target: "n42::interop::h2v4", kind = envelope.message.kind().as_str(), "suppressed identical H2 rebroadcast");
+                return Ok(());
+            }
             self.network.broadcast_h2_v4(envelope)
         } else {
             self.network.broadcast_consensus(message)
@@ -2470,6 +2560,8 @@ impl ConsensusService {
             h2_v4_catchup_active: false,
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
+            gov5_execution_pull_rounds: 0,
+            gov5_execution_pull_last_at: None,
             h2_v4_fetch_fulfilled_at: HashMap::new(),
             network,
             consensus_event_rx: None,
@@ -2549,6 +2641,9 @@ impl ConsensusService {
             tx_forward_buffer: Vec::new(),
             tx_forward_missing_leader_warned_view: None,
             pending_vote_resend: None,
+            recent_h2_broadcasts: std::sync::Mutex::new(HashMap::new()),
+            leader_disabled: false,
+            committee_pool: None,
             pipeline_timings: HashMap::new(),
             last_commit_instant: None,
             last_commit_view: None,
@@ -2719,6 +2814,8 @@ impl ConsensusService {
             h2_v4_catchup_active: false,
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
+            gov5_execution_pull_rounds: 0,
+            gov5_execution_pull_last_at: None,
             h2_v4_fetch_fulfilled_at: HashMap::new(),
             network,
             consensus_event_rx: Some(consensus_event_rx),
@@ -2798,6 +2895,9 @@ impl ConsensusService {
             tx_forward_buffer: Vec::new(),
             tx_forward_missing_leader_warned_view: None,
             pending_vote_resend: None,
+            recent_h2_broadcasts: std::sync::Mutex::new(HashMap::new()),
+            leader_disabled: false,
+            committee_pool: None,
             pipeline_timings: HashMap::new(),
             last_commit_instant: None,
             last_commit_view: None,
@@ -2839,6 +2939,30 @@ impl ConsensusService {
     ) -> Self {
         self.engine.enable_h2_v4_signing(identity);
         self.h2_v4_identity = Some(identity);
+        self
+    }
+
+    /// Stamps gov5's committee-evidence root into every payload this node
+    /// builds (`parentBeaconRoot = Blake3(parent evidence)`); the execution
+    /// side verifies the same link on import.
+    pub fn with_committee_pool(mut self, pool: Arc<n42_consensus::SimulatedCommitteePool>) -> Self {
+        self.committee_pool = Some(pool);
+        self
+    }
+
+    /// Keeps the H2 transport of [`Self::with_h2_v4_participant`] but signs
+    /// and verifies with gov5's pre-interopV4 domains, for a fleet whose
+    /// chainspec does not set `hotstuff.interopV4`.
+    pub fn with_gov5_legacy_signing(mut self) -> Self {
+        self.engine.enable_gov5_legacy_signing();
+        self
+    }
+
+    /// Never build a payload as leader (a member without a local QMDB root
+    /// cannot seal a gov5 block); its leader views time out like an absent
+    /// validator's while it keeps importing and voting.
+    pub fn with_leader_disabled(mut self) -> Self {
+        self.leader_disabled = true;
         self
     }
 
@@ -2959,6 +3083,14 @@ impl ConsensusService {
     pub fn with_recovered_commit_qc(mut self, qc: QuorumCertificate) -> Self {
         self.prev_randao_cache = alloy_primitives::keccak256(qc.aggregate_signature.to_bytes());
         self.last_commit_qc = Some(qc);
+        self
+    }
+
+    /// Seed the build timestamp floor from the authenticated execution head.
+    /// A restarted fast local chain can be ahead of wall time; retrying from
+    /// wall time alone then rejects every leader until the clock catches up.
+    pub fn with_recovered_head_timestamp(mut self, timestamp: u64) -> Self {
+        self.last_committed_timestamp = self.last_committed_timestamp.max(timestamp);
         self
     }
 
@@ -3111,6 +3243,7 @@ impl ConsensusService {
                     // This handles the case where FCU returned SYNCING earlier and
                     // the leader couldn't propose, causing a permanent stall.
                     if self.engine.is_current_leader()
+                        && !self.leader_disabled
                         && self.next_build_at.is_none()
                         && self.speculative_build_hash.is_none()
                     {
@@ -6424,6 +6557,268 @@ mod tests {
         );
     }
 
+    // === gov5 execution pull (devlog-142 stall follow-up) ===
+
+    /// Both network channels: `RequestSync` travels on the ordinary command
+    /// channel, `RequestGov5BlockByHash` on the priority channel.
+    struct TestNetworkRx {
+        cmd_rx: mpsc::Receiver<NetworkCommand>,
+        prx: mpsc::Receiver<NetworkCommand>,
+    }
+
+    fn gov5_lag_orchestrator(
+        gov5: bool,
+    ) -> (ConsensusService, TestNetworkRx, libp2p::PeerId, B256) {
+        let (engine, output_rx) = make_test_engine();
+        let (network, cmd_rx, prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        if gov5 {
+            orch = orch.with_h2_v4_participant(test_h2_identity());
+        }
+        let peer = libp2p::PeerId::random();
+        orch.connected_peers.insert(peer);
+        // Execution validated view 10 at head 0xAA; the fleet committed view 12
+        // whose body never reached this member (`pending_data=false`).
+        orch.execution_validated_head_view = 10;
+        orch.head_block_hash = B256::repeat_byte(0xAA);
+        orch.head_block_number = 13_562_197;
+        let committed_hash = B256::repeat_byte(0xC1);
+        orch.async_commit_states.insert(
+            12,
+            AsyncCommitState {
+                view: 12,
+                block_hash: committed_hash,
+                commit_qc: QuorumCertificate::genesis(),
+                stage: AsyncCommitStage::Committed,
+                finalize_in_flight: false,
+                committed_at: Instant::now(),
+            },
+        );
+        (orch, TestNetworkRx { cmd_rx, prx }, peer, committed_hash)
+    }
+
+    fn drain_commands(rx: &mut TestNetworkRx) -> Vec<NetworkCommand> {
+        let mut out = Vec::new();
+        while let Ok(command) = rx.cmd_rx.try_recv() {
+            out.push(command);
+        }
+        while let Ok(command) = rx.prx.try_recv() {
+            out.push(command);
+        }
+        out
+    }
+
+    fn counter_value(
+        snapshotter: &metrics_util::debugging::Snapshotter,
+        name: &str,
+        label: (&str, &str),
+    ) -> u64 {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(key, _, _, value)| {
+                let key = key.key();
+                (key.name() == name
+                    && key
+                        .labels()
+                        .any(|l| l.key() == label.0 && l.value() == label.1))
+                .then_some(match value {
+                    DebugValue::Counter(count) => count,
+                    _ => 0,
+                })
+            })
+            .unwrap_or(0)
+    }
+
+    /// The commit-execution deadline (the trigger seen in the 06:27 stall)
+    /// must pull the committed block by hash from a gov5 peer, not fan out an
+    /// N42 state-sync that no gov5 member answers.
+    #[tokio::test(flavor = "current_thread")]
+    async fn gov5_execution_lag_pulls_by_hash_and_never_requests_state_sync() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let (mut orch, mut cmd_rx, peer, committed_hash) = gov5_lag_orchestrator(true);
+
+        orch.handle_commit_execution_timeout(12, committed_hash);
+
+        assert!(
+            !orch.sync_in_flight,
+            "gov5 members must never own an N42 state-sync request"
+        );
+        assert!(orch.sync_requested_peers.is_empty());
+        assert!(
+            orch.h2_v4_fetch_requested_at.contains_key(&committed_hash),
+            "the committed block is tracked as an authenticated gov5 fetch"
+        );
+        let commands = drain_commands(&mut cmd_rx);
+        assert_eq!(commands.len(), 1, "exactly one pull: {commands:?}");
+        match &commands[0] {
+            NetworkCommand::RequestGov5BlockByHash {
+                peer: requested_peer,
+                block_hash,
+            } => {
+                assert_eq!(*requested_peer, peer);
+                assert_eq!(*block_hash, committed_hash);
+            }
+            other => panic!("expected a gov5 block-by-hash pull, got {other:?}"),
+        }
+        assert_eq!(
+            counter_value(
+                &snapshotter,
+                "n42_gov5_execution_pull_started_total",
+                ("reason", "execution_catchup"),
+            ),
+            1
+        );
+    }
+
+    /// Without the gov5 profile the pre-existing recovery is untouched: the
+    /// deadline fans out the N42 execution catch-up request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn standard_profile_execution_lag_still_uses_state_sync() {
+        let (mut orch, mut cmd_rx, _peer, committed_hash) = gov5_lag_orchestrator(false);
+
+        orch.handle_commit_execution_timeout(12, committed_hash);
+
+        assert!(
+            orch.sync_in_flight,
+            "standard profile keeps the state-sync fan-out"
+        );
+        assert!(orch.h2_v4_fetch_requested_at.is_empty());
+        let commands = drain_commands(&mut cmd_rx);
+        assert!(
+            matches!(commands.as_slice(), [NetworkCommand::RequestSync { .. }]),
+            "expected one state-sync request, got {commands:?}"
+        );
+    }
+
+    /// Every sync entry point (execution catch-up, state sync, the per-view
+    /// re-arm) converges on one outstanding pull per target hash.
+    #[tokio::test(flavor = "current_thread")]
+    async fn gov5_execution_pull_is_not_duplicated_while_in_flight() {
+        let (mut orch, mut cmd_rx, _peer, committed_hash) = gov5_lag_orchestrator(true);
+
+        assert!(orch.initiate_gov5_execution_pull("execution_catchup"));
+        orch.initiate_execution_catchup_sync(10, 12);
+        orch.initiate_sync(10, 12);
+        assert!(
+            orch.initiate_gov5_execution_pull("state_sync"),
+            "still in flight"
+        );
+        orch.rearm_gov5_execution_pull();
+        orch.handle_view_changed(13).await;
+
+        assert!(!orch.sync_in_flight);
+        assert_eq!(orch.h2_v4_fetch_requested_at.len(), 1);
+        assert_eq!(
+            orch.gov5_execution_pull_rounds, 1,
+            "one peer draw for one pull"
+        );
+        let commands = drain_commands(&mut cmd_rx);
+        let pulls = commands
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    NetworkCommand::RequestGov5BlockByHash { block_hash, .. } if *block_hash == committed_hash
+                )
+            })
+            .count();
+        assert_eq!(
+            pulls, 1,
+            "one network pull for one in-flight target: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, NetworkCommand::RequestSync { .. })),
+            "no state-sync under the gov5 profile: {commands:?}"
+        );
+    }
+
+    /// The pull targets the newest authenticated block above the execution
+    /// head (its ancestry walk covers everything below it), and nothing is
+    /// pulled once execution has caught up.
+    #[tokio::test(flavor = "current_thread")]
+    async fn gov5_execution_pull_targets_newest_authenticated_block_and_stops_when_caught_up() {
+        let (mut orch, mut cmd_rx, _peer, committed_hash) = gov5_lag_orchestrator(true);
+        let newer_hash = B256::repeat_byte(0xC5);
+        orch.h2_v4_block_views.insert(newer_hash, 15);
+        // Parent sentinels (view 0) are never a target.
+        orch.h2_v4_block_views.insert(B256::repeat_byte(0xC4), 0);
+        assert_eq!(orch.gov5_execution_pull_target(), Some((newer_hash, 15)));
+
+        orch.initiate_execution_catchup_sync(10, 15);
+        let commands = drain_commands(&mut cmd_rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [NetworkCommand::RequestGov5BlockByHash { block_hash, .. }] if *block_hash == newer_hash
+            ),
+            "newest authenticated block is pulled: {commands:?}"
+        );
+        assert!(!orch.h2_v4_fetch_requested_at.contains_key(&committed_hash));
+
+        // Execution reaches the fleet's head: nothing above it, no pull.
+        orch.h2_v4_fetch_requested_at.clear();
+        orch.execution_validated_head_view = 15;
+        assert_eq!(orch.gov5_execution_pull_target(), None);
+        orch.gov5_execution_pull_last_at = None;
+        assert!(!orch.initiate_gov5_execution_pull("execution_catchup"));
+        orch.rearm_gov5_execution_pull();
+        assert!(drain_commands(&mut cmd_rx).is_empty());
+    }
+
+    /// A pull whose fetch retired without moving the execution head is
+    /// re-issued on a later view change, throttled to one per fetch deadline
+    /// and rotated to the next peer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn gov5_execution_pull_rearms_on_view_change_after_the_fetch_retired() {
+        let (mut orch, mut cmd_rx, first_peer, committed_hash) = gov5_lag_orchestrator(true);
+        let second_peer = libp2p::PeerId::random();
+        orch.connected_peers.insert(second_peer);
+
+        orch.handle_commit_execution_timeout(12, committed_hash);
+        let first = drain_commands(&mut cmd_rx);
+        assert_eq!(first.len(), 1);
+
+        // The fetch retired (deadline retry exhausted / body discarded) but
+        // execution is still behind; within the throttle nothing happens.
+        orch.h2_v4_fetch_requested_at.clear();
+        orch.handle_view_changed(13).await;
+        assert!(
+            drain_commands(&mut cmd_rx).is_empty(),
+            "throttled inside the fetch deadline"
+        );
+
+        orch.gov5_execution_pull_last_at =
+            Some(Instant::now() - H2_V4_FETCH_RETRY_TIMEOUT - Duration::from_millis(1));
+        orch.handle_view_changed(14).await;
+        let second = drain_commands(&mut cmd_rx);
+        let peers_used: Vec<_> = first
+            .iter()
+            .chain(second.iter())
+            .filter_map(|command| match command {
+                NetworkCommand::RequestGov5BlockByHash { peer, block_hash }
+                    if *block_hash == committed_hash =>
+                {
+                    Some(*peer)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(peers_used.len(), 2, "re-armed exactly once: {second:?}");
+        assert_ne!(
+            peers_used[0], peers_used[1],
+            "the re-arm rotates to the other peer"
+        );
+        assert!(peers_used.contains(&first_peer) && peers_used.contains(&second_peer));
+        assert!(!orch.sync_in_flight);
+    }
+
     #[test]
     fn executed_h2_history_cannot_exhaust_the_bounded_catchup_suffix() {
         let (engine, output_rx) = make_test_engine();
@@ -6716,6 +7111,22 @@ mod tests {
         let orch = orch.with_recovered_commit_qc(qc);
         assert_eq!(orch.prev_randao_cache, expected);
         assert!(orch.last_commit_qc.is_some());
+    }
+
+    #[test]
+    fn recovered_head_timestamp_keeps_first_build_above_durable_parent() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_recovered_head_timestamp(2_000_000_000);
+        let attrs = orch.build_payload_attributes(Some(1_900_000_000), B256::ZERO);
+        assert_eq!(attrs.timestamp, 2_000_000_001);
+        let mut orch = orch.with_recovered_head_timestamp(1);
+        assert_eq!(
+            orch.build_payload_attributes(Some(1), B256::ZERO).timestamp,
+            2_000_000_001
+        );
     }
 
     #[test]
@@ -8338,5 +8749,117 @@ mod tests {
                     (key.key().name() == "n42_eager_import_rescued_total").then_some(value)
                 });
         assert_eq!(rescued, Some(DebugValue::Counter(1)));
+    }
+    /// Block-like bytes for codec tests: runs of repeated values mixed with
+    /// noise, so zstd sees both matches and literals.
+    fn codec_sample(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let run = (state % 64) as usize + 1;
+            let byte = (state >> 32) as u8;
+            if state & 1 == 0 {
+                out.extend(std::iter::repeat_n(byte, run.min(len - out.len())));
+            } else {
+                for offset in 0..run.min(len - out.len()) {
+                    out.push(
+                        byte.wrapping_mul(31)
+                            .wrapping_add(offset as u8 ^ (state as u8)),
+                    );
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn pooled_zstd_matches_one_shot() {
+        let level = payload_zstd_level();
+        for len in [0usize, 1, 100, 4_096, 131_072, 1 << 20, 3 << 20] {
+            let payload = codec_sample(len, len as u64);
+            let one_shot = zstd::bulk::compress(&payload, level).unwrap();
+            // Twice: the second call exercises the reused context.
+            for round in 0..2 {
+                let pooled = compress_payload(&payload);
+                assert_eq!(pooled, one_shot, "len {len} round {round}");
+                assert_eq!(
+                    decompress_payload(&pooled).unwrap(),
+                    payload,
+                    "len {len} round {round}"
+                );
+            }
+            assert_eq!(
+                zstd_decompress_pooled(&one_shot, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE).unwrap(),
+                zstd::bulk::decompress(&one_shot, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE).unwrap()
+            );
+        }
+        // A different level on the same thread must not leak the previous one.
+        let payload = codec_sample(1 << 20, 99);
+        assert_eq!(
+            zstd_compress_pooled(&payload, 1).unwrap(),
+            zstd::bulk::compress(&payload, 1).unwrap()
+        );
+        assert_eq!(
+            zstd_compress_pooled(&payload, level).unwrap(),
+            zstd::bulk::compress(&payload, level).unwrap()
+        );
+    }
+
+    /// Timing only. `cargo test -p n42-consensus-service zstd_pool_bench --release -- --ignored --nocapture`
+    #[test]
+    #[ignore = "measurement, not a correctness gate"]
+    fn zstd_pool_bench() {
+        let level = payload_zstd_level();
+        for (label, len) in [
+            ("16 KiB", 16usize << 10),
+            ("1 MiB", 1usize << 20),
+            ("12 MiB", 12usize << 20),
+        ] {
+            let payload = codec_sample(len, len as u64);
+            let iterations: u32 = if len > (4 << 20) {
+                10
+            } else if len >= (1 << 20) {
+                50
+            } else {
+                2_000
+            };
+            let compressed = zstd::bulk::compress(&payload, level).unwrap();
+
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(zstd::bulk::compress(&payload, level).unwrap());
+            }
+            let old_compress = started.elapsed() / iterations;
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(zstd_compress_pooled(&payload, level).unwrap());
+            }
+            let new_compress = started.elapsed() / iterations;
+
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(
+                    zstd::bulk::decompress(&compressed, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE)
+                        .unwrap(),
+                );
+            }
+            let old_decompress = started.elapsed() / iterations;
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(
+                    zstd_decompress_pooled(&compressed, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE)
+                        .unwrap(),
+                );
+            }
+            let new_decompress = started.elapsed() / iterations;
+            println!(
+                "zstd level {level} {label} ({} -> {} bytes, {iterations} iterations):\n  compress   {old_compress:?} -> {new_compress:?}\n  decompress {old_decompress:?} -> {new_decompress:?}",
+                payload.len(),
+                compressed.len()
+            );
+        }
     }
 }

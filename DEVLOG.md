@@ -12,6 +12,7 @@ Logs are split into separate files by phase for easy maintenance:
 
 | File | Content | Phase |
 |------|---------|-------|
+| [devlog-144-independent-chain94-fleet-20260904](docs/devlog-144-independent-chain94-fleet-20260904.md) | Gov5 历史快照上的纯 Rust 七节点独立舰队、原生出块、重启验收 | Deployment |
 | [devlog-141-three-month-audit-20260904](docs/devlog-141-three-month-audit-20260904.md) | 三个月审计：SBMT 证明边界、Gov5 误封禁/缓存、崩溃恢复、n42-rs 对照优化 | Audit |
 | [devlog-01-foundation](docs/devlog-01-foundation.md) | Phase 1-6: Execution, Consensus, Network, Mobile Verify, Integration | Foundation |
 | [devlog-02-integration-test](docs/devlog-02-integration-test.md) | Phase 7-15: E2E Integration, Testing, Feature Completion | Integration |
@@ -171,6 +172,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-136-h2-v4-batch-verification](docs/devlog-136-h2-v4-batch-verification.md) | H2-v4 补齐随机系数批量验签：域与单验函数绑成 Ciphersuite 值避免 fallback 用错域，实测纯验签 7 节点 4.84x／500 节点 23.18x | Performance |
 | [devlog-137-branch-convergence-audit-20260807](docs/devlog-137-branch-convergence-audit-20260807.md) | 两条长期分支（gov5-live 238 提交 + security-refresh 12 提交）收敛合并到 20260804 依赖基线 + 深度审计：未认证 gossip 撤销 Gov5 fetch（高）、伪造签名钩子进生产二进制（高）、匿名 gossip 信封作用域过宽、缓存随机驱逐、清理过期 RUSTSEC ignore | Security |
 | [devlog-138-gov5-h2v4-brief-followup](docs/devlog-138-gov5-h2v4-brief-followup.md) | 按 gov5 H2-v4 hand-off brief 收口：fixture CRLF 隐患 + 原始字节 SHA 门禁、补 canonical payload 检查与五条拒绝路径、v4 签名硬编码零 changes_hash（原为日志声称但代码未做，committee 变更时会与 gov5 互拒） | Interop |
+| [devlog-140-erigon-borrow-20260828](docs/devlog-140-erigon-borrow-20260828.md) | 借鉴 Erigon 三月变更六项落地：QMDB WAL fsync 移出 state 锁（提交锁持有 1.49→0.42 ms）+ 持久 WAL 句柄/fsync 与 tip-cache 指标、Block-STM 执行/abort/回退计数（强制冲突每 tx 执行 12.6 次）、zstd/Snappy 上下文复用（小帧 −43%~−65%，大负载噪声内）、gov5 range 响应 256 MiB 总预算 + 全保护 live cache 不再驱逐 index 0、range 服务端每批一个 ConsistentProvider + spawn_blocking 预取、手机 witness 父块为 head 时用 tip 状态 | Performance |
 | [devlog-112-dependency-refresh-reth-2.4.1](docs/devlog-112-dependency-refresh-reth-2.4.1.md) | 2026-07-21 稳定依赖刷新：固定 N42 Reth 2.4.1 配对提交，升级可独立迁移的 Cargo 依赖，并保留 replay/共识/SP1 格式钉住项 | Maintenance |
 | [devlog-118-audit-and-deps-20260804](docs/devlog-118-audit-and-deps-20260804.md) | v0.5.x 收尾 4 提交增量审计（1 minor 修复：越界测试绑常量）+ reth fork 合并上游 75 提交（20260804）+ 全依赖升级（revm 42/alloy 2.3/alloy-evm 0.38/rpt 0.6/rand 0.10/lru 0.18/toml 1.1），仅 2 处 API 适配 | Audit |
 | [devlog-119-post-merge-audit-20260806](docs/devlog-119-post-merge-audit-20260806.md) | 合并后审计：HIGH-1 守卫补 observer 第 5 消费点、blob 广播发送/接收尺寸漂移修复（共享常量 + 分帧）、ingest 批字节上限；compact 缓存生命周期与 twig 缓冲复用核查为清 | Audit |

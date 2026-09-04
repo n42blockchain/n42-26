@@ -14,6 +14,7 @@ pub mod h2_wire;
 pub mod mobile;
 pub mod reconnection;
 pub mod service;
+pub mod snappy_pool;
 pub mod state_sync;
 pub mod transport;
 pub mod tx_forward;

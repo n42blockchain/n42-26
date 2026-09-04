@@ -12,7 +12,9 @@ use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::{ConfigureEvm, execute::Executor};
 use reth_primitives_traits::{BlockBody, NodePrimitives};
 use reth_provider::BlockHashReader;
-use reth_storage_api::{BlockReader, StateProviderFactory, TransactionVariant};
+use reth_storage_api::{
+    BlockNumReader, BlockReader, StateProviderBox, StateProviderFactory, TransactionVariant,
+};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc,
@@ -236,6 +238,91 @@ pub async fn mobile_packet_loop<P>(
     info!("mobile packet generation loop stopped (channel closed)");
 }
 
+/// Which state a witness was generated against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WitnessStateSource {
+    /// The parent is the canonical head: the tip state provider serves reads
+    /// from the in-memory overlay without per-key history lookups.
+    Tip,
+    /// Any other parent: the historical provider at that block.
+    Historical,
+}
+
+impl WitnessStateSource {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Tip => "tip",
+            Self::Historical => "historical",
+        }
+    }
+}
+
+fn canonical_head<P>(provider: &P) -> Option<(u64, B256)>
+where
+    P: BlockNumReader + BlockHashReader,
+{
+    let number = provider.best_block_number().ok()?;
+    let hash = provider.block_hash(number).ok()??;
+    Some((number, hash))
+}
+
+/// Whether `state` is exactly the state after `parent_hash` at
+/// `parent_number`: it knows the parent under that number and nothing after
+/// it. Asked of the state provider itself, so the answer cannot lag it.
+fn state_is_at(state: &StateProviderBox, parent_number: u64, parent_hash: B256) -> bool {
+    let at_parent =
+        matches!(state.block_hash(parent_number), Ok(Some(hash)) if hash == parent_hash);
+    let nothing_after = matches!(
+        parent_number
+            .checked_add(1)
+            .map(|next| state.block_hash(next)),
+        Some(Ok(None))
+    );
+    at_parent && nothing_after
+}
+
+/// Pick the parent state a witness executes against.
+///
+/// When `parent_hash` is the canonical head, `latest()` is the same state as
+/// `history_by_block_hash(parent_hash)` but skips the block-number lookup,
+/// the canonical check and the historical overlay setup.
+///
+/// The head check alone is not enough: `best_block_number()` reads the chain
+/// info tracker while `latest()` reads the in-memory block map, and the
+/// engine updates the map before the tracker, so for a moment the tracker
+/// still names the parent while `latest()` already includes its child (and
+/// re-reading the tracker afterwards would still name the parent). The state
+/// provider is therefore asked which blocks it knows; the historical path is
+/// used unless it knows the parent and nothing after it.
+fn parent_state_provider<P>(
+    provider: &P,
+    parent_hash: B256,
+) -> Result<(StateProviderBox, WitnessStateSource), MobilePacketError>
+where
+    P: StateProviderFactory + BlockNumReader + BlockHashReader,
+{
+    if let Some((parent_number, head_hash)) = canonical_head(provider)
+        && head_hash == parent_hash
+    {
+        let latest = provider
+            .latest()
+            .map_err(|e| MobilePacketError::StateProvider(e.to_string()))?;
+        if state_is_at(&latest, parent_number, parent_hash) {
+            metrics::counter!("n42_mobile_witness_state_source_total", "source" => "tip")
+                .increment(1);
+            return Ok((latest, WitnessStateSource::Tip));
+        }
+        metrics::counter!("n42_mobile_witness_state_source_total", "source" => "tip_moved")
+            .increment(1);
+    }
+    let state = provider
+        .history_by_block_hash(parent_hash)
+        .map_err(|e| MobilePacketError::StateProvider(e.to_string()))?;
+    metrics::counter!("n42_mobile_witness_state_source_total", "source" => "historical")
+        .increment(1);
+    Ok((state, WitnessStateSource::Historical))
+}
+
 /// Generates a V2 stream packet and broadcasts it.
 ///
 /// Flow: fetch block → get parent state → wrap with ReadLogDatabase → execute
@@ -264,9 +351,7 @@ where
             .ok_or(MobilePacketError::BlockNotFound(block_hash))?;
 
         let parent_hash = recovered_block.header().parent_hash();
-        let state_provider = provider
-            .history_by_block_hash(parent_hash)
-            .map_err(|e| MobilePacketError::StateProvider(e.to_string()))?;
+        let (state_provider, state_source) = parent_state_provider(provider, parent_hash)?;
 
         let inner_db = reth_revm::database::StateProviderDatabase::new(&state_provider);
         let logged_db = ReadLogDatabase::new(inner_db);
@@ -334,6 +419,7 @@ where
 
         debug!(
             block_number,
+            state_source = state_source.label(),
             read_log_entries = read_log_count,
             read_log_bytes = packet.read_log_data.len(),
             bytecodes = packet.bytecodes.len(),
@@ -421,6 +507,190 @@ where
 mod tests {
     use super::*;
     use alloy_primitives::{B256, Bytes};
+
+    #[test]
+    fn witness_state_source_uses_the_tip_only_for_the_canonical_head() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use reth_provider::test_utils::MockEthProvider;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let provider = MockEthProvider::default();
+        let older = B256::repeat_byte(0x11);
+        let head = B256::repeat_byte(0x22);
+        for (number, hash) in [(6u64, older), (7, head)] {
+            provider.add_block(
+                hash,
+                reth_ethereum_primitives::Block {
+                    header: alloy_consensus::Header {
+                        number,
+                        ..Default::default()
+                    },
+                    body: Default::default(),
+                },
+            );
+        }
+        assert_eq!(canonical_head(&provider), Some((7, head)));
+
+        let (_, source) = parent_state_provider(&provider, head).unwrap();
+        assert_eq!(source, WitnessStateSource::Tip);
+        let (_, source) = parent_state_provider(&provider, older).unwrap();
+        assert_eq!(source, WitnessStateSource::Historical);
+        let (_, source) = parent_state_provider(&provider, B256::repeat_byte(0x33)).unwrap();
+        assert_eq!(source, WitnessStateSource::Historical);
+
+        let counts: HashMap<String, u64> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(key, _, _, _)| key.key().name() == "n42_mobile_witness_state_source_total")
+            .map(|(key, _, _, value)| {
+                let source = key
+                    .key()
+                    .labels()
+                    .find(|label| label.key() == "source")
+                    .map(|label| label.value().to_string())
+                    .unwrap();
+                let DebugValue::Counter(count) = value else {
+                    panic!("counter expected");
+                };
+                (source, count)
+            })
+            .collect();
+        assert_eq!(counts.get("tip"), Some(&1));
+        assert_eq!(counts.get("historical"), Some(&2));
+    }
+
+    /// The engine updates the in-memory block map before the chain info
+    /// tracker, so `best_block_number()` can still name the parent while
+    /// `latest()` already carries its child. That window must take the
+    /// historical path: a witness against the child's state is wrong.
+    #[test]
+    fn witness_state_source_falls_back_when_the_tip_state_is_ahead_of_the_head() {
+        use alloy_eips::{BlockNumHash, BlockNumberOrTag};
+        use reth_provider::test_utils::MockEthProvider;
+        use reth_storage_api::{BlockIdReader, StateProviderBox};
+
+        /// `head` answers the chain-info questions, `tip` serves `latest()`.
+        struct LaggingHead {
+            head: MockEthProvider,
+            tip: MockEthProvider,
+        }
+
+        impl BlockHashReader for LaggingHead {
+            fn block_hash(&self, number: u64) -> reth_provider::ProviderResult<Option<B256>> {
+                self.head.block_hash(number)
+            }
+            fn canonical_hashes_range(
+                &self,
+                start: u64,
+                end: u64,
+            ) -> reth_provider::ProviderResult<Vec<B256>> {
+                self.head.canonical_hashes_range(start, end)
+            }
+        }
+
+        impl BlockNumReader for LaggingHead {
+            fn chain_info(&self) -> reth_provider::ProviderResult<reth_chainspec::ChainInfo> {
+                self.head.chain_info()
+            }
+            fn best_block_number(&self) -> reth_provider::ProviderResult<u64> {
+                self.head.best_block_number()
+            }
+            fn last_block_number(&self) -> reth_provider::ProviderResult<u64> {
+                self.head.last_block_number()
+            }
+            fn block_number(&self, hash: B256) -> reth_provider::ProviderResult<Option<u64>> {
+                self.head.block_number(hash)
+            }
+        }
+
+        impl BlockIdReader for LaggingHead {
+            fn pending_block_num_hash(
+                &self,
+            ) -> reth_provider::ProviderResult<Option<BlockNumHash>> {
+                self.head.pending_block_num_hash()
+            }
+            fn safe_block_num_hash(&self) -> reth_provider::ProviderResult<Option<BlockNumHash>> {
+                self.head.safe_block_num_hash()
+            }
+            fn finalized_block_num_hash(
+                &self,
+            ) -> reth_provider::ProviderResult<Option<BlockNumHash>> {
+                self.head.finalized_block_num_hash()
+            }
+        }
+
+        impl StateProviderFactory for LaggingHead {
+            fn latest(&self) -> reth_provider::ProviderResult<StateProviderBox> {
+                self.tip.latest()
+            }
+            fn state_by_block_number_or_tag(
+                &self,
+                number_or_tag: BlockNumberOrTag,
+            ) -> reth_provider::ProviderResult<StateProviderBox> {
+                self.head.state_by_block_number_or_tag(number_or_tag)
+            }
+            fn history_by_block_number(
+                &self,
+                block: u64,
+            ) -> reth_provider::ProviderResult<StateProviderBox> {
+                self.head.history_by_block_number(block)
+            }
+            fn history_by_block_hash(
+                &self,
+                block: B256,
+            ) -> reth_provider::ProviderResult<StateProviderBox> {
+                self.head.history_by_block_hash(block)
+            }
+            fn state_by_block_hash(
+                &self,
+                block: B256,
+            ) -> reth_provider::ProviderResult<StateProviderBox> {
+                self.head.state_by_block_hash(block)
+            }
+            fn pending(&self) -> reth_provider::ProviderResult<StateProviderBox> {
+                self.head.pending()
+            }
+            fn pending_state_by_hash(
+                &self,
+                block_hash: B256,
+            ) -> reth_provider::ProviderResult<Option<StateProviderBox>> {
+                self.head.pending_state_by_hash(block_hash)
+            }
+            fn maybe_pending(&self) -> reth_provider::ProviderResult<Option<StateProviderBox>> {
+                self.head.maybe_pending()
+            }
+        }
+
+        let parent = B256::repeat_byte(0x22);
+        let child = B256::repeat_byte(0x33);
+        let block = |number: u64| reth_ethereum_primitives::Block {
+            header: alloy_consensus::Header {
+                number,
+                ..Default::default()
+            },
+            body: Default::default(),
+        };
+        let head = MockEthProvider::default();
+        head.add_block(parent, block(7));
+        let tip = MockEthProvider::default();
+        tip.add_block(parent, block(7));
+        tip.add_block(child, block(8));
+        let provider = LaggingHead { head, tip };
+        assert_eq!(canonical_head(&provider), Some((7, parent)));
+
+        let (state, source) = parent_state_provider(&provider, parent).unwrap();
+        assert_eq!(source, WitnessStateSource::Historical);
+        assert_eq!(state.block_hash(8).unwrap(), None);
+
+        // Once the tracker catches up the tip state is used again.
+        provider.head.add_block(child, block(8));
+        let (_, source) = parent_state_provider(&provider, child).unwrap();
+        assert_eq!(source, WitnessStateSource::Tip);
+    }
 
     #[test]
     fn test_code_cache_insert_and_contains() {

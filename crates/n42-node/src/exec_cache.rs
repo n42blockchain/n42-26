@@ -17,13 +17,18 @@ pub use n42_consensus_service::exec_cache::ExecutionOutputCache;
 /// In-process adapter over reth's global `reth_evm::payload_cache`.
 pub struct RethExecutionOutputCache {
     qmdb_store: Option<Arc<crate::qmdb_state_root::Gov5QmdbStateRootStore>>,
+    chain_spec: Arc<reth_chainspec::ChainSpec>,
 }
 
 impl RethExecutionOutputCache {
     pub const fn new(
         qmdb_store: Option<Arc<crate::qmdb_state_root::Gov5QmdbStateRootStore>>,
+        chain_spec: Arc<reth_chainspec::ChainSpec>,
     ) -> Self {
-        Self { qmdb_store }
+        Self {
+            qmdb_store,
+            chain_spec,
+        }
     }
 }
 
@@ -34,10 +39,9 @@ impl ExecutionOutputCache for RethExecutionOutputCache {
 
     fn take_gov5_normalization(
         &self,
-        hash: B256,
-        parent_hash: B256,
+        execution: &alloy_rpc_types_engine::ExecutionData,
     ) -> Option<(B256, B256, Vec<u8>)> {
-        take_gov5_normalization_output(&hash, parent_hash, self.qmdb_store.as_deref())
+        take_gov5_normalization_output(execution, self.qmdb_store.as_deref(), &self.chain_spec)
     }
 
     fn inject(&self, hash: B256, compressed: &[u8], source: &'static str) -> bool {
@@ -158,14 +162,29 @@ fn serialize_execution_output(
 /// commitment to exactly the same execution output that will be re-keyed under
 /// the normalized H2 block hash.
 fn take_gov5_normalization_output(
-    hash: &B256,
-    parent_hash: B256,
+    execution: &alloy_rpc_types_engine::ExecutionData,
     qmdb_store: Option<&crate::qmdb_state_root::Gov5QmdbStateRootStore>,
+    chain_spec: &reth_chainspec::ChainSpec,
 ) -> Option<(B256, B256, Vec<u8>)> {
+    let hash = &execution.block_hash();
+    let parent_hash = execution.parent_hash();
     let (output, senders) =
         reth_evm::payload_cache::take_broadcast_execution::<CachedPayloadData>(hash)?;
     let receipts_root = n42_network::gov5_native_receipts_root(&output.result.receipts);
-    let operations = crate::qmdb_state::gov5_qmdb_operations_from_output(&output);
+    let payload = execution.payload.as_v1();
+    let key = n42_execution::restored_slots_key(
+        parent_hash,
+        payload.transactions.iter().map(alloy_primitives::keccak256),
+    );
+    let restored = n42_execution::restored_slots_for(key).unwrap_or_default();
+    let mut operations =
+        crate::qmdb_state::gov5_qmdb_operations_with_restored(&output.state, &restored);
+    if reth_chainspec::EthereumHardforks::is_prague_active_at_timestamp(
+        chain_spec,
+        payload.timestamp,
+    ) {
+        crate::qmdb_state::with_gov5_prague_system_caller(&mut operations);
+    }
     let state_root = match qmdb_store {
         Some(store) => match store.compute_candidate(parent_hash, &operations) {
             Ok(root) => root,

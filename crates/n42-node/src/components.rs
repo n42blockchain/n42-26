@@ -1,5 +1,8 @@
 use arc_swap::ArcSwapOption;
-use n42_consensus::{N42Consensus, N42HeaderProfile, ValidatorSet, ValidatorSetResolver};
+use n42_consensus::{
+    CommitteePoolConfig, N42Consensus, N42HeaderProfile, ValidatorSet, ValidatorSetResolver,
+    shared_committee_pool,
+};
 use n42_execution::N42EvmConfig;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_ethereum_primitives::EthPrimitives;
@@ -88,7 +91,38 @@ where
     async fn build_consensus(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::Consensus> {
         let chain_spec = ctx.chain_spec();
 
-        let consensus = if let Some(validator_set) = self.validator_set {
+        // gov5's committee-evidence link: when the genesis enables
+        // `hotstuff.committeePool`, every header's parentBeaconRoot must be
+        // Blake3 of the parent's simulated evidence. The 200k-key pool is
+        // derived once per process and shared with the block builder.
+        let committee_pool = if self.header_profile == N42HeaderProfile::Gov5H2 {
+            match CommitteePoolConfig::from_genesis(chain_spec.genesis())? {
+                Some(config) => {
+                    let started = std::time::Instant::now();
+                    let pool = shared_committee_pool(&config)?;
+                    info!(
+                        target: "n42::consensus",
+                        pool_size = config.pool_size,
+                        committee_size = config.committee_size,
+                        ramp_blocks = config.ramp_blocks,
+                        derive_ms = started.elapsed().as_millis() as u64,
+                        "gov5 committee pool ready: parentBeaconRoot is verified against rebuilt committee evidence"
+                    );
+                    Some(pool)
+                }
+                None => {
+                    info!(
+                        target: "n42::consensus",
+                        "genesis has no enabled hotstuff.committeePool: parentBeaconRoot is not checked against committee evidence"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut consensus = if let Some(validator_set) = self.validator_set {
             let current = validator_set.load_full();
             info!(
                 target: "n42::consensus",
@@ -106,6 +140,9 @@ where
             info!(target: "n42::consensus", "No initial validators configured, QC verification disabled");
             N42Consensus::new(chain_spec).with_header_profile(self.header_profile)
         };
+        if let Some(pool) = committee_pool {
+            consensus = consensus.with_committee_pool(pool);
+        }
 
         Ok(Arc::new(consensus))
     }

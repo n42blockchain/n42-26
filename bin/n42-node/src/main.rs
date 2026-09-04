@@ -64,6 +64,60 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+/// Serve gov5 bodies-by-range from one consistent storage view per batch.
+///
+/// `block_by_number` and `block_hash` on the blockchain provider each take
+/// their own snapshot, so a reorg or a persistence step between the two calls
+/// could pair a body with another block's canonical hash;
+/// `encode_gov5_block_rlp` would then reject the pair via its `hash_slow()`
+/// check and the whole range would fail. A `ConsistentProvider` pins one
+/// database read transaction plus one in-memory canonical snapshot for the
+/// batch; it is dropped before the batch is written to the peer so the read
+/// transaction never outlives the socket pacing.
+fn gov5_canonical_block_reader<N>(
+    provider: reth_provider::providers::BlockchainProvider<N>,
+) -> n42_network::Gov5CanonicalBlockReader
+where
+    N: reth_provider::providers::ProviderNodeTypes<
+            Primitives = reth_ethereum_primitives::EthPrimitives,
+        >,
+{
+    let best_provider = provider.clone();
+    n42_network::Gov5CanonicalBlockReader::new_ranged(
+        move || {
+            best_provider
+                .best_block_number()
+                .map_err(|error| error.to_string())
+        },
+        move |numbers| {
+            let view = provider
+                .consistent_provider()
+                .map_err(|error| error.to_string())?;
+            let mut rlps = Vec::with_capacity(numbers.size_hint().0);
+            for number in numbers {
+                let Some(block) = view
+                    .block_by_number(number)
+                    .map_err(|error| error.to_string())?
+                else {
+                    break;
+                };
+                let block_hash = view
+                    .block_hash(number)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| {
+                        format!("canonical hash is missing for persisted block {number}")
+                    })?;
+                let execution = ExecutionData::from_block_unchecked(block_hash, &block);
+                rlps.push(
+                    n42_network::encode_gov5_block_rlp(&execution)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            Ok(rlps)
+        },
+    )
+}
+
 fn env_bool(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -100,6 +154,22 @@ fn activate_gov5_pos_execution(chain: &mut ChainSpec) {
     chain.genesis.config.terminal_total_difficulty = Some(U256::ZERO);
     chain.genesis.config.merge_netsplit_block = Some(0);
     debug_assert!(chain.is_paris_active_at_block(0));
+}
+
+/// gov5 runs Prague from its `pectraTime` (EIP-2935 history storage, the
+/// EIP-7002/7251 end-of-block system calls, EIP-7702), which the chain-94
+/// genesis file carries under a name reth does not read. The QMDB root of every
+/// gov5 block includes those writes, so a member that recomputes roots must run
+/// the same fork: `N42_GOV5_PRAGUE_TIME=<unix seconds>` activates it. Recorded
+/// chain-94 blocks 13,560,376..13,565,343 reproduce their roots only with it.
+fn apply_gov5_prague_time(chain: &mut ChainSpec) -> Option<u64> {
+    let prague_time = env_parse::<u64>("N42_GOV5_PRAGUE_TIME")?;
+    chain.hardforks.insert(
+        EthereumHardfork::Prague,
+        ForkCondition::Timestamp(prague_time),
+    );
+    chain.genesis.config.prague_time = Some(prague_time);
+    Some(prague_time)
 }
 
 fn resolve_observer_genesis_hash(
@@ -393,6 +463,209 @@ fn load_gov5_genesis_execution_bootstrap(
     })
 }
 
+/// Establish a gov5 applied head as the execution base from a leaf-form (v2)
+/// QMDB export — the only snapshot a fleet node that reclaims dead entry rows
+/// can write (chain 94: 63 M slots, 6 M live). The split commitment is
+/// rebuilt (every twig's leaves folded against its frozen leaf root, every
+/// live entry against its leaf, the upper root against the header), bound to
+/// the chain (chain id, genesis, the genesis allocation's leaf prefix in twig
+/// zero) and, when the caller names one, to an expected (block, hash, root).
+/// Once verified the tree is written back next to the branch checkpoint in
+/// its hollow form (sealed twigs as leaf root plus bits, ~ 700 MB for chain
+/// 94), and later starts read that file instead of the export.
+#[allow(clippy::too_many_arguments)]
+fn load_gov5_leaf_form_execution_bootstrap(
+    leaf_form_path: Option<&Path>,
+    genesis_range_path: &Path,
+    genesis: &Genesis,
+    chain_id: u64,
+    genesis_hash: B256,
+    expected: Option<(u64, B256, B256)>,
+    branch_state_path: &Path,
+    max_replay_depth: usize,
+) -> eyre::Result<QmdbExecutionBootstrap> {
+    use n42_node::qmdb_state_root::{QmdbBaseIdentity, base_file_path};
+    use n42_twig_core::hash_leaf;
+
+    let header_genesis_tree = gov5_qmdb_genesis_tree(genesis)
+        .map_err(|error| eyre::eyre!("failed to build Gov5 QMDB genesis state: {error}"))?;
+    let replay_execution_genesis = gov5_replay_execution_genesis(genesis);
+    let replay_genesis_tree =
+        gov5_qmdb_genesis_tree(&replay_execution_genesis).map_err(|error| {
+            eyre::eyre!("failed to build Gov5 replay-v2 execution genesis state: {error}")
+        })?;
+    let prefix_count = header_genesis_tree
+        .snapshot()
+        .entries
+        .len()
+        .max(replay_genesis_tree.snapshot().entries.len());
+
+    let base_file = base_file_path(branch_state_path);
+    let (source, from_base_file) = if base_file.is_file() {
+        (base_file.clone(), true)
+    } else {
+        let path = leaf_form_path.ok_or_else(|| {
+            eyre::eyre!(
+                "no QMDB base file at {} and N42_GOV5_QMDB_LEAF_FORM is not set",
+                base_file.display()
+            )
+        })?;
+        (path.to_path_buf(), false)
+    };
+    let started = std::time::Instant::now();
+    let (tree, header) = Gov5QmdbStateRootStore::read_base_file_with_prefix(&source, prefix_count)
+        .map_err(|error| {
+            eyre::eyre!(
+                "failed to load QMDB leaf form {}: {error}",
+                source.display()
+            )
+        })?;
+    if header.chain_id != chain_id || B256::from(header.genesis_hash) != genesis_hash {
+        return Err(eyre::eyre!(
+            "QMDB leaf form {} belongs to chain {} / genesis {}, not chain {chain_id} / {genesis_hash}",
+            source.display(),
+            header.chain_id,
+            B256::from(header.genesis_hash)
+        ));
+    }
+    let base_block_hash = B256::from(header.block_hash);
+    let base_root = B256::from(header.root);
+    if let Some((block, hash, root)) = expected
+        && (header.block_number != block || base_block_hash != hash || base_root != root)
+    {
+        return Err(eyre::eyre!(
+            "QMDB leaf form {} is block {} ({base_block_hash}, root {base_root}); expected block {block} ({hash}, root {root})",
+            source.display(),
+            header.block_number
+        ));
+    }
+
+    let range_file = File::open(genesis_range_path).map_err(|error| {
+        eyre::eyre!(
+            "failed to open Gov5 genesis range {}: {error}",
+            genesis_range_path.display()
+        )
+    })?;
+    let range = decode_finalized_range_stream(BufReader::new(range_file), chain_id, genesis_hash)
+        .map_err(|error| eyre::eyre!("failed to verify Gov5 genesis range: {error}"))?;
+    let genesis_entry = range
+        .entries()
+        .first()
+        .filter(|entry| entry.number() == 0 && entry.block_hash() == genesis_hash)
+        .ok_or_else(|| {
+            eyre::eyre!("Gov5 genesis range must start with the configured block zero")
+        })?;
+    let header_genesis_root = B256::from(header_genesis_tree.root());
+    if header_genesis_root != genesis_entry.state_root() {
+        return Err(eyre::eyre!(
+            "configured genesis alloc produces QMDB root {header_genesis_root}, but authenticated Gov5 block zero commits {}",
+            genesis_entry.state_root()
+        ));
+    }
+    // The leaf hashes of twig zero are frozen forever, so the first slots of
+    // the export identify the allocation the chain was seeded from, exactly
+    // as the positional prefix did for the v1 snapshot. A base file written
+    // by this node carries no twig-zero leaves; the check ran when the export
+    // it came from was verified.
+    let prefix_matches = |snapshot: &n42_twig_core::qmdb_compat::QmdbSnapshot| -> bool {
+        header.genesis_prefix_leaves.len() >= snapshot.entries.len()
+            && snapshot
+                .entries
+                .iter()
+                .zip(&header.genesis_prefix_leaves)
+                .all(|(entry, leaf)| hash_leaf(&entry.key, &entry.value) == *leaf)
+    };
+    let (execution_genesis, execution_profile) = if header.genesis_prefix_leaves.is_empty() {
+        if !from_base_file {
+            return Err(eyre::eyre!(
+                "QMDB leaf form {} carries no twig-zero leaves; the genesis prefix cannot be checked",
+                source.display()
+            ));
+        }
+        // The profile was resolved when the export was verified; the fleet
+        // profile is recorded by the persisted execution genesis.
+        let profile =
+            std::env::var("N42_GOV5_QMDB_EXECUTION_PROFILE").unwrap_or_else(|_| "native".into());
+        match profile.as_str() {
+            "replay-v2" => (replay_execution_genesis, "replay-v2"),
+            _ => (genesis.clone(), "native"),
+        }
+    } else if prefix_matches(&replay_genesis_tree.snapshot()) {
+        (replay_execution_genesis, "replay-v2")
+    } else if prefix_matches(&header_genesis_tree.snapshot()) {
+        (genesis.clone(), "native")
+    } else {
+        return Err(eyre::eyre!(
+            "QMDB leaf form matches neither the native nor replay-v2 authenticated genesis prefix"
+        ));
+    };
+    let store = Gov5QmdbStateRootStore::persistent_from_leaf_tree(
+        base_block_hash,
+        base_root,
+        tree,
+        max_replay_depth,
+        branch_state_path.to_path_buf(),
+    )
+    .map_err(|error| eyre::eyre!("failed to initialize QMDB leaf-form store: {error}"))?
+    .with_identity(QmdbBaseIdentity {
+        chain_id,
+        genesis_hash,
+        block_number: header.block_number,
+    });
+    let (live, next_slot, twigs) = store
+        .tree_stats()
+        .map_err(|error| eyre::eyre!("QMDB store: {error}"))?;
+    info!(
+        target: "n42::cli",
+        source = %source.display(),
+        from_base_file,
+        block = header.block_number,
+        %base_block_hash,
+        %base_root,
+        live,
+        next_slot,
+        twigs,
+        execution_profile,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "QMDB split commitment rebuilt from the leaf form and verified against its root"
+    );
+    if !from_base_file {
+        let written = std::time::Instant::now();
+        match store.write_base_file() {
+            Ok(Some((at, number))) => info!(
+                target: "n42::cli",
+                path = %base_file.display(),
+                block = number,
+                %at,
+                elapsed_ms = written.elapsed().as_millis() as u64,
+                "QMDB base file written; later starts read it instead of the export"
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                warn!(target: "n42::cli", %error, "QMDB base file could not be written; the export stays required")
+            }
+        }
+    }
+    Ok(QmdbExecutionBootstrap {
+        store: Arc::new(store),
+        checkpoint: QmdbPortableVerification {
+            chain_id,
+            genesis_hash: genesis_hash.0,
+            block_number: header.block_number,
+            block_hash: header.block_hash,
+            root: header.root,
+            next_slot: header.next_slot,
+            live_count: header.live,
+        },
+        base_block_number: header.block_number,
+        base_block_hash,
+        base_root,
+        genesis_header: genesis_entry.header().clone(),
+        execution_genesis,
+        execution_profile,
+    })
+}
+
 fn required_observer_env<T>(name: &str) -> eyre::Result<T>
 where
     T: std::str::FromStr,
@@ -602,7 +875,8 @@ fn connect_trusted_peers(net_handle: &n42_network::NetworkHandle) {
 /// gov5 topology already reserves a separate TCP port.
 fn listen_gov5_tcp(net_service: &mut NetworkService, default_port: u16) -> eyre::Result<()> {
     let tcp_port = env_parse("N42_GOV5_TCP_PORT").unwrap_or(default_port);
-    let listen_addr: libp2p::Multiaddr = format!("/ip4/0.0.0.0/tcp/{tcp_port}")
+    let listen_ip = n42_listen_ip()?;
+    let listen_addr: libp2p::Multiaddr = format!("/ip4/{listen_ip}/tcp/{tcp_port}")
         .parse()
         .map_err(|error| eyre::eyre!("failed to parse Gov5 TCP listen address: {error}"))?;
     if let Err(error) = net_service.listen_on(listen_addr.clone()) {
@@ -620,6 +894,13 @@ fn listen_gov5_tcp(net_service: &mut NetworkService, default_port: u16) -> eyre:
         );
     }
     Ok(())
+}
+
+fn n42_listen_ip() -> eyre::Result<std::net::Ipv4Addr> {
+    std::env::var("N42_LISTEN_IP")
+        .unwrap_or_else(|_| "0.0.0.0".into())
+        .parse()
+        .map_err(|error| eyre::eyre!("invalid N42_LISTEN_IP: {error}"))
 }
 
 fn build_epoch_manager(
@@ -1115,6 +1396,11 @@ fn main() {
                 "checkpoint-start participant mode cannot replay the same finalized bootstrap"
             ));
         }
+        let leaf_form_env = std::env::var("N42_GOV5_QMDB_LEAF_FORM").ok();
+        let leaf_form_base_present = n42_node::qmdb_state_root::base_file_path(
+            &data_dir.join("gov5_qmdb_branches.bin"),
+        )
+        .is_file();
         let qmdb_execution = if env_bool("N42_GOV5_QMDB_EXECUTION")
             || bootstrap_bundle.is_some()
         {
@@ -1130,6 +1416,62 @@ fn main() {
                     "N42_GOV5_QMDB_EXECUTION requires observer or H2-v4 participant mode and N42_GOV5_HEADER_PROFILE=1"
                 ));
             }
+            if bootstrap_bundle.is_none() && (leaf_form_env.is_some() || leaf_form_base_present) {
+                // Checkpoint-anchored execution with a locally rebuilt split
+                // commitment: the leaf-form export of a fleet node's applied
+                // head, or the base file a previous start wrote from it.
+                let genesis_range = std::env::var("N42_GOV5_GENESIS_BOOTSTRAP").map_err(|_| {
+                    eyre::eyre!(
+                        "N42_GOV5_GENESIS_BOOTSTRAP is required with N42_GOV5_QMDB_LEAF_FORM"
+                    )
+                })?;
+                let expected = match (
+                    env_parse::<u64>("N42_QMDB_BOOTSTRAP_BLOCK"),
+                    env_parse::<B256>("N42_QMDB_BOOTSTRAP_BLOCK_HASH"),
+                    env_parse::<B256>("N42_QMDB_BOOTSTRAP_ROOT"),
+                ) {
+                    (Some(block), Some(hash), Some(root)) => Some((block, hash, root)),
+                    (None, None, None) => None,
+                    _ => {
+                        return Err(eyre::eyre!(
+                            "N42_QMDB_BOOTSTRAP_BLOCK, _BLOCK_HASH and _ROOT must be set together"
+                        ));
+                    }
+                };
+                let max_replay_depth =
+                    env_parse("N42_QMDB_REPLAY_DEPTH").unwrap_or(DEFAULT_QMDB_REPLAY_DEPTH);
+                let loaded = load_gov5_leaf_form_execution_bootstrap(
+                    leaf_form_env.as_deref().map(Path::new),
+                    Path::new(&genesis_range),
+                    &builder.config().chain.genesis,
+                    builder.config().chain.chain.id(),
+                    interop_genesis,
+                    expected,
+                    &data_dir.join("gov5_qmdb_branches.bin"),
+                    max_replay_depth,
+                )?;
+                let chain = Arc::make_mut(&mut builder.config_mut().chain);
+                chain.genesis = loaded.execution_genesis.clone();
+                chain.genesis_header =
+                    SealedHeader::new(loaded.genesis_header.clone(), interop_genesis);
+                activate_gov5_pos_execution(chain);
+                if let Some(prague_time) = apply_gov5_prague_time(chain) {
+                    info!(target: "n42::cli", prague_time, "Prague activated for gov5 execution (N42_GOV5_PRAGUE_TIME)");
+                }
+                info!(
+                    target: "n42::cli",
+                    genesis_range,
+                    base_block = loaded.base_block_number,
+                    base_hash = %loaded.base_block_hash,
+                    base_root = %loaded.base_root,
+                    execution_profile = loaded.execution_profile,
+                    slots = loaded.checkpoint.next_slot,
+                    live = loaded.checkpoint.live_count,
+                    archive_floor = loaded.base_block_number,
+                    "prepared Gov5 checkpoint-anchored QMDB Engine Tree execution base (leaf form); state roots are recomputed"
+                );
+                Some(loaded)
+            } else {
             let (
                 path,
                 genesis_range,
@@ -1187,6 +1529,9 @@ fn main() {
             chain.genesis_header =
                 SealedHeader::new(loaded.genesis_header.clone(), interop_genesis);
             activate_gov5_pos_execution(chain);
+            if let Some(prague_time) = apply_gov5_prague_time(chain) {
+                info!(target: "n42::cli", prague_time, "Prague activated for gov5 execution (N42_GOV5_PRAGUE_TIME)");
+            }
             info!(
                 target: "n42::cli",
                 path,
@@ -1203,12 +1548,76 @@ fn main() {
                 "prepared Gov5 block-zero QMDB Engine Tree execution base"
             );
             Some(loaded)
+            }
         } else {
             None
         };
-        if h2_v4_participant && qmdb_execution.is_none() {
+        // Checkpoint-anchored execution without a local QMDB forest: the
+        // execution layer was initialised at a gov5 applied head by
+        // `n42-init-snapshot`, every block is still fully executed, but the
+        // state root is taken from the proposer. The only mode available on
+        // a chain whose slot log the portable snapshot cannot carry.
+        let trusted_state_root_base = if env_bool("N42_GOV5_STATE_ROOT_TRUST") {
+            if qmdb_execution.is_some() {
+                return Err(eyre::eyre!(
+                    "N42_GOV5_STATE_ROOT_TRUST and N42_GOV5_QMDB_EXECUTION are mutually exclusive"
+                ));
+            }
+            if !(observer_mode || h2_v4_participant)
+                || header_profile != N42HeaderProfile::Gov5H2
+            {
+                return Err(eyre::eyre!(
+                    "N42_GOV5_STATE_ROOT_TRUST requires observer or H2-v4 participant mode and N42_GOV5_HEADER_PROFILE=1"
+                ));
+            }
+            if builder.config().prune_config().is_some() {
+                return Err(eyre::eyre!(
+                    "checkpoint-anchored gov5 execution rejects all CLI pruning options"
+                ));
+            }
+            let base_block = required_observer_env::<u64>("N42_GOV5_TRUSTED_BASE_BLOCK")?;
+            let base_hash = required_observer_env::<B256>("N42_GOV5_TRUSTED_BASE_HASH")?;
+            let base_root = required_observer_env::<B256>("N42_GOV5_TRUSTED_BASE_ROOT")?;
+            let genesis_range = std::env::var("N42_GOV5_GENESIS_BOOTSTRAP").map_err(|_| {
+                eyre::eyre!("N42_GOV5_GENESIS_BOOTSTRAP is required with N42_GOV5_STATE_ROOT_TRUST")
+            })?;
+            let range_file = File::open(&genesis_range).map_err(|error| {
+                eyre::eyre!("failed to open Gov5 genesis range {genesis_range}: {error}")
+            })?;
+            let range = decode_finalized_range_stream(
+                BufReader::new(range_file),
+                builder.config().chain.chain.id(),
+                interop_genesis,
+            )
+            .map_err(|error| eyre::eyre!("failed to verify Gov5 genesis range: {error}"))?;
+            let genesis_entry = range
+                .entries()
+                .first()
+                .filter(|entry| entry.number() == 0 && entry.block_hash() == interop_genesis)
+                .ok_or_else(|| {
+                    eyre::eyre!("Gov5 genesis range must start with the configured block zero")
+                })?;
+            let chain = Arc::make_mut(&mut builder.config_mut().chain);
+            chain.genesis_header =
+                SealedHeader::new(genesis_entry.header().clone(), interop_genesis);
+            activate_gov5_pos_execution(chain);
+            if let Some(prague_time) = apply_gov5_prague_time(chain) {
+                info!(target: "n42::cli", prague_time, "Prague activated for gov5 execution (N42_GOV5_PRAGUE_TIME)");
+            }
+            warn!(
+                target: "n42::cli",
+                base_block,
+                %base_hash,
+                %base_root,
+                "N42_GOV5_STATE_ROOT_TRUST=1: state roots are taken from proposers; transactions, receipts, gas and rewards are executed and checked, the QMDB root is not"
+            );
+            Some((base_block, base_hash, base_root))
+        } else {
+            None
+        };
+        if h2_v4_participant && qmdb_execution.is_none() && trusted_state_root_base.is_none() {
             return Err(eyre::eyre!(
-                "N42_GOV5_H2_PARTICIPANT requires N42_GOV5_QMDB_EXECUTION=1"
+                "N42_GOV5_H2_PARTICIPANT requires N42_GOV5_QMDB_EXECUTION=1 or N42_GOV5_STATE_ROOT_TRUST=1"
             ));
         }
         let allow_deterministic_validator_peers =
@@ -1406,13 +1815,19 @@ fn main() {
         if let Some(bootstrap) = &qmdb_execution {
             n42_node = n42_node.with_gov5_qmdb_state_root_store(bootstrap.store.clone());
         }
-        let qmdb_execution_base = qmdb_execution.as_ref().map(|bootstrap| {
-            (
-                bootstrap.base_block_number,
-                bootstrap.base_block_hash,
-                bootstrap.base_root,
-            )
-        });
+        if trusted_state_root_base.is_some() {
+            n42_node = n42_node.with_gov5_trusted_state_root();
+        }
+        let qmdb_execution_base = qmdb_execution
+            .as_ref()
+            .map(|bootstrap| {
+                (
+                    bootstrap.base_block_number,
+                    bootstrap.base_block_hash,
+                    bootstrap.base_root,
+                )
+            })
+            .or(trusted_state_root_base);
         let qmdb_execution_store = qmdb_execution
             .as_ref()
             .map(|bootstrap| Arc::clone(&bootstrap.store));
@@ -1438,7 +1853,8 @@ fn main() {
         // output sidecars cannot reconstruct Gov5 blocks (their H2 wire body
         // deliberately carries no Rust compact diff), so enabling a second
         // Twig/JMT tree would create a permanent false gap at every commit.
-        let authoritative_qmdb_execution = qmdb_execution.is_some();
+        let authoritative_qmdb_execution =
+            qmdb_execution.is_some() || trusted_state_root_base.is_some();
         let twig_enabled = !authoritative_qmdb_execution
             && match std::env::var("N42_TWIG") {
                 Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
@@ -1636,7 +2052,31 @@ fn main() {
                         .map(|store| store.root_for(head_block_hash))
                         .transpose()?
                         .flatten();
-                    if persisted_root.is_none() {
+                    if trusted_state_root_base.is_some() {
+                        // No local lineage exists in trusted mode; the base
+                        // must still be canonical below the persisted head.
+                        let base_is_canonical = best_block_number >= base_block_number
+                            && full_node
+                                .provider
+                                .block_hash(base_block_number)?
+                                .is_some_and(|hash| hash == base_block_hash);
+                        if !base_is_canonical {
+                            return Err(eyre::eyre!(
+                                "trusted execution base is block {} ({}) but local Reth head is block {} ({}) and does not build on it",
+                                base_block_number,
+                                base_block_hash,
+                                best_block_number,
+                                head_block_hash,
+                            ));
+                        }
+                        info!(
+                            target: "n42::cli",
+                            best_block = best_block_number,
+                            %head_block_hash,
+                            base_block = base_block_number,
+                            "resuming trusted-root execution above the checkpoint base"
+                        );
+                    } else if persisted_root.is_none() {
                         return Err(eyre::eyre!(
                             "QMDB execution base is block {} ({}, root {}) but local Reth head is block {} ({}) and has no authenticated persisted QMDB lineage",
                             base_block_number,
@@ -2085,42 +2525,14 @@ fn main() {
                             interop_genesis_hash,
                         )
                             .map_err(|e| eyre::eyre!("failed to create observer network service: {e}"))?;
-                    let best_provider = full_node.provider.clone();
-                    let block_provider = full_node.provider.clone();
-                    net_service.set_gov5_canonical_block_reader(
-                        n42_network::Gov5CanonicalBlockReader::new(
-                            move || {
-                                best_provider
-                                    .best_block_number()
-                                    .map_err(|error| error.to_string())
-                            },
-                            move |number| {
-                                let Some(block) = block_provider
-                                    .block_by_number(number)
-                                    .map_err(|error| error.to_string())?
-                                else {
-                                    return Ok(None);
-                                };
-                                let block_hash = block_provider
-                                    .block_hash(number)
-                                    .map_err(|error| error.to_string())?
-                                    .ok_or_else(|| {
-                                        format!(
-                                            "canonical hash is missing for persisted block {number}"
-                                        )
-                                    })?;
-                                let execution =
-                                    ExecutionData::from_block_unchecked(block_hash, &block);
-                                n42_network::encode_gov5_block_rlp(&execution)
-                                    .map(Some)
-                                    .map_err(|error| error.to_string())
-                            },
-                        ),
-                    );
+                    net_service.set_gov5_canonical_block_reader(gov5_canonical_block_reader(
+                        full_node.provider.clone(),
+                    ));
 
                     let consensus_port: u16 = env_parse("N42_CONSENSUS_PORT").unwrap_or(9400);
                     let listen_addr: libp2p::Multiaddr = format!(
-                        "/ip4/0.0.0.0/udp/{}/quic-v1",
+                        "/ip4/{}/udp/{}/quic-v1",
+                        n42_listen_ip()?,
                         consensus_port
                     )
                     .parse()
@@ -2156,6 +2568,7 @@ fn main() {
                     .with_exec_output_cache(std::sync::Arc::new(
                         n42_node::exec_cache::RethExecutionOutputCache::new(
                             qmdb_execution_store.clone(),
+                            full_node.provider.chain_spec(),
                         ),
                     ));
                     if let Some(schedule) = epoch_schedule.clone() {
@@ -2245,43 +2658,15 @@ fn main() {
                     }
                         .map_err(|e| eyre::eyre!("failed to create consensus network service: {e}"))?;
                 if h2_v4_participant {
-                    let best_provider = full_node.provider.clone();
-                    let block_provider = full_node.provider.clone();
-                    net_service.set_gov5_canonical_block_reader(
-                        n42_network::Gov5CanonicalBlockReader::new(
-                            move || {
-                                best_provider
-                                    .best_block_number()
-                                    .map_err(|error| error.to_string())
-                            },
-                            move |number| {
-                                let Some(block) = block_provider
-                                    .block_by_number(number)
-                                    .map_err(|error| error.to_string())?
-                                else {
-                                    return Ok(None);
-                                };
-                                let block_hash = block_provider
-                                    .block_hash(number)
-                                    .map_err(|error| error.to_string())?
-                                    .ok_or_else(|| {
-                                        format!(
-                                            "canonical hash is missing for persisted block {number}"
-                                        )
-                                    })?;
-                                let execution =
-                                    ExecutionData::from_block_unchecked(block_hash, &block);
-                                n42_network::encode_gov5_block_rlp(&execution)
-                                    .map(Some)
-                                    .map_err(|error| error.to_string())
-                            },
-                        ),
-                    );
+                    net_service.set_gov5_canonical_block_reader(gov5_canonical_block_reader(
+                        full_node.provider.clone(),
+                    ));
                 }
 
                 let consensus_port: u16 = env_parse("N42_CONSENSUS_PORT").unwrap_or(9400);
                 let listen_addr: libp2p::Multiaddr = format!(
-                    "/ip4/0.0.0.0/udp/{}/quic-v1",
+                    "/ip4/{}/udp/{}/quic-v1",
+                    n42_listen_ip()?,
                     consensus_port
                 )
                 .parse()
@@ -2359,6 +2744,7 @@ fn main() {
 
                 let (sharded_hub, star_hub_handle, hub_event_rx) =
                     ShardedStarHub::new(ShardedStarHubConfig {
+                        bind_ip: n42_listen_ip()?.into(),
                         base_port: starhub_port,
                         shard_count,
                         max_connections_per_shard: max_conns_per_shard,
@@ -2760,6 +3146,7 @@ fn main() {
                 .with_exec_output_cache(std::sync::Arc::new(
                     n42_node::exec_cache::RethExecutionOutputCache::new(
                         qmdb_execution_store.clone(),
+                        full_node.provider.chain_spec(),
                     ),
                 ))
                 .with_staking_sink(std::sync::Arc::new(
@@ -2773,12 +3160,65 @@ fn main() {
                 ))
                 .with_committed_block_count(restored_block_count);
 
+                if let Some(header) = full_node.provider.header(consensus_head_hash)? {
+                    orchestrator = orchestrator.with_recovered_head_timestamp(header.timestamp);
+                }
+
                 if h2_v4_participant {
+                    if env_bool("N42_GOV5_NATIVE_PRODUCER") {
+                        if qmdb_execution_store.is_none() || trusted_state_root_base.is_some() {
+                            return Err(eyre::eyre!("native producer requires recomputed QMDB roots"));
+                        }
+                        // Reth persists the alloy header view, not field 23. Rebuild
+                        // the supported zero-registry form and bind it to the exact
+                        // durable head hash before using it for a leader build.
+                        let header = full_node.provider.header(consensus_head_hash)?
+                            .ok_or_else(|| eyre::eyre!("native producer head is missing"))?;
+                        let native = n42_consensus::Gov5NativeHeader {
+                            header,
+                            mobile_registry_root: Some(alloy_primitives::B256::ZERO),
+                        };
+                        if native.hash() != consensus_head_hash {
+                            return Err(eyre::eyre!("native producer requires an authenticated zero-registry head"));
+                        }
+                        n42_consensus::remember_gov5_native_header(&native.encode());
+                        let rewards = n42_node::sinks::Gov5WithdrawalSource::from_genesis(
+                            &full_node.provider.chain_spec().genesis, fee_recipient,
+                        ).map_err(eyre::Report::msg)?;
+                        orchestrator = orchestrator.with_withdrawal_source(Arc::new(rewards));
+                    }
                     let identity = n42_network::h2_v4::H2V4ChainIdentity {
                         chain_id: full_node.provider.chain_spec().chain().id(),
                         genesis_hash: interop_genesis_hash,
                     };
                     orchestrator = orchestrator.with_h2_v4_participant(identity);
+                    if trusted_state_root_base.is_some() {
+                        orchestrator = orchestrator.with_leader_disabled();
+                    }
+                    // gov5's committee-evidence link: a leader must stamp
+                    // parentBeaconRoot = Blake3(parent evidence). The pool is the
+                    // one the consensus validator derived (shared per process).
+                    if header_profile == N42HeaderProfile::Gov5H2
+                        && let Some(config) = n42_consensus::CommitteePoolConfig::from_genesis(
+                            &full_node.provider.chain_spec().genesis,
+                        )?
+                    {
+                        let pool = n42_consensus::shared_committee_pool(&config)?;
+                        info!(
+                            target: "n42::cli",
+                            pool_size = config.pool_size,
+                            committee_size = config.committee_size,
+                            "gov5 committee pool wired into the block builder: proposals carry the committee-evidence root"
+                        );
+                        orchestrator = orchestrator.with_committee_pool(pool);
+                    }
+                    if env_bool("N42_GOV5_LEGACY_SIGNING") {
+                        info!(
+                            target: "n42::cli",
+                            "gov5 legacy signing profile enabled: the fleet runs without hotstuff.interopV4"
+                        );
+                        orchestrator = orchestrator.with_gov5_legacy_signing();
+                    }
                     info!(target: "n42::cli", chain_id = identity.chain_id, genesis_hash = %identity.genesis_hash, validator_index = my_index, "H2-v4 participant bridge enabled");
                 }
 
@@ -3022,6 +3462,7 @@ mod observer_identity_tests {
                     })
                     .collect(),
             },
+            leaf_form: None,
         }
     }
 
@@ -3034,6 +3475,7 @@ mod observer_identity_tests {
                 value: vec![0x01],
                 active: true,
             }],
+            leaf_form: None,
         };
         let replay = n42_twig_core::qmdb_compat::QmdbSnapshot {
             next_slot: 2,
@@ -3045,6 +3487,7 @@ mod observer_identity_tests {
                     active: true,
                 },
             ],
+            leaf_form: None,
         };
 
         let native_portable = portable_with_entries(&native.entries);

@@ -4,6 +4,7 @@ pub mod execution_path;
 pub mod executor;
 pub mod precompile_random;
 pub mod read_log;
+pub mod restored_slots;
 pub mod state_diff;
 pub mod witness;
 
@@ -15,3 +16,7 @@ pub use executor::{
     execute_block_with_witness, parallel_evm_enabled,
 };
 pub use read_log::{ReadLogDatabase, ReadLogEntry};
+pub use restored_slots::{
+    RestoredSlot, TrackingBlockExecutorFactory, TrackingExecutor, record_restored_slots,
+    restored_slots_for, restored_slots_key,
+};

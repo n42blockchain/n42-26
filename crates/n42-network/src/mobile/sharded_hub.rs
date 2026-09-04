@@ -10,6 +10,8 @@ use super::star_hub::{HubEvent, SessionIdGenerator, StarHub, StarHubConfig, Star
 /// Multiple QUIC endpoints share load across different ports, enabling linear
 /// scaling beyond single-socket limits (~10K connections per socket).
 pub struct ShardedStarHubConfig {
+    /// Bind interface; loopback is useful for isolated local fleets.
+    pub bind_ip: std::net::IpAddr,
     /// Base port for the first shard; subsequent shards use base_port+N.
     pub base_port: u16,
     /// Number of QUIC endpoint shards (minimum: 1).
@@ -23,6 +25,7 @@ pub struct ShardedStarHubConfig {
 impl Default for ShardedStarHubConfig {
     fn default() -> Self {
         Self {
+            bind_ip: std::net::Ipv4Addr::UNSPECIFIED.into(),
             base_port: 9443,
             shard_count: 1,
             max_connections_per_shard: 10_000,
@@ -106,7 +109,7 @@ impl ShardedStarHub {
                 )
             })?;
             let shard_config = StarHubConfig {
-                bind_addr: format!("0.0.0.0:{port}").parse()?,
+                bind_addr: std::net::SocketAddr::new(config.bind_ip, port),
                 max_connections: config.max_connections_per_shard,
                 idle_timeout_secs: config.idle_timeout_secs,
                 cert_dir: config.cert_dir.clone(),

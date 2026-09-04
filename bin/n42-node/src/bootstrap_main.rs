@@ -1,9 +1,15 @@
 use alloy_primitives::{B256, keccak256};
 use clap::Parser;
 use n42_chainspec::ConsensusConfig;
+use n42_consensus::{
+    ValidatorSet,
+    protocol::quorum::{
+        ConsensusSigningProfile, verify_commit_qc_with_profile, verify_qc_any_domain_with_profile,
+    },
+};
 use n42_consensus_service::{
     bootstrap::{BOOTSTRAP_BUNDLE_VERSION, Gov5BootstrapBundle, Gov5BootstrapPayload},
-    persistence::{ConsensusSnapshot, load_consensus_state},
+    persistence::{ConsensusSnapshot, load_consensus_state, save_consensus_state},
 };
 use n42_network::{
     h2_wire::decode_h2_qc, quorum_certificate_from_h2, verify_finalized_range_stream,
@@ -34,20 +40,35 @@ struct Args {
     /// lockedQC(SSZ) + committedQC(SSZ).
     #[arg(long, conflicts_with = "consensus_state")]
     gov5_hotstuff_state_hex: Option<String>,
-    #[arg(long)]
-    genesis_range: PathBuf,
-    #[arg(long)]
-    finalized_range: PathBuf,
-    #[arg(long)]
-    qmdb_checkpoint: PathBuf,
+    #[arg(long, required_unless_present = "consensus_state_out")]
+    genesis_range: Option<PathBuf>,
+    #[arg(long, required_unless_present = "consensus_state_out")]
+    finalized_range: Option<PathBuf>,
+    #[arg(long, required_unless_present = "consensus_state_out")]
+    qmdb_checkpoint: Option<PathBuf>,
     #[arg(long)]
     chain_id: u64,
     #[arg(long)]
     genesis_hash: B256,
-    #[arg(long)]
-    sequence: u64,
-    #[arg(long)]
-    output: PathBuf,
+    #[arg(long, required_unless_present = "consensus_state_out")]
+    sequence: Option<u64>,
+    #[arg(long, required_unless_present = "consensus_state_out")]
+    output: Option<PathBuf>,
+    /// Checkpoint-anchored mode: write only `consensus_state.json` for a
+    /// member whose execution layer was initialised at the checkpoint by
+    /// `n42-init-snapshot` (a chain whose history cannot be re-executed).
+    /// Requires `--gov5-hotstuff-state-hex`, `--checkpoint-block` and
+    /// `--checkpoint-hash`; the commit QC is verified against the validator
+    /// set and must name the checkpoint block.
+    #[arg(long, requires = "gov5_hotstuff_state_hex")]
+    consensus_state_out: Option<PathBuf>,
+    #[arg(long, requires = "consensus_state_out")]
+    checkpoint_block: Option<u64>,
+    #[arg(long, requires = "consensus_state_out")]
+    checkpoint_hash: Option<B256>,
+    /// Verify gov5's QCs with the pre-interopV4 signing domains.
+    #[arg(long, requires = "consensus_state_out")]
+    legacy_signing: bool,
 }
 
 fn read_u32_le(bytes: &[u8], offset: usize, label: &str) -> eyre::Result<u32> {
@@ -145,11 +166,77 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> eyre::Result<()> {
     Ok(())
 }
 
+fn write_checkpoint_consensus_state(args: &Args, config: &ConsensusConfig) -> eyre::Result<()> {
+    let out = args
+        .consensus_state_out
+        .as_ref()
+        .expect("checkpoint mode is selected by this argument");
+    let state_hex = args
+        .gov5_hotstuff_state_hex
+        .as_ref()
+        .ok_or_else(|| eyre::eyre!("--consensus-state-out requires --gov5-hotstuff-state-hex"))?;
+    let checkpoint_block = args
+        .checkpoint_block
+        .ok_or_else(|| eyre::eyre!("--consensus-state-out requires --checkpoint-block"))?;
+    let checkpoint_hash = args
+        .checkpoint_hash
+        .ok_or_else(|| eyre::eyre!("--consensus-state-out requires --checkpoint-hash"))?;
+    let snapshot = snapshot_from_gov5_state(
+        state_hex,
+        checkpoint_block,
+        &config.initial_validators,
+        config.fault_tolerance,
+    )?;
+    if snapshot.last_committed_qc.block_hash != checkpoint_hash {
+        return Err(eyre::eyre!(
+            "gov5 committed QC names block {}, but the checkpoint is {checkpoint_hash}",
+            snapshot.last_committed_qc.block_hash
+        ));
+    }
+    let validator_set = ValidatorSet::try_new(&config.initial_validators, config.fault_tolerance)
+        .map_err(|error| eyre::eyre!("invalid validator set: {error}"))?;
+    let profile = if args.legacy_signing {
+        ConsensusSigningProfile::Gov5Legacy
+    } else {
+        ConsensusSigningProfile::H2V4(H2V4ChainIdentity {
+            chain_id: args.chain_id,
+            genesis_hash: args.genesis_hash,
+        })
+    };
+    verify_commit_qc_with_profile(
+        &snapshot.last_committed_qc,
+        &validator_set,
+        &B256::ZERO,
+        profile,
+    )
+    .map_err(|error| eyre::eyre!("gov5 committed QC failed verification: {error}"))?;
+    if snapshot.locked_qc != snapshot.last_committed_qc {
+        verify_qc_any_domain_with_profile(
+            &snapshot.locked_qc,
+            &validator_set,
+            &B256::ZERO,
+            profile,
+        )
+        .map_err(|error| eyre::eyre!("gov5 locked QC failed verification: {error}"))?;
+    }
+    snapshot
+        .validate()
+        .map_err(|error| eyre::eyre!("consensus snapshot is inconsistent: {error}"))?;
+    save_consensus_state(out, &snapshot)?;
+    println!(
+        "wrote {} view={} locked_qc_view={} committed_qc_view={} committed_block={} {}",
+        out.display(),
+        snapshot.current_view,
+        snapshot.locked_qc.view,
+        snapshot.last_committed_qc.view,
+        checkpoint_block,
+        checkpoint_hash
+    );
+    Ok(())
+}
+
 fn main() -> eyre::Result<()> {
     let args = Args::parse();
-    if args.sequence == 0 {
-        return Err(eyre::eyre!("--sequence must be greater than zero"));
-    }
     let config = ConsensusConfig::from_file(&args.consensus_config)
         .map_err(|error| eyre::eyre!("invalid consensus config: {error}"))?;
     if config.initial_validators.is_empty() {
@@ -157,9 +244,34 @@ fn main() -> eyre::Result<()> {
             "bootstrap creation requires an explicit validator set"
         ));
     }
-    let genesis_range = read(&args.genesis_range)?;
-    let finalized_range = read(&args.finalized_range)?;
-    let qmdb_checkpoint = read(&args.qmdb_checkpoint)?;
+    if args.consensus_state_out.is_some() {
+        return write_checkpoint_consensus_state(&args, &config);
+    }
+    let sequence = args
+        .sequence
+        .ok_or_else(|| eyre::eyre!("--sequence is required"))?;
+    if sequence == 0 {
+        return Err(eyre::eyre!("--sequence must be greater than zero"));
+    }
+    let output = args
+        .output
+        .clone()
+        .ok_or_else(|| eyre::eyre!("--output is required"))?;
+    let genesis_range = read(
+        args.genesis_range
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("--genesis-range is required"))?,
+    )?;
+    let finalized_range = read(
+        args.finalized_range
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("--finalized-range is required"))?,
+    )?;
+    let qmdb_checkpoint = read(
+        args.qmdb_checkpoint
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("--qmdb-checkpoint is required"))?,
+    )?;
 
     let qmdb = verify_portable_stream(
         Cursor::new(&qmdb_checkpoint),
@@ -222,16 +334,16 @@ fn main() -> eyre::Result<()> {
     let replay_nonce = keccak256(
         [
             args.chain_id.to_le_bytes().as_slice(),
-            args.sequence.to_le_bytes().as_slice(),
+            sequence.to_le_bytes().as_slice(),
             issued_at_unix_secs.to_le_bytes().as_slice(),
             args.genesis_hash.as_slice(),
-            args.output.as_os_str().as_encoded_bytes(),
+            output.as_os_str().as_encoded_bytes(),
         ]
         .concat(),
     );
     let payload = Gov5BootstrapPayload {
         format_version: BOOTSTRAP_BUNDLE_VERSION,
-        sequence: args.sequence,
+        sequence,
         replay_nonce,
         issued_at_unix_secs,
         chain_id: args.chain_id,
@@ -258,10 +370,10 @@ fn main() -> eyre::Result<()> {
         &config.initial_validators,
         config.fault_tolerance,
     )?;
-    atomic_write(&args.output, &serde_json::to_vec_pretty(&bundle)?)?;
+    atomic_write(&output, &serde_json::to_vec_pretty(&bundle)?)?;
     println!(
         "wrote {} (sequence {}, digest {}, checkpoint {} {})",
-        args.output.display(),
+        output.display(),
         bundle.payload.sequence,
         bundle.content_digest,
         bundle.payload.checkpoint_block,
