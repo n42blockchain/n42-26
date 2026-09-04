@@ -693,7 +693,13 @@ fn append_wal_record(
         .write_all(&payload_len.to_le_bytes())
         .and_then(|()| file.write_all(&payload))
         .and_then(|()| file.write_all(checksum.as_bytes()))
-        .and_then(|()| file.sync_all());
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            if original_len == 0 {
+                n42_jmt::snapshot::sync_parent_directory(path)?;
+            }
+            Ok(())
+        });
     if let Err(error) = write_result {
         let _ = file.set_len(original_len);
         let _ = file.sync_all();
@@ -764,7 +770,10 @@ fn truncate_incomplete_wal(path: &Path, valid_len: usize) -> Result<(), Gov5Qmdb
     OpenOptions::new()
         .write(true)
         .open(path)
-        .and_then(|file| file.set_len(valid_len as u64))
+        .and_then(|file| {
+            file.set_len(valid_len as u64)?;
+            file.sync_all()
+        })
         .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))
 }
 
@@ -861,6 +870,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Gov5QmdbStateRootError>
         .and_then(|()| file.sync_all())
         .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
     std::fs::rename(&tmp, path)
+        .and_then(|()| n42_jmt::snapshot::sync_parent_directory(path))
         .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))
 }
 

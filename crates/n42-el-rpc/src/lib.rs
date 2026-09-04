@@ -14,19 +14,46 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{
-    ExecutionData, ExecutionPayload, ExecutionPayloadEnvelopeV4, ForkchoiceState,
-    ForkchoiceUpdated, JwtSecret, PayloadAttributes, PayloadId, PayloadStatus,
+    ExecutionData, ExecutionPayloadEnvelopeV4, ForkchoiceState, ForkchoiceUpdated, JwtSecret,
+    PayloadAttributes, PayloadId, PayloadStatus,
 };
 use n42_consensus_service::el::{BuiltBlock, ElError, ExecutionLayer, ResolveKind};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::VecDeque;
 
 const NEW_PAYLOAD_V4: &str = "engine_newPayloadV4";
 const FCU_V3: &str = "engine_forkchoiceUpdatedV3";
 const GET_PAYLOAD_V4: &str = "engine_getPayloadV4";
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_TRACKED_BUILDS: usize = 16;
+
+/// Keep recent roots across repeated getPayload calls, bounding abandoned builds.
+#[derive(Default)]
+struct PayloadBuildRoots(VecDeque<(PayloadId, B256)>);
+
+impl PayloadBuildRoots {
+    fn remember(&mut self, id: PayloadId, root: B256) {
+        if let Some((_, stored)) = self.0.iter_mut().find(|(key, _)| *key == id) {
+            *stored = root;
+            return;
+        }
+        if self.0.len() == MAX_TRACKED_BUILDS {
+            self.0.pop_front();
+        }
+        self.0.push_back((id, root));
+    }
+
+    fn get(&self, id: PayloadId) -> Option<B256> {
+        self.0
+            .iter()
+            .find(|(key, _)| *key == id)
+            .map(|(_, root)| *root)
+    }
+}
 
 /// Engine-API JSON-RPC client implementing [`ExecutionLayer`] against a remote EL.
 pub struct EngineApiRpcExecutionLayer {
@@ -34,21 +61,28 @@ pub struct EngineApiRpcExecutionLayer {
     jwt: JwtSecret,
     client: reqwest::Client,
     next_id: AtomicU64,
+    request_timeout: Duration,
     /// `payload_id → parent_beacon_block_root`, captured at
     /// `fork_choice_updated_with_attrs` so `resolve_payload` can rebuild the
     /// sidecar (the `getPayload` envelope does not carry it).
-    parent_beacon: Mutex<HashMap<PayloadId, B256>>,
+    parent_beacon: Mutex<PayloadBuildRoots>,
 }
 
 impl EngineApiRpcExecutionLayer {
     /// New client for `url` (e.g. `http://127.0.0.1:8551`) authenticated with `jwt`.
     pub fn new(url: impl Into<String>, jwt: JwtSecret) -> Self {
+        Self::with_timeout(url, jwt, DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    /// New client with a deadline covering connection, response headers and body.
+    pub fn with_timeout(url: impl Into<String>, jwt: JwtSecret, request_timeout: Duration) -> Self {
         Self {
             url: url.into(),
             jwt,
             client: reqwest::Client::new(),
             next_id: AtomicU64::new(1),
-            parent_beacon: Mutex::new(HashMap::new()),
+            request_timeout,
+            parent_beacon: Mutex::new(PayloadBuildRoots::default()),
         }
     }
 
@@ -76,16 +110,19 @@ impl EngineApiRpcExecutionLayer {
         let resp = self
             .client
             .post(&self.url)
+            .timeout(self.request_timeout)
             .header(reqwest::header::AUTHORIZATION, auth)
             .json(&body)
             .send()
             .await
-            .map_err(|e| ElError(format!("{method} transport: {e}")))?;
+            .map_err(|e| ElError(format!("{method} transport: {e}")))?
+            .error_for_status()
+            .map_err(|e| ElError(format!("{method} HTTP status: {e}")))?;
         let bytes = resp
             .bytes()
             .await
             .map_err(|e| ElError(format!("{method} body: {e}")))?;
-        parse_jsonrpc_result(&bytes).map_err(|e| ElError(format!("{method}: {}", e.0)))
+        parse_jsonrpc_result(&bytes, id).map_err(|e| ElError(format!("{method}: {}", e.0)))
     }
 }
 
@@ -123,7 +160,7 @@ impl ExecutionLayer for EngineApiRpcExecutionLayer {
             self.parent_beacon
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(id, root);
+                .remember(id, root);
         }
         Ok(updated)
     }
@@ -133,6 +170,19 @@ impl ExecutionLayer for EngineApiRpcExecutionLayer {
         id: PayloadId,
         _kind: ResolveKind,
     ) -> Option<Result<BuiltBlock, ElError>> {
+        let parent_beacon = match self
+            .parent_beacon
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+        {
+            Some(root) => root,
+            None => {
+                return Some(Err(ElError(format!(
+                    "unknown or expired payload build {id}: parent beacon root unavailable"
+                ))));
+            }
+        };
         // WaitForPending → a single getPayload call (the remote builder packs
         // synchronously for this RPC).
         let result = match self.call(GET_PAYLOAD_V4, json!([id])).await {
@@ -143,12 +193,6 @@ impl ExecutionLayer for EngineApiRpcExecutionLayer {
             Ok(env) => env,
             Err(e) => return Some(Err(ElError(format!("getPayload envelope: {e}")))),
         };
-        let parent_beacon = self
-            .parent_beacon
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&id)
-            .unwrap_or(B256::ZERO);
         Some(Ok(envelope_v4_to_built_block(envelope, parent_beacon)))
     }
 }
@@ -190,9 +234,16 @@ fn bearer_header(jwt: &JwtSecret) -> Result<String, ElError> {
 
 /// Extracts the `result` field of a JSON-RPC response, surfacing `error` as
 /// [`ElError`].
-fn parse_jsonrpc_result(body: &[u8]) -> Result<Value, ElError> {
+fn parse_jsonrpc_result(body: &[u8], expected_id: u64) -> Result<Value, ElError> {
     let mut v: Value =
         serde_json::from_slice(body).map_err(|e| ElError(format!("invalid json-rpc: {e}")))?;
+    if v.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || v.get("id").and_then(Value::as_u64) != Some(expected_id)
+    {
+        return Err(ElError(
+            "json-rpc response version or request id mismatch".into(),
+        ));
+    }
     if let Some(err) = v.get("error")
         && !err.is_null()
     {
@@ -250,13 +301,11 @@ fn fcu_v3_params(
 /// blobs through the normal mempool/EL path, so an empty set is correct here.
 // TODO: thread real blob-tx hashes if standalone leaders ever rebroadcast sidecars.
 fn envelope_v4_to_built_block(env: ExecutionPayloadEnvelopeV4, parent_beacon: B256) -> BuiltBlock {
-    let v3 = env.envelope_inner.execution_payload.clone();
-    let payload = ExecutionPayload::V3(v3);
+    let (payload, sidecar) = env.into_payload_and_sidecar(parent_beacon);
     let hash = payload.block_hash();
     let number = payload.block_number();
     let timestamp = payload.timestamp();
     let tx_count = payload.as_v1().transactions.len();
-    let (payload, sidecar) = env.into_payload_and_sidecar(parent_beacon);
     BuiltBlock {
         hash,
         number,
@@ -283,7 +332,7 @@ mod tests {
     #[test]
     fn parse_result_ok() {
         let body = br#"{"jsonrpc":"2.0","id":1,"result":{"status":"VALID","latestValidHash":null,"validationError":null}}"#;
-        let v = parse_jsonrpc_result(body).expect("ok result");
+        let v = parse_jsonrpc_result(body, 1).expect("ok result");
         let status: PayloadStatus = serde_json::from_value(v).expect("payload status");
         assert!(status.is_valid());
     }
@@ -291,7 +340,7 @@ mod tests {
     #[test]
     fn parse_result_error_surfaces_message() {
         let body = br#"{"jsonrpc":"2.0","id":1,"error":{"code":-38003,"message":"invalid payload attributes"}}"#;
-        let err = parse_jsonrpc_result(body).expect_err("should be error");
+        let err = parse_jsonrpc_result(body, 1).expect_err("should be error");
         assert!(err.0.contains("-38003"));
         assert!(err.0.contains("invalid payload attributes"));
     }
@@ -299,7 +348,95 @@ mod tests {
     #[test]
     fn parse_result_missing_result() {
         let body = br#"{"jsonrpc":"2.0","id":1}"#;
-        assert!(parse_jsonrpc_result(body).is_err());
+        assert!(parse_jsonrpc_result(body, 1).is_err());
+    }
+
+    #[test]
+    fn parse_result_rejects_wrong_or_missing_request_identity() {
+        for body in [
+            json!({"jsonrpc": "2.0", "id": 2, "result": null}),
+            json!({"jsonrpc": "2.0", "id": "1", "result": null}),
+            json!({"jsonrpc": "2.0", "result": null}),
+            json!({"jsonrpc": "1.0", "id": 1, "result": null}),
+            json!({"id": 1, "result": null}),
+        ] {
+            assert!(parse_jsonrpc_result(&serde_json::to_vec(&body).unwrap(), 1).is_err());
+        }
+    }
+
+    #[test]
+    fn abandoned_builds_are_bounded_and_recent_roots_survive_repeated_collection() {
+        let mut roots = PayloadBuildRoots::default();
+        let oldest = PayloadId::new(0u64.to_be_bytes());
+        for index in 0..MAX_TRACKED_BUILDS as u64 {
+            roots.remember(
+                PayloadId::new(index.to_be_bytes()),
+                B256::repeat_byte(index as u8),
+            );
+        }
+        // Updating one build must not duplicate its entry or evict another root.
+        roots.remember(oldest, B256::repeat_byte(42));
+        assert_eq!(roots.0.len(), MAX_TRACKED_BUILDS);
+        let recent = PayloadId::new((MAX_TRACKED_BUILDS as u64).to_be_bytes());
+        let root = B256::repeat_byte(99);
+        roots.remember(recent, root);
+        assert_eq!(roots.0.len(), MAX_TRACKED_BUILDS);
+        assert_eq!(roots.get(oldest), None);
+        assert_eq!(roots.get(recent), Some(root));
+        assert_eq!(roots.get(recent), Some(root));
+        assert_eq!(
+            roots.get(PayloadId::new(1u64.to_be_bytes())),
+            Some(B256::repeat_byte(1))
+        );
+    }
+
+    #[test]
+    fn envelope_conversion_preserves_metadata_transactions_and_beacon_root() {
+        use alloy_rpc_types_engine::{ExecutionPayloadEnvelopeV3, ExecutionPayloadV3};
+        let execution_payload: ExecutionPayloadV3 = serde_json::from_value(json!({
+            "parentHash": B256::ZERO,
+            "feeRecipient": alloy_primitives::Address::ZERO,
+            "stateRoot": B256::ZERO,
+            "receiptsRoot": B256::ZERO,
+            "logsBloom": alloy_primitives::Bloom::ZERO,
+            "prevRandao": B256::ZERO,
+            "blockNumber": "0x2a",
+            "gasLimit": "0x100000",
+            "gasUsed": "0x0",
+            "timestamp": "0x7b",
+            "extraData": "0x",
+            "baseFeePerGas": "0x1",
+            "blockHash": B256::repeat_byte(17),
+            "transactions": [alloy_primitives::Bytes::from_static(b"transaction")],
+            "withdrawals": [],
+            "blobGasUsed": "0x0",
+            "excessBlobGas": "0x0"
+        }))
+        .unwrap();
+        let envelope = ExecutionPayloadEnvelopeV4 {
+            envelope_inner: ExecutionPayloadEnvelopeV3 {
+                execution_payload,
+                block_value: Default::default(),
+                blobs_bundle: Default::default(),
+                should_override_builder: false,
+            },
+            execution_requests: Default::default(),
+        };
+        let root = B256::repeat_byte(19);
+        let built = envelope_v4_to_built_block(envelope, root);
+        assert_eq!(built.hash, B256::repeat_byte(17));
+        assert_eq!(
+            (built.number, built.timestamp, built.tx_count),
+            (42, 123, 1)
+        );
+        assert_eq!(
+            built.execution_data.payload.transactions()[0].as_ref(),
+            b"transaction"
+        );
+        assert_eq!(
+            built.execution_data.sidecar.parent_beacon_block_root(),
+            Some(root)
+        );
     }
 
     #[test]

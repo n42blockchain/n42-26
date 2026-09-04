@@ -78,6 +78,39 @@ const BLOCK_DIRECT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BLOCK_DIRECT_QUEUE_DEPTH: usize = 64;
 const MAX_BLOCK_DIRECT_RETRIES: u8 = 2;
 
+/// Check the requested hash before touching the serve cache. Only byte-identical
+/// cached bodies can bypass transaction decoding and root verification.
+fn cache_gov5_served_block(
+    blocks: &mut HashMap<B256, Vec<u8>>,
+    order: &mut VecDeque<B256>,
+    rlp: &[u8],
+    expected_hash: Option<B256>,
+) -> Result<B256, Gov5BlockError> {
+    let hash = attributable_hash(rlp).ok_or(Gov5BlockError::InvalidRlp)?;
+    if let Some(expected) = expected_hash
+        && hash != expected
+    {
+        return Err(Gov5BlockError::UnexpectedBlockHash {
+            expected,
+            actual: hash,
+        });
+    }
+    if blocks.get(&hash).is_some_and(|cached| cached == rlp) {
+        return Ok(hash);
+    }
+    decode_gov5_block_rlp(rlp)?;
+    if !blocks.contains_key(&hash) {
+        if blocks.len() >= MAX_SERVED_GOV5_BLOCKS
+            && let Some(oldest) = order.pop_front()
+        {
+            blocks.remove(&oldest);
+        }
+        order.push_back(hash);
+    }
+    blocks.insert(hash, rlp.to_vec());
+    Ok(hash)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum PendingBlockDirectFrame {
     Complete,
@@ -1919,27 +1952,17 @@ impl NetworkService {
         }
     }
 
-    fn retain_gov5_served_block(&mut self, rlp: &[u8]) -> Result<B256, Gov5BlockError> {
-        let block = decode_gov5_block_rlp(rlp)?;
-        if self.gov5_served_blocks.len() >= MAX_SERVED_GOV5_BLOCKS
-            && !self.gov5_served_blocks.contains_key(&block.block_hash)
-        {
-            // Evict the oldest entry, not an arbitrary HashMap key: the newest
-            // blocks are the ones followers are still about to request.
-            while let Some(evicted) = self.gov5_served_block_order.pop_front() {
-                if self.gov5_served_blocks.remove(&evicted).is_some() {
-                    break;
-                }
-            }
-        }
-        if self
-            .gov5_served_blocks
-            .insert(block.block_hash, rlp.to_vec())
-            .is_none()
-        {
-            self.gov5_served_block_order.push_back(block.block_hash);
-        }
-        Ok(block.block_hash)
+    fn retain_gov5_served_block(
+        &mut self,
+        rlp: &[u8],
+        expected_hash: Option<B256>,
+    ) -> Result<B256, Gov5BlockError> {
+        cache_gov5_served_block(
+            &mut self.gov5_served_blocks,
+            &mut self.gov5_served_block_order,
+            rlp,
+            expected_hash,
+        )
     }
 
     fn handle_gossipsub_message(&mut self, source: PeerId, message: gossipsub::Message) {
@@ -1987,7 +2010,7 @@ impl NetworkService {
                 match snap::raw::Decoder::new().decompress_vec(&message.data) {
                     Ok(rlp) if rlp.len() == decoded_len => {
                         metrics::counter!("n42_gov5_blocks_observed_total").increment(1);
-                        if let Err(error) = self.retain_gov5_served_block(&rlp) {
+                        if let Err(error) = self.retain_gov5_served_block(&rlp, None) {
                             tracing::warn!(
                                 target: "n42::interop::block",
                                 %source,
@@ -2920,7 +2943,7 @@ impl NetworkService {
                     return;
                 }
                 metrics::counter!("n42_gov5_block_push_received_total").increment(1);
-                if let Err(error) = self.retain_gov5_served_block(&request.rlp) {
+                if let Err(error) = self.retain_gov5_served_block(&request.rlp, None) {
                     tracing::warn!(
                         target: "n42::interop::block",
                         %peer,
@@ -3101,40 +3124,12 @@ impl NetworkService {
                     tracing::debug!(%peer, "received redundant gov5 block response after another fan-out peer succeeded");
                     return;
                 };
-                match self.retain_gov5_served_block(&response.rlp) {
-                    Ok(actual_hash) if actual_hash == requested_hash => {}
-                    Ok(actual_hash) => {
-                        self.gov5_served_blocks.remove(&actual_hash);
-                        let error = format!(
-                            "gov5 block fetch hash mismatch: requested {requested_hash}, got {actual_hash}"
-                        );
-                        metrics::counter!("n42_gov5_block_fetch_failed_total").increment(1);
-                        if !self
-                            .pending_gov5_block_requests
-                            .values()
-                            .any(|hash| *hash == requested_hash)
-                        {
-                            self.pending_gov5_block_hashes.remove(&requested_hash);
-                            self.recent_gov5_block_requests.remove(&requested_hash);
-                            self.emit_event(NetworkEvent::Gov5BlockFetchFailed {
-                                source: peer,
-                                block_hash: requested_hash,
-                                error,
-                                // This peer served a different block; another
-                                // may still hold the requested one.
-                                permanent: false,
-                            });
-                        }
-                        return;
-                    }
+                match self.retain_gov5_served_block(&response.rlp, Some(requested_hash)) {
+                    Ok(_) => {}
                     Err(error) => {
-                        // A rejection only rules out the requested hash if the
-                        // bytes actually belong to it. A peer that does not
-                        // have the block answers with an empty body, which
-                        // fails to decode but says nothing about the block —
-                        // and the serve cache is a 1024-entry FIFO, so an
-                        // honest, fully-synced peer returns empty for anything
-                        // older than that.
+                        // Only an invalid matching header rules out the hash.
+                        // An empty response or a corrupt body attached to an
+                        // honest header must remain retryable through another peer.
                         let permanent = error.is_permanent()
                             && attributable_hash(&response.rlp) == Some(requested_hash);
                         metrics::counter!("n42_gov5_block_fetch_failed_total").increment(1);
@@ -3791,7 +3786,7 @@ impl NetworkService {
                     return;
                 };
 
-                if let Err(error) = self.retain_gov5_served_block(&rlp) {
+                if let Err(error) = self.retain_gov5_served_block(&rlp, None) {
                     tracing::warn!(
                         target: "n42::interop::h2v4",
                         %error,
@@ -4129,6 +4124,92 @@ impl NetworkService {
 mod tests {
     use super::*;
     use crate::transport::deterministic_validator_peer_id;
+
+    fn served_block_fixture(number: u64) -> Vec<u8> {
+        use alloy_consensus::{Block, Header, TxEnvelope, proofs::calculate_transaction_root};
+        let block: Block<TxEnvelope> = Block {
+            header: Header {
+                number,
+                ommers_hash: B256::ZERO,
+                transactions_root: calculate_transaction_root::<TxEnvelope>(&[]),
+                base_fee_per_gas: Some(0),
+                extra_data: alloy_primitives::Bytes::from_static(b"N42H\x07\0\0\0\0\0\0\0"),
+                ..Default::default()
+            },
+            body: Default::default(),
+        };
+        crate::gov5_block::encode_gov5_block_rlp(
+            &alloy_rpc_types_engine::ExecutionData::from_block_unchecked(
+                block.header.hash_slow(),
+                &block,
+            ),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn gov5_mismatched_fetch_does_not_remove_cached_block_or_grow_fifo() {
+        let mut blocks = HashMap::new();
+        let mut order = VecDeque::new();
+        let rlp = served_block_fixture(1);
+        let hash = cache_gov5_served_block(&mut blocks, &mut order, &rlp, None).unwrap();
+        let other = served_block_fixture(2);
+        for response in [&rlp, &other]
+            .into_iter()
+            .cycle()
+            .take(MAX_SERVED_GOV5_BLOCKS * 2)
+        {
+            assert!(matches!(
+                cache_gov5_served_block(&mut blocks, &mut order, response, Some(B256::ZERO)),
+                Err(Gov5BlockError::UnexpectedBlockHash { .. })
+            ));
+        }
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[&hash], rlp);
+        assert_eq!(order, VecDeque::from([hash]));
+    }
+
+    #[test]
+    fn gov5_duplicate_reuses_cached_allocation_but_validates_changed_body() {
+        let mut blocks = HashMap::new();
+        let mut order = VecDeque::new();
+        let rlp = served_block_fixture(1);
+        let hash = cache_gov5_served_block(&mut blocks, &mut order, &rlp, None).unwrap();
+        let allocation = blocks[&hash].as_ptr();
+        assert_eq!(
+            cache_gov5_served_block(&mut blocks, &mut order, &rlp, Some(hash)).unwrap(),
+            hash
+        );
+        assert_eq!(blocks[&hash].as_ptr(), allocation);
+        let mut corrupt = rlp.clone();
+        *corrupt.last_mut().unwrap() = 0x80;
+        assert_eq!(attributable_hash(&corrupt), Some(hash));
+        assert!(cache_gov5_served_block(&mut blocks, &mut order, &corrupt, Some(hash)).is_err());
+        assert_eq!(blocks[&hash], rlp);
+        assert_eq!(order, VecDeque::from([hash]));
+    }
+
+    #[test]
+    fn gov5_serve_cache_evicts_in_fifo_order_at_capacity() {
+        let mut blocks = HashMap::new();
+        let mut order = VecDeque::new();
+        let first =
+            cache_gov5_served_block(&mut blocks, &mut order, &served_block_fixture(0), None)
+                .unwrap();
+        for number in 1..=MAX_SERVED_GOV5_BLOCKS {
+            cache_gov5_served_block(
+                &mut blocks,
+                &mut order,
+                &served_block_fixture(number as u64),
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(blocks.len(), MAX_SERVED_GOV5_BLOCKS);
+        assert_eq!(order.len(), MAX_SERVED_GOV5_BLOCKS);
+        assert!(!blocks.contains_key(&first));
+        assert!(order.iter().all(|hash| blocks.contains_key(hash)));
+    }
 
     #[test]
     fn gov5_direct_requires_trust_or_validator_binding() {

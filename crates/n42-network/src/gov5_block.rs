@@ -26,29 +26,25 @@ pub enum Gov5BlockError {
     PayloadReconstruction(String),
     #[error("execution payload block hash does not match its reconstructed header")]
     PayloadHashMismatch,
+    #[error("gov5 block fetch hash mismatch: requested {expected}, got {actual}")]
+    UnexpectedBlockHash { expected: B256, actual: B256 },
 }
 
 impl Gov5BlockError {
-    /// Whether this verdict, **if the bytes are known to belong to the hash
-    /// that was requested**, rules that hash out for good.
+    /// Whether the failure is intrinsic to the header. This must still be
+    /// paired with [`attributable_hash`] matching the requested hash.
     ///
-    /// This is only half of the test. The error alone cannot say which block
-    /// it describes: every path here returns before `block_hash` is derived,
-    /// so what failed is whatever the peer chose to send. Pair it with
-    /// [`attributable_hash`], which recovers the hash those bytes actually
-    /// commit to — a peer answering "I do not have it" sends an empty body,
-    /// and treating that as a verdict on the requested block would blacklist a
-    /// perfectly good hash because one peer was behind.
-    ///
-    /// Kept as a method on the error so a future variant has to state which
-    /// kind it is.
+    /// A matching header alone does not authenticate the body: a peer can
+    /// attach malformed RLP, different transactions, or invalid auxiliary
+    /// fields to an honest header. Those failures must remain retryable.
     pub const fn is_permanent(&self) -> bool {
         match self {
+            Self::HeaderProfile(_) => true,
             Self::InvalidRlp
-            | Self::HeaderProfile(_)
             | Self::TransactionRootMismatch
             | Self::PayloadReconstruction(_)
-            | Self::PayloadHashMismatch => true,
+            | Self::PayloadHashMismatch
+            | Self::UnexpectedBlockHash { .. } => false,
         }
     }
 }
@@ -361,6 +357,13 @@ mod tests {
     use n42_consensus::gov5_native_receipts_root;
 
     fn block_fixture(transactions_root: B256) -> Vec<u8> {
+        block_fixture_with_transactions(transactions_root, Vec::new())
+    }
+
+    fn block_fixture_with_transactions(
+        transactions_root: B256,
+        transactions: Vec<Bytes>,
+    ) -> Vec<u8> {
         let header = Header {
             ommers_hash: B256::ZERO,
             transactions_root,
@@ -371,7 +374,6 @@ mod tests {
         };
         let mut header_rlp = Vec::new();
         header.encode(&mut header_rlp);
-        let transactions = Vec::<Bytes>::new();
         let verifiers = Vec::<Bytes>::new();
         let rewards = Vec::<Bytes>::new();
         let payload_length =
@@ -415,6 +417,39 @@ mod tests {
             decode_gov5_block_rlp(&encoded).unwrap_err(),
             Gov5BlockError::InvalidRlp
         );
+    }
+
+    #[test]
+    fn corrupted_body_cannot_permanently_reject_a_valid_header() {
+        let good = block_fixture(calculate_transaction_root::<TxEnvelope>(&[]));
+        let hash = decode_gov5_block_rlp(&good).unwrap().block_hash;
+        let mut bad = good.clone();
+        *bad.last_mut().unwrap() = 0x80;
+        assert_eq!(attributable_hash(&bad), Some(hash));
+        let error = decode_gov5_block_rlp(&bad).unwrap_err();
+        assert!(
+            !error.is_permanent(),
+            "a peer can corrupt unsigned body fields"
+        );
+        assert_eq!(decode_gov5_block_rlp(&good).unwrap().block_hash, hash);
+    }
+
+    #[test]
+    fn missing_transactions_are_retryable_even_when_header_hash_matches() {
+        use alloy_consensus::{SignableTransaction, TxLegacy};
+        use alloy_primitives::Signature;
+        let transaction: TxEnvelope = TxLegacy::default()
+            .into_signed(Signature::new(U256::from(1), U256::from(2), false))
+            .into();
+        let root = calculate_transaction_root(std::slice::from_ref(&transaction));
+        let good = block_fixture_with_transactions(root, vec![transaction.encoded_2718().into()]);
+        let hash = decode_gov5_block_rlp(&good).unwrap().block_hash;
+        let missing = block_fixture(root);
+        assert_eq!(attributable_hash(&missing), Some(hash));
+        let error = decode_gov5_block_rlp(&missing).unwrap_err();
+        assert_eq!(error, Gov5BlockError::TransactionRootMismatch);
+        assert!(!error.is_permanent());
+        assert_eq!(decode_gov5_block_rlp(&good).unwrap().block_hash, hash);
     }
 
     #[test]
@@ -551,22 +586,22 @@ mod tests {
         ));
     }
 
-    /// The retry loop keys off this classification, so a new variant defaulting
-    /// to the wrong side is the difference between giving up on a bad block and
-    /// re-requesting it from every peer forever. Enumerated explicitly rather
-    /// than spot-checked so adding a variant forces a decision here.
     #[test]
-    fn every_content_verdict_is_permanent() {
+    fn only_header_profile_verdicts_are_permanent() {
+        assert!(Gov5BlockError::HeaderProfile("invalid difficulty".to_owned()).is_permanent());
         for error in [
             Gov5BlockError::InvalidRlp,
-            Gov5BlockError::HeaderProfile("difficulty is not zero".to_owned()),
             Gov5BlockError::TransactionRootMismatch,
             Gov5BlockError::PayloadReconstruction("bad payload".to_owned()),
             Gov5BlockError::PayloadHashMismatch,
+            Gov5BlockError::UnexpectedBlockHash {
+                expected: B256::ZERO,
+                actual: B256::repeat_byte(1),
+            },
         ] {
             assert!(
-                error.is_permanent(),
-                "{error} is a verdict about content the hash commits to, so refetching cannot change it"
+                !error.is_permanent(),
+                "{error} can be caused by a peer changing the response body"
             );
         }
     }
@@ -596,8 +631,7 @@ mod tests {
         }
     }
 
-    /// A body that names its block but fails validation is attributable: the
-    /// header hashes to exactly the block being judged, so the verdict sticks.
+    /// Attribution identifies the header, but does not validate its body.
     #[test]
     fn a_body_that_fails_validation_still_names_its_block() {
         let good = block_fixture(calculate_transaction_root::<TxEnvelope>(&[]));

@@ -931,6 +931,14 @@ mod tests {
         // Null args -> -1.
         let r = unsafe { n42_verify_state_proof(std::ptr::null(), 0, combined.as_ptr()) };
         assert_eq!(r, -1);
+
+        // A valid outer shard path must not let an oversized inner path panic
+        // across this extern-C boundary (which would abort the host process).
+        let mut oversized = proof;
+        oversized.inner.siblings.resize(253, EMPTY_HASH);
+        let bytes = bincode::serialize(&oversized).unwrap();
+        let r = unsafe { n42_verify_state_proof(bytes.as_ptr(), bytes.len(), combined.as_ptr()) };
+        assert_eq!(r, 2, "oversized proof must return verification failure");
     }
 
     #[test]

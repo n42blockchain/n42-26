@@ -18,6 +18,47 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::info;
 
+/// Makes a file's directory entry durable after creation or atomic replacement.
+/// On Unix an error must stop checkpointing before the covered WAL is truncated.
+/// Other platforms retain their existing file-sync/rename durability semantics.
+pub fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        // A bare relative filename has an empty parent, meaning the current directory.
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+pub(crate) fn write_snapshot_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_snapshot_bytes_with_sync(path, bytes, sync_parent_directory)
+}
+
+fn write_snapshot_bytes_with_sync(
+    path: &Path,
+    bytes: &[u8],
+    sync_directory: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension("tmp");
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, path)?;
+    sync_directory(path)
+}
+
 /// Serializable snapshot of a ShardedJmt's state.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct JmtSnapshot {
@@ -121,32 +162,10 @@ impl ShardedJmt<MemTreeStore> {
 pub fn save_snapshot(path: &Path, snapshot: &JmtSnapshot) -> eyre::Result<()> {
     let start = std::time::Instant::now();
 
-    // Ensure parent directory exists.
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
     let raw = bincode::serialize(snapshot)?;
     let compressed = zstd::bulk::compress(&raw, 3)?;
 
-    // Atomic + durable write: write temp, fsync it, rename, then fsync the dir
-    // so a power/OS crash cannot leave a renamed-but-empty or lost snapshot.
-    let tmp_path = path.with_extension("tmp");
-    {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&tmp_path)?;
-        f.write_all(&compressed)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, path)?;
-    // Directory fsync makes the rename itself durable (unix only; Windows has no
-    // directory-fsync and ReplaceFile-style renames are already crash-safe).
-    #[cfg(unix)]
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = std::fs::File::open(parent)
-    {
-        let _ = dir.sync_all();
-    }
+    write_snapshot_bytes(path, &compressed)?;
 
     let elapsed_ms = start.elapsed().as_millis();
     info!(
@@ -193,6 +212,30 @@ mod tests {
     use alloy_primitives::{Address, U256};
     use n42_execution::state_diff::{AccountChangeType, AccountDiff, StateDiff, ValueChange};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn snapshot_directory_sync_failure_is_not_reported_as_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot");
+        let error = write_snapshot_bytes_with_sync(&path, b"snapshot", |renamed| {
+            assert_eq!(std::fs::read(renamed).unwrap(), b"snapshot");
+            Err(std::io::Error::other("injected directory sync failure"))
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected directory sync failure")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_propagates_open_failure_and_accepts_relative_filenames() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(sync_parent_directory(&dir.path().join("missing/snapshot")).is_err());
+        sync_parent_directory(Path::new("snapshot")).unwrap();
+    }
 
     fn make_diff(n: usize) -> StateDiff {
         let mut accounts = BTreeMap::new();

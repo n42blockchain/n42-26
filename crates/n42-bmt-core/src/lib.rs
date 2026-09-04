@@ -550,6 +550,12 @@ impl BmtProof {
         expected_value_hash: Option<Hash>,
         base_depth: usize,
     ) -> bool {
+        // Proofs arrive from untrusted servers, including through non-unwinding
+        // C entry points. Reject impossible bit ranges before indexing the key
+        // or adding base_depth to an attacker-controlled path length.
+        if base_depth > 256 || self.siblings.len() > 256 - base_depth {
+            return false;
+        }
         if self.value_hash != expected_value_hash {
             return false;
         }
@@ -817,6 +823,54 @@ mod tests {
         let vh = hash_value(&42u64.to_le_bytes());
         assert!(t.prove(key).verify(&root, Some(vh), 0));
         assert!(t.prove(key_from(99999)).verify(&root, None, 0));
+    }
+
+    #[test]
+    fn oversized_untrusted_proof_is_rejected_without_panicking() {
+        let roots = [EMPTY_HASH; SHARD_COUNT];
+        let proof = ShardedBmtProof {
+            shard_index: 0,
+            shard_root: EMPTY_HASH,
+            shard_path: shard_tree_path(&roots, 0),
+            inner: BmtProof {
+                key: [0; 32],
+                value_hash: None,
+                siblings: vec![EMPTY_HASH; 253],
+                other_leaf: None,
+            },
+            value: None,
+        };
+        assert_eq!(
+            proof.verify(&shard_tree_root(&roots)),
+            Err(BmtVerifyError::InShardProofFailed)
+        );
+    }
+
+    #[test]
+    fn proof_bit_range_checks_include_base_depth_and_exclusion_paths() {
+        let mut proof = BmtProof {
+            key: [0; 32],
+            value_hash: None,
+            siblings: Vec::new(),
+            other_leaf: None,
+        };
+        assert!(proof.verify(&EMPTY_HASH, None, 256));
+        assert!(!proof.verify(&EMPTY_HASH, None, 257));
+        assert!(!proof.verify(&EMPTY_HASH, None, usize::MAX));
+        proof.siblings = vec![EMPTY_HASH; 257];
+        assert!(!proof.verify(&EMPTY_HASH, None, 0));
+        proof.other_leaf = Some(([1; 32], [2; 32]));
+        assert!(!proof.verify(&EMPTY_HASH, None, 0));
+
+        // The deepest valid proof is still allowed (keys differ only at bit 255).
+        let mut tree = Sbmt::with_base_depth(4);
+        tree.insert([0; 32], b"first");
+        let mut other = [0; 32];
+        other[31] = 1;
+        tree.insert(other, b"second");
+        let valid = tree.prove([0; 32]);
+        assert_eq!(valid.siblings.len(), 252);
+        assert!(valid.verify(&tree.root_hash(), Some(hash_value(b"first")), 4));
     }
 
     #[test]

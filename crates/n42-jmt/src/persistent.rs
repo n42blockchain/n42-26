@@ -19,7 +19,9 @@
 
 use crate::sharded::ShardedJmt;
 use crate::sharded_bmt::ShardedSbmt;
-use crate::snapshot::{JmtSnapshot, load_snapshot, save_snapshot};
+use crate::snapshot::{
+    JmtSnapshot, load_snapshot, save_snapshot, sync_parent_directory, write_snapshot_bytes,
+};
 use crate::store::MemTreeStore;
 use crate::twig::TwigState;
 
@@ -291,25 +293,9 @@ fn twig_snapshot_entry_count(snapshot: &TwigSnapshot) -> usize {
 fn save_twig_snapshot(path: &Path, snapshot: &TwigSnapshot) -> eyre::Result<()> {
     let start = std::time::Instant::now();
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
     let raw = bincode::serialize(snapshot)?;
     let compressed = zstd::bulk::compress(&raw, 3)?;
-    let tmp_path = path.with_extension("tmp");
-    {
-        let mut f = File::create(&tmp_path)?;
-        f.write_all(&compressed)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, path)?;
-    #[cfg(unix)]
-    if let Some(parent) = path.parent()
-        && let Ok(dir) = File::open(parent)
-    {
-        let _ = dir.sync_all();
-    }
+    write_snapshot_bytes(path, &compressed)?;
 
     let elapsed_ms = start.elapsed().as_millis();
     tracing::info!(
@@ -394,6 +380,7 @@ impl PersistentSbmt {
             .create(true)
             .append(true)
             .open(&wal_path)?;
+        sync_parent_directory(&wal_path)?;
 
         Ok(Self {
             inner,
@@ -708,6 +695,7 @@ impl PersistentTwig {
             .create(true)
             .append(true)
             .open(&wal_path)?;
+        sync_parent_directory(&wal_path)?;
 
         Ok(Self {
             inner,

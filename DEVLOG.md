@@ -12,6 +12,7 @@ Logs are split into separate files by phase for easy maintenance:
 
 | File | Content | Phase |
 |------|---------|-------|
+| [devlog-141-three-month-audit-20260904](docs/devlog-141-three-month-audit-20260904.md) | 三个月审计：SBMT 证明边界、Gov5 误封禁/缓存、崩溃恢复、n42-rs 对照优化 | Audit |
 | [devlog-01-foundation](docs/devlog-01-foundation.md) | Phase 1-6: Execution, Consensus, Network, Mobile Verify, Integration | Foundation |
 | [devlog-02-integration-test](docs/devlog-02-integration-test.md) | Phase 7-15: E2E Integration, Testing, Feature Completion | Integration |
 | [devlog-03-audit-hardening](docs/devlog-03-audit-hardening.md) | Code Audit, Test Coverage, Production Hardening | Production |

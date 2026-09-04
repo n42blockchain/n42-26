@@ -43,7 +43,21 @@ pub fn append_execution_lineage_proof(
     record.extend_from_slice(&checksum.as_bytes()[..16]);
     debug_assert_eq!(record.len(), EXECUTION_LINEAGE_RECORD_LEN);
 
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let len = file.metadata()?.len();
+    let complete_len = len - len % EXECUTION_LINEAGE_RECORD_LEN as u64;
+    if complete_len != len {
+        // Recovery tolerates a torn final record, but a later append must not
+        // turn that tail into the prefix of a corrupt complete record. Use a
+        // write handle for portable truncation (append-only handles on Windows
+        // cannot set_len). The service serializes lineage writes.
+        let repair = OpenOptions::new().write(true).open(&path)?;
+        repair.set_len(complete_len)?;
+        repair.sync_all()?;
+    }
+    if complete_len == 0 {
+        n42_jmt::snapshot::sync_parent_directory(&path)?;
+    }
     file.write_all(&record)?;
     file.sync_data()
 }
@@ -340,7 +354,8 @@ pub fn save_consensus_state(path: &Path, snapshot: &ConsensusSnapshot) -> io::Re
         // rename could leave a zero-length file (data still in page cache).
         file.sync_all()?;
     }
-    std::fs::rename(&tmp_path, path)
+    std::fs::rename(&tmp_path, path)?;
+    n42_jmt::snapshot::sync_parent_directory(path)
 }
 
 /// Loads a consensus snapshot from a JSON file.
@@ -501,6 +516,9 @@ impl FileVoteLog {
                 ));
             }
         }
+        // The vote watermark is only crash-safe if a newly created file's
+        // directory entry is durable before consensus emits its first vote.
+        n42_jmt::snapshot::sync_parent_directory(&path)?;
         Ok(Self {
             path,
             file: Mutex::new(file),
@@ -1267,6 +1285,16 @@ mod tests {
         file.write_all(b"N42Epartial").unwrap();
         file.sync_data().unwrap();
 
+        assert_eq!(
+            recover_execution_lineage_proof(&snapshot_path, hash).unwrap(),
+            Some((77, hash))
+        );
+        let next_hash = B256::repeat_byte(0x34);
+        append_execution_lineage_proof(&snapshot_path, 78, next_hash).unwrap();
+        assert_eq!(
+            recover_execution_lineage_proof(&snapshot_path, next_hash).unwrap(),
+            Some((78, next_hash))
+        );
         assert_eq!(
             recover_execution_lineage_proof(&snapshot_path, hash).unwrap(),
             Some((77, hash))
