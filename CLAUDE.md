@@ -26,7 +26,9 @@ paradigmxyz/main `92855d264`，merge commit `82debcaff`）**，对应 workspace 
 **revm 42.0.1 / alloy-evm 0.38.0 / reth-primitives-traits 0.6.0 / Alloy 2.3.0**。动手前先
 `git -C ../reth log -1 --oneline` 确认 reth 在 `82debcaff`（或其后代）。jit/revmc 默认关闭
 （Windows 无 LLVM 22；Linux 要 JIT 用 `--features jit`）。**CI 已对齐**：所有 workflow
-checkout reth 的 `chore/reth-upstream-20260804`（见 `.github/workflows/*.yml`）。
+固定 reth 为该分支的 `23316e3ff8adca8c3bd5085ff0565fcae019202a`，构建前通过
+`bash scripts/apply-reth-patches.sh ../reth` 应用仓库内的交易根缓存 API 补丁；
+Docker 构建也应用同一补丁（见 `.github/workflows/*.yml` 和 `README.md`）。
 适配要点：reth 2.4.1 删除 changed-path 跟踪并重构 sparse-trie proof target；N42 的
 payload-cache/state-root 定制必须保留 `HashedPostState` 路径。20260804 合并起
 `BlobStore::insert` 收 `PooledBlobSidecar`（`BlobTransactionSidecarVariant` 加

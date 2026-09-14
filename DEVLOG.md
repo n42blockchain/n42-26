@@ -12,6 +12,7 @@ Logs are split into separate files by phase for easy maintenance:
 
 | File | Content | Phase |
 |------|---------|-------|
+| [devlog-145-ci-reth-cache-api-20260914](docs/devlog-145-ci-reth-cache-api-20260914.md) | 修复 CI 缺少 reth 交易根缓存 API 导致的三个编译失败检查 | CI |
 | [devlog-144-independent-chain94-fleet-20260904](docs/devlog-144-independent-chain94-fleet-20260904.md) | Gov5 历史快照上的纯 Rust 七节点独立舰队、原生出块、重启验收 | Deployment |
 | [devlog-141-three-month-audit-20260904](docs/devlog-141-three-month-audit-20260904.md) | 三个月审计：SBMT 证明边界、Gov5 误封禁/缓存、崩溃恢复、n42-rs 对照优化 | Audit |
 | [devlog-01-foundation](docs/devlog-01-foundation.md) | Phase 1-6: Execution, Consensus, Network, Mobile Verify, Integration | Foundation |

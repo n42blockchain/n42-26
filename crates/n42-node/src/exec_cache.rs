@@ -265,3 +265,56 @@ pub(crate) fn inject_compact_block(hash: &B256, compressed: &[u8], source: &'sta
     metrics::histogram!("n42_compact_inject_ms").record(total_ms as f64);
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transaction_root_survives_compact_round_trip_and_is_evicted_by_hash() {
+        let hash = B256::repeat_byte(0x42);
+        let other_hash = B256::repeat_byte(0x43);
+        let root = B256::repeat_byte(0x44);
+        let cache = RethExecutionOutputCache::new(None, reth_chainspec::MAINNET.clone());
+
+        reth_evm::payload_cache::store_payload_transactions_root(hash, root);
+        reth_evm::payload_cache::store_broadcast_execution(
+            hash,
+            (
+                BlockExecutionOutput::<reth_ethereum_primitives::Receipt>::default(),
+                Vec::<Address>::new(),
+            ),
+        );
+        let compressed = cache
+            .take_serialized(hash)
+            .expect("cached execution output");
+        let compact: CompactBlockExecution =
+            serde_json::from_slice(&decompress_payload(&compressed).unwrap()).unwrap();
+        assert_eq!(compact.transactions_root, Some(root));
+
+        reth_evm::payload_cache::remove_payload_transactions_root(&hash);
+        assert!(cache.inject(hash, &compressed, "test"));
+        assert_eq!(
+            reth_evm::payload_cache::payload_transactions_root(&hash),
+            Some(root)
+        );
+        assert_eq!(
+            reth_evm::payload_cache::payload_transactions_root(&other_hash),
+            None
+        );
+
+        cache.evict(other_hash);
+        assert_eq!(
+            reth_evm::payload_cache::payload_transactions_root(&hash),
+            Some(root)
+        );
+        cache.evict(hash);
+        assert_eq!(
+            reth_evm::payload_cache::payload_transactions_root(&hash),
+            None
+        );
+        assert!(
+            reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&hash).is_none()
+        );
+    }
+}

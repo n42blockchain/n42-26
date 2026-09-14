@@ -12,18 +12,22 @@ WORKDIR /build
 RUN apt-get update && apt-get install -y cmake clang libclang-dev pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy patched reth dependency first (changes less frequently -> better layer caching)
+# Copy reth and apply the same cache API patch used by CI.
 COPY reth/ /build/reth/
+COPY n42-26/patches/ /build/n42-26/patches/
+COPY n42-26/scripts/apply-reth-patches.sh /build/n42-26/scripts/apply-reth-patches.sh
+RUN bash /build/n42-26/scripts/apply-reth-patches.sh /build/reth
 
 # Copy n42 workspace
 COPY n42-26/Cargo.toml n42-26/Cargo.lock /build/n42-26/
 COPY n42-26/crates/ /build/n42-26/crates/
 COPY n42-26/bin/ /build/n42-26/bin/
+COPY n42-26/tests/e2e/ /build/n42-26/tests/e2e/
 
 WORKDIR /build/n42-26
 
 # Build release binary
-RUN cargo build --release -p n42-node-bin \
+RUN cargo build --release --locked -p n42-node-bin \
     && strip /build/n42-26/target/release/n42-node
 
 # ── Runtime stage ──

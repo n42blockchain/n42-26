@@ -25,8 +25,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: n42blockchain/reth
-          ref: chore/reth-upstream-20260804
+          ref: 23316e3ff8adca8c3bd5085ff0565fcae019202a # chore/reth-upstream-20260804
           path: reth
+
+      - name: Apply N42 reth patches
+        run: bash n42-26/scripts/apply-reth-patches.sh reth
 
       - uses: dtolnay/rust-toolchain@1.97.1
 
@@ -48,7 +51,7 @@ jobs:
 
       - name: Build n42-node and e2e harness
         working-directory: n42-26
-        run: cargo build --release -p n42-node-bin -p e2e-test
+        run: cargo build --release --locked -p n42-node-bin -p e2e-test
         env:
           RUSTFLAGS: "-C target-cpu=native"
 

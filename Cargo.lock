@@ -10505,7 +10505,6 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-rpc-types-engine",
- "rayon",
  "reth-basic-payload-builder",
  "reth-chainspec",
  "reth-consensus-common",
