@@ -68,6 +68,7 @@ class DecisionShadowTests(unittest.TestCase):
             self.assertEqual(main([str(events), "--output", str(out), "--metrics", str(metrics)]), 0)
             self.assertEqual(json.loads(out.read_text())["id"], "cli1")
             self.assertEqual(json.loads(metrics.read_text())["events"], 1)
+            self.assertIsNone(json.loads(metrics.read_text())["model_call_reduction_vs_every_event"])
 
     def test_collects_bounded_redacted_log_lines(self):
         records = list(collect_lines(["normal\n", "TYPESAFE_API_KEY=abc123 finality stalled\n", "x" * 9000], "node", "run1", 10))

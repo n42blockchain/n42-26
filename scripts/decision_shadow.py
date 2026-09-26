@@ -139,11 +139,11 @@ def classify(event, model_call=None):
     return result
 
 
-def score(records, jev_cost_per_million_tokens=None, total_input_tokens=None):
+def score(records, jev_cost_per_million_tokens=None, total_input_tokens=None, model_enabled=True):
     rows = list(records)
     labelled = [r for r in rows if r.get("truth") in HEALTH]
     result = {"events": len(rows), "labelled_events": len(labelled), "model_calls": sum(bool(r.get("model_called")) for r in rows),
-              "model_call_reduction_vs_every_event": 1 - sum(bool(r.get("model_called")) for r in rows) / len(rows) if rows else None,
+              "model_call_reduction_vs_every_event": 1 - sum(bool(r.get("model_called")) for r in rows) / len(rows) if rows and model_enabled else None,
               "mean_latency_ms": statistics.mean(r["latency_ms"] for r in rows) if rows else None,
               "estimated_jev_cost_per_10000_events_usd": (total_input_tokens / len(rows) * 10000 / 1_000_000 * jev_cost_per_million_tokens) if rows and total_input_tokens is not None and jev_cost_per_million_tokens is not None else None}
     for key in ("rule", "shadow"):
@@ -196,7 +196,7 @@ def main(argv=None):
             record = classify(json.loads(line), official_jev if args.jev else None)
             records.append(record)
             out.write(json.dumps(record, ensure_ascii=False) + "\n")
-    args.metrics.write_text(json.dumps(score(records), indent=2) + "\n", encoding="utf-8")
+    args.metrics.write_text(json.dumps(score(records, model_enabled=args.jev), indent=2) + "\n", encoding="utf-8")
     return 0
 
 
