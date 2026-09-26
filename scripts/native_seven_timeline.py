@@ -14,6 +14,7 @@ TIMESTAMP = re.compile(r"^(\S+)")
 STAGES = {
     "N42_CADENCE: build_start->broadcast": ("leader_broadcast_ms", "build_start_to_broadcast_ms"),
     "validated normalized Gov5 leader payload": ("leader_validation_ms", "elapsed_ms"),
+    "N42_COMPRESS: payload compressed": ("compression_ms", "compress_ms"),
     "N42_FOLLOWER_IMPORT: block_data->accepted": ("follower_import_ms", "follower_import_ms"),
 }
 
@@ -42,6 +43,8 @@ def build_timeline(campaign: Path, tag: str) -> dict:
             "leader_validation_ms": None,
             "packing_ms": None,
             "builder_finish_ms": None,
+            "payload_built_ms": None,
+            "compression_ms": None,
             "follower_import_ms": {},
         }
         for block in audit["blocks"]
@@ -66,6 +69,10 @@ def build_timeline(campaign: Path, tag: str) -> dict:
                         duration = re.search(r"\btotal_finish_ms=(\d+)\b", line)
                         if duration:
                             active_build["builder_finish_ms"] = int(duration.group(1))
+                    elif "payload built elapsed_ms=" in line:
+                        duration = re.search(r"\belapsed_ms=(\d+)\b", line)
+                        if duration:
+                            active_build["payload_built_ms"] = int(duration.group(1))
                 found = HASH.search(line)
                 completed_build = None
                 if "N42_CADENCE: build_start->broadcast" in line:
@@ -99,7 +106,7 @@ def build_timeline(campaign: Path, tag: str) -> dict:
         if 0 <= window < len(windows):
             windows[window] += block["successful_transactions"]
     stage_summary = {}
-    for field in ("packing_ms", "builder_finish_ms", "leader_broadcast_ms", "leader_validation_ms", "follower_import_ms"):
+    for field in ("packing_ms", "builder_finish_ms", "payload_built_ms", "leader_broadcast_ms", "leader_validation_ms", "compression_ms", "follower_import_ms"):
         values = []
         for block in blocks:
             value = block[field]
