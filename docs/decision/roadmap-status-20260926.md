@@ -1,5 +1,9 @@
 # N42 × Jev roadmap status (2026-09-26)
 
+This status snapshot describes the earlier Jev-first proposal. The approved
+local-first sequence and eight-class benchmark now live in
+`local-system1-roadmap.md`; use that document for subsequent phases.
+
 The proposed five-phase roadmap is a staged product plan. A previous, separate
 testnet M1 exists in this workspace as untracked files: a public-proposal
 DecisionHub, Jev relay, TypeScript SDK and example DApp. It has not been

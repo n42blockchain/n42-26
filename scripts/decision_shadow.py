@@ -58,6 +58,21 @@ def collect_lines(lines, source, prefix, observed_at_ms):
         yield record
 
 
+def load_labels(path):
+    labels = {}
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str) or item.get("truth") not in HEALTH or item.get("truth_domain") not in DOMAINS:
+                raise ValueError("invalid adjudicated label")
+            if item["id"] in labels:
+                raise ValueError("duplicate adjudicated label")
+            labels[item["id"]] = {"truth": item["truth"], "truth_domain": item["truth_domain"]}
+    return labels
+
+
 def rule_decision(event):
     text = event["text"].lower()
     critical = ("finality stalled", "qc mismatch", "state root mismatch", "data unavailable", "consensus halted")
@@ -182,20 +197,35 @@ def main(argv=None):
     parser.add_argument("events", type=Path, help="sanitized, labelled JSONL input")
     parser.add_argument("--output", type=Path, required=True, help="new shadow JSONL output")
     parser.add_argument("--metrics", type=Path, required=True, help="new metrics JSON output")
+    parser.add_argument("--labels", type=Path, help="separately adjudicated JSONL labels")
     parser.add_argument("--jev", action="store_true", help="call pinned TypeSafe Jev model")
     args = parser.parse_args(argv)
     if args.output.exists() or args.metrics.exists():
         parser.error("output files must not exist")
     if args.jev and not os.environ.get("TYPESAFE_API_KEY"):
         parser.error("TYPESAFE_API_KEY is required with --jev")
+    labels = load_labels(args.labels) if args.labels else {}
     records = []
+    seen = set()
     with args.events.open(encoding="utf-8") as source, args.output.open("x", encoding="utf-8") as out:
         for line in source:
             if not line.strip():
                 continue
-            record = classify(json.loads(line), official_jev if args.jev else None)
+            event = json.loads(line)
+            event_id = event.get("id") if isinstance(event, dict) else None
+            if event_id in seen:
+                raise ValueError("duplicate event id")
+            seen.add(event_id)
+            if event_id in labels:
+                for field, value in labels[event_id].items():
+                    if field in event and event[field] != value:
+                        raise ValueError("embedded and adjudicated labels disagree")
+                    event[field] = value
+            record = classify(event, official_jev if args.jev else None)
             records.append(record)
             out.write(json.dumps(record, ensure_ascii=False) + "\n")
+    if set(labels) - seen:
+        raise ValueError("labels refer to unknown event ids")
     args.metrics.write_text(json.dumps(score(records, model_enabled=args.jev), indent=2) + "\n", encoding="utf-8")
     return 0
 

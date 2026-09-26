@@ -1,5 +1,11 @@
 # Phase 1: read-only node/CI shadow gateway
 
+This describes the earlier Jev-first prototype. The local-first, eight-class
+Rules / GLiClass / Jev benchmark is specified in `local-system1-roadmap.md` and
+implemented separately by `scripts/decision_benchmark.py` and
+`scripts/run_decision_provider.py`. Use the new eight-class corpus for the
+current Go/No-Go decision.
+
 `scripts/decision_shadow.py` accepts one sanitized event per JSONL line and
 records the deterministic rule result beside a shadow Jev classification. It
 cannot write node configuration, call an N42 RPC method, sign, submit, restart

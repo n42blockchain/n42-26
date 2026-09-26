@@ -3,7 +3,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from decision_shadow import classify, collect_lines, evaluate, main, redact, score
+from decision_shadow import classify, collect_lines, evaluate, load_labels, main, redact, score
 
 
 class DecisionShadowTests(unittest.TestCase):
@@ -78,6 +78,14 @@ class DecisionShadowTests(unittest.TestCase):
         self.assertEqual(records[1]["observed_at_ms"], 10)
         self.assertTrue(records[2]["truncated"])
         self.assertLessEqual(len(records[2]["text"].encode()), 8192)
+
+    def test_external_labels_reject_duplicates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "labels.jsonl"
+            path.write_text('{"id":"e1","truth":"CRITICAL","truth_domain":"CONSENSUS"}\n'
+                            '{"id":"e1","truth":"HEALTHY","truth_domain":"UNKNOWN"}\n')
+            with self.assertRaises(ValueError):
+                load_labels(path)
 
 
 if __name__ == "__main__":
