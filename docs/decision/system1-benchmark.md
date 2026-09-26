@@ -77,4 +77,11 @@ the Phase 1 corpus supports a calibrated threshold.
 The [official GLiClass README](https://github.com/Knowledgator/GLiClass)
 shows its local pipeline and CPU-compatible serving options. The adapter loads
 only a local directory and never downloads a model at runtime. No GLiClass
-package or model is bundled with this repository.
+package or model is bundled with this repository. Under the shared quiet-hardware
+claim, `scripts/install-local-decision-models.sh` creates an isolated Python
+environment in `.artifacts/decision-system1-models/.venv`, installs a CPU-only
+PyTorch and GLiClass, downloads pinned GLiClass small v1.0 and ModernBERT-base
+revisions, hashes files and runs local loading smoke tests. The script refuses
+to run without both Codex claim files. Use the model path in its manifest for
+`--model-dir`. ModernBERT-base is a masked-language-model checkpoint, not an
+N42 fault classifier until it receives an independently trained head.
