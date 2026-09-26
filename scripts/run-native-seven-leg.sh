@@ -63,6 +63,7 @@ done
 mkdir -p "$RUNTIME/logs" "$RUNTIME/pids" "$RESULT"
 printf 'tag\t%s\noptions\t%s\nmax_txs_per_block\t%s\n' "$TAG" "$*" "$BLOCK_CAP" > "$RESULT/leg.tsv"
 printf 'gov5_reuse_builder_execution\t%s\n' "${N42_GOV5_REUSE_BUILDER_EXECUTION:-1}" >> "$RESULT/leg.tsv"
+printf 'rpc_max_response_mb\t%s\n' "${N42_BENCH_RPC_MAX_RESPONSE_MB:-160}" >> "$RESULT/leg.tsv"
 sha256sum target/release/n42-node target/release/n42-stress \
     target/release/n42-keccak target/release/n42-verify-commit \
     "$TEMPLATE/presigned-24m.bin" > "$RESULT/binary-workload-sha256.txt"
@@ -92,7 +93,8 @@ trap 'exit 143' TERM
 
 python3 "$SCRIPT_DIR/chain94-fleet.py" --runtime "$RUNTIME" start \
     --foreground --binary "$PROJECT_DIR/target/release/n42-node" \
-    --disable-tx-forward --qmdb-reads only --max-txs-per-block "$BLOCK_CAP" "$@" \
+    --disable-tx-forward --qmdb-reads only --max-txs-per-block "$BLOCK_CAP" \
+    --rpc-max-response-mb "${N42_BENCH_RPC_MAX_RESPONSE_MB:-160}" "$@" \
     > "$RESULT/supervisor.log" 2>&1 &
 supervisor="$!"
 
