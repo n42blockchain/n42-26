@@ -27,7 +27,9 @@ def _timestamp_ns(line: str) -> int | None:
         instant = dt.datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
     except ValueError:
         return None
-    return int(instant.timestamp() * 1_000_000_000)
+    elapsed = instant - dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+    return ((elapsed.days * 86400 + elapsed.seconds) * 1_000_000_000
+            + elapsed.microseconds * 1000)
 
 
 def build_timeline(campaign: Path, tag: str) -> dict:
@@ -45,6 +47,8 @@ def build_timeline(campaign: Path, tag: str) -> dict:
             "builder_finish_ms": None,
             "payload_built_ms": None,
             "compression_ms": None,
+            "payload_to_engine_ms": None,
+            "validation_to_compress_done_ms": None,
             "follower_import_ms": {},
         }
         for block in audit["blocks"]
@@ -73,6 +77,13 @@ def build_timeline(campaign: Path, tag: str) -> dict:
                         duration = re.search(r"\belapsed_ms=(\d+)\b", line)
                         if duration:
                             active_build["payload_built_ms"] = int(duration.group(1))
+                            active_build["payload_built_ns"] = _timestamp_ns(line)
+                    elif "Received new payload from consensus engine" in line and active_build.get("payload_built_ns") is not None and "payload_to_engine_ms" not in active_build:
+                        received_ns = _timestamp_ns(line)
+                        if received_ns is not None:
+                            active_build["payload_to_engine_ms"] = max(
+                                0, (received_ns - active_build["payload_built_ns"]) // 1_000_000
+                            )
                 found = HASH.search(line)
                 completed_build = None
                 if "N42_CADENCE: build_start->broadcast" in line:
@@ -80,6 +91,10 @@ def build_timeline(campaign: Path, tag: str) -> dict:
                 if not found or found.group(1) not in by_hash:
                     continue
                 block = by_hash[found.group(1)]
+                if "validated normalized Gov5 leader payload" in line:
+                    block["validation_complete_ns"] = _timestamp_ns(line)
+                if "N42_COMPRESS: payload compressed" in line:
+                    block["compression_complete_ns"] = _timestamp_ns(line)
                 if completed_build is not None:
                     block.update(completed_build)
                 if index == 0 and "N42_CADENCE: inter-block commit interval" in line:
@@ -98,6 +113,10 @@ def build_timeline(campaign: Path, tag: str) -> dict:
     windows = [0, 0, 0, 0]
     unmatched = 0
     for block in blocks:
+        validated = block.get("validation_complete_ns")
+        compressed = block.get("compression_complete_ns")
+        if validated is not None and compressed is not None and compressed >= validated:
+            block["validation_to_compress_done_ms"] = (compressed - validated) // 1_000_000
         committed = block["node0_commit_ns"]
         if committed is None:
             unmatched += 1
@@ -106,7 +125,7 @@ def build_timeline(campaign: Path, tag: str) -> dict:
         if 0 <= window < len(windows):
             windows[window] += block["successful_transactions"]
     stage_summary = {}
-    for field in ("packing_ms", "builder_finish_ms", "payload_built_ms", "leader_broadcast_ms", "leader_validation_ms", "compression_ms", "follower_import_ms"):
+    for field in ("packing_ms", "builder_finish_ms", "payload_built_ms", "payload_to_engine_ms", "leader_broadcast_ms", "leader_validation_ms", "compression_ms", "validation_to_compress_done_ms", "follower_import_ms"):
         values = []
         for block in blocks:
             value = block[field]

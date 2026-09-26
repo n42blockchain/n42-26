@@ -28,9 +28,11 @@ class TimelineTest(unittest.TestCase):
                 "2001-09-09T01:46:47Z INFO N42_TIMEOUT_VIEW: leader_build_start view=7\n"
                 "2001-09-09T01:46:47Z INFO N42_PAYLOAD_PACK: tx packing complete tx_count=10 packing_ms=45\n"
                 "2001-09-09T01:46:47Z INFO N42_FINISH_BREAKDOWN: builder.finish() total_finish_ms=30\n"
-                "2001-09-09T01:46:47Z INFO payload built elapsed_ms=80 tx_count=10\n"
+                "2001-09-09T01:46:47.000Z INFO payload built elapsed_ms=80 tx_count=10\n"
+                "2001-09-09T01:46:47.100Z INFO Received new payload from consensus engine number=7\n"
+                "2001-09-09T01:46:47.300Z INFO validated normalized Gov5 leader payload hash=0xaaaa elapsed_ms=200\n"
+                "2001-09-09T01:46:47.500Z INFO N42_COMPRESS: payload compressed hash=0xaaaa compress_ms=7\n"
                 "2001-09-09T01:46:48Z INFO N42_CADENCE: build_start->broadcast hash=0xaaaa build_start_to_broadcast_ms=110\n"
-                "2001-09-09T01:46:48Z INFO N42_COMPRESS: payload compressed hash=0xaaaa compress_ms=7\n"
                 "2001-09-09T01:46:49Z INFO N42_TIMEOUT_VIEW: leader_build_start view=8\n"
                 "2001-09-09T01:46:49Z INFO N42_PAYLOAD_PACK: tx packing complete tx_count=0 packing_ms=99\n"
                 "2001-09-09T01:46:50Z INFO N42_CADENCE: build_start->broadcast hash=0xdddd build_start_to_broadcast_ms=120\n"
@@ -48,6 +50,8 @@ class TimelineTest(unittest.TestCase):
             self.assertEqual(result["blocks"][0]["builder_finish_ms"], 30)
             self.assertEqual(result["blocks"][0]["payload_built_ms"], 80)
             self.assertEqual(result["blocks"][0]["compression_ms"], 7)
+            self.assertEqual(result["blocks"][0]["payload_to_engine_ms"], 100)
+            self.assertEqual(result["blocks"][0]["validation_to_compress_done_ms"], 200)
             self.assertEqual(result["blocks"][0]["follower_import_ms"], {"node1": 70})
             self.assertEqual(result["blocks"][1]["leader_broadcast_ms"], 130)
             self.assertIsNone(result["blocks"][1]["packing_ms"])
