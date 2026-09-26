@@ -182,6 +182,20 @@ def verify_native_header(raw_hex, block):
     return dict(verified_header_hash=actual, native_header_rlp="0x"+raw.hex())
 
 
+def fetch_block_receipts(url, block_hash, expected_count, call=rpc, sleep=time.sleep):
+    """Read the complete receipts for one immutable committed block hash."""
+    block_hash = digest(block_hash)
+    for attempt in range(3):
+        receipts = call(url, "eth_getBlockReceipts", [block_hash])
+        if receipts is not None:
+            if not isinstance(receipts, list) or len(receipts) != expected_count:
+                raise AuditError("receipt count differs from committed transaction count")
+            return receipts
+        if attempt < 2:
+            sleep(0.5)
+    raise AuditError(f"{url}: receipts unavailable for committed block {block_hash}")
+
+
 def receipt_summary(receipts, block):
     """Verify positional RPC metadata and reconstruct Gov5's native receipt root."""
     transactions = [digest(tx) for tx in block["transactions"]]
@@ -569,7 +583,10 @@ def audit(start, end, call=rpc, *, trusted=None):
                 raise AuditError(f"{url}: common committed chain differs")
             header = verify_native_header(call(url, "n42_nativeHeader", [block["hash"]]), remote)
             try:
-                verified = receipt_summary(call(url, "eth_getBlockReceipts", [block["hash"]]), remote)
+                verified = receipt_summary(
+                    fetch_block_receipts(url, block["hash"], len(remote["transactions"]), call=call),
+                    remote,
+                )
             except (AuditError, OSError, subprocess.SubprocessError) as error:
                 raise AuditError(f"{url}: receipt verification at block {number}: {error}") from error
             if execution is not None and execution != verified:

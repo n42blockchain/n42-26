@@ -114,6 +114,20 @@ class Fleet:
 
 
 class AuditTests(unittest.TestCase):
+    def test_receipt_fetch_retries_only_the_captured_hash(self):
+        block_hash = digest(5)
+        responses = iter((None, [{"transactionHash": digest(50)}]))
+        calls = []
+
+        def request(url, method, params):
+            calls.append((method, params))
+            return next(responses)
+
+        receipts = audit.fetch_block_receipts("node0", block_hash, 1,
+                                              call=request, sleep=lambda _: None)
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(calls, [("eth_getBlockReceipts", [block_hash])] * 2)
+
     def test_rpc_error_preserves_method_code_and_message_for_large_receipts(self):
         response = dict(jsonrpc="2.0", id=1,
                         error=dict(code=-32005, message="response exceeds 160 MiB limit"))
