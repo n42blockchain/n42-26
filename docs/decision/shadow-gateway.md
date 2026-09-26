@@ -19,7 +19,8 @@ Input example:
 {"id":"ci-102","source":"ci","text":"execution test failed","observed_at_ms":1790445000000,"truth":"DEGRADED","truth_domain":"EXECUTION"}
 ```
 
-Allowed sources: `node`, `ci`, `benchmark`, `peerdas`, `block_stm`, `qmdb`.
+Allowed sources: `node`, `ci`, `rpc`, `network`, `benchmark`, `configuration`,
+`peerdas`, `block_stm`, `qmdb`.
 `truth` and `truth_domain` are optional adjudicated labels used only for
 measurement. IDs and event text have size limits; obvious key/token patterns
 are removed before model calls, but operators must sanitize logs before

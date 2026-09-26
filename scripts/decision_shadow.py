@@ -16,7 +16,7 @@ from pathlib import Path
 MODEL = "jev-1.13.0"
 HEALTH = ("HEALTHY", "DEGRADED", "CRITICAL")
 DOMAINS = ("NETWORK", "CONSENSUS", "EXECUTION", "STORAGE", "UNKNOWN")
-SOURCES = ("node", "ci", "benchmark", "peerdas", "block_stm", "qmdb")
+SOURCES = ("node", "ci", "rpc", "network", "benchmark", "configuration", "peerdas", "block_stm", "qmdb")
 KEY_RE = re.compile(r"(?i)\b([a-z_]*(?:api[_-]?key|secret|token|password|private[_-]?key)[a-z_]*)\s*[=:]\s*\S+")
 HEX_KEY_RE = re.compile(r"\b0x[0-9a-fA-F]{64}\b")
 

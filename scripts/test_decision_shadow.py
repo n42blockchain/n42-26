@@ -46,6 +46,8 @@ class DecisionShadowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             classify(event)
         event["text"] = "normal"
+        event["source"] = "rpc"
+        self.assertEqual(classify(event)["source"], "rpc")
         event["source"] = "wallet"
         with self.assertRaises(ValueError):
             classify(event)
