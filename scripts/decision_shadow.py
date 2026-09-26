@@ -40,6 +40,24 @@ def validate_event(event):
     return event
 
 
+def collect_lines(lines, source, prefix, observed_at_ms):
+    """Convert a finite text-log snapshot into bounded, redacted shadow events."""
+    if source not in SOURCES or not re.fullmatch(r"[A-Za-z0-9_-]{1,96}", prefix):
+        raise ValueError("invalid source or event prefix")
+    for line_number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        raw = redact(line.rstrip("\r\n"))
+        encoded = raw.encode("utf-8")
+        truncated = len(encoded) > 8192
+        if truncated:
+            raw = encoded[:8192].decode("utf-8", errors="ignore")
+        record = {"id": f"{prefix}-{line_number}", "source": source, "text": raw,
+                  "observed_at_ms": observed_at_ms, "truncated": truncated}
+        validate_event(record)
+        yield record
+
+
 def rule_decision(event):
     text = event["text"].lower()
     critical = ("finality stalled", "qc mismatch", "state root mismatch", "data unavailable", "consensus halted")

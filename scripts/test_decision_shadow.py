@@ -3,7 +3,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from decision_shadow import classify, evaluate, main, redact, score
+from decision_shadow import classify, collect_lines, evaluate, main, redact, score
 
 
 class DecisionShadowTests(unittest.TestCase):
@@ -68,6 +68,15 @@ class DecisionShadowTests(unittest.TestCase):
             self.assertEqual(main([str(events), "--output", str(out), "--metrics", str(metrics)]), 0)
             self.assertEqual(json.loads(out.read_text())["id"], "cli1")
             self.assertEqual(json.loads(metrics.read_text())["events"], 1)
+
+    def test_collects_bounded_redacted_log_lines(self):
+        records = list(collect_lines(["normal\n", "TYPESAFE_API_KEY=abc123 finality stalled\n", "x" * 9000], "node", "run1", 10))
+        self.assertEqual(len(records), 3)
+        self.assertEqual(records[1]["id"], "run1-2")
+        self.assertNotIn("abc123", records[1]["text"])
+        self.assertEqual(records[1]["observed_at_ms"], 10)
+        self.assertTrue(records[2]["truncated"])
+        self.assertLessEqual(len(records[2]["text"].encode()), 8192)
 
 
 if __name__ == "__main__":

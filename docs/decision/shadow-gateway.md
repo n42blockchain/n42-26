@@ -20,6 +20,8 @@ are removed before model calls, but operators must sanitize logs before
 creating the input file. The output contains no event text.
 
 ```sh
+python3 scripts/collect_decision_events.py node.log \
+  --source node --prefix node0-window1 --output events.jsonl
 python3 scripts/decision_shadow.py events.jsonl \
   --output shadow.jsonl --metrics metrics.json
 TYPESAFE_API_KEY=... python3 scripts/decision_shadow.py events.jsonl \
@@ -28,7 +30,11 @@ python3 -m unittest discover -s scripts -p test_decision_shadow.py -v
 ```
 
 Outputs must be new paths so an experiment cannot silently overwrite prior
-evidence. The Jev call uses the pinned `jev-1.13.0` template; an alternate
+evidence. The collector is an offline snapshot converter, not a daemon: feed
+CI logs, benchmark summaries or node logs with the matching `--source` and
+unique `--prefix`. It redacts common key/token patterns and truncates long
+lines, but operators must inspect and sanitize the source for other secrets
+before sending events to a model. The Jev call uses the pinned `jev-1.13.0` template; an alternate
 endpoint is accepted only via HTTPS or loopback HTTP for tests. The script
 does not infer token use from text. Cost per 10,000 events remains `null`
 until actual metered token counts and an explicit current price are supplied
