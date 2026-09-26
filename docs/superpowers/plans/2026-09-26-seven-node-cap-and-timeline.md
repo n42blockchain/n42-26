@@ -17,6 +17,7 @@
 - 60 seconds unscored warmup; same-binary A/B/A when comparing an optimization; include first and subsequent 15/30-second windows and the 60-second total.
 - Three quiet checks and both shared claims before heavy work; never stop another driver's tasks.
 - Do not count old bypass-flag, Go Gov5 or n42-rs numbers as equivalent without a validation/workload mapping.
+- A 400k/600k acceptance run needs at least 48 million chain-941007 nonce-correct pre-signed transactions per leg; the current 24-million file is only a diagnostic supply source.
 
 ## Review Focus
 
@@ -90,3 +91,4 @@
 - [ ] **Step 2: Under the shared box-claim controller**, build release binaries, run focused tests, 60-second unscored warmup and one 60-second 220k scored leg. Wait naturally for other claims; do not modify their processes or claims.
 - [ ] **Step 3: Require** strict seven-node auditor pass, zero unverified or failed committed transactions, matching QC and roots, post-run seven-node verification and a timeline with audited-hash match rate 100%. If any fails, retain artifacts, fix the cause and rerun under a new immutable tag.
 - [ ] **Step 4: Compare** per-block critical path, first/subsequent windows, resources and previous 100k shape without treating the cross-cap difference as a causal code uplift. Choose the largest measured wall-clock limiter, write the next bounded optimization plan, and commit the report and controller.
+- [ ] **Step 5: Check supply** against the measured attempt rate. If the 24-million file is exhausted or the resulting baseline could reach 400k, generate and preflight at least 48 million chain-941007 transactions under a later quiet claim before treating any run as target acceptance.

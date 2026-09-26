@@ -8,6 +8,8 @@ The current valid full-warmup result is 32,010.53 successful committed TPS with 
 
 Use 60 seconds of unscored warmup and same-binary A/B/A for causal comparisons. The shared box-claim controller must pass three quiet checks and own both claims before any build, offline audit or fleet run. Other drivers' claims and processes are never stopped. No result from the older benchmark-bypass chain, Go Gov5, or n42-rs is directly comparable without a workload and validation mapping.
 
+The current seven-node pre-signed file contains 24 million transactions, exactly one minute at 400k TPS and insufficient for a 600k TPS minute. Any 400k/600k acceptance run must use a newly generated, chain-941007, nonce-correct file with at least 48 million transactions per leg and the same sender/recipient distribution across A/B/A; preflight must reject an undersized or wrong-chain file. The existing 24-million file remains useful for a diagnostic baseline below its supply ceiling.
+
 ## Evidence and gap
 
 The current 100,000-tx-cap A/B/A is valid: 25,050.88 / 32,010.53 / 25,012.18 TPS, A drift -0.15%, with seven-node QC/receipts/roots passing. For audited transaction-bearing blocks, median build-start-to-broadcast is 1,542 / 1,356 / 1,530 ms, median follower import 655 / 659 / 657 ms, and median leader normalized-payload validation 616 / 426 / 616 ms. Cache reuse saves the duplicate leader execution but does not remove the slower builder and import stages. Source: `docs/benchmarks/20260925-seven-node-rekey-round.md` and the retained warm60 artifacts.
