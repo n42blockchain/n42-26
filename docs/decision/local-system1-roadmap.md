@@ -50,3 +50,9 @@ has run. A 1,000-line node-log smoke sample has no adjudicated labels and
 cannot satisfy the Phase 1 gate. The gateway falls back on explicit `UNKNOWN`
 or provider error; low-score fallback is deliberately not enabled before
 N42-specific score calibration.
+
+The first unlabelled review queue now contains 207 candidates from a preserved
+seven-node leader log, a coverage CI failure list and a seven-node qualification
+log. Its ignored manifest at `.artifacts/decision-system1-candidates-20260926-manifest.json`
+records exact source SHA-256 hashes and sampling parameters. No candidate has
+been promoted to ground truth.

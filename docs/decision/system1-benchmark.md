@@ -12,6 +12,13 @@ from the older Jev-first health/domain shadow prototype.
      --source node --prefix incident-run1-node0 --output events.jsonl
    ```
 
+   For a bounded review queue across several files, use
+   `scripts/decision_candidates.py` with `SOURCE:PATH` inputs,
+   `--per-bucket`, `--output`, `--manifest` and `--label-template`. It samples
+   normal and keyword-abnormal lines separately with a fixed seed; these are
+   **candidate** buckets, not truth labels. The template contains null labels
+   until a person adjudicates them.
+
 2. Adjudicate **without viewing provider predictions**. For every event ID,
    provide exactly one line in `labels.jsonl`:
 
