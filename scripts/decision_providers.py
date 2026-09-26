@@ -73,6 +73,8 @@ class JevProvider:
         confidence = choice.get("confidence")
         if not isinstance(probabilities, dict) or set(probabilities) != set(LABELS) or any(type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= 1 for v in probabilities.values()) or abs(sum(probabilities.values()) - 1) > .02:
             raise ValueError("invalid Jev distribution")
+        if probabilities[choice["choice"]] + 0.000001 < max(probabilities.values()):
+            raise ValueError("Jev choice disagrees with distribution")
         if type(confidence) not in (int, float) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
             raise ValueError("invalid Jev confidence")
         deep = response["answers"]["q1"]
