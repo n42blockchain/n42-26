@@ -26,3 +26,9 @@ node logs, CI failures, benchmark regressions and storage/network incidents.
 Compare rules-only and rules-plus-Jev on severe-event recall, false-positive
 rate, domain accuracy, detection latency, System-2 escalation rate and cost per
 10,000 events. No deployment or later phase is implied by unit-test success.
+
+An offline smoke run converted 1,000 lines from the preserved seven-node B
+leader log and produced rule-only shadow records under `.artifacts/decision-shadow-node0-*`.
+All 1,000 were unlabelled, and no TypeSafe key was configured; therefore recall,
+false-positive rate, domain accuracy and model-cost metrics are intentionally
+`null`. This verifies the file pipeline only, not the go/no-go gate.
