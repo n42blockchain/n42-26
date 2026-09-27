@@ -35,6 +35,7 @@ fi
 
 TEMPLATE="${N42_SEVEN_ARTIFACT_DIR:-$PROJECT_DIR/.artifacts/native-seven-20260924}"
 CAMPAIGN="${N42_SEVEN_CAMPAIGN_DIR:-$PROJECT_DIR/.artifacts/native-seven-ab-20260924}"
+PRESIGNED="${N42_SEVEN_PRESIGNED_TXS:-$TEMPLATE/presigned-24m.bin}"
 RUNTIME="$CAMPAIGN/runtime-$TAG"
 RESULT="$CAMPAIGN/result-$TAG"
 if [[ -e "$RUNTIME" || -e "$RESULT" ]]; then
@@ -47,7 +48,7 @@ for file in manifest.json consensus.json trusted-config.json test-accounts.json 
         exit 2
     fi
 done
-for file in target/release/n42-node target/release/n42-stress target/release/n42-keccak target/release/n42-verify-commit "$TEMPLATE/presigned-24m.bin"; do
+for file in target/release/n42-node target/release/n42-stress target/release/n42-keccak target/release/n42-verify-commit "$PRESIGNED"; do
     if [[ ! -f "$file" ]]; then
         echo "Missing binary or workload: $file" >&2
         exit 2
@@ -66,7 +67,7 @@ printf 'gov5_reuse_builder_execution\t%s\n' "${N42_GOV5_REUSE_BUILDER_EXECUTION:
 printf 'rpc_max_response_mb\t%s\n' "${N42_BENCH_RPC_MAX_RESPONSE_MB:-160}" >> "$RESULT/leg.tsv"
 sha256sum target/release/n42-node target/release/n42-stress \
     target/release/n42-keccak target/release/n42-verify-commit \
-    "$TEMPLATE/presigned-24m.bin" > "$RESULT/binary-workload-sha256.txt"
+    "$PRESIGNED" > "$RESULT/binary-workload-sha256.txt"
 date -Is > "$RESULT/started-at.txt"
 cp /proc/buddyinfo "$RESULT/buddy-before.txt"
 cp /proc/meminfo "$RESULT/meminfo-before.txt"
@@ -159,7 +160,7 @@ N42_BENCH_RPC_BASE=23400 \
 N42_BENCH_INGEST_BASE=34400 \
 N42_BENCH_METRICS_BASE=23600 \
 N42_BENCH_TRUSTED_CONFIG="$RUNTIME/trusted-config.json" \
-N42_PRESIGNED_TXS="$TEMPLATE/presigned-24m.bin" \
+N42_PRESIGNED_TXS="$PRESIGNED" \
 N42_BENCH_DATA_DIR="$RUNTIME" \
 N42_BENCH_ARTIFACT_DIR="$RESULT/qualification" \
 N42_BENCH_VARIANT="$TAG" \
@@ -168,8 +169,27 @@ N42_KECCAK_BIN="$PROJECT_DIR/target/release/n42-keccak" \
 N42_COMMIT_VERIFY_BIN="$PROJECT_DIR/target/release/n42-verify-commit" \
 bash "$SCRIPT_DIR/qualify-1m-tps.sh" > "$RESULT/qualification.log" 2>&1
 
+if [[ "${N42_SEVEN_SCORE_MODE:-0}" == 1 ]]; then
+    for file in h2-score-start.json h2-score-end.json score-start.ns; do
+        if [[ ! -s "$RESULT/qualification/$file" ]]; then
+            echo "Missing warmed score boundary: $file" >&2
+            exit 1
+        fi
+    done
+    python3 "$SCRIPT_DIR/h2-tps-audit.py" audit \
+        --trusted-config "$RESULT/qualification/trusted-config.json" \
+        --start "$RESULT/qualification/h2-score-start.json" \
+        --end "$RESULT/qualification/h2-score-end.json" \
+        --out "$RESULT/qualification/h2-score-audit.json" --min-tps 1 \
+        > "$RESULT/score-audit.log" 2>&1
+fi
+
 python3 "$SCRIPT_DIR/chain94-fleet.py" --runtime "$RUNTIME" verify \
     --seconds 20 --min-blocks 1 --no-require-rotation > "$RESULT/verify-after.log" 2>&1
 python3 "$SCRIPT_DIR/native_seven_timeline.py" "$CAMPAIGN" "$TAG" \
     > "$RESULT/timeline.log" 2>&1
+if [[ "${N42_SEVEN_SCORE_MODE:-0}" == 1 ]]; then
+    python3 "$SCRIPT_DIR/native_seven_timeline.py" "$CAMPAIGN" "$TAG" --score \
+        > "$RESULT/timeline-score.log" 2>&1
+fi
 cat "$RESULT/qualification/summary.tsv"

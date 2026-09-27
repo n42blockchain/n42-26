@@ -32,10 +32,16 @@ def _timestamp_ns(line: str) -> int | None:
             + elapsed.microseconds * 1000)
 
 
-def build_timeline(campaign: Path, tag: str) -> dict:
+def build_timeline(
+    campaign: Path,
+    tag: str,
+    *,
+    audit_name: str = "h2-audit.json",
+    start_marker: str = "ingest-start.ns",
+) -> dict:
     qualification = campaign / f"result-{tag}" / "qualification"
-    audit = json.loads((qualification / "h2-audit.json").read_text())
-    start_ns = int((qualification / "ingest-start.ns").read_text().strip())
+    audit = json.loads((qualification / audit_name).read_text())
+    start_ns = int((qualification / start_marker).read_text().strip())
     blocks = [
         {
             "hash": block["hash"],
@@ -154,14 +160,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("campaign", type=Path)
     parser.add_argument("tag")
+    parser.add_argument("--score", action="store_true", help="use the warmed scored audit and boundary")
     args = parser.parse_args(argv)
-    result = build_timeline(args.campaign, args.tag)
+    result = build_timeline(
+        args.campaign, args.tag,
+        audit_name="h2-score-audit.json" if args.score else "h2-audit.json",
+        start_marker="score-start.ns" if args.score else "ingest-start.ns",
+    )
     output = args.campaign / f"result-{args.tag}"
-    (output / "timeline.json").write_text(json.dumps(result, indent=2) + "\n")
+    stem = "timeline-score" if args.score else "timeline"
+    (output / f"{stem}.json").write_text(json.dumps(result, indent=2) + "\n")
     rows = ["stage\tcount\tmedian_ms\tp90_ms"]
     for name, values in result["stages"].items():
         rows.append(f"{name}\t{values['count']}\t{values['median_ms']}\t{values['p90_ms']}")
-    (output / "timeline.tsv").write_text("\n".join(rows) + "\n")
+    (output / f"{stem}.tsv").write_text("\n".join(rows) + "\n")
     print(json.dumps({key: result[key] for key in ("tag", "unmatched_audited_transaction_blocks", "successful_commit_windows_15s", "stages")}))
     return 0 if result["unmatched_audited_transaction_blocks"] == 0 else 1
 
