@@ -12,7 +12,11 @@ if [[ "${N42_QUIET_CLAIM:-}" != 1 || ! -f /data/blockchain/.box-claim-codex || !
     exit 2
 fi
 
-TAG="cap220-warmed"
+TAG="${N42_SEVEN_LEG_TAG:-cap220-warmed}"
+if [[ ! "$TAG" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "N42_SEVEN_LEG_TAG must contain only letters, digits, underscores or dashes" >&2
+    exit 2
+fi
 export N42_SEVEN_ARTIFACT_DIR="${N42_SEVEN_ARTIFACT_DIR:-$PROJECT_DIR/.artifacts/native-seven-20260924-v2}"
 export N42_SEVEN_CAMPAIGN_DIR="${N42_SEVEN_CAMPAIGN_DIR:-$PROJECT_DIR/.artifacts/native-seven-220k-warmed-20260927}"
 export N42_SEVEN_PRESIGNED_TXS="${N42_SEVEN_PRESIGNED_TXS:-$PROJECT_DIR/.artifacts/native-seven-presigned-48m-20260927.bin}"
@@ -35,7 +39,7 @@ python3 "$SCRIPT_DIR/presign-workload-preflight.py" \
     --file "$N42_SEVEN_PRESIGNED_TXS" \
     --trusted-config "$N42_SEVEN_ARTIFACT_DIR/trusted-config.json" \
     --chain-id 941007 --duration 150 --minimum-tps 220000 \
-    --out "$PROJECT_DIR/.artifacts/native-seven-220k-warmed-preflight-20260927.json"
+    --out "$PROJECT_DIR/.artifacts/${TAG}-presigned-preflight.json"
 
 watch_boundaries() {
     local attempt
@@ -54,13 +58,19 @@ watch_boundaries() {
         --trusted-config "$QUALIFICATION/trusted-config.json" \
         --rpc "$(python3 -c 'print(",".join(f"http://127.0.0.1:{23400+i}" for i in range(7)))')" \
         --out "$QUALIFICATION/h2-score-start.json"
-    python3 - "$QUALIFICATION" <<'PY'
+    PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$QUALIFICATION" <<'PY'
 import json
 import sys
+import time
 from pathlib import Path
+from native_seven_timeline import monotonic_to_wall_ns
 directory = Path(sys.argv[1])
 boundary = json.loads((directory / "h2-score-start.json").read_text())
-(directory / "score-start.ns").write_text(str(boundary["started_ns"]) + "\n")
+wall_start_ns = monotonic_to_wall_ns(
+    boundary["started_ns"], wall_now_ns=time.time_ns(),
+    monotonic_now_ns=time.monotonic_ns(),
+)
+(directory / "score-start.ns").write_text(str(wall_start_ns) + "\n")
 PY
     sleep 60
     python3 "$SCRIPT_DIR/h2-tps-audit.py" capture \
@@ -69,7 +79,7 @@ PY
         --out "$QUALIFICATION/h2-score-end.json"
 }
 
-watch_boundaries > "$PROJECT_DIR/.artifacts/native-seven-220k-warmed-boundary-20260927.log" 2>&1 &
+watch_boundaries > "$PROJECT_DIR/.artifacts/${TAG}-boundary.log" 2>&1 &
 watcher="$!"
 cleanup() {
     local code=$?
@@ -82,6 +92,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-N42_BENCH_DURATION_SECS=150 bash "$SCRIPT_DIR/run-native-seven-leg.sh" "$TAG" --parallel-build
+read -r -a LEG_OPTIONS <<< "${N42_SEVEN_LEG_OPTIONS:---parallel-build}"
+N42_BENCH_DURATION_SECS=150 bash "$SCRIPT_DIR/run-native-seven-leg.sh" "$TAG" "${LEG_OPTIONS[@]}"
 wait "$watcher"
 trap - EXIT INT TERM

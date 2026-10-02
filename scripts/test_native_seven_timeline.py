@@ -3,10 +3,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from native_seven_timeline import build_timeline
+from native_seven_timeline import build_timeline, monotonic_to_wall_ns
 
 
 class TimelineTest(unittest.TestCase):
+    def test_monotonic_capture_time_maps_to_unix_wall_clock(self):
+        mapped = monotonic_to_wall_ns(2_000, wall_now_ns=10_500, monotonic_now_ns=1_500)
+        self.assertEqual(mapped, 11_000)
+
     def test_scored_boundary_uses_only_scored_audit_and_window_origin(self):
         with tempfile.TemporaryDirectory() as directory:
             campaign = Path(directory)

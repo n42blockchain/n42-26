@@ -19,6 +19,11 @@ STAGES = {
 }
 
 
+def monotonic_to_wall_ns(monotonic_ns: int, *, wall_now_ns: int, monotonic_now_ns: int) -> int:
+    """Map a same-boot monotonic timestamp onto the node logs' Unix clock."""
+    return monotonic_ns + wall_now_ns - monotonic_now_ns
+
+
 def _timestamp_ns(line: str) -> int | None:
     match = TIMESTAMP.search(line)
     if not match:
