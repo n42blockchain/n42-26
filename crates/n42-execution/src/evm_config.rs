@@ -4,6 +4,7 @@ use alloy_rpc_types_engine::ExecutionData;
 use reth_chainspec::ChainSpec;
 use reth_evm::{
     ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutableTxIterator, ExecutionCtxFor,
+    SenderRecoveryCache,
 };
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{
@@ -41,6 +42,12 @@ impl N42EvmConfig {
     /// Returns a reference to the inner `EthEvmConfig`.
     pub fn inner(&self) -> &InnerConfig {
         &self.inner
+    }
+
+    /// Shares verified sender recovery results with transaction ingress.
+    pub fn with_sender_recovery_cache(mut self, cache: SenderRecoveryCache) -> Self {
+        self.inner = self.inner.with_sender_recovery_cache(cache);
+        self
     }
 
     /// Returns the chain spec.
@@ -110,10 +117,16 @@ impl ConfigureEngineEvm<ExecutionData> for N42EvmConfig {
         payload: &ExecutionData,
     ) -> Result<impl ExecutableTxIterator<Self>, Self::Error> {
         let txs = payload.payload.transactions().clone();
-        let convert = |tx: Bytes| {
+        let sender_recovery_cache = self.inner.sender_recovery_cache.clone();
+        let convert = move |tx: Bytes| {
             let tx =
                 TxTy::<Self::Primitives>::decode_2718_exact(tx.as_ref()).map_err(AnyError::new)?;
-            let signer = tx.try_recover().map_err(AnyError::new)?;
+            let signer = if let Some(cache) = &sender_recovery_cache {
+                cache.recover(&tx)
+            } else {
+                tx.try_recover()
+            }
+            .map_err(AnyError::new)?;
             Ok::<_, AnyError>(tx.with_signer(signer))
         };
         Ok((txs, convert))
@@ -123,7 +136,64 @@ impl ConfigureEngineEvm<ExecutionData> for N42EvmConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::{Block, BlockBody, Header, TxLegacy};
+    use alloy_primitives::{B256, Signature, U256};
     use n42_chainspec::{N42_CHAIN_ID, n42_dev_chainspec};
+    use reth_ethereum_primitives::{Transaction, TransactionSigned};
+    use reth_evm::{ConvertTx, ExecutableTxTuple};
+
+    fn payload(transactions: Vec<TransactionSigned>) -> ExecutionData {
+        let block = Block {
+            header: Header::default(),
+            body: BlockBody {
+                transactions,
+                ..Default::default()
+            },
+        };
+        ExecutionData::from_block_unchecked(B256::ZERO, &block)
+    }
+
+    #[test]
+    fn payload_recovery_shares_cache_with_ingress_and_config_clones() {
+        let tx = TransactionSigned::new_unhashed(
+            Transaction::Legacy(TxLegacy::default()),
+            Signature::test_signature(),
+        );
+        let expected = tx.try_recover().unwrap();
+        let cache = SenderRecoveryCache::new(4);
+        let config =
+            N42EvmConfig::new(n42_dev_chainspec()).with_sender_recovery_cache(cache.clone());
+        assert_eq!(cache.get(tx.tx_hash()), None);
+        let input = payload(vec![tx.clone()]);
+        for config in [config.clone(), config] {
+            let (raw, convert) = config.tx_iterator_for_payload(&input).unwrap().into_parts();
+            for tx in raw {
+                assert!(convert.convert(tx).is_ok());
+            }
+            assert_eq!(cache.get(tx.tx_hash()), Some(expected));
+        }
+    }
+
+    #[test]
+    fn payload_recovery_rejects_invalid_signatures_with_or_without_cache() {
+        let tx = TransactionSigned::new_unhashed(
+            Transaction::Legacy(TxLegacy::default()),
+            Signature::new(U256::ZERO, U256::ZERO, false),
+        );
+        let cache = SenderRecoveryCache::new(4);
+        let config = N42EvmConfig::new(n42_dev_chainspec());
+        let input = payload(vec![tx.clone()]);
+        for config in [
+            config.clone(),
+            config.with_sender_recovery_cache(cache.clone()),
+        ] {
+            let (raw, convert) = config.tx_iterator_for_payload(&input).unwrap().into_parts();
+            for tx in raw {
+                assert!(convert.convert(tx).is_err());
+            }
+            assert_eq!(cache.get(tx.tx_hash()), None);
+        }
+    }
 
     #[test]
     fn test_evm_config_creation() {
