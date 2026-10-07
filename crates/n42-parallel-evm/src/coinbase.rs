@@ -10,6 +10,7 @@ use crate::types::ParallelEvmError;
 use alloy_primitives::{Address, U256};
 use revm::context::{BlockEnv, TxEnv};
 use revm::database_interface::DatabaseRef;
+use revm::primitives::KECCAK_EMPTY;
 use revm::state::{Account, AccountInfo, TransactionId};
 use std::fmt;
 
@@ -87,10 +88,18 @@ impl DeferredCoinbase {
     /// write (nonce/code changed — defensive; the EOA guard makes this unreachable
     /// for the deferred path in practice).
     pub(crate) fn extract_delta(&self, account: &Account) -> Option<U256> {
-        let base = self.base.clone().unwrap_or_default();
-        let only_balance =
-            account.info.nonce == base.nonce && account.info.code_hash == base.code_hash;
-        only_balance.then(|| account.info.balance.saturating_sub(base.balance))
+        // Inspect only scalar fields. Cloning the same AccountInfo for every
+        // transaction also clones its shared bytecode, contending on the Arc
+        // reference count across workers. An absent account has these exact
+        // AccountInfo::default() fields, without constructing its bytecode.
+        let (nonce, code_hash, balance) = self
+            .base
+            .as_ref()
+            .map_or((0, KECCAK_EMPTY, U256::ZERO), |base| {
+                (base.nonce, base.code_hash, base.balance)
+            });
+        let only_balance = account.info.nonce == nonce && account.info.code_hash == code_hash;
+        only_balance.then(|| account.info.balance.saturating_sub(balance))
     }
 
     /// Materialize the final beneficiary = `base + sum` into the block output, once
