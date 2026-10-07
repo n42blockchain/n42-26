@@ -91,13 +91,14 @@ where
         // Current gov5 uses difficulty 0. Preserved replay-v2 ranges were produced while H2 used
         // difficulty 1. Engine payloads omit the field, so reconstruct both permitted values and
         // let the hash-authenticated block identity select exactly one without operator guessing.
-        let mut current = block.clone();
-        current.header.difficulty = U256::ZERO;
-        validate_gov5_h2_header(&current.header).map_err(NewPayloadError::other)?;
-        let current = current.seal_slow();
+        block.header.difficulty = U256::ZERO;
+        validate_gov5_h2_header(&block.header).map_err(NewPayloadError::other)?;
+        let current = block.seal_slow();
         if current.hash() == expected_hash {
             return Ok(current);
         }
+        // Reuse the transaction body when trying the legacy header variant.
+        let mut block = current.into_block();
         block.header.difficulty = U256::from(1);
         validate_gov5_h2_header(&block.header).map_err(NewPayloadError::other)?;
         let legacy = block.seal_slow();
