@@ -60,10 +60,8 @@ where
         }
         let mut standard_payload = payload;
         standard_payload.payload.set_extra_data(Bytes::new());
-        let mut standard_block = standard_payload
-            .clone()
-            .try_into_block::<TransactionSigned>()?;
         if replay_v2_shape {
+            let mut standard_block = standard_payload.try_into_block::<TransactionSigned>()?;
             standard_block.header.extra_data = original_extra;
             standard_block.header.withdrawals_root = Some(keccak256([]));
             validate_gov5_replay_v2_header(&standard_block.header)
@@ -78,9 +76,13 @@ where
             }
             .into());
         }
+        // This pass only needs the standard header hash. Build it from raw
+        // envelopes; the upstream validator below still decodes every
+        // transaction and checks the standard header and fork-specific fields.
+        let standard_header = standard_payload.clone().into_block_raw()?.header;
         standard_payload
             .payload
-            .set_block_hash(standard_block.header.hash_slow());
+            .set_block_hash(standard_header.hash_slow());
         let standard = <EthereumEngineValidator<ChainSpec> as PayloadValidator<Types>>::convert_payload_to_block(
             &self.inner,
             standard_payload,
@@ -281,6 +283,92 @@ mod tests {
         zero_ommers_payload_with_difficulty(U256::ZERO)
     }
 
+    fn transaction_block(difficulty: U256) -> EthBlock {
+        use alloy_consensus::{SignableTransaction, TxLegacy, proofs::calculate_transaction_root};
+        use alloy_primitives::Signature;
+
+        let transactions: Vec<TransactionSigned> = (0..2)
+            .map(|nonce| {
+                TxLegacy {
+                    nonce,
+                    ..Default::default()
+                }
+                .into_signed(Signature::new(U256::from(1), U256::from(2), false))
+                .into()
+            })
+            .collect();
+        let mut payload = zero_ommers_payload_with_difficulty(difficulty);
+        payload.payload.set_extra_data(Bytes::new());
+        let mut block = payload.try_into_block::<TransactionSigned>().unwrap();
+        block.header.extra_data = [b"N42H".as_slice(), &[0_u8; 8], &[0_u8; 96]]
+            .concat()
+            .into();
+        block.header.ommers_hash = B256::ZERO;
+        block.header.difficulty = difficulty;
+        block.header.transactions_root = calculate_transaction_root(&transactions);
+        block.body.transactions = transactions;
+        block
+    }
+
+    #[test]
+    fn gov5_nonempty_body_survives_current_and_legacy_header_variants() {
+        let validator =
+            N42EngineValidator::new(Arc::new(ChainSpec::default()), N42HeaderProfile::Gov5H2);
+        for difficulty in [U256::ZERO, U256::from(1)] {
+            let block = transaction_block(difficulty);
+            let expected = block.header.hash_slow();
+            let payload = ExecutionData::from_block_unchecked(expected, &block);
+            let sealed = <N42EngineValidator<ChainSpec> as PayloadValidator<EthEngineTypes>>::convert_payload_to_block(
+                &validator, payload,
+            ).unwrap();
+            assert_eq!(sealed.hash(), expected);
+            assert_eq!(sealed.body().transactions, block.body.transactions);
+        }
+    }
+
+    #[test]
+    fn gov5_rejects_malformed_or_nonexact_transaction_envelopes() {
+        use alloy_eips::eip2718::Encodable2718;
+
+        let validator =
+            N42EngineValidator::new(Arc::new(ChainSpec::default()), N42HeaderProfile::Gov5H2);
+        let block = transaction_block(U256::ZERO);
+        let mut trailing = block.body.transactions[0].encoded_2718();
+        trailing.push(0);
+        for encoded in [vec![0x80], vec![0x7f, 0xc0], trailing] {
+            let mut payload = ExecutionData::from_block_unchecked(block.header.hash_slow(), &block);
+            payload.payload.transactions_mut()[0] = encoded.into();
+            assert!(<N42EngineValidator<ChainSpec> as PayloadValidator<EthEngineTypes>>::convert_payload_to_block(
+                &validator, payload,
+            ).is_err());
+        }
+    }
+
+    #[test]
+    fn gov5_rejects_changed_body_under_the_original_header_hash() {
+        let validator =
+            N42EngineValidator::new(Arc::new(ChainSpec::default()), N42HeaderProfile::Gov5H2);
+        let block = transaction_block(U256::ZERO);
+        let mut payload = ExecutionData::from_block_unchecked(block.header.hash_slow(), &block);
+        payload.payload.transactions_mut().swap(0, 1);
+        assert!(<N42EngineValidator<ChainSpec> as PayloadValidator<EthEngineTypes>>::convert_payload_to_block(
+            &validator, payload,
+        ).is_err());
+    }
+
+    #[test]
+    fn gov5_keeps_upstream_pre_shanghai_withdrawal_rejection() {
+        let validator =
+            N42EngineValidator::new(Arc::new(ChainSpec::default()), N42HeaderProfile::Gov5H2);
+        let mut block = transaction_block(U256::ZERO);
+        block.body.withdrawals = Some(Default::default());
+        block.header.withdrawals_root = Some(alloy_consensus::constants::EMPTY_ROOT_HASH);
+        let payload = ExecutionData::from_block_unchecked(block.header.hash_slow(), &block);
+        assert!(<N42EngineValidator<ChainSpec> as PayloadValidator<EthEngineTypes>>::convert_payload_to_block(
+            &validator, payload,
+        ).is_err());
+    }
+
     #[test]
     fn gov5_profile_reconstructs_zero_ommers_block_hash() {
         let validator =
@@ -337,6 +425,32 @@ mod tests {
     }
 
     #[test]
+    fn gov5_replay_v2_preserves_nonempty_body_and_exact_decoding() {
+        let validator =
+            N42EngineValidator::new(Arc::new(ChainSpec::default()), N42HeaderProfile::Gov5H2);
+        let mut block = transaction_block(U256::ZERO);
+        block.header.ommers_hash = alloy_consensus::constants::EMPTY_OMMER_ROOT_HASH;
+        block.header.extra_data = Bytes::from(vec![0; 32]);
+        block.header.withdrawals_root = Some(keccak256([]));
+        block.header.blob_gas_used = Some(0);
+        block.header.excess_blob_gas = Some(0);
+        block.header.parent_beacon_block_root = Some(B256::ZERO);
+        block.header.requests_hash = Some(alloy_consensus::constants::EMPTY_ROOT_HASH);
+        let expected = block.header.hash_slow();
+        let payload = ExecutionData::from_block_unchecked(expected, &block);
+        let sealed = <N42EngineValidator<ChainSpec> as PayloadValidator<EthEngineTypes>>::convert_payload_to_block(
+            &validator, payload.clone(),
+        ).unwrap();
+        assert_eq!(sealed.hash(), expected);
+        assert_eq!(sealed.body().transactions, block.body.transactions);
+        let mut malformed = payload;
+        malformed.payload.transactions_mut()[0] = Bytes::from_static(&[0x80]);
+        assert!(<N42EngineValidator<ChainSpec> as PayloadValidator<EthEngineTypes>>::convert_payload_to_block(
+            &validator, malformed,
+        ).is_err());
+    }
+
+    #[test]
     fn gov5_profile_seals_native_headers_through_the_registry() {
         use alloy_eips::eip4895::Withdrawals;
         use n42_consensus::{Gov5NativeHeader, gov5_native_rewards_root};
@@ -344,9 +458,11 @@ mod tests {
         // requests placeholder and a mobile-registry root. Alloy's
         // re-encoding cannot reproduce it, so its hash differs from gov5's.
         let extra_data = [b"N42H".as_slice(), &[0_u8; 8], &[0_u8; 96]].concat();
+        let transactions = transaction_block(U256::ZERO).body.transactions;
         let header = Header {
             ommers_hash: B256::ZERO,
             number: 13_560_376,
+            transactions_root: alloy_consensus::proofs::calculate_transaction_root(&transactions),
             base_fee_per_gas: Some(7),
             withdrawals_root: Some(gov5_native_rewards_root(&[])),
             blob_gas_used: Some(0),
@@ -365,6 +481,7 @@ mod tests {
         let block = ConsensusBlock {
             header,
             body: BlockBody::<TransactionSigned> {
+                transactions,
                 withdrawals: Some(Withdrawals::default()),
                 ..Default::default()
             },
@@ -391,6 +508,12 @@ mod tests {
             sealed.header().withdrawals_root,
             Some(gov5_native_rewards_root(&[]))
         );
+        assert_eq!(sealed.body().transactions, block.body.transactions);
+        let mut changed = ExecutionData::from_block_unchecked(hash, &block);
+        changed.payload.transactions_mut().swap(0, 1);
+        assert!(<N42EngineValidator<ChainSpec> as PayloadValidator<EthEngineTypes>>::convert_payload_to_block(
+            &validator, changed,
+        ).is_err());
 
         // Without a remembered encoding the same payload has no provable hash.
         let mut unknown = block.clone();
