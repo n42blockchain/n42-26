@@ -44,6 +44,26 @@ use crate::transport::{
 };
 use crate::tx_forward::{TxForwardRequest, TxForwardResponse};
 
+// Keep send-side eligibility aligned with the receive-side decompression cap.
+const MAX_GOV5_GOSSIP_BLOCK_BYTES: usize = 1 << 20;
+
+fn gov5_block_fits_gossip(bytes: usize) -> bool {
+    bytes <= MAX_GOV5_GOSSIP_BLOCK_BYTES
+}
+
+#[cfg(test)]
+mod gov5_gossip_size_tests {
+    use super::{MAX_GOV5_GOSSIP_BLOCK_BYTES, gov5_block_fits_gossip};
+
+    #[test]
+    fn gossip_size_boundary_matches_receive_cap() {
+        assert!(gov5_block_fits_gossip(MAX_GOV5_GOSSIP_BLOCK_BYTES - 1));
+        assert!(gov5_block_fits_gossip(MAX_GOV5_GOSSIP_BLOCK_BYTES));
+        assert!(!gov5_block_fits_gossip(MAX_GOV5_GOSSIP_BLOCK_BYTES + 1));
+        assert!(!gov5_block_fits_gossip(usize::MAX));
+    }
+}
+
 const MAX_PENDING_RELIABLE_EVENTS: usize = 2048;
 const MAX_PENDING_DATA_EVENTS: usize = 8192;
 // Bound work done before polling the swarm. Draining an always-ready priority
@@ -1991,9 +2011,8 @@ impl NetworkService {
                 .as_ref()
                 .is_some_and(|hash| topic == hash) =>
             {
-                const MAX_GOV5_BLOCK_BYTES: usize = 1 << 20;
                 let decoded_len = match snap::raw::decompress_len(&message.data) {
-                    Ok(len) if len <= MAX_GOV5_BLOCK_BYTES => len,
+                    Ok(len) if gov5_block_fits_gossip(len) => len,
                     Ok(len) => {
                         metrics::counter!("n42_gov5_blocks_rejected_total", "reason" => "oversized")
                             .increment(1);
@@ -3830,6 +3849,17 @@ impl NetworkService {
                     bytes = rlp.len(),
                     "direct-pushed gov5 leader block"
                 );
+
+                // Large blocks were already retained and queued for direct
+                // delivery above. Our gossip receiver rejects their decoded
+                // size, so avoid compressing and publishing a useless duplicate.
+                if !gov5_block_fits_gossip(rlp.len()) {
+                    metrics::counter!("n42_gov5_block_gossip_skipped_total", "reason" => "oversized")
+                        .increment(1);
+                    tracing::debug!(target: "n42::interop::h2v4", bytes = rlp.len(),
+                        "gov5 block exceeds gossip receive cap; using direct delivery");
+                    return;
+                }
 
                 match crate::snappy_pool::raw_compress(&rlp) {
                     Ok(data) => {
