@@ -27,7 +27,11 @@ where
     type EVM = N42EvmConfig;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
-        Ok(N42EvmConfig::new(ctx.chain_spec()))
+        let mut evm = N42EvmConfig::new(ctx.chain_spec());
+        if let Some(cache) = ctx.sender_recovery_cache() {
+            evm = evm.with_sender_recovery_cache(cache.clone());
+        }
+        Ok(evm)
     }
 }
 

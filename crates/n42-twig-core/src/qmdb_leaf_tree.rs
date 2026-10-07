@@ -71,11 +71,21 @@ impl OpenTwig {
     }
 
     fn set_leaf(&mut self, local: usize, leaf: Hash) {
-        let mut node = TWIG_SIZE + local;
-        self.nodes[node] = leaf;
-        while node > 1 {
-            node >>= 1;
-            self.nodes[node] = hash_node(&self.nodes[node * 2], &self.nodes[node * 2 + 1]);
+        self.nodes[TWIG_SIZE + local] = leaf;
+        self.fold_range(local, local + 1);
+    }
+
+    /// Fold the union of the contiguous appended leaves' paths. Each shared
+    /// ancestor is hashed once, including the old prefix of a partial twig.
+    fn fold_range(&mut self, start: usize, end: usize) {
+        let mut first = TWIG_SIZE + start;
+        let mut last = TWIG_SIZE + end - 1;
+        while first > 1 {
+            first >>= 1;
+            last >>= 1;
+            for node in first..=last {
+                self.nodes[node] = hash_node(&self.nodes[node * 2], &self.nodes[node * 2 + 1]);
+            }
         }
     }
 
@@ -258,6 +268,12 @@ impl QmdbLeafTree {
 
     /// Append a new frozen leaf, deactivating an earlier live slot for `key`.
     pub fn set(&mut self, key: Hash, value: Vec<u8>) {
+        let leaf = hash_leaf(&key, &value);
+        self.set_with_leaf(key, value, leaf, None);
+    }
+
+    /// `fold_from` defers folding until the batch ends or this twig seals.
+    fn set_with_leaf(&mut self, key: Hash, value: Vec<u8>, leaf: Hash, fold_from: Option<usize>) {
         if let Some(old) = self.live.get(&key) {
             let (old_slot, old_value) = (old.slot, old.value.clone());
             self.record_deactivation(old_slot, key, old_value);
@@ -275,12 +291,15 @@ impl QmdbLeafTree {
             self.open = Some(OpenTwig::new(twig_id, &self.nulls));
             self.twig_roots.push(NULL_HASH);
         }
-        let leaf = hash_leaf(&key, &value);
         let open = self
             .open
             .as_mut()
             .expect("appending always has an open twig");
-        open.set_leaf(local, leaf);
+        if fold_from.is_some() {
+            open.nodes[TWIG_SIZE + local] = leaf;
+        } else {
+            open.set_leaf(local, leaf);
+        }
         open.bits[local / 8] |= 1 << (local % 8);
         self.dirty.insert(twig_id);
         self.live.insert(
@@ -291,6 +310,9 @@ impl QmdbLeafTree {
             },
         );
         if local + 1 == TWIG_SIZE {
+            if let Some(start) = fold_from {
+                open.fold_range(start, TWIG_SIZE);
+            }
             self.seal_open();
         }
     }
@@ -355,11 +377,38 @@ impl QmdbLeafTree {
                 return Err(QmdbOperationError::DuplicateKey(pair[0].key));
             }
         }
+        // The reference n42-rs block path separates hashing from structural
+        // writes. Batch the independent leaf hashes, then fold each appended
+        // twig once rather than walking eleven ancestors per operation.
+        let jobs: Vec<_> = operations
+            .iter()
+            .filter_map(|operation| {
+                operation
+                    .value
+                    .as_deref()
+                    .map(|value| (&operation.key, value))
+            })
+            .collect();
+        let mut leaves = vec![NULL_HASH; jobs.len()];
+        crate::simd::hash_leaves(&jobs, &mut leaves);
+        drop(jobs);
+        let mut leaves = leaves.into_iter();
+        let first_slot = self.next_slot;
         for operation in operations {
             if let Some(value) = operation.value {
-                self.set(operation.key, value);
+                let twig_start = self.next_slot / TWIG_SIZE as u64 * TWIG_SIZE as u64;
+                let start = first_slot.saturating_sub(twig_start) as usize;
+                self.set_with_leaf(operation.key, value, leaves.next().unwrap(), Some(start));
             } else {
                 self.delete(&operation.key);
+            }
+        }
+        if self.next_slot > first_slot {
+            if let Some(open) = self.open.as_mut() {
+                let twig_start = open.id as u64 * TWIG_SIZE as u64;
+                let start = first_slot.saturating_sub(twig_start) as usize;
+                let end = (self.next_slot - twig_start) as usize;
+                open.fold_range(start, end);
             }
         }
         Ok(self.root())
@@ -428,7 +477,8 @@ impl QmdbLeafTree {
 
         // 1. Truncate the block's appends, newest first, reopening twigs on
         //    the way down.
-        let mut slot = self.next_slot;
+        let previous_end = self.next_slot;
+        let mut slot = previous_end;
         while slot > prev {
             slot -= 1;
             let twig_id = (slot as usize) / TWIG_SIZE;
@@ -460,7 +510,11 @@ impl QmdbLeafTree {
             if appended == 0 {
                 self.drop_open_twig();
             } else {
-                open.recompute();
+                let removed_end = (previous_end - open.id as u64 * TWIG_SIZE as u64)
+                    .min(TWIG_SIZE as u64) as usize;
+                if appended < removed_end {
+                    open.fold_range(appended, removed_end);
+                }
             }
         }
         let keep_below = self.twig_count().max(self.upper_cap);
@@ -562,6 +616,7 @@ impl QmdbLeafTree {
             return self.upper[1];
         }
         let dirty = std::mem::take(&mut self.dirty);
+        let mut changed = Vec::with_capacity(dirty.len());
         for twig_id in dirty {
             let root = if twig_id < count {
                 self.twig_root(twig_id)
@@ -571,10 +626,18 @@ impl QmdbLeafTree {
             if twig_id < self.twig_roots.len() {
                 self.twig_roots[twig_id] = root;
             }
-            let mut index = self.upper_cap + twig_id;
+            let index = self.upper_cap + twig_id;
             self.upper[index] = root;
-            while index > 1 {
-                index >>= 1;
+            changed.push(index);
+        }
+        // BTreeSet yields ascending ids. Deduplicate their shared ancestors
+        // level by level, as the n42-rs cached QMDB upper-tree path does.
+        while changed.first().is_some_and(|&index| index > 1) {
+            for index in &mut changed {
+                *index >>= 1;
+            }
+            changed.dedup();
+            for &index in &changed {
                 self.upper[index] = hash_node(&self.upper[index * 2], &self.upper[index * 2 + 1]);
             }
         }
@@ -1259,6 +1322,81 @@ mod tests {
         for n in 0..5000u64 {
             assert_eq!(full.get(&key(n)), leaf.get(&key(n)), "key {n}");
         }
+    }
+
+    #[test]
+    fn batched_append_matches_eager_qmdb_across_seals_and_undo() {
+        // Partial prefixes, exact seals and multiple new twigs exercise the
+        // range fold's edges. The full split-QMDB tree is the independent oracle.
+        for prefix in [0, 1, TWIG_SIZE - 1, TWIG_SIZE, TWIG_SIZE + 3] {
+            for count in [1, 3, TWIG_SIZE - 1, TWIG_SIZE, TWIG_SIZE * 2 + 7] {
+                let mut full = QmdbCompatTree::new();
+                let mut leaf = QmdbLeafTree::new();
+                let seed = sets(0..prefix as u64, 1);
+                let parent = full.apply_sorted_ops(seed.clone()).unwrap();
+                assert_eq!(leaf.apply_sorted_ops(seed).unwrap(), parent);
+                let before = leaf.leaf_form();
+                // Includes overwrites of old slots as well as new appends.
+                let ops = sets(0..count as u64, 2);
+                let expected = full.apply_sorted_ops(ops.clone()).unwrap();
+                let (root, undo) = leaf.apply_sorted_ops_recorded(ops.clone()).unwrap();
+                assert_eq!(root, expected, "prefix {prefix}, count {count}");
+                if let Some(op) = ops.iter().find(|op| leaf.open_twig_holds(&op.key)) {
+                    assert!(leaf.prove(&op.key).unwrap().verify_for_key(&root, &op.key));
+                }
+                leaf.apply_undo(&undo).unwrap();
+                assert_eq!(leaf.root(), parent);
+                assert_eq!(leaf.leaf_form(), before);
+                assert_eq!(leaf.apply_sorted_ops(ops).unwrap(), expected);
+                let deletes = deletes(0..count as u64);
+                assert_eq!(
+                    leaf.apply_sorted_ops(deletes.clone()).unwrap(),
+                    full.apply_sorted_ops(deletes).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_batch_hashes_and_refused_duplicates_preserve_qmdb_state() {
+        let (mut full, mut leaf) = churned();
+        let parent = leaf.root();
+        let before = leaf.leaf_form();
+        let duplicate = vec![
+            QmdbOperation {
+                key: key(7),
+                value: Some(vec![1]),
+            },
+            QmdbOperation {
+                key: key(7),
+                value: None,
+            },
+        ];
+        assert_eq!(
+            leaf.apply_sorted_ops_recorded(duplicate),
+            Err(QmdbOperationError::DuplicateKey(key(7)))
+        );
+        assert_eq!(leaf.root(), parent);
+        assert_eq!(leaf.leaf_form(), before);
+        assert!(leaf.recording.is_none());
+        let lengths = [0, 1, 31, 32, 63, 64, 72, 95, 96, 127, 128, 1025];
+        let mut ops: Vec<_> = (0..5000u64)
+            .map(|n| QmdbOperation {
+                key: key(n),
+                value: if n % 3 == 0 {
+                    None
+                } else {
+                    Some(vec![n as u8; lengths[n as usize % lengths.len()]])
+                },
+            })
+            .collect();
+        ops.reverse();
+        let expected = full.apply_sorted_ops(ops.clone()).unwrap();
+        let (root, undo) = leaf.apply_sorted_ops_recorded(ops).unwrap();
+        assert_eq!(root, expected);
+        leaf.apply_undo(&undo).unwrap();
+        assert_eq!(leaf.root(), parent);
+        assert_eq!(leaf.leaf_form(), before);
     }
 
     #[test]
