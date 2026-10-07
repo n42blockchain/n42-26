@@ -18,6 +18,27 @@ use reth_payload_primitives::{
 use reth_primitives_traits::{Block, SealedBlock};
 use std::sync::Arc;
 
+struct PayloadConversionTimer {
+    phase: &'static str,
+    started: std::time::Instant,
+}
+
+impl PayloadConversionTimer {
+    fn new(phase: &'static str) -> Self {
+        Self {
+            phase,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for PayloadConversionTimer {
+    fn drop(&mut self) {
+        metrics::histogram!("n42_engine_payload_conversion_duration_ms", "phase" => self.phase)
+            .record(self.started.elapsed().as_secs_f64() * 1_000.0);
+    }
+}
+
 /// Engine payload validator with an explicit, chain-bound N42 header profile.
 #[derive(Clone, Debug)]
 pub struct N42EngineValidator<ChainSpec> {
@@ -58,6 +79,11 @@ where
         if !replay_v2_shape {
             validate_gov5_header_extra(&original_extra).map_err(NewPayloadError::other)?;
         }
+        let prepare_timer = PayloadConversionTimer::new(if replay_v2_shape {
+            "replay_v2"
+        } else {
+            "standard_header"
+        });
         let mut standard_payload = payload;
         standard_payload.payload.set_extra_data(Bytes::new());
         if replay_v2_shape {
@@ -83,10 +109,14 @@ where
         standard_payload
             .payload
             .set_block_hash(standard_header.hash_slow());
+        drop(prepare_timer);
+        let standard_timer = PayloadConversionTimer::new("ethereum_validate");
         let standard = <EthereumEngineValidator<ChainSpec> as PayloadValidator<Types>>::convert_payload_to_block(
             &self.inner,
             standard_payload,
         )?;
+        drop(standard_timer);
+        let _native_timer = PayloadConversionTimer::new("native_header_bind");
         let mut block = standard.into_block();
         block.header.ommers_hash = B256::ZERO;
         block.header.extra_data = original_extra;
