@@ -185,20 +185,29 @@ where
     }
 
     let elapsed = start.elapsed();
-    info!(
-        target: "n42::parallel_evm",
-        num_txs,
-        rounds = round,
-        elapsed_ms = elapsed.as_millis() as u64,
-        "parallel execution completed"
-    );
-    metrics::counter!("n42_parallel_evm_blocks_total").increment(1);
     metrics::histogram!("n42_parallel_evm_duration_ms").record(elapsed.as_millis() as f64);
 
+    let output_start = std::time::Instant::now();
     let mut output = build_output(outputs)?;
     if let Some(cb) = &coinbase {
         cb.materialize(mv.sum_bene_deltas(), &mut output);
     }
+    let output_elapsed = output_start.elapsed();
+    let total_elapsed = start.elapsed();
+    metrics::histogram!("n42_parallel_evm_output_assembly_ms")
+        .record(output_elapsed.as_secs_f64() * 1_000.0);
+    metrics::histogram!("n42_parallel_evm_total_duration_ms")
+        .record(total_elapsed.as_secs_f64() * 1_000.0);
+    metrics::counter!("n42_parallel_evm_blocks_total").increment(1);
+    info!(
+        target: "n42::parallel_evm",
+        num_txs,
+        rounds = round,
+        elapsed_ms = total_elapsed.as_millis() as u64,
+        worker_ms = elapsed.as_millis() as u64,
+        output_assembly_ms = output_elapsed.as_millis() as u64,
+        "parallel execution completed"
+    );
     Ok(output)
 }
 
