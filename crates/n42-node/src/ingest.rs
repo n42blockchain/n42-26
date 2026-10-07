@@ -605,8 +605,10 @@ where
     // Set TCP_NODELAY for low latency
     stream.set_nodelay(true)?;
 
-    // Reusable buffer for reading tx data
-    let mut tx_buf = vec![0u8; 65536];
+    // Reuse one contiguous batch buffer and transaction offsets per connection.
+    // A credit-gated batch still has to be drained to preserve wire framing.
+    let mut batch_data = Vec::new();
+    let mut raw_txs = Vec::new();
     let base_high_water = ingest_high_water();
     let target_pending = ingest_target_pending(base_high_water);
     let credit_probe_enabled = ingest_credit_probe_enabled();
@@ -673,7 +675,9 @@ where
 
         // Read the batch into memory first. This lets the sender use credit probes
         // without requiring a second decode pass when only a prefix is admissible.
-        let mut raw_txs = Vec::with_capacity(num_txs);
+        raw_txs.clear();
+        raw_txs.reserve(num_txs);
+        batch_data.clear();
         let mut batch_bytes = 0usize;
 
         for _ in 0..num_txs {
@@ -696,17 +700,19 @@ where
                 return Ok(());
             }
 
-            // Read tx data
-            if tx_len > tx_buf.len() {
-                tx_buf.resize(tx_len, 0);
-            }
-            stream.read_exact(&mut tx_buf[..tx_len]).await?;
+            // Read directly into the batch arena; no per-transaction allocation
+            // or copy from a temporary socket buffer. The byte cap above also
+            // bounds the reusable arena for this connection.
+            let start = batch_data.len();
+            let end = start + tx_len;
+            batch_data.resize(end, 0);
+            stream.read_exact(&mut batch_data[start..end]).await?;
 
             // Read pre-recovered sender address (20 bytes)
             let mut sender_buf = [0u8; 20];
             stream.read_exact(&mut sender_buf).await?;
             let sender = Address::from(sender_buf);
-            raw_txs.push((tx_buf[..tx_len].to_vec(), sender));
+            raw_txs.push((start..end, sender));
         }
 
         let pending_before = pool.pending_count();
@@ -783,7 +789,8 @@ where
         // Decode only the prefix that the current credit window can consume.
         let mut pooled_txs = Vec::with_capacity(take_limit);
         let mut batch_decode_errors = 0u64;
-        for (tx_bytes, sender) in raw_txs.iter().take(take_limit) {
+        for (range, sender) in raw_txs.iter().take(take_limit) {
+            let tx_bytes = &batch_data[range.clone()];
             let tx: TransactionSigned =
                 match alloy_eips::eip2718::Decodable2718::decode_2718(&mut &tx_bytes[..]) {
                     Ok(tx) => tx,
