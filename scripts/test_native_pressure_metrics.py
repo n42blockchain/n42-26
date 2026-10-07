@@ -60,6 +60,20 @@ class MetricsTests(unittest.TestCase):
         result = self.summarize([{"n42_engine_wait_ms_sum": 10, "n42_engine_wait_ms_count": 2}, {"n42_engine_wait_ms_sum": 20}, {"n42_engine_wait_ms_sum": 30, "n42_engine_wait_ms_count": 6}])
         self.assertEqual(result["histogram_means"], {})
 
+    def test_measurement_window_excludes_empty_block_audit_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metrics.jsonl"
+            path.write_text("".join(json.dumps({"nodes": [{"port": 23600, "time_ns": i,
+                "metrics": {"n42_engine_wait_ms_sum": total, "n42_engine_wait_ms_count": count}}]}) + "\n"
+                for i, total, count in [(1, 0, 0), (2, 10, 1), (3, 30, 2), (4, 30, 100)]))
+            result = summary.summarize(path, 2, 3)
+            self.assertEqual(result["snapshots"], 2)
+            self.assertEqual(result["nodes"]["23600"]["histogram_means"]["n42_engine_wait_ms"]["mean"], 20)
+
+    def test_reversed_window_is_rejected(self):
+        with self.assertRaises(ValueError):
+            summary.summarize(Path("unused"), 3, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

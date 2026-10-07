@@ -6,20 +6,28 @@ import json
 from pathlib import Path
 
 
-def summarize(path):
+def summarize(path, start_ns=None, end_ns=None):
+    if start_ns is not None and end_ns is not None and end_ns <= start_ns:
+        raise ValueError("metric window must have positive duration")
     series = {}
     errors = []
     snapshots = 0
-    for line in path.read_text().splitlines():
-        row = json.loads(line)
-        snapshots += 1
-        for node in row["nodes"]:
-            if "error" in node:
-                errors.append({"port": node["port"], "time_ns": node["time_ns"], "error": node["error"]})
+    with path.open() as source:
+        rows = (json.loads(line) for line in source)
+        for row in rows:
+            selected = [node for node in row["nodes"]
+                        if (start_ns is None or node["time_ns"] >= start_ns)
+                        and (end_ns is None or node["time_ns"] <= end_ns)]
+            if not selected:
                 continue
-            samples = series.setdefault(str(node["port"]), {})
-            for sample, value in node["metrics"].items():
-                samples.setdefault(sample, []).append((node["time_ns"], value))
+            snapshots += 1
+            for node in selected:
+                if "error" in node:
+                    errors.append({"port": node["port"], "time_ns": node["time_ns"], "error": node["error"]})
+                    continue
+                samples = series.setdefault(str(node["port"]), {})
+                for sample, value in node["metrics"].items():
+                    samples.setdefault(sample, []).append((node["time_ns"], value))
     nodes = {}
     for port, samples in series.items():
         metrics = {}
@@ -49,6 +57,7 @@ def summarize(path):
                                       "mean": (last - first) / delta_count}
         nodes[port] = {"metrics": metrics, "histogram_means": means}
     return {"snapshots": snapshots, "scrape_errors": errors, "nodes": nodes,
+            "window": {"start_ns": start_ns, "end_ns": end_ns},
             "scope": "per-port successful scrape ranges; histogram mean units follow source metric; quantiles are not reconstructed"}
 
 
@@ -56,8 +65,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--start-marker", type=Path, help="Unix-nanosecond ingest start marker")
+    parser.add_argument("--end-marker", type=Path, help="Unix-nanosecond ingest end marker")
     args = parser.parse_args()
-    args.out.write_text(json.dumps(summarize(args.input), indent=2) + "\n")
+    start = int(args.start_marker.read_text().strip()) if args.start_marker else None
+    end = int(args.end_marker.read_text().strip()) if args.end_marker else None
+    args.out.write_text(json.dumps(summarize(args.input, start, end), indent=2) + "\n")
 
 
 if __name__ == "__main__":
