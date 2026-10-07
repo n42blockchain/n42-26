@@ -675,6 +675,7 @@ where
 
         // Read the batch into memory first. This lets the sender use credit probes
         // without requiring a second decode pass when only a prefix is admissible.
+        let read_start = Instant::now();
         raw_txs.clear();
         raw_txs.reserve(num_txs);
         batch_data.clear();
@@ -715,7 +716,13 @@ where
             raw_txs.push((start..end, sender));
         }
 
+        metrics::histogram!("n42_ingest_batch_duration_ms", "phase" => "socket_read")
+            .record(read_start.elapsed().as_secs_f64() * 1_000.0);
+        metrics::histogram!("n42_ingest_batch_bytes").record(batch_bytes as f64);
+        metrics::histogram!("n42_ingest_batch_transactions").record(num_txs as f64);
+
         let pending_before = pool.pending_count();
+        metrics::histogram!("n42_ingest_pending_at_admission").record(pending_before as f64);
         let dynamic_high_water = effective_high_water(base_high_water, credit_probe_enabled);
         let dynamic_credit_limit =
             effective_credit_limit(base_high_water, target_pending, credit_probe_enabled);
@@ -732,6 +739,7 @@ where
         if pending_before >= dynamic_high_water
             && (!credit_probe_enabled || leased_credit_remaining == 0)
         {
+            metrics::counter!("n42_ingest_batches_total", "outcome" => "hard_gate").increment(1);
             if !hard_gate_logged {
                 info!(
                     target: "n42::ingest",
@@ -759,6 +767,7 @@ where
         hard_gate_logged = false;
 
         if extended_ack_enabled && take_limit == 0 {
+            metrics::counter!("n42_ingest_batches_total", "outcome" => "soft_gate").increment(1);
             stats.soft_gated.fetch_add(1, Ordering::Relaxed);
             if !soft_gate_logged {
                 info!(
@@ -787,6 +796,7 @@ where
         soft_gate_logged = false;
 
         // Decode only the prefix that the current credit window can consume.
+        let decode_start = Instant::now();
         let mut pooled_txs = Vec::with_capacity(take_limit);
         let mut batch_decode_errors = 0u64;
         for (range, sender) in raw_txs.iter().take(take_limit) {
@@ -813,12 +823,27 @@ where
                 .fetch_add(batch_decode_errors, Ordering::Relaxed);
         }
 
+        metrics::histogram!("n42_ingest_batch_duration_ms", "phase" => "decode")
+            .record(decode_start.elapsed().as_secs_f64() * 1_000.0);
+
         // Trusted direct pool submission path.
+        let admission_start = Instant::now();
         let batch_size = pooled_txs.len();
         let results = pool.add_prevalidated(pooled_txs);
+        metrics::histogram!("n42_ingest_batch_duration_ms", "phase" => "pool_admission")
+            .record(admission_start.elapsed().as_secs_f64() * 1_000.0);
+        metrics::counter!("n42_ingest_batches_total", "outcome" => "submitted").increment(1);
         let accepted = results.iter().filter(|r| r.is_ok()).count();
         let pool_errors = batch_size - accepted;
         let consumed = take_limit;
+        metrics::counter!("n42_ingest_transactions_total", "outcome" => "accepted")
+            .increment(accepted as u64);
+        metrics::counter!("n42_ingest_transactions_total", "outcome" => "decode_error")
+            .increment(batch_decode_errors);
+        metrics::counter!("n42_ingest_transactions_total", "outcome" => "pool_error")
+            .increment(pool_errors as u64);
+        metrics::counter!("n42_ingest_transactions_total", "outcome" => "deferred")
+            .increment((num_txs - consumed) as u64);
 
         stats.accepted.fetch_add(accepted as u64, Ordering::Relaxed);
         if pool_errors > 0 {
