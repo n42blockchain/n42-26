@@ -320,12 +320,13 @@ def _start(args, children, cancelled):
     # fleets need the adaptive pool sized by the requested block cap.
     low_memory = not fresh
     disable_forward = bool(getattr(args, "disable_tx_forward", False))
+    single_flight = bool(getattr(args, "import_single_flight", False))
     gov5_reuse = os.environ.get("N42_GOV5_REUSE_BUILDER_EXECUTION", "1")
     if gov5_reuse not in {"0", "1"}:
         raise ValueError("N42_GOV5_REUSE_BUILDER_EXECUTION must be 0 or 1")
     run = dict(foreground=bool(getattr(args, "foreground", False)), low_memory=low_memory, disable_tx_forward=disable_forward, max_txs_per_block=max_txs, build_budget_ms=build_budget, rpc_max_response_mb=rpc_max_response_mb, binary=str(binary), sha256=digest(binary), started=time.time(),
                block_interval_ms=consensus_config["slot_time_ms"],
-               fast_transfers=args.fast_transfers, parallel_build=args.parallel_build, parallel_import=args.parallel_import, qmdb_reads=args.qmdb_reads, gov5_reuse_builder_execution=gov5_reuse,
+               import_single_flight=single_flight, fast_transfers=args.fast_transfers, parallel_build=args.parallel_build, parallel_import=args.parallel_import, qmdb_reads=args.qmdb_reads, gov5_reuse_builder_execution=gov5_reuse,
                log_offsets={str(i): (runtime / f"logs/node{i}.log").stat().st_size
                             if (runtime / f"logs/node{i}.log").exists() else 0 for i in range(count)})
     write_json(runtime / "run.json", run)
@@ -348,6 +349,7 @@ def _start(args, children, cancelled):
             "N42_FAST_TRANSFER": "1" if args.fast_transfers else "0",
             "N42_PARALLEL_BUILD": "1" if args.parallel_build else "0",
             "N42_PARALLEL_IMPORT": "1" if args.parallel_import else "0",
+            "N42_IMPORT_SINGLE_FLIGHT": "1" if single_flight else "0",
             "N42_QMDB_READS": args.qmdb_reads,
             "N42_GOV5_QMDB_LEAF_FORM": str(runtime / "artifacts/snapshot.qmdb"),
             "N42_GOV5_GENESIS_BOOTSTRAP": str(runtime / "artifacts/genesis-range.n42frng"),
@@ -505,6 +507,7 @@ def main():
     start_parser.add_argument("--fast-transfers", action="store_true", help="enable eligible plain-transfer execution; other transactions still use the interpreter")
     start_parser.add_argument("--parallel-build", action="store_true", help="execute eligible payload prefixes in parallel; retain the serial tail and complete state-root calculation")
     start_parser.add_argument("--disable-tx-forward", action="store_true", help="keep transactions in the receiving validator pool for per-node continuous ingest; block gossip remains enabled")
+    start_parser.add_argument("--import-single-flight", action="store_true", help="serialize same-hash imports at the Engine adapter; all requests retain full validation")
     start_parser.add_argument("--parallel-import", action="store_true", help="execute eligible sealed transfer blocks in parallel with full receipts and QMDB root validation")
     start_parser.add_argument("--rpc-max-response-mb", type=int, default=160, help="bounded JSON-RPC response limit in MiB (16..512)")
     start_parser.add_argument("--max-txs-per-block", type=int, help="explicit block transaction cap; defaults to the fleet manifest")

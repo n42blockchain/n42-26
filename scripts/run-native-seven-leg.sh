@@ -8,7 +8,7 @@ PROJECT_DIR="$(dirname -- "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 TAG [--fast-transfers] [--parallel-build] [--parallel-import]" >&2
+    echo "Usage: $0 TAG [--fast-transfers] [--parallel-build] [--parallel-import] [--import-single-flight]" >&2
     exit 2
 fi
 TAG="$1"
@@ -24,7 +24,7 @@ if [[ ! "$TAG" =~ ^[a-zA-Z0-9_-]+$ ]]; then
 fi
 for option in "$@"; do
     case "$option" in
-        --fast-transfers|--parallel-build|--parallel-import) ;;
+        --fast-transfers|--parallel-build|--parallel-import|--import-single-flight) ;;
         *) echo "Unsupported fleet option: $option" >&2; exit 2 ;;
     esac
 done
@@ -48,7 +48,11 @@ for file in manifest.json consensus.json trusted-config.json test-accounts.json 
         exit 2
     fi
 done
-for file in target/release/n42-node target/release/n42-stress target/release/n42-keccak target/release/n42-verify-commit "$PRESIGNED"; do
+NODE_BINARY="${N42_SEVEN_NODE_BINARY:-$PROJECT_DIR/target/release/n42-node}"
+STRESS_BINARY="${N42_SEVEN_STRESS_BINARY:-$PROJECT_DIR/target/release/n42-stress}"
+KECCAK_BINARY="${N42_SEVEN_KECCAK_BINARY:-$PROJECT_DIR/target/release/n42-keccak}"
+COMMIT_VERIFY_BINARY="${N42_SEVEN_COMMIT_VERIFY_BINARY:-$PROJECT_DIR/target/release/n42-verify-commit}"
+for file in "$NODE_BINARY" "$STRESS_BINARY" "$KECCAK_BINARY" "$COMMIT_VERIFY_BINARY" "$PRESIGNED"; do
     if [[ ! -f "$file" ]]; then
         echo "Missing binary or workload: $file" >&2
         exit 2
@@ -65,8 +69,8 @@ mkdir -p "$RUNTIME/logs" "$RUNTIME/pids" "$RESULT"
 printf 'tag\t%s\noptions\t%s\nmax_txs_per_block\t%s\n' "$TAG" "$*" "$BLOCK_CAP" > "$RESULT/leg.tsv"
 printf 'gov5_reuse_builder_execution\t%s\n' "${N42_GOV5_REUSE_BUILDER_EXECUTION:-1}" >> "$RESULT/leg.tsv"
 printf 'rpc_max_response_mb\t%s\n' "${N42_BENCH_RPC_MAX_RESPONSE_MB:-160}" >> "$RESULT/leg.tsv"
-sha256sum target/release/n42-node target/release/n42-stress \
-    target/release/n42-keccak target/release/n42-verify-commit \
+sha256sum "$NODE_BINARY" "$STRESS_BINARY" \
+    "$KECCAK_BINARY" "$COMMIT_VERIFY_BINARY" \
     "$PRESIGNED" > "$RESULT/binary-workload-sha256.txt"
 date -Is > "$RESULT/started-at.txt"
 cp /proc/buddyinfo "$RESULT/buddy-before.txt"
@@ -93,7 +97,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 python3 "$SCRIPT_DIR/chain94-fleet.py" --runtime "$RUNTIME" start \
-    --foreground --binary "$PROJECT_DIR/target/release/n42-node" \
+    --foreground --binary "$NODE_BINARY" \
     --disable-tx-forward --qmdb-reads only --max-txs-per-block "$BLOCK_CAP" \
     --rpc-max-response-mb "${N42_BENCH_RPC_MAX_RESPONSE_MB:-160}" "$@" \
     > "$RESULT/supervisor.log" 2>&1 &
@@ -164,9 +168,9 @@ N42_PRESIGNED_TXS="$PRESIGNED" \
 N42_BENCH_DATA_DIR="$RUNTIME" \
 N42_BENCH_ARTIFACT_DIR="$RESULT/qualification" \
 N42_BENCH_VARIANT="$TAG" \
-N42_STRESS_BIN="$PROJECT_DIR/target/release/n42-stress" \
-N42_KECCAK_BIN="$PROJECT_DIR/target/release/n42-keccak" \
-N42_COMMIT_VERIFY_BIN="$PROJECT_DIR/target/release/n42-verify-commit" \
+N42_STRESS_BIN="$STRESS_BINARY" \
+N42_KECCAK_BIN="$KECCAK_BINARY" \
+N42_COMMIT_VERIFY_BIN="$COMMIT_VERIFY_BINARY" \
 bash "$SCRIPT_DIR/qualify-1m-tps.sh" > "$RESULT/qualification.log" 2>&1
 
 if [[ "${N42_SEVEN_SCORE_MODE:-0}" == 1 ]]; then
