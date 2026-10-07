@@ -19,6 +19,7 @@ use reth_payload_primitives::{PayloadKind, PayloadTypes};
 pub struct RethExecutionLayer {
     engine: ConsensusEngineHandle<EthEngineTypes>,
     payload_builder: Option<PayloadBuilderHandle<EthEngineTypes>>,
+    import_gate: Option<super::import_gate::ImportGate>,
 }
 
 impl RethExecutionLayer {
@@ -30,6 +31,7 @@ impl RethExecutionLayer {
         Self {
             engine,
             payload_builder: Some(payload_builder),
+            import_gate: super::import_gate::ImportGate::configured(),
         }
     }
 
@@ -38,6 +40,7 @@ impl RethExecutionLayer {
         Self {
             engine,
             payload_builder: None,
+            import_gate: super::import_gate::ImportGate::configured(),
         }
     }
 }
@@ -45,6 +48,10 @@ impl RethExecutionLayer {
 #[async_trait::async_trait]
 impl ExecutionLayer for RethExecutionLayer {
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError> {
+        let _import_guard = match &self.import_gate {
+            Some(gate) => Some(gate.acquire(payload.block_hash()).await),
+            None => None,
+        };
         // consensus_loop::background_import / execution_bridge eager import.
         self.engine
             .new_payload(payload)
