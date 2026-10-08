@@ -359,21 +359,9 @@ where
         let codes_handle = logged_db.codes_handle();
 
         let mut executor = evm_config.executor(logged_db);
-        let replay_started = std::time::Instant::now();
-        let replay_result = executor.execute_one(&recovered_block);
-        let replay_ms = replay_started.elapsed().as_secs_f64() * 1_000.0;
-        metrics::histogram!("n42_mobile_witness_reexecution_duration_ms").record(replay_ms);
-        metrics::counter!(
-            "n42_mobile_witness_reexecution_total",
-            "outcome" => if replay_result.is_ok() { "success" } else { "error" },
-        )
-        .increment(1);
-        let _output = replay_result.map_err(|e| MobilePacketError::Execution(e.to_string()))?;
-        info!(
-            %block_hash,
-            elapsed_ms = replay_ms,
-            "N42_WITNESS_REEXEC: post-commit witness execution completed"
-        );
+        let _output = executor
+            .execute_one(&recovered_block)
+            .map_err(|e| MobilePacketError::Execution(e.to_string()))?;
 
         let read_log = match Arc::try_unwrap(log_handle) {
             Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| {
