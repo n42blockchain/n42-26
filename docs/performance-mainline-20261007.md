@@ -43,6 +43,11 @@ P1 加入这一消费者：首次 canonical 执行捕获或派生经校验的 re
 按认证块与精确父状态保留有界共享对象，包生成直接编码该对象。并行执行的日志需按交易顺序
 组织，system calls 和真实读取顺序不能丢失。先比较旧生成器和复用生成器的完整 packet 内容、
 读取状态版本、移动端验证结果；未缓存或历史重建保留明确 fallback，记录发生次数。
+当前同步 provider/execute/encode/compress 工作还运行在异步包生成任务中；需测 Tokio 调度
+延迟，比较有界专用任务池的诊断候选，避免影响共识任务。后台化只解决调度，仍要消除重复计算。
+已增加 `n42_mobile_witness_reexecution_duration_ms`、按 success/error 分类的次数和块哈希日志，
+该指标仅覆盖 execute_one，不把读取、编码和压缩误归于执行。
+
 容量轮必须统计 canonical、构块、跟随导入和 witness 的所有执行次数，并拆分正常热路径
 与恢复任务。取消移动验证或生成空 witness 都不能作为这一优化的通过条件。
 
