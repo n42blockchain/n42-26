@@ -57,3 +57,16 @@ QC 提交、QMDB 持久化或网络传播。test 分配器和数据形态不同�
 发布执行所需的连续 BundleState 在 seal 后合并；`freeze_on_thread` 在消费输出前仍须 join，
 线程创建失败会退回原输出，并非省略冻结或验证。
 这些是后续迁移契约，不把本轮 legacy 转换基准当作原生帧路径的容量验证。
+
+## 后续验证发现与修复
+
+排队任务实际执行后，两个完整库测试和隔离测试都在编译阶段因 E0382 失败，
+未运行回归或基准。交易体复用后错误分支仍引用已移动的 `current`。
+修复 `b5568ae` 在移动前保存 `current_hash`，保持原错误哈希不变。
+失败源码和日志保留为 `.failed-original` / `failed-*.log`，旧 manifest 保存在
+`failed-source-manifest.json`；新的 manifest 记录修正版本。
+
+修正后的验证由 `claim-retry.jsonl` 对应驱动（PID `1965464`）重新排队，
+还包括直接转账/解释器微基准及 witness 重执行计时的编译验证。
+截至本次更新尚未启动该批任务，不能视为修复后的编译、测试或性能测量通过。
+主线迁移计划及新发现见 [性能主线](../performance-mainline-20261007.md)。
