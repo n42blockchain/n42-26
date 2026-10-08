@@ -67,7 +67,10 @@ pub fn frame_tree_root(frame_roots: &[B256]) -> B256 {
 /// body exactly or names an empty frame, i.e. the body is not frame-aligned
 /// by that layout.
 pub fn frame_tree_root_of(tx_hashes: &[B256], layout: &[usize]) -> Option<B256> {
-    if layout.iter().any(|len| *len == 0) || layout.iter().sum::<usize>() != tx_hashes.len() {
+    let covered = layout
+        .iter()
+        .try_fold(0usize, |total, len| total.checked_add(*len))?;
+    if layout.iter().any(|len| *len == 0) || covered != tx_hashes.len() {
         return None;
     }
     let mut at = 0usize;
@@ -344,6 +347,13 @@ mod tests {
             root.to_string(),
             "0xda965b3735d18da2dc9567c85f04f64c4df7e15e2f9cc1796aba0a583bf8d9aa"
         );
+    }
+
+    #[test]
+    fn a_layout_sum_must_not_wrap() {
+        assert!(frame_tree_root_of(&[leaf(0)], &[usize::MAX, 2]).is_none());
+        assert!(frame_tree_root_of(&[], &[usize::MAX, 1]).is_none());
+        assert!(frame_tree_root_of(&[leaf(0)], &[usize::MAX]).is_none());
     }
 
     #[test]

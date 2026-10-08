@@ -3,7 +3,8 @@
 Reference: `n42-rs` at `52a1df393ea3ca37518edfd428651202f76fb3a7`.
 
 Copied transaction/frame/envelope/storage/primitive rules and specification vectors.
-Retained original test suite; copied only the bounded decompressed-key cache from
+Retained original test suite; added checked layout-length summation to reject
+overflow before slicing (valid frame roots unchanged); copied only the bounded decompressed-key cache from
 `sender_cache.rs`. `alt_sig.rs` calls the private `key_cache` module.
 The native traits/transaction versions follow the validated Reth 2.7 / Alloy 2.5
 source profile. Test with the adapted Reth checkout; older Reth sources are not
