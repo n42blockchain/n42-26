@@ -240,6 +240,35 @@ mod tests {
     }
 
     #[test]
+    fn execution_parameters_preserve_native_identity() {
+        use alloy_consensus::Typed2718;
+        use alloy_primitives::TxKind;
+        let frame = admit(&encoded(), &[], None).unwrap();
+        for admitted in frame.transactions() {
+            let native = admitted.transaction();
+            let tx = native.tx();
+            let before = *native.hash();
+            let env = admitted.execution_env();
+            assert_eq!(env.caller, admitted.sender());
+            assert_eq!(env.nonce, tx.nonce);
+            assert_eq!(env.chain_id, Some(tx.chain_id));
+            assert_eq!(env.gas_limit, tx.gas_limit);
+            assert_eq!(env.gas_price, tx.max_fee_per_gas);
+            assert_eq!(env.gas_priority_fee, Some(tx.max_priority_fee_per_gas));
+            assert_eq!(env.kind, TxKind::Call(tx.to));
+            assert_eq!(env.value, tx.value);
+            assert_eq!(env.data, tx.input);
+            assert_eq!(env.access_list, tx.access_list);
+            assert!(env.blob_hashes.is_empty());
+            assert!(env.authorization_list.is_empty());
+            assert_eq!(env.max_fee_per_blob_gas, 0);
+            assert_eq!(env.tx_type, 2);
+            assert_eq!(native.ty(), 0x50);
+            assert_eq!(*native.hash(), before);
+        }
+    }
+
+    #[test]
     fn trusted_gateway_attests_the_actual_root() {
         let input = encoded();
         let root = admit(&input, &[], None).unwrap().root();

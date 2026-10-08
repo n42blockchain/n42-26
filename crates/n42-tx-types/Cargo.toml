@@ -7,6 +7,8 @@ license.workspace = true
 description = "N42 native Ed25519 transactions, blocks, receipts and authenticated frames"
 
 [dependencies]
+alloy-evm = { version = "0.39.0", default-features = false }
+revm = { version = "43.0.3", default-features = false, features = ["std", "serde"] }
 alloy-consensus = { version = "2.5.0", default-features = false, features = ["std", "serde", "secp256k1"] }
 alloy-eips = { version = "2.5.0", default-features = false, features = ["std", "serde"] }
 alloy-primitives = { workspace = true, features = ["std", "serde", "rlp"] }

@@ -11,7 +11,8 @@ source profile. Test with the adapted Reth checkout; older Reth sources are not
 the supported native integration base. Existing root dependency migration stays
 separate from this port.
 
-RPC and execution-environment adapters, frame queue and node wiring follow separately.
+Execution-environment conversion is ported as `execution.rs`; authenticated admission
+exposes `execution_env()` without signer recovery. RPC, frame queue and node wiring follow separately.
 The node has not yet switched its primitive types or admitted native frames.
 
 Reference source SHA256:
@@ -23,3 +24,6 @@ Reference source SHA256:
 - `compact.rs`: `92205c883c7068eb0e54396f6d95672647c8e9e9b8fabc607cfff36e5e3276d2`
 - `sender_cache.rs`: `792445bae54bf3e01a64ea353322ea04c731f8f89c7d7e8c46e7d3649d570db6`
 - `lib.rs`: `a362795aa67b88725b1c1b387109d952d1e8e77b1783fb5a28fc26e4e459cf1b`
+
+Execution adapter reference: `b03e71c8f307074df388caaae43c26b764b9417d`, `evm.rs` SHA256 `5bf5ff039a7f6b52b3162e5f489448966ca9028b9e368799b29adc9f46d490a7`.
+Native wire/hash/receipt identity remains 0x50; internal TxEnv type 2 carries fee semantics.

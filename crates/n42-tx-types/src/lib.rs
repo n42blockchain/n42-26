@@ -7,6 +7,7 @@ pub mod admission;
 pub mod alt_sig;
 mod compact;
 pub mod envelope;
+pub mod execution;
 pub mod frame;
 mod key_cache;
 pub mod primitives;

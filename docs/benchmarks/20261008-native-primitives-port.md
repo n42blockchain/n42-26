@@ -28,8 +28,11 @@
   这是规范向量验证，不替代 Rust 移植代码的编译与测试。
 - `python3 -m unittest discover -s scripts -p test_summarize_execution_probe.py -v`：9 项通过。
 - rustfmt、限定改动的 `git diff --check` 及三个 Cargo manifest 语法解析通过。
-- Rust release 测试与原生帧基准尚未开始：参考仓库持有 `.box-claim-rust`，
-  正在运行同机多验证者压测。独占驱动继续排队，不将等待状态视为通过。
+- 基础冻结快照 Rust release 测试：19 项通过、4 项忽略。
+- 最终认证快照编译失败：快照遗漏 admission 模块导出，示例条件分支数组长度不匹配。
+  已刷新完整源码快照并显式使用 slice；失败日志保留，不计为认证代码通过。
+- 新验证任务 `.artifacts/native-execution-20261008/` 已排队；参考链持有共享机器。
+  包含认证、执行参数回归及 warmup/A1/B/A2 帧认证微基准，结果待补。
 
 ## 冻结验证任务
 
@@ -52,3 +55,10 @@ B 的信任配置与 A 不同，不能把结果解释为无条件保持同一认
 先审阅 Rust 真实结果并修复，再把 N42 原生交易环境转换接到直接转账执行接口，
 随后接有界帧队列及 frame plan；以实时原生交易、共同提交、回执和 QMDB bin root
 作为首次端到端验收。共享 owner 与构块产物复用在这些真实入口上实现。
+
+## 执行参数接线
+
+借用参考 tx-types 的转换接口，新增 `AdmittedTransaction::execution_env()`，直接使用认证后的 sender，
+不重新解码或恢复签名。原生交易和回执类型仍为 0x50；内部执行参数 type 2 表示费用语义。
+该参数可供现有直接转账执行器及解释器备用路径使用。新增字段一致性回归；
+尚未切换节点执行工厂、帧队列和原生回执构建器，因此没有端到端性能结论。
