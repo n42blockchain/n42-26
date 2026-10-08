@@ -39,7 +39,8 @@ def summarize(lines, prefix):
     if len(counts) != 1 or any(len(values) != 10 for values in groups.values()):
         raise ValueError('need four complete legs of ten samples with identical counts')
     result = {
-        'scope': 'execution microbenchmark; excludes canonical consensus and persistence',
+        'scope': ('native frame admission microbenchmark; excludes execution, QMDB, consensus and persistence; trusted gateway policy differs between A and B'
+                  if prefix == 'NATIVE_FRAME_PROBE' else 'execution microbenchmark; excludes canonical consensus and persistence'),
         'transactions_per_sample': counts.pop(),
         'warmup_excluded': True,
         'legs': {tag: {'samples': len(values), 'median_ms': statistics.median(values),
@@ -58,7 +59,7 @@ def summarize(lines, prefix):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('log', type=Path)
-    parser.add_argument('--prefix', choices=['PROBE', 'TRANSFER_PROBE'], required=True)
+    parser.add_argument('--prefix', choices=['PROBE', 'TRANSFER_PROBE', 'NATIVE_FRAME_PROBE'], required=True)
     args = parser.parse_args()
     print(json.dumps(summarize(args.log.read_text().splitlines(), args.prefix), indent=2))
 

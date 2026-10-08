@@ -45,6 +45,12 @@ class ProbeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             summarize(data, 'PROBE')
 
+    def test_native_admission_has_explicit_scope(self):
+        result = summarize(rows(prefix='NATIVE_FRAME_PROBE'), 'NATIVE_FRAME_PROBE')
+        self.assertIn('native frame admission', result['scope'])
+        self.assertIn('trusted gateway policy differs', result['scope'])
+        self.assertNotIn('tps', result)
+
     def test_transfer_gas_checked(self):
         data = rows(prefix='TRANSFER_PROBE')
         summarize(data, 'TRANSFER_PROBE')
