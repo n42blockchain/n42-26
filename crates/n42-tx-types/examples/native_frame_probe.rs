@@ -62,7 +62,7 @@ fn main() {
             let frame = AdmittedFrame::authenticate(
                 chain_id,
                 &encoded,
-                if tag == "b" { &attestations } else { &[] },
+                if tag == "b" { &attestations[..] } else { &[] },
                 if tag == "b" { Some(&gateways) } else { None },
                 limits,
             )
