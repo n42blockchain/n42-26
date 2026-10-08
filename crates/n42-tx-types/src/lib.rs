@@ -3,6 +3,7 @@
 //! N42 native transaction, block, receipt and authenticated frame primitives.
 //! Ported from n42-rs; node admission/build integration is a separate step.
 extern crate alloc;
+pub mod admission;
 pub mod alt_sig;
 mod compact;
 pub mod envelope;
