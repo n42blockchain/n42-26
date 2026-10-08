@@ -1,117 +1,88 @@
-# 性能主线：同机共享执行、原生帧与 QMDB bin 树
+# N42 原生实时链性能主线
 
-日期：2026-10-07。目标是先消除重复工作、复制和串行等待，再按实测瓶颈继续优化。
-每批保持小提交、逐次推送，代码、正确性和容量结论分别记录。
+更新：2026-10-07。按用户纠正，以 N42 链的实时交易、出块、执行和共识为对象。
+本计划替换此前围绕通用 Engine 适配器、独立执行层对照和 witness 的安排。
+既有回放/兼容路径的数据保留为历史记录，不用来验收这条原生链路。
 
-## 当前事实与对照来源
+## 核对的参考代码
 
-- 本仓库使用 `Gov5QmdbStateRootStore → QmdbLeafTree` 的 QMDB 二叉承诺。
-  账户读的持久化索引是派生读取视图，不是另一个状态承诺。保持现有编码、证明、undo 和 WAL 格式。
-- `fast_transfer.rs` 已直接检查并计算合格转账的余额、nonce、gas 和结果，跳过解释器；
-  `parallel_transfer.rs` 按 sender 依赖分组。不能再把“增加转账快速路径”作为尚未实施的新方案。
-  普通合约、特殊交易和不符合资格的转账保留解释器执行。
-- 现有 `ImportGate` 仅在一个适配器中串行化同哈希请求，每个请求仍提交完整 payload。
-  它既不是跨进程执行共享，也不是完成结果缓存。上轮 E7 A/B/A 未证明吞吐收益。
-- 现有领导者构块输出命中缓存；跟随者在已测 E7 路径仍独立执行。
-  同机七验证者共享一 EL（E1）应成为第一条容量主线，E7 单独作为独立执行对照。
-- 上轮 E7 合格数据：A1 37,952.29、B 36,904.73、A2 36,731.55 canonical TPS。
-  构块 819–825 ms、打包 205–209 ms、规范化验证 963–971 ms、跟随导入 1,362.5–1,417 ms。
-  QMDB prepare 平均 17–33 ms。这些阶段可能重叠，不能相加或外推 E1 容量。
-  来源：[完整审计](benchmarks/20261007-pressure-feedback.md)。
-- 只读参考 `../n42-rs` HEAD `bce4921b8`：
-  `bin/n42/src/import_once.rs`、`crates/n42/tx-queue/src/frames.rs`、
-  `crates/n42/engine-types/src/output_shards.rs`、`docs/SHARED_EXECUTION_SCOPE.md`。
-  不修改参考仓库，不把旧 scope 文档中的“未实现”误当作当前代码状态。
-- 最新参考 `loop346a-stopped2.out` 的 A2 记录 3,126,667 / 3,060,000 / 2,993,333 TPS，
-  构块重复执行 0/1,426，抽样 Ed25519/回执读取通过，但最终 settlement 因 FCU 错误停止。
-  因此这是一份机制与瓶颈证据，不是新的完整通过容量结果，也不是本仓库实测。
-  参考使用延后两块填写字段的配置；本仓库不能直接照搬该协议时序。
+只读核对 `../n42-rs` HEAD `f6ab43cea` 及当前源码：
 
-## 新发现：提交后 witness 再执行
-
-`crates/n42-node/src/mobile_packet.rs::generate_and_broadcast_v2` 在提交后打开父状态，
-用 `ReadLogDatabase` 包装 provider，再调用 `execute_one` 收集 ordered read log 与 bytecodes。
-所以“领导者构块缓存命中”并不等于一个节点完整生命周期只执行一次。
-
-重新关联已审计的 A1 13 个非空块与七节点日志，得到 91 次 mobile packet 成功广播，
-每节点恰好 13 次；这些成功路径覆盖 16,575,552 笔交易执行（2,367,936 × 7）。
-成功广播所在源码路径经过上述重新执行；这是重复工作的实证，并非额外 canonical 交易。
-广播相对 node0 commit 的中位延迟 456.07 ms、最大 917.12 ms，包含跨节点提交差异、
-队列、读取、执行、编码、压缩与广播，不可解释成 execute_one 耗时，也不可当作可节约的时间。
-明细：`.artifacts/gov5-validator-20261007/mobile-reexecution-audit.json`。
-
-P1 加入这一消费者：首次 canonical 执行捕获或派生经校验的 read-log/bytecode witness，
-按认证块与精确父状态保留有界共享对象，包生成直接编码该对象。并行执行的日志需按交易顺序
-组织，system calls 和真实读取顺序不能丢失。先比较旧生成器和复用生成器的完整 packet 内容、
-读取状态版本、移动端验证结果；未缓存或历史重建保留明确 fallback，记录发生次数。
-当前同步 provider/execute/encode/compress 工作还运行在异步包生成任务中；需测 Tokio 调度
-延迟，比较有界专用任务池的诊断候选，避免影响共识任务。后台化只解决调度，仍要消除重复计算。
-已增加 `n42_mobile_witness_reexecution_duration_ms`、按 success/error 分类的次数和块哈希日志，
-该指标仅覆盖 execute_one，不把读取、编码和压缩误归于执行。
-
-容量轮必须统计 canonical、构块、跟随导入和 witness 的所有执行次数，并拆分正常热路径
-与恢复任务。取消移动验证或生成空 witness 都不能作为这一优化的通过条件。
-
-## 目标结构
-
-同机验证者保留各自密钥、投票与 QC 验证，共享一个执行服务与状态存储。
-入队后的交易/帧为不可变对象。每个认证块由一个 owner 执行或接管已有构块输出，
-其余请求者等待并读取相同结果；QMDB root、下一块读取和最终持久化消费相同的输出。
-同机结果优先使用共享对象/句柄，网络才编码交易体或状态结果。
-
-先采用一个 EL 进程服务多验证者的架构；若进程隔离要求仍需多个执行进程，才比较
-Unix socket、共享内存不可变页和 RPC 服务的额外成本。共享内存需要版本、生命周期、
-崩溃恢复和认证绑定，不能用裸指针替代。
-E1 明确共享执行故障域；E7 保留独立执行、校验与持久化口径。
-
-## 分批实施与验收
-
-| 批次 | 借用思路及本仓库落点 | 测试与实际效果验收 |
+| 环节 | 参考源码 | 实际机制 |
 | --- | --- | --- |
-| P0：建立归因 | 每块关联 admitted/build/execute/root/seal/QC/commit/durable 时间；采集队列笔数与字节、CPU、RSS、major faults、编码和复制字节 | 缺失阶段记 unavailable；同一个块的时间线确认真正关键路径；修复前轮 converter 编译错误并补回归 |
-| P1：同机执行一次 | 在共享 EL 内统一导入入口，按链身份、认证父状态及块身份复用 owner/result；接管构块输出，覆盖所有导入道路 | 同时七请求只发生一次执行、一次 root 计算及持久化；own_executed_again=0；换主、owner 取消、失败、重试、分叉、过期与边界淘汰测试 |
-| P2：认证帧与传输 | 迁移 Ed25519 原生帧认证边界与不可变 frame index；frame plan 持 Arc 引用，同机传句柄，异机传 frame id 与缺失补取 | 错签、重放、截断、nonce 缺口、缺失帧、乱序和部分帧均有用例；测编码/解码次数、bytes/tx、补取率及端到端队列延迟 |
-| P3：有界入队 | admission 同时限制 transaction、byte、in-flight frame；信用在真实释放后归还，batch 不能绕过限制 | 慢消费者与断连持续压力下 RSS/backlog 有界；记录 offered/admitted/canonical 和背压时间；16,384 frame index 保留上限不能替代信用 |
-| P4：直接转账进一步瘦身 | 测量现有 fast path 对解释器；尝试 sender lane 的批量 nonce/余额结算和紧凑账户 delta，减少逐笔 Account/Result/HashMap 分配 | EVM 作为差分 oracle；验证 self-transfer、recipient 也是 sender、共享收款人、overflow、费用与失败次序、fork/system calls；不改变合法性和回执结果 |
-| P5：分片输出直读 | 输出保留 batch maps，加 address→batch index，只合并冲突；QMDB 操作与下一块 provider 直接读冻结视图 | 与连续 BundleState 逐账户/slot、receipt、bin root 和 undo 比较；量化 freeze/index/conflict/merge、缓存 miss 和下一块等待 |
-| P6：封块与共识流水 | 输出可读就允许依赖任务推进，把不依赖投票的连续状态合并与持久化准备移出关键路径；QC 与 durable 完成各自计时 | 最终字段仍遵守当前 H2/Gov5 协议；不能把参考延后字段直接移植。验证换主、超时、分叉、延迟输出、读等待、重启与恢复；衡量周期和完成延迟 |
-| P7：存储深入优化 | 根据大状态测试比较 WAL group commit、批量哈希、受影响祖先折叠、快照与后台压缩；固定 fsync/恢复语义 | apply/undo/proof 和重启后根一致；报告 durable TPS、写放大、IO/tx、同步耗时和持续 compaction backlog |
+| 原生交易 | `crates/n42/tx-types/src/{alt_sig,envelope,primitives}.rs` | `0x50` Ed25519 交易；sender 由算法和公钥派生；`N42TxEnvelope`、N42 Block/Receipt 贯穿链路 |
+| 认证与入队 | `tx-types/src/frame.rs`、`tx-queue/src/{lib,frames}.rs` | 入队计算 frame root；认证覆盖有序交易哈希及签名字节；交易持不可变引用，frame index 随 canonical prune 回收 |
+| 构块与传输 | `engine-types/src/{frame_blocks,payload}.rs` | frame plan 按帧取引用，最后一帧可取前缀；frame description 表达有序帧与前缀，缺失内容补取 |
+| 直接执行 | `engine-types/src/{fast_transfer,parallel_transfer}.rs` | sender 依赖分组，直接计算转账状态；账户 read set/批处理减少共享读取和逐笔开销 |
+| 输出与下一块 | `engine-types/src/output_shards.rs`、`payload.rs` | 保留 batch maps，以地址索引关联输出，只合并冲突；FrozenShards 供 root 与下一块读取，连续状态组装在封块后完成 |
+| 构块结果复用 | `engine-types/src/{built_executions,chain_alias}.rs` | 保留构块执行结果；共识封头改变身份后绑定原结果，避免自己的块再次执行 |
+| 同机共享执行 | `bin/n42/src/{import_once,payload_serve}.rs` | 同一执行实例内，多验证者的同块请求由一个 owner 处理，其余共享 checked/final 结果；覆盖 own/compact/foreign/payload 各入口 |
+| 封块与共识 | `engine-types/src/{payload,post_seal,fields_at_seal}.rs`、`docs/PHASE_D_DEFERRED_EXECUTION.md` | 区分执行结束、输出可读、封块、投票/QC、字段发布与持久化；拆解 seal 后到下一块启动的等待 |
+| 状态承诺 | `qmdb-state/src/forest.rs`、`qmdb-reth/src/{read_view,state_reader}.rs` | 精确父版本账户读取、QMDB bin 树、undo/分叉切换与持久化 |
 
-P1 的结果复用必须以认证内容/状态为边界。仅凭请求声明的 blockHash 返回 VALID 会绕过
-同哈希不同 body 的校验；可信的内部结果句柄与任意外部 payload 应走不同入口。
-owner 中断后可接管，SYNCING/ACCEPTED 不永久缓存；活动项不能因容量淘汰而产生第二个 owner。
-forkchoice 的 canonical 更新与执行去重分别处理，不能吞掉换主后的合法更新。
+Reth/revm 可作为内部实现组件；产品和测试对象是上述 N42 原生链路。
+frame tree 是交易承诺规则，QMDB bin 树是状态承诺，两者分别验证。
+参考 frameBlocks 受链配置控制；当前实现也保留非帧体规则，不能把任意 body 的 root
+无条件替换为 frame tree。认证帧不足配置门槛时仍须验证交易，不能信任声明 sender。
 
-P4 不预设当前逐笔 EVM 包装必须保留，也不预设共享内存必须更快。候选可以是紧凑列式
-账户数组、批量费用归集、sender lane 执行、按地址索引的不可变 delta。每次只替换一个边界，
-用相同输入和状态差分确认，再比较时间和内存。发生 sender 交叉依赖时保持原交易次序。
+## 本仓库必须先跨过的边界
 
-## 测试和测量方案
+本仓库已有 `Gov5QmdbStateRootStore → QmdbLeafTree`，以及直接转账和 sender 分组执行。
+这些是已有基础，不重复把它们包装为新优化。
 
-1. **正确性门槛**：先模块与集成测试。状态、gas、回执顺序、原生头、QC、QMDB bin root
-   和恢复后状态一致。所有失败运行保留日志；候选测试失败时不进入容量比较。
-2. **执行微基准**：新增 `transfer_execution_probe`，同一 release 二进制比较解释器 A1、
-   直接转账 B、解释器 A2，10 次/段，预热单列。每段最终三方账户及 gas 完全相同，
-   B 强制命中 direct path。热缓存单 sender 基准只回答执行内核成本，不能换算成链 TPS；
-   后续扩展多 sender、随机账户、真实 pinned QMDB parent、大状态与混合合约数据。
-3. **E1 主线**：七验证者、一 EL，同一 genesis、账户、数据、线程预算与持久化设置。
-   先短正确性轮，再固定二进制 warmup/A1/B/A2；至少重复三组，负载先 60 秒再 5–10 分钟。
-   offered rate 逐级提升，直到 canonical 不再上升或 backlog 不再稳定；发送速率不是吞吐。
-4. **E7 对照**：同一认证帧工作负载、相同总 CPU 预算；分别报告每 EL 执行/root 次数及资源。
-   不用 E1 的单执行结果证明七份独立执行容量。
-5. **验收数据**：common canonical tx/window、QC 与所有相关根、durable tx/window、
-   p50/p90/p99 阶段与队列延迟、execution/root 次数、换主次数、bytes/tx、CPU秒/百万笔、
-   RSS、major faults、WAL IO/tx。收益需超过 A 两端漂移且重复可见；同时检查尾延迟与 backlog。
-6. **同机独占**：遵守 `/data/blockchain/wr-logs/BOX-CLAIM-PROTOCOL.md`；
-   不与参考任务抢机器，不在 A/B/A 之间编译，重编译后第一轮排除。
+当前 `crates/n42-node/src/node.rs`、`parallel_payload.rs` 等仍沿用 Ethereum primitives，
+交易类型主要是 `TransactionSigned`；`ingest.rs` 的受信任预恢复 TCP 批次并不等同于
+参考的 N42 原生认证帧队列。第一步应打通原生类型、认证帧和实际出块路径，
+不能通过打开开关或提高批次上限宣称已移植。
 
-## 本轮执行记录
+现有 `ImportGate` 仅在适配器中排队，不能代表同机共享执行。
+要共享的是原生构块/执行产物、父状态视图、root 和最终结果，而不是缓存外部请求声明。
 
-- 前轮 frozen converter 测试实际编译失败（E0382）；三个测试/基准入口都未得到通过结果。
-  已保存原日志与原源码，修复为移动交易体前保存 `current_hash`，保持错误输出身份不变。
-- 增加直接转账/解释器对照 executable，最终账户与 gas 比较，限定纯执行微基准口径。
-- 汇总工具 8 项测试通过；运行器 13 项、指标 7 项、时间线 4 项测试重跑通过。
-  从旧审计数据确认 91 次 witness 包广播的重复执行路径；这是新归因，不是新容量轮。
-- 测试与两个微基准通过同一个独占驱动排队；共享机器仍有参考仓库测试占用。
-  真实执行结果填入本节及独立报告后，再按阶段成本选择 P1/P2/P4/P5 的下一段实现。
-  当前没有新的 TPS、加速倍数或运行正确性通过结论。
+## 正确路径与实施顺序
+
+实时 N42 交易 → Ed25519/帧认证 → 有界帧队列 → frame plan → 直接转账执行
+→ 冻结分片输出 → QMDB bin root/下一块读取 → N42 封头、投票与 QC → 提交与持久化。
+同机验证者各自签名投票，对同一块共享一次执行产物。
+
+| 批次 | 实施内容 | 验收 |
+| --- | --- | --- |
+| 1：原生类型与帧贯通 | 借用 N42TxEnvelope/Block/Receipt、0x50 Ed25519 编解码与认证；让交易类型贯穿入队、队列、构块、直接执行、封头和读取 | 官方仓库内测试向量、跨实现 hash/sender/signature、畸形输入；实时发送原生交易得到可读取的成功块与回执 |
+| 2：帧引用与背压 | 入队一次计算 root；帧内引用贯穿 frame plan 和传输；计数、字节和 in-flight frame 信用独立有界 | nonce 缺口、帧前缀、重复/乱序、缺帧补取、断连释放；队列/RSS 有界；记录复制字节与查找次数 |
+| 3：一次执行与共享结果 | 移植 built_executions、封头身份绑定与 import_once 的统一 owner；共享结果跨所有验证者入口，换主继续使用已发布输出 | 同块并发请求执行一次，own_executed_again=0；取消接管、失败重试、分叉和淘汰不产生重复 owner；各验证者 QC 与 canonical 身份一致 |
+| 4：账户读取与直接批处理 | 精确父 QMDB 视图；比较原读取、按块 read set 和紧凑账户数组；直接计算余额/nonce/费用，减少逐笔 map/result 分配 | 相同原生交易与父状态的状态/gas/回执等价；共享收款人、sender 交叉依赖、自转账、溢出与失败次序测试 |
+| 5：输出分片直读 | 保留 batch output，按地址建 index，只合并冲突；root 和下一块 provider 直接读 FrozenShards | bin root、账户/slot、回执、undo 等价；测 freeze/index/conflict、下一块等待和内存；不把分片重新合成大 map 放回关键路径 |
+| 6：封块和共识流水 | 实测执行结束→输出可读→封块→QC→下一块启动；按参考拆开等待和后台字段计算 | 同步/延后字段语义与 N42 链协议一致；换主、超时、延迟输出、失败恢复测试；提交 TPS 与尾延迟同时改善 |
+| 7：存储深入优化 | 批量 QMDB 操作/哈希、受影响祖先折叠、WAL 批次与后台压缩；以大状态和持续写入选方案 | durable TPS、写放大、IO/tx、fsync、compaction backlog；重启、undo 与证明根一致 |
+
+不预设参考所有开关都更快。帧大小、线程数、read set、dense id、索引构建和后台任务池
+分别做对照；按真实关键路径选择下一段。逻辑和物理 CPU、NUMA、内存局部性也纳入测量。
+封头/字段规则变化先在具有明确 N42 协议配置的测试链验证，再考虑同步到目标链。
+
+## 测试和数据闭环
+
+- 首个端到端基线：同一计算机，七个 N42 验证者，共享一个原生执行实例；实时发送
+  N42 Ed25519 交易，使用足够覆盖测量窗口的输入流。报告 offered、admitted、
+  common canonical 和 durable 交易数，不把入队率当吞吐。
+- 每批先做模块/集成正确性，再冻结二进制、配置、输入和父状态，运行 warmup/A1/B/A2；
+  重编译后的首轮不计收益。先 60 秒，之后 5–10 分钟稳定性轮；重复多组，检查两端漂移。
+- 每块采集：入队、frame select、账户读取、直接执行、输出冻结、QMDB root、封块、QC、
+  下一块启动和 durable 时间；同时采集执行次数、构块复用次数、bytes/tx、CPU、RSS、
+  major faults、队列字节与笔数。缺失阶段明确标记，不按零处理。
+- 以各验证者共同提交、N42 原生头/回执与 QMDB bin root 一致作为正确性门槛；
+  共享执行的收益必须同时有“每块一次执行”计数与 canonical/durable 完成数据。
+- 转账正确性可使用现有解释器做局部差分，性能主基准直接走 N42 原生执行。
+  通用 Engine payload 转换和单 sender 热缓存测量不代表这一主线容量。
+- 重型任务遵守共享机器的 BOX-CLAIM 协议。已完成的旧任务不重新排队；下一批队列
+  只安排本计划中的原生路径测试。
+
+## 前轮结果归档
+
+前轮排队任务已完成并释放机器：converter 库筛选测试两版各 5 项通过，隔离测试
+30 项通过，执行库 129 项通过。原 E0382 编译错误修复已得到该冻结快照验证。
+
+旧微基准：100k 热缓存转账解释器 A1/A2 中位约 65.16/65.17 ms，直接路径 34.33 ms；
+220k legacy payload 转换 A1/A2 约 185.90/185.67 ms，候选 109.92 ms。
+这些结果来自 `.artifacts/gov5-validator-20261007/`，仅归档各自局部范围，
+不作为 N42 原生实时链的容量或架构迁移完成依据。
+
+此次按用户纠正撤销前轮新增 witness 重执行计时，保留此前已有代码和其他未提交改动。
