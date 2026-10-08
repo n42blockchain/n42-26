@@ -126,6 +126,7 @@ where
         block.header.difficulty = U256::ZERO;
         validate_gov5_h2_header(&block.header).map_err(NewPayloadError::other)?;
         let current = block.seal_slow();
+        let current_hash = current.hash();
         if current.hash() == expected_hash {
             return Ok(current);
         }
@@ -218,7 +219,7 @@ where
             return Ok(SealedBlock::new_unchecked(block, expected_hash));
         }
         Err(PayloadError::BlockHash {
-            execution: current.hash(),
+            execution: current_hash,
             consensus: expected_hash,
         }
         .into())
