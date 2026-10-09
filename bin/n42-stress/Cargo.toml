@@ -28,3 +28,6 @@ serde_json.workspace = true
 reqwest = { version = "0.13", features = ["json"] }
 hex.workspace = true
 tiny-keccak = { version = "2", features = ["keccak"] }
+
+rayon.workspace = true
+tempfile.workspace = true

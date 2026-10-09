@@ -124,6 +124,46 @@ fn env_bool(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn validate_immediate_persistence(
+    persistence_threshold: u64,
+    state_masking_blocks: u64,
+    memory_block_buffer_target: u64,
+) -> Result<(), String> {
+    if persistence_threshold == 0 && state_masking_blocks == 0 && memory_block_buffer_target == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "N42 requires immediate persistence (threshold=0, state masking=0, memory buffer=0); got threshold={persistence_threshold}, state masking={state_masking_blocks}, memory buffer={memory_block_buffer_target}"
+    ))
+}
+
+fn authenticated_native_producer_head(
+    header: alloy_consensus::Header,
+    expected_hash: alloy_primitives::B256,
+) -> eyre::Result<n42_consensus::Gov5NativeHeader> {
+    let with_zero_registry = n42_consensus::Gov5NativeHeader {
+        header: header.clone(),
+        mobile_registry_root: Some(alloy_primitives::B256::ZERO),
+    };
+    if with_zero_registry.hash() == expected_hash {
+        return Ok(with_zero_registry);
+    }
+    // Gov5's genesis omits the registry field. It is still authenticated by
+    // its exact native hash; only post-genesis heads must carry the zero field.
+    if header.number == 0 {
+        let genesis = n42_consensus::Gov5NativeHeader {
+            header,
+            mobile_registry_root: None,
+        };
+        if genesis.hash() == expected_hash {
+            return Ok(genesis);
+        }
+    }
+    Err(eyre::eyre!(
+        "native producer requires an authenticated zero-registry head"
+    ))
+}
+
 fn restart_entry_view(
     snapshot_view: u64,
     _last_voted_view: u64,
@@ -1155,7 +1195,12 @@ fn main() {
 
     // Parallel state-root computation currently falls back repeatedly on this workload,
     // so make the synchronous path the default unless the operator overrides it explicitly.
-    let engine_defaults = DefaultEngineValues::default().with_state_root_fallback(true);
+    // Keep Reth 2.6+'s persistence window and state masking disabled for N42/QMDB.
+    let engine_defaults = DefaultEngineValues::default()
+        .with_persistence_threshold(0)
+        .with_num_state_masking_blocks(0)
+        .with_memory_block_buffer_target(0)
+        .with_state_root_fallback(true);
     if let Err(error) = engine_defaults.try_init() {
         warn!(
             target: "n42::cli",
@@ -1165,6 +1210,13 @@ fn main() {
     }
 
     if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |mut builder, _| {
+        let engine_config = builder.config().tree_config();
+        validate_immediate_persistence(
+            engine_config.persistence_threshold(),
+            engine_config.num_state_masking_blocks(),
+            engine_config.memory_block_buffer_target(),
+        )
+        .map_err(eyre::Report::msg)?;
         info!(target: "n42::cli", "Launching N42 node");
 
         // Warn about benchmark/debug env vars that weaken security.
@@ -1815,6 +1867,15 @@ fn main() {
         if let Some(bootstrap) = &qmdb_execution {
             n42_node = n42_node.with_gov5_qmdb_state_root_store(bootstrap.store.clone());
         }
+        let qmdb_reads = std::env::var("N42_QMDB_READS").unwrap_or_else(|_| "off".to_owned())
+            .parse::<n42_node::qmdb_state_reader::QmdbReadsMode>().map_err(|error| eyre::eyre!(error))?;
+        if qmdb_reads != n42_node::qmdb_state_reader::QmdbReadsMode::Off {
+            let bootstrap = qmdb_execution.as_ref().ok_or_else(|| eyre::eyre!(
+                "N42_QMDB_READS requires an authenticated N42_GOV5_QMDB_EXECUTION store"
+            ))?;
+            n42_node::qmdb_state_reader::register(bootstrap.store.clone(), qmdb_reads)?;
+            info!(target: "n42::cli", mode = ?qmdb_reads, "QMDB exact-block execution state reads enabled");
+        }
         if trusted_state_root_base.is_some() {
             n42_node = n42_node.with_gov5_trusted_state_root();
         }
@@ -1984,10 +2045,12 @@ fn main() {
         let rpc_twig = twig.clone();
         let rpc_qmdb_archive = qmdb_archive;
         let rpc_admin_token = std::env::var("N42_ADMIN_TOKEN").ok();
+        let rpc_validator_public_key = my_pubkey.clone();
         let handle = builder
             .node(n42_node)
             .extend_rpc_modules(move |ctx| {
                 let mut rpc_server = N42RpcServer::new(rpc_consensus_state)
+                    .with_validator_public_key(rpc_validator_public_key)
                     .with_staking_manager(rpc_staking_manager);
                 if let Some(scheduler) = rpc_zk_scheduler {
                     rpc_server = rpc_server.with_zk_scheduler(scheduler);
@@ -3174,13 +3237,7 @@ fn main() {
                         // durable head hash before using it for a leader build.
                         let header = full_node.provider.header(consensus_head_hash)?
                             .ok_or_else(|| eyre::eyre!("native producer head is missing"))?;
-                        let native = n42_consensus::Gov5NativeHeader {
-                            header,
-                            mobile_registry_root: Some(alloy_primitives::B256::ZERO),
-                        };
-                        if native.hash() != consensus_head_hash {
-                            return Err(eyre::eyre!("native producer requires an authenticated zero-registry head"));
-                        }
+                        let native = authenticated_native_producer_head(header, consensus_head_hash)?;
                         n42_consensus::remember_gov5_native_header(&native.encode());
                         let rewards = n42_node::sinks::Gov5WithdrawalSource::from_genesis(
                             &full_node.provider.chain_spec().genesis, fee_recipient,
@@ -3400,6 +3457,48 @@ mod observer_identity_tests {
     use super::*;
     use n42_twig_core::qmdb_compat::{QmdbEntrySnapshot, QmdbSlotEntry, QmdbSlotSnapshot};
     use std::io::Write;
+
+    #[test]
+    fn immediate_persistence_requires_all_three_windows_disabled() {
+        assert!(validate_immediate_persistence(0, 0, 0).is_ok());
+        assert!(validate_immediate_persistence(1, 0, 0).is_err());
+        assert!(validate_immediate_persistence(0, 1, 0).is_err());
+        assert!(validate_immediate_persistence(0, 0, 1).is_err());
+    }
+
+    #[test]
+    fn native_producer_accepts_only_authenticated_genesis_without_registry_field() {
+        let genesis = alloy_consensus::Header::default();
+        let legacy_genesis = n42_consensus::Gov5NativeHeader {
+            header: genesis.clone(),
+            mobile_registry_root: None,
+        };
+        assert_eq!(
+            authenticated_native_producer_head(genesis.clone(), legacy_genesis.hash())
+                .unwrap()
+                .mobile_registry_root,
+            None
+        );
+        let zero_genesis = n42_consensus::Gov5NativeHeader {
+            header: genesis.clone(),
+            mobile_registry_root: Some(alloy_primitives::B256::ZERO),
+        };
+        assert_eq!(
+            authenticated_native_producer_head(genesis, zero_genesis.hash())
+                .unwrap()
+                .mobile_registry_root,
+            Some(alloy_primitives::B256::ZERO)
+        );
+        let child = alloy_consensus::Header {
+            number: 1,
+            ..Default::default()
+        };
+        let unauthenticated_child = n42_consensus::Gov5NativeHeader {
+            header: child.clone(),
+            mobile_registry_root: None,
+        };
+        assert!(authenticated_native_producer_head(child, unauthenticated_child.hash()).is_err());
+    }
 
     #[test]
     fn secret_hex_supports_file_reference_without_putting_secret_in_environment() {
