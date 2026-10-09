@@ -12,6 +12,7 @@ Logs are split into separate files by phase for easy maintenance:
 
 | File | Content | Phase |
 |------|---------|-------|
+| [devlog-177-reth-27-upgrade-20261003](docs/devlog-177-reth-27-upgrade-20261003.md) | Reth v2.7.0 six-patch port, N42 compatibility changes, immediate persistence, workspace verification and remaining fleet gates | Upgrade |
 | [devlog-145-ci-reth-cache-api-20260914](docs/devlog-145-ci-reth-cache-api-20260914.md) | 修复 CI 缺少 reth 交易根缓存 API 导致的三个编译失败检查 | CI |
 | [devlog-144-independent-chain94-fleet-20260904](docs/devlog-144-independent-chain94-fleet-20260904.md) | Gov5 历史快照上的纯 Rust 七节点独立舰队、原生出块、重启验收 | Deployment |
 | [devlog-141-three-month-audit-20260904](docs/devlog-141-three-month-audit-20260904.md) | 三个月审计：SBMT 证明边界、Gov5 误封禁/缓存、崩溃恢复、n42-rs 对照优化 | Audit |
@@ -185,5 +186,7 @@ Logs are split into separate files by phase for easy maintenance:
 | [devlog-93-eth-client-survey-stage1](docs/devlog-93-eth-client-survey-stage1.md) | 调研 reth/erigon/geth 近三月更新（reth 2.0→2.3 已随 fork 获得、EIP-7928 BAL、Storage V2、Ress 无状态）；借鉴清单+效果/工作量评估；阶段一执行：geth 3 CVE + OP witness 不兼容均不适用、witness 对抗回归测试 3 个（截断/插入/code_hash 篡改，9 测试全绿）、Storage V2 经 reth CLI 透传新节点已默认 | Survey |
 
 ---
+
+Latest testing update: [devlog-176-workspace-coverage-20260923](docs/devlog-176-workspace-coverage-20260923.md) — Rust workspace source-line coverage 73.0631%, 13 new behavior tests, reproducible 70% gate; seven socket-permission failures remain in the sandbox.
 
 New entries: append to the corresponding category file, or create a new numbered file (e.g., `devlog-57-xxx.md`) in `docs/`.
