@@ -68,10 +68,17 @@ done
 mkdir -p "$RUNTIME/logs" "$RUNTIME/pids" "$RESULT"
 printf 'tag\t%s\noptions\t%s\nmax_txs_per_block\t%s\n' "$TAG" "$*" "$BLOCK_CAP" > "$RESULT/leg.tsv"
 printf 'gov5_reuse_builder_execution\t%s\n' "${N42_GOV5_REUSE_BUILDER_EXECUTION:-1}" >> "$RESULT/leg.tsv"
+printf 'reth_persistence_threshold\t0\nreth_state_masking_blocks\t0\nreth_memory_block_buffer_target\t0\n' >> "$RESULT/leg.tsv"
 printf 'rpc_max_response_mb\t%s\n' "${N42_BENCH_RPC_MAX_RESPONSE_MB:-160}" >> "$RESULT/leg.tsv"
+if [[ -n "${N42_RETH_SOURCE_MANIFEST:-}" ]]; then
+    cp "$N42_RETH_SOURCE_MANIFEST" "$RESULT/source-manifest.json"
+fi
 sha256sum "$NODE_BINARY" "$STRESS_BINARY" \
     "$KECCAK_BINARY" "$COMMIT_VERIFY_BINARY" \
     "$PRESIGNED" > "$RESULT/binary-workload-sha256.txt"
+sha256sum "$TEMPLATE/manifest.json" "$TEMPLATE/consensus.json" \
+    "$TEMPLATE/trusted-config.json" "$TEMPLATE/test-accounts.json" \
+    "$TEMPLATE/recipients.json" > "$RESULT/run-config-sha256.txt"
 date -Is > "$RESULT/started-at.txt"
 cp /proc/buddyinfo "$RESULT/buddy-before.txt"
 cp /proc/meminfo "$RESULT/meminfo-before.txt"

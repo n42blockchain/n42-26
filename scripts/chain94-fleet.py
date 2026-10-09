@@ -326,6 +326,7 @@ def _start(args, children, cancelled):
         raise ValueError("N42_GOV5_REUSE_BUILDER_EXECUTION must be 0 or 1")
     run = dict(foreground=bool(getattr(args, "foreground", False)), low_memory=low_memory, disable_tx_forward=disable_forward, max_txs_per_block=max_txs, build_budget_ms=build_budget, rpc_max_response_mb=rpc_max_response_mb, binary=str(binary), sha256=digest(binary), started=time.time(),
                block_interval_ms=consensus_config["slot_time_ms"],
+               immediate_persistence=dict(persistence_threshold=0, state_masking_blocks=0, memory_block_buffer_target=0),
                import_single_flight=single_flight, fast_transfers=args.fast_transfers, parallel_build=args.parallel_build, parallel_import=args.parallel_import, qmdb_reads=args.qmdb_reads, gov5_reuse_builder_execution=gov5_reuse,
                log_offsets={str(i): (runtime / f"logs/node{i}.log").stat().st_size
                             if (runtime / f"logs/node{i}.log").exists() else 0 for i in range(count)})
@@ -384,6 +385,9 @@ def _start(args, children, cancelled):
                    "--http", "--http.addr", "127.0.0.1", "--http.port", str(ports["http"] + index),
                    "--authrpc.addr", "127.0.0.1", "--authrpc.port", str(ports["auth"] + index),
                    "--rpc.max-response-size", str(rpc_max_response_mb),
+                   "--engine.persistence-threshold", "0",
+                   "--engine.num-state-masking-blocks", "0",
+                   "--engine.memory-block-buffer-target", "0",
                    "--metrics", f"127.0.0.1:{ports['metrics'] + index}",
                    "--ipcdisable", "--log.file.directory", str(node / "logs"),
                    "--log.file.max-files", "0", "--color", "never"]

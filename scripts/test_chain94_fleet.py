@@ -111,6 +111,9 @@ class FleetTests(unittest.TestCase):
                 for call in spawn.call_args_list:
                     command = call.args[0]
                     self.assertEqual(command[command.index("--rpc.max-response-size") + 1], "512")
+                    self.assertEqual(command[command.index("--engine.persistence-threshold") + 1], "0")
+                    self.assertEqual(command[command.index("--engine.num-state-masking-blocks") + 1], "0")
+                    self.assertEqual(command[command.index("--engine.memory-block-buffer-target") + 1], "0")
                     env = call.kwargs["env"]
                     self.assertEqual(env["N42_FAST_TRANSFER"], "1" if fast else "0")
                     self.assertEqual(env["N42_PARALLEL_BUILD"], "1" if parallel else "0")
@@ -122,6 +125,9 @@ class FleetTests(unittest.TestCase):
                     self.assertEqual(env["N42_LOW_MEMORY"], "1")
                     self.assertEqual(env["N42_DISABLE_TX_FORWARD"], "0")
                 recorded = fleet.read_json(runtime / "run.json")
+                self.assertEqual(recorded["immediate_persistence"], dict(
+                    persistence_threshold=0, state_masking_blocks=0, memory_block_buffer_target=0
+                ))
                 self.assertEqual(recorded["fast_transfers"], fast)
                 self.assertEqual(recorded["parallel_build"], parallel)
                 self.assertEqual(recorded["parallel_import"], importing)

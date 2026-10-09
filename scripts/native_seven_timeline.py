@@ -14,6 +14,7 @@ TIMESTAMP = re.compile(r"^(\S+)")
 STAGES = {
     "N42_CADENCE: build_start->broadcast": ("leader_broadcast_ms", "build_start_to_broadcast_ms"),
     "validated normalized Gov5 leader payload": ("leader_validation_ms", "elapsed_ms"),
+    "N42_LEADER_GOV5_ENCODE: native block encoded": ("gov5_encode_ms", "gov5_encode_ms"),
     "N42_COMPRESS: payload compressed": ("compression_ms", "compress_ms"),
     "N42_FOLLOWER_IMPORT: block_data->accepted": ("follower_import_ms", "follower_import_ms"),
 }
@@ -54,6 +55,7 @@ def build_timeline(
             "node0_commit_ns": None,
             "leader_broadcast_ms": None,
             "leader_validation_ms": None,
+            "gov5_encode_ms": None,
             "packing_ms": None,
             "builder_finish_ms": None,
             "payload_built_ms": None,
@@ -136,7 +138,7 @@ def build_timeline(
         if 0 <= window < len(windows):
             windows[window] += block["successful_transactions"]
     stage_summary = {}
-    for field in ("packing_ms", "builder_finish_ms", "payload_built_ms", "payload_to_engine_ms", "leader_broadcast_ms", "leader_validation_ms", "compression_ms", "validation_to_compress_done_ms", "follower_import_ms"):
+    for field in ("packing_ms", "builder_finish_ms", "payload_built_ms", "payload_to_engine_ms", "leader_broadcast_ms", "leader_validation_ms", "gov5_encode_ms", "compression_ms", "validation_to_compress_done_ms", "follower_import_ms"):
         values = []
         for block in blocks:
             value = block[field]
