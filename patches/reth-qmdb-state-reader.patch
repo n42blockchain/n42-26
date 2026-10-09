@@ -1,0 +1,79 @@
+diff --git a/crates/storage/provider/src/providers/blockchain_provider.rs b/crates/storage/provider/src/providers/blockchain_provider.rs
+index 78e2bdfcd..0187a3986 100644
+--- a/crates/storage/provider/src/providers/blockchain_provider.rs
++++ b/crates/storage/provider/src/providers/blockchain_provider.rs
+@@ -808,7 +808,7 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
+ 
+     fn state_by_block_hash(&self, hash: BlockHash) -> ProviderResult<StateProviderBox> {
+         trace!(target: "providers::blockchain", ?hash, "Getting state by block hash");
+-        if let Some(state) = self.canonical_in_memory_state.state_by_hash(hash) {
++        let state = if let Some(state) = self.canonical_in_memory_state.state_by_hash(hash) {
+             self.state_provider_for_state(state)
+         } else if let Ok(state) = self.history_by_block_hash(hash) {
+             // This could be tracked by a historical block
+@@ -819,7 +819,10 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
+         } else {
+             // if we couldn't find it anywhere, then we should return an error
+             Err(ProviderError::StateForHashNotFound(hash))
+-        }
++        }?;
++        // Resolve the standard provider first, then adapt it. This covers both
++        // canonical in-memory state and database/pending state consistently.
++        reth_storage_api::n42_state::wrap(hash, state)
+     }
+ 
+     /// Returns the state provider for pending state.
+diff --git a/crates/storage/storage-api/src/lib.rs b/crates/storage/storage-api/src/lib.rs
+index f4f8e53af..105c13572 100644
+--- a/crates/storage/storage-api/src/lib.rs
++++ b/crates/storage/storage-api/src/lib.rs
+@@ -11,6 +11,10 @@
+ 
+ extern crate alloc;
+ 
++/// Optional exact-block state read adapter used by N42 QMDB integration.
++#[cfg(feature = "std")]
++pub mod n42_state;
++
+ // Re-export used error types.
+ pub use reth_storage_errors as errors;
+ mod bal;
+diff --git a/crates/storage/storage-api/src/n42_state.rs b/crates/storage/storage-api/src/n42_state.rs
+new file mode 100644
+index 000000000..e6736d5a8
+--- /dev/null
++++ b/crates/storage/storage-api/src/n42_state.rs
+@@ -0,0 +1,33 @@
++//! Optional process-local state provider wrapping at an exact block hash.
++//!
++//! Registered chains can replace account/storage reads without changing provider
++//! selection or the engine's unpersisted overlay. Registration is explicit;
++//! ordinary Reth processes keep their existing behavior.
++
++use crate::StateProviderBox;
++use alloy_primitives::B256;
++use reth_storage_errors::provider::ProviderResult;
++use std::sync::{Arc, OnceLock};
++
++/// A chain-specific provider adapter. It must preserve block identity and the
++/// code/hash/history semantics of the wrapped provider.
++pub trait BlockStateAdapter: Send + Sync + 'static {
++    /// Wrap an already resolved provider. Missing state must remain an error;
++    /// implementations must not synthesize empty accounts or zero slots.
++    fn wrap(&self, hash: B256, inner: StateProviderBox) -> ProviderResult<StateProviderBox>;
++}
++
++static ADAPTER: OnceLock<Arc<dyn BlockStateAdapter>> = OnceLock::new();
++
++/// Install the adapter once, before the node starts.
++pub fn register(adapter: Arc<dyn BlockStateAdapter>) -> bool {
++    ADAPTER.set(adapter).is_ok()
++}
++
++/// Adapt state only after Reth resolves the provider for the exact block hash.
++pub fn wrap(hash: B256, inner: StateProviderBox) -> ProviderResult<StateProviderBox> {
++    match ADAPTER.get() {
++        Some(adapter) => adapter.wrap(hash, inner),
++        None => Ok(inner),
++    }
++}

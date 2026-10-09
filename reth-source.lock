@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "source": "https://github.com/paradigmxyz/reth",
+  "upstream_tag": "v2.7.0",
+  "upstream_commit": "3d592ece6de8c4559987416a544fc215fd6d6921",
+  "adapted_commit": "3452d7d0217095446b0f2632a283e314951da273",
+  "patch_series": [
+    {
+      "name": "reth-qmdb-state-reader",
+      "commit": "6bd30e58a30160474fa7822286acc78e0dabb141"
+    },
+    {
+      "name": "reth-n42-perf",
+      "commit": "285b918f3f76f171ccd838730c7d47a52a7818e3"
+    },
+    {
+      "name": "reth-payload-transactions-root",
+      "commit": "3c7fa828df51a192e34d266a753c6ac2f5680e3a"
+    },
+    {
+      "name": "reth-gov5-cached-state-root",
+      "commit": "92bff7ca66de188f6e6a58cb7b99f4b5e955a24d"
+    },
+    {
+      "name": "reth-import-batch",
+      "commit": "401aa9105bf36b8caec6b0d8f250a0499d64ef3a"
+    },
+    {
+      "name": "reth-engine-state-provider-factory",
+      "commit": "3452d7d0217095446b0f2632a283e314951da273"
+    }
+  ],
+  "workspace_dependency_versions": {
+    "reth-primitives-traits": "0.8.2",
+    "alloy-consensus": "2.5.0",
+    "alloy-eips": "2.5.0",
+    "alloy-genesis": "2.5.0",
+    "alloy-network": "2.5.0",
+    "alloy-rpc-types-engine": "2.5.0",
+    "alloy-rpc-types-eth": "2.5.0",
+    "alloy-signer": "2.5.0",
+    "alloy-signer-local": "2.5.0",
+    "alloy-evm": "0.39.0",
+    "revm": "43.0.3",
+    "alloy-primitives": "1.7.3",
+    "alloy-sol-types": "1.7.3"
+  }
+}
