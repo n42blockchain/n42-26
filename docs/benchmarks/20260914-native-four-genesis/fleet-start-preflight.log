@@ -1,0 +1,14 @@
+Traceback (most recent call last):
+  File "/home/n42/src/n42/n42-26/scripts/chain94-fleet.py", line 444, in <module>
+    main()
+    ~~~~^^
+  File "/home/n42/src/n42/n42-26/scripts/chain94-fleet.py", line 440, in main
+    globals()[args.command](args)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/home/n42/src/n42/n42-26/scripts/chain94-fleet.py", line 239, in start
+    with socket.socket(socket.AF_INET, socktype) as sock:
+         ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/socket.py", line 236, in __init__
+    _socket.socket.__init__(self, family, type, proto, fileno)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+PermissionError: [Errno 1] Operation not permitted

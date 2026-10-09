@@ -1,0 +1,38 @@
+    Finished `release` profile [optimized] target(s) in 0.68s
+     Running unittests src/bin/n42-keccak.rs (target/release/deps/n42_keccak-d21d334169e675c7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/release/deps/n42_stress-542128305dfab267)
+
+running 1 test
+loaded complete framing of 72000000 records; verified first 55000 per RPC: 220000 secp256k1 signatures, chain 941004, 5000 senders, all 147000 recipients, contiguous nonces 0..43; no chain execution measured
+test tests::audit_generated_fresh_four_minute ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 43.27s
+
+	Command being timed: "cargo test --release --manifest-path /tmp/n42-ci-repro-j5wu4xcf/n42-26/Cargo.toml --locked --offline -p n42-stress audit_generated_fresh_four_minute -- --ignored --nocapture"
+	User time (seconds): 36.44
+	System time (seconds): 6.52
+	Percent of CPU this job got: 97%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:44.05
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 13239236
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 587
+	Minor (reclaiming a frame) page faults: 4025521
+	Voluntary context switches: 27189
+	Involuntary context switches: 567
+	Swaps: 0
+	File system inputs: 6837176
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

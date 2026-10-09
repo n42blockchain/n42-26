@@ -1,0 +1,68 @@
+    Finished `release` profile [optimized] target(s) in 0.08s
+     Running unittests lib.rs (/tmp/n42-store-release-bench/target/release/deps/n42_store_release_bench-b79d8910187cffdc)
+
+running 55 tests
+test baseline::tests::a_base_file_round_trips_the_tree_at_the_committed_tip ... ok
+test baseline::tests::bench_persistent_commit_path ... ignored, measurement, not a correctness gate
+test baseline::tests::borrowed_wal_record_encodes_identically_to_the_owned_record ... ok
+test baseline::tests::cached_tip_does_not_leak_across_branches ... ok
+test baseline::tests::cached_tip_rejects_at_the_same_depth_as_a_cold_store ... ok
+test baseline::tests::cached_tip_reproduces_cold_reconstruction ... ok
+test baseline::tests::candidate_is_published_only_after_root_match ... ok
+test baseline::tests::historical_snapshot_and_proof_are_bound_to_exact_block ... ok
+test baseline::tests::immutable_read_views_pin_siblings_across_cache_eviction ... ok
+test baseline::tests::missing_parent_and_depth_limit_fail_closed ... ok
+test baseline::tests::persistent_empty_chain_uses_linear_wal_and_recovers_torn_tail ... ok
+test baseline::tests::persistent_store_replays_and_rejects_wrong_base ... ok
+test baseline::tests::production_default_exceeds_legacy_65536_boundary ... ok
+test baseline::tests::qmdb_commit_lock_hold_vs_wal_append ... ignored, measurement, not a correctness gate
+test baseline::tests::qmdb_replay_scaling_by_depth ... ignored, measurement, not a correctness gate
+test baseline::tests::read_cache_byte_budget_keeps_pinned_and_oversized_versions_correct ... ok
+test baseline::tests::read_cache_keeps_the_frequently_used_old_database_frontier ... ok
+test baseline::tests::read_view_publication_requires_root_match_and_durable_wal ... ok
+test baseline::tests::sibling_candidates_reconstruct_from_their_exact_parent_branch ... ok
+test baseline::tests::the_tree_walks_the_graph_in_place_and_returns_to_the_base ... ok
+test baseline::tests::tip_cache_metric_counts_resumed_and_cold_reconstructions ... ok
+test baseline::tests::wal_append_does_not_hold_the_state_lock ... ok
+test baseline::tests::wal_append_failure_rolls_back_the_insert ... ok
+test baseline::tests::wal_rollback_failure_poisons_the_handle_until_reopen ... ok
+test optimized::tests::a_base_file_round_trips_the_tree_at_the_committed_tip ... ok
+test optimized::tests::bench_persistent_commit_path ... ignored, measurement, not a correctness gate
+test optimized::tests::borrowed_wal_record_encodes_identically_to_the_owned_record ... ok
+test optimized::tests::cached_tip_does_not_leak_across_branches ... ok
+test optimized::tests::cached_tip_rejects_at_the_same_depth_as_a_cold_store ... ok
+test optimized::tests::cached_tip_reproduces_cold_reconstruction ... ok
+test optimized::tests::candidate_is_published_only_after_root_match ... ok
+test optimized::tests::historical_snapshot_and_proof_are_bound_to_exact_block ... ok
+test optimized::tests::immutable_read_views_pin_siblings_across_cache_eviction ... ok
+test optimized::tests::missing_parent_and_depth_limit_fail_closed ... ok
+test optimized::tests::persistent_empty_chain_uses_linear_wal_and_recovers_torn_tail ... ok
+test optimized::tests::persistent_store_replays_and_rejects_wrong_base ... ok
+test optimized::tests::production_default_exceeds_legacy_65536_boundary ... ok
+test optimized::tests::qmdb_commit_lock_hold_vs_wal_append ... ignored, measurement, not a correctness gate
+test optimized::tests::qmdb_replay_scaling_by_depth ... ignored, measurement, not a correctness gate
+test optimized::tests::read_cache_byte_budget_keeps_pinned_and_oversized_versions_correct ... ok
+test optimized::tests::read_cache_keeps_the_frequently_used_old_database_frontier ... ok
+test optimized::tests::read_view_preparation_error_restores_the_applied_tree ... ok
+test optimized::tests::read_view_publication_requires_root_match_and_durable_wal ... ok
+test optimized::tests::rejected_large_candidate_reverts_before_retry_and_view_publication ... ok
+test optimized::tests::sibling_candidates_reconstruct_from_their_exact_parent_branch ... ok
+test optimized::tests::the_tree_walks_the_graph_in_place_and_returns_to_the_base ... ok
+test optimized::tests::tip_cache_metric_counts_resumed_and_cold_reconstructions ... ok
+test optimized::tests::wal_append_does_not_hold_the_state_lock ... ok
+test optimized::tests::wal_append_failure_rolls_back_the_insert ... ok
+test optimized::tests::wal_rollback_failure_poisons_the_handle_until_reopen ... ok
+test qmdb_read_view::tests::account_codec_covers_nonce_and_balance_boundaries ... ok
+test qmdb_read_view::tests::account_decode_agrees_with_canonical_encoder_on_generated_inputs ... ok
+test qmdb_read_view::tests::bench_immutable_read_views ... ignored
+test qmdb_read_view::tests::corrupt_accounts_are_errors_not_absence ... ok
+test qmdb_read_view::tests::sharded_versions_match_tree_and_sequential_updates ... ok
+
+test result: ok. 48 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 1.30s
+
+   Doc-tests n42_store_release_bench
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

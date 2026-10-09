@@ -1,0 +1,34 @@
+{
+  "fixture_only": true,
+  "fleet_tps_measured": false,
+  "mandatory_tps_gate_integrated": false,
+  "cli_cases_passed": 27,
+  "rust_unit_tests_passed": 3,
+  "rpc_tests_passed": 18,
+  "binary_sha256": "9b54ff256271f185308221dab5951e2dd73f00fce25cdd46aa896a109f8defca",
+  "reth_revision": "23316e3ff8adca8c3bd5085ff0565fcae019202a",
+  "limitations": [
+    "Caller must authenticate signing configuration and ordered validator roster.",
+    "Only H2-v4 signatures explicitly bind chain identity.",
+    "Verifier shares production signing-message and BLS implementation.",
+    "Direct certificate verification does not independently establish ancestor finality or throughput."
+  ],
+  "files": {
+    "cli-results.json": "d24ad4783c7c2e7b180e556cba78ba9ccaa8b6c5f99bd58b44069c45c66385d2",
+    "fixtures/gov5legacy-commit.json": "6e0ce52fdd7d281cfa3f2b726f90b5f8f231525a92770fd50b57c2d49abc40c1",
+    "fixtures/gov5legacy-prepare.json": "3844ca8f22d83bfeb3711966efd5d16f179a53162d84e55c671f7be13a1167dd",
+    "fixtures/h2v4-commit.json": "ae99de341478f04540fc558aa0257f975f5ceaa66ddd1d76a92e49a6cd6697c2",
+    "fixtures/h2v4-prepare.json": "c7f20f97e045e54b9da2257e71b6598f631b1607e2bb3a2588e0b9f9a8b6c055",
+    "fixtures/native-commit.json": "37ca271ee36c60b4fb0045fe7a48b312100bfb3fc8cfe11f3b7b2cfd66d797f4",
+    "fixtures/native-prepare.json": "007a7776aad70b615ce87751fec187613a59a08b27ce3ef718c56fa9ba9f7d41",
+    "n42-commit-proof-build.log": "7c6f1e2fdd0795170fa977fd27992b36247765602824d2edd7a717baae609c34",
+    "n42-commit-proof-cli.log": "eae998f62202dd81b2631590b6624699722c6fe4033ec2fbf1c97bb9bc9f6d1c",
+    "n42-commit-proof-clippy.log": "d760099b532109c3fafef8ca4b0d6b275b2b87eb6241a01c42670848cbb9a88c",
+    "n42-commit-proof-fixture-export.log": "a7cc880c45225735c807d3c125aeeb698e05d3913b410e9d9aac76846acfabfb",
+    "n42-commit-proof-rpc-tests.log": "32dea88c85c7db072558faeba365c7de7f637319b8dce31736f918734783d688",
+    "n42-commit-proof-tests.log": "794bbfd8b818a5ab69f8cf2b829839458baf35bbe0d74f0b86093b83e977d17c",
+    "n42-verify-commit.rs": "73adb2e99bde3cd7cb43ab02cb7b3f5419bc0a778161e5b15d276d7ef3b23ec9",
+    "rpc.rs": "6d762622da1565e6b7229bfb16338ce337b840c0b39e3be99717dd466f9492b3",
+    "run-cli-tests.py": "749520d919d4ca02ee97a9e7692eeb47698fa5557314596d7c8786843ced5190"
+  }
+}

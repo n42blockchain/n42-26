@@ -1,0 +1,64 @@
+{
+  "remote_refresh": false,
+  "sources": [
+    {
+      "repository": "n42-rs",
+      "ref": "466c1839791afadba7f1dd4d48c5518440dcafba",
+      "source": "docs/FLEET7_HANDOFF.md",
+      "source_sha256": "69ca1f8f406899ee7af16ae683b1119331db58f2d064d7dd86f873e123683096",
+      "artifact": "rs-handoff.md",
+      "artifact_sha256": "69ca1f8f406899ee7af16ae683b1119331db58f2d064d7dd86f873e123683096",
+      "line_ranges": null
+    },
+    {
+      "repository": "n42-rs",
+      "ref": "466c1839791afadba7f1dd4d48c5518440dcafba",
+      "source": "docs/NATIVE_FLEET7.md",
+      "source_sha256": "3cc602ddefb1f2fd3bc00949b7c73f835a0d7b637fae7bbed1e6de662695206f",
+      "artifact": "rs-record-excerpts.md",
+      "artifact_sha256": "e95ced4b98ce0745e9a6e6e3bb812c7f373d33438f214254458c0762a818f965",
+      "line_ranges": [
+        [
+          1,
+          280
+        ],
+        [
+          2079,
+          2099
+        ]
+      ]
+    },
+    {
+      "repository": "N42-gov5",
+      "ref": "99f1039661f22362d91a9af2e49ecb98bc9c2d04",
+      "source": "docs/QS_HANDOVER_20260912.md",
+      "source_sha256": "6cb95fbd2865a7c35f9ffd5185f3f65daca36cf095828568704a4238cda5385e",
+      "artifact": "gov5-handoff.md",
+      "artifact_sha256": "6cb95fbd2865a7c35f9ffd5185f3f65daca36cf095828568704a4238cda5385e",
+      "line_ranges": null
+    },
+    {
+      "repository": "N42-gov5",
+      "ref": "99f1039661f22362d91a9af2e49ecb98bc9c2d04",
+      "source": "docs/QS_LINUX_ANSWERS_20260824.md",
+      "source_sha256": "f3a5553095f2e3d40f5995854e97a7882231b01ccfc5721a04b6cc94bbb3414e",
+      "artifact": "gov5-windows-record.md",
+      "artifact_sha256": "35e08988c7f2cd289c46c386cf19d8467980b71beefa0f63912dad250aac3d51",
+      "line_ranges": [
+        [
+          53,
+          81
+        ]
+      ]
+    },
+    {
+      "repository": "N42-gov5",
+      "ref": "99f1039661f22362d91a9af2e49ecb98bc9c2d04",
+      "source": "docs/ethel/datc-weekly-update.md",
+      "source_sha256": "e03042f79fc388553dfb10910636d3c5dd13ab71bcf88ba5602430df7988529a",
+      "artifact": "gov5-weekly-update.md",
+      "artifact_sha256": "e03042f79fc388553dfb10910636d3c5dd13ab71bcf88ba5602430df7988529a",
+      "line_ranges": null
+    }
+  ]
+}

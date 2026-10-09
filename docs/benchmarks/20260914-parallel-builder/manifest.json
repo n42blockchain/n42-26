@@ -1,0 +1,38 @@
+{
+  "scope": "selected source files, not complete workspace; correctness validation only",
+  "rethBaseline": "23316e3ff8adca8c3bd5085ff0565fcae019202a",
+  "rethPatches": [
+    "patches/reth-payload-transactions-root.patch",
+    "patches/reth-qmdb-state-reader.patch"
+  ],
+  "upstreamRs": "466c1839791afadba7f1dd4d48c5518440dcafba",
+  "sourceSha256": {
+    "Cargo.toml": "f1994cb885df3ce78969f2829862946242db85e53f4761cea092b8885e7de3b7",
+    "Cargo.lock": "0544b34f24e643ba767d5d4302c72672c2721f465944c5ad88c65ae024758940",
+    "crates/n42-node/Cargo.toml": "a49eeeb44e76f4358b63b305c1a37aa6b4a0482d0328460cd11bfbd114ad60d0",
+    "crates/n42-node/src/lib.rs": "dfc36adc538a532800494d9edda807df360abed06d414ec8cb68f8a1e2e43ab8",
+    "crates/n42-node/src/payload.rs": "ef9f311ebd01540198355b25c424f70ad9f45c826d81e78a3f3a8429d23162e6",
+    "crates/n42-node/src/parallel_payload.rs": "aca674a212f4df2c2d555ec55542cf54414a48aafac000533188ee10ecdd362b",
+    "crates/n42-execution/src/parallel_block.rs": "86a0d8677b1b670a6c1865511270b9a77b0b1efb19fb7ae3df91f023c2fe7986",
+    "crates/n42-execution/src/parallel_transfer.rs": "2a702bc1edb5ddd054d2983185d1dfcce837c77b16491ab8af15f3bb3bbafa20",
+    "crates/n42-execution/src/restored_slots.rs": "2a59f9bcbfdcd9a2905cfdfa8e1fe107108cf6a8f501a5f2cdac5fe567eb96d2",
+    "scripts/chain94-fleet.py": "fb5a66163fc86bd717c16cbb7cda3c3191b2d79fc38186ff6096f72d3608d368",
+    "scripts/test_chain94_fleet.py": "57d1929bc433656e1cb9bd6020248abea0a8e435e0cd268a4ba31394ce67552a",
+    "scripts/testnet.sh": "66ed1432d764f728afb4d72fbda3c9a5e47ff9021e072f49943b3024d7ba2a47",
+    "scripts/qualify-1m-tps.sh": "6d2dfff4b8f65a6759b4766421aea3689bb77dd67be45721139ae9ee3309de19",
+    "docs/devlog-168-parallel-payload-builder-20260914.md": "da3471d2fbdbe7bf1488ffa6deb619032389913c73fb147bdc28f1962b312442"
+  },
+  "onlineBuilderOptIn": "N42_PARALLEL_BUILD=1",
+  "supportedForks": [
+    "Prague",
+    "Osaka"
+  ],
+  "defaultDevFork": "Cancun (not eligible yet)",
+  "fleetTPS": null,
+  "productionBinaryBuild": {
+    "status": "complete",
+    "scope": "devlog168 source, before Cancun eligibility changes",
+    "sha256": "43fa9151b5eaf01c2a6d1a23e68038025a95ad49611f8c6e38c073f73e6d9e6c",
+    "log": "binary-build.log"
+  }
+}

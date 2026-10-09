@@ -1,0 +1,76 @@
+commit 074f9c8f22a7755de3bbe3e4455dec6a32b2a4d2
+Author:     MiraWells <1020080523@qq.com>
+AuthorDate: Mon Sep 14 23:41:52 2026 -0400
+Commit:     MiraWells <1020080523@qq.com>
+CommitDate: Mon Sep 14 23:42:12 2026 -0400
+
+    docs(qs): 35zzp re-run -- body phase 15 ms, B mean 87.9k under less memory; 35zzq held
+    
+    The BLAKE3 transactions root cut the follower body phase from ~100-180 ms to 15 ms (p90 42) with no mismatch in 351 full imports, but the B mean read 87.9k against the 35zzo re-run's 90.6k: first windows +4%, second windows -14%. The run had ~7 GB less available memory (tmpfs /tmp at 35 GB), node heaps passed GOMEMLIMIT and the watchdog stopped it at the end of B2. 35zzq is held until the headroom is restored or a second variable is accepted.
+
+diff --git a/docs/QS_BLOCK_TIME_BUDGET.md b/docs/QS_BLOCK_TIME_BUDGET.md
+index 5680d7c5..5b99cb29 100644
+--- a/docs/QS_BLOCK_TIME_BUDGET.md
++++ b/docs/QS_BLOCK_TIME_BUDGET.md
+@@ -4492,6 +4492,37 @@ The warm-up's second window fell further (3.16 s blocks), which fits the
+ section 6bi slide being reached sooner by a faster chain. Logs and the
+ per-minute summary: `wr-logs/r35zzp-paused/`.
+ 
++**35zzp re-run (2026-09-14 22:45-23:40 EDT).** Gate live, no root mismatch or
++BAD BLOCK in 351 full imports. Stopped by the memory watchdog (MemAvailable 19 GB)
++at the end of B2, after all four B windows.
++
++| window | 35zzo re-run | 35zzp re-run |
++|---|---|---|
++| A1 win1 / win2 | 63.6k / 61.0k | 59.4k / 55.8k |
++| B1 win1 / win2 | 113.4k / 67.9k | 118.2k / 57.0k |
++| B2 win1 / win2 | 113.2k / 67.9k | 117.2k / 59.2k |
++
++B mean 87.9k against 90.6k (-3%); A1 57.6k against 62.3k. Follower body
++phase median 15 ms (p90 42) against ~100-180 ms in 35zzo; valid 43 ms,
++proc 796 ms, write 165 ms, total 1042 ms medians.
++
++**Prediction 71: the mechanism holds, the throughput claim fails on this
++run.** Body <=35 ms is met by a wide margin. The B mean did not gain 3-4%:
++first windows gained ~4%, second windows lost ~14%. The run is not a clean
++A/B against 35zzo: the tmpfs `/tmp` had grown to 35 GB (Shmem 27.9 GB
++against 20.8 GB during 35zzo), leaving B legs 21-24 GB available where
++35zzo had 31-33 GB, node heaps reached 10.3-12.7 GB against GOMEMLIMIT
++10 GiB, and this morning's partial 35zzp on the smaller tmpfs read 125.9k
++in B1 win1 against 118.2k tonight. The second-window slide (6bi) is what
++the transactions-root saving feeds into, and less memory deepens it.
++
++**35zzq is held.** With ~7 GB less headroom it would reach the 20 GB
++watchdog floor in its B legs as this run did. Before it runs either the
++tmpfs shrinks (its largest holders are another session's Claude task
++outputs, 7.9 GB, and a CI reproduction tree, 4.8 GB, neither gov5's) or a
++round applies the packet-window flag the harness has been dropping
++(~1 GB a node, section 6bi), which is a second variable for 35zzq.
++
+ ## 6bk. Round 35zzq: 35zzp plus deferred execution -- registered before the round ran (2026-09-13)
+ 
+ Replaces 35zzn. Runs on n42-r75 (r74 plus the leader's write taking
+diff --git a/docs/QS_HANDOVER_20260912.md b/docs/QS_HANDOVER_20260912.md
+index 96bca4e8..35308a47 100644
+--- a/docs/QS_HANDOVER_20260912.md
++++ b/docs/QS_HANDOVER_20260912.md
+@@ -5,7 +5,18 @@ paused the session. Detail and every prediction live in
+ `docs/QS_BLOCK_TIME_BUDGET.md` (sections 6ba-6bh cover this handover's span);
+ this file is the entry point. No keys in here.
+ 
+-## Paused 2026-09-14 04:40 EDT (read this first)
++## 2026-09-14 23:45 EDT (read this first)
++
++- 35zzp re-run finished its B legs: B mean 87.9k (35zzo re-run 90.6k), follower body
++  median 15 ms (was ~100-180), stopped by the memory watchdog at the end of B2. The
++  tmpfs /tmp grew to 35 GB since the morning, so the run had ~7 GB less memory than 35zzo.
++- **35zzq is held** (its chain script was stopped): it would hit the same 20 GB floor.
++  It needs either a smaller /tmp (owners: the n42-rs session's task outputs and
++  /tmp/n42-ci-repro-*) or the packet-window flag moved into QS_NODE_EXTRA, which the user
++  has to accept as a second variable. Resume with `chain-35zzq.sh` once decided.
++- Nothing of gov5 runs or is claimed.
++
++## Paused 2026-09-14 04:40 EDT
+ 
+ - **Box:** nothing of gov5 runs or is queued: no claim, no fleet, no runner, no chain
+   script. BOX-NOTE-gov5.txt says so. The box is shared by turns with n42-rs (user's

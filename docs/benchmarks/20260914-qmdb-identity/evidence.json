@@ -1,0 +1,17 @@
+{
+  "scope": "QMDB state-root job conflict regression, operation identity, and Gov5 normalization adapter tests; no fleet throughput measurement",
+  "source_sha256": {
+    "crates/n42-node/src/qmdb_state_root.rs": "fbfc27e911777ea5e65241a1c030d717c1c9f6672d98e4e11036efe602b7c24f",
+    "crates/n42-node/src/exec_cache.rs": "710d0d54a70e085e9b21dd71b0ab74261d59268f8944371751c72a558a479699",
+    "crates/n42-consensus-service/src/exec_cache.rs": "163de810f284aa8cb4292b08b0c905f5b23383aa3e14e89df20638359e9d9033",
+    "crates/n42-consensus-service/src/orchestrator/execution_bridge.rs": "0973538e3e59380c7329ee2de9ea582e232cacf2a6a74ed1bf22b05107350947"
+  },
+  "reth_baseline": "23316e3ff8adca8c3bd5085ff0565fcae019202a",
+  "logs_sha256": {
+    "before.log": "a9906da20eb6e4caef62a43f4ba4a4cdc15b5f921d150d6a296e56f0794daf69",
+    "qmdb-tests.log": "c751e82a6da1c93a9d9d68da795ad25bc8122fb950afd08102dbfbb5fbe94b3b",
+    "normalization-tests.log": "5e39f29231870e8e3b8bfc01ce0d4f49fd3abff84a4688cd80b84d885e272a95",
+    "bridge-tests.log": "0b27146ca705375aa1b871d7ad6ed884000f4d55fdcdec882e11b4020c88b3ce",
+    "workspace-clippy.log": "d1698d7b106b6f1e31d23fced7701e56a7c955453e506ec0e261e88e5ac183fc"
+  }
+}

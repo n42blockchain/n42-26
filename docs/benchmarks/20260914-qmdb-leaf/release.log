@@ -1,0 +1,111 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling libc v0.2.189
+   Compiling syn v2.0.119
+   Compiling rustix v1.1.4
+   Compiling cfg-if v1.0.4
+   Compiling anyhow v1.0.104
+   Compiling version_check v0.9.5
+   Compiling generic-array v0.14.7
+   Compiling either v1.17.0
+   Compiling itertools v0.12.1
+   Compiling typenum v1.20.1
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v2.0.1
+   Compiling cc v1.4.0
+   Compiling prost-derive v0.12.6
+   Compiling getrandom v0.4.3
+   Compiling syn v3.0.3
+   Compiling regex-syntax v0.8.11
+   Compiling prettyplease v0.2.37
+   Compiling equivalent v1.0.2
+   Compiling bitflags v2.13.1
+   Compiling linux-raw-sys v0.12.1
+   Compiling hashbrown v0.17.1
+   Compiling bytes v1.12.1
+   Compiling indexmap v2.14.0
+   Compiling prost v0.12.6
+   Compiling regex-automata v0.4.18
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling serde_core v1.0.229
+   Compiling once_cell v1.21.4
+   Compiling fixedbitset v0.4.2
+   Compiling fastrand v2.5.0
+   Compiling rand_core v0.10.1
+   Compiling tempfile v3.27.0
+   Compiling petgraph v0.6.5
+   Compiling digest v0.10.7
+   Compiling regex v1.13.1
+   Compiling prost-types v0.12.6
+   Compiling cpufeatures v0.2.17
+   Compiling multimap v0.10.1
+   Compiling memchr v2.8.3
+   Compiling cpp_demangle v0.4.5
+   Compiling log v0.4.33
+   Compiling uuid v1.24.0
+   Compiling object v0.37.3
+   Compiling heck v0.5.0
+   Compiling prost-build v0.12.6
+   Compiling debugid v0.8.0
+   Compiling sha2 v0.10.9
+   Compiling findshlibs v0.10.2
+   Compiling equator-macro v0.4.2
+   Compiling memmap2 v0.9.11
+   Compiling zmij v1.0.23
+   Compiling cpufeatures v0.3.0
+   Compiling serde v1.0.229
+   Compiling scopeguard v1.2.0
+   Compiling adler2 v2.0.1
+   Compiling stable_deref_trait v1.2.1
+   Compiling thiserror v2.0.19
+   Compiling rustc-demangle v0.1.28
+   Compiling gimli v0.32.3
+   Compiling symbolic-demangle v12.18.3
+   Compiling addr2line v0.25.1
+   Compiling symbolic-common v12.18.3
+   Compiling miniz_oxide v0.8.9
+   Compiling lock_api v0.4.14
+   Compiling equator v0.4.2
+   Compiling pprof v0.15.0
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.19
+   Compiling blake3 v1.8.5
+   Compiling bitflags v1.3.2
+   Compiling serde_json v1.0.151
+   Compiling nix v0.26.4
+   Compiling backtrace v0.3.76
+   Compiling aligned-vec v0.6.4
+   Compiling spin v0.10.1
+   Compiling chacha20 v0.10.1
+   Compiling smallvec v1.15.2
+   Compiling arrayvec v0.7.8
+   Compiling constant_time_eq v0.4.2
+   Compiling arrayref v0.3.9
+   Compiling itoa v1.0.18
+   Compiling rand v0.10.2
+   Compiling bincode v1.3.3
+   Compiling memory-stats v1.2.0
+   Compiling hex v0.4.3
+   Compiling n42-twig-core v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-twig-core)
+    Finished `release` profile [optimized] target(s) in 23.19s
+     Running unittests src/lib.rs (target/release/deps/n42_twig_core-bbe7395f06bea51b)
+
+running 1 test
+test qmdb_leaf_tree::tests::bench_batched_leaf_paths ... leaf_fold round=0 batched=false operations=147000 elapsed_ms=227.707
+leaf_fold round=0 batched=true operations=147000 elapsed_ms=84.670
+leaf_fold round=1 batched=true operations=147000 elapsed_ms=83.188
+leaf_fold round=1 batched=false operations=147000 elapsed_ms=220.297
+leaf_fold round=2 batched=false operations=147000 elapsed_ms=219.468
+leaf_fold round=2 batched=true operations=147000 elapsed_ms=83.256
+leaf_fold round=3 batched=true operations=147000 elapsed_ms=82.323
+leaf_fold round=3 batched=false operations=147000 elapsed_ms=220.364
+leaf_fold round=4 batched=false operations=147000 elapsed_ms=219.116
+leaf_fold round=4 batched=true operations=147000 elapsed_ms=82.411
+leaf_fold round=5 batched=true operations=147000 elapsed_ms=83.595
+leaf_fold round=5 batched=false operations=147000 elapsed_ms=220.936
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 63 filtered out; finished in 2.97s
+

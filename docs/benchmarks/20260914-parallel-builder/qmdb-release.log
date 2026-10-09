@@ -1,0 +1,13 @@
+    Finished `release` profile [optimized] target(s) in 0.71s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/release/deps/n42_node-c15500b3af4fa567)
+
+running 4 tests
+test qmdb_state_reader::canonical_bench::bench_canonical_qmdb_execution_and_commit ... ignored, release measurement with a durable store on TMPDIR
+test qmdb_state_reader::canonical_bench::canonical_qmdb_execution_commits_consecutive_blocks ... ok
+test qmdb_state_reader::canonical_bench::canonical_qmdb_fast_transfer_matches_prague_interpreter_and_restart ... ok
+test qmdb_state_reader::canonical_bench::parallel_qmdb_transfer_blocks_match_interpreter_and_restart ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 244 filtered out; finished in 1.61s
+

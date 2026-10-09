@@ -1,0 +1,59 @@
+[
+  {
+    "keys": 2000000,
+    "pair": 0,
+    "version": "qmdb",
+    "initialize_ms": 353.031,
+    "derive_ms": 102.497,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 476.314,
+        "per_second": 2099456
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 38.801,
+        "per_second": 25772245
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 0,
+    "version": "paths",
+    "initialize_ms": 321.157,
+    "derive_ms": 98.664,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 481.331,
+        "per_second": 2077570
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 39.892,
+        "per_second": 25067424
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 0,
+    "version": "foldpaths",
+    "initialize_ms": 362.427,
+    "derive_ms": 115.497,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 471.047,
+        "per_second": 2122930
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 37.953,
+        "per_second": 26348330
+      }
+    }
+  }
+]

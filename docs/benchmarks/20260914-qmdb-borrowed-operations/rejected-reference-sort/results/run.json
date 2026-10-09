@@ -1,0 +1,13 @@
+{
+  "binary_sha256": "4cf7f3d6970a76cbeb0dde284bb04a86dba2f775b2445473c8ce2f14f78fe333",
+  "pairs": 6,
+  "blocks": 3,
+  "keys": [
+    200000,
+    2000000
+  ],
+  "ordered": [
+    0,
+    1
+  ]
+}

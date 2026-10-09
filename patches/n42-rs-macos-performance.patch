@@ -1,0 +1,206 @@
+diff --git a/bin/n42/src/lib.rs b/bin/n42/src/lib.rs
+index 36e770796..e209d2404 100644
+--- a/bin/n42/src/lib.rs
++++ b/bin/n42/src/lib.rs
+@@ -47,7 +47,13 @@ pub mod payload_serve;
+ pub mod queue_prune;
+ pub mod queue_reorg;
+ pub mod road_runtime;
++#[cfg(target_os = "linux")]
+ pub mod stacks;
++#[cfg(not(target_os = "linux"))]
++pub mod stacks {
++    pub fn install() {}
++    pub fn dump_all(_each: std::time::Duration) -> usize { 0 }
++}
+ 
+ /// Re-exported utils.
+ pub mod utils {
+diff --git a/bin/n42/src/main.rs b/bin/n42/src/main.rs
+index e1afd60c5..4c9979395 100644
+--- a/bin/n42/src/main.rs
++++ b/bin/n42/src/main.rs
+@@ -46,6 +46,7 @@ fn main() {
+     // memory drove 5.8M direct-compaction stalls that tore the page cache
+     // out from under the importers' reads (round 39: the "first leg"
+     // collapses, 0.7-0.8 s cycles, millions of major faults at 70 GB free).
++    #[cfg(target_os = "linux")]
+     if std::env::var("N42_THP_DISABLE").is_ok_and(|v| v == "1") {
+         // SAFETY: prctl with PR_SET_THP_DISABLE takes no pointers.
+         let rc = unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1u64, 0u64, 0u64, 0u64) };
+diff --git a/bin/n42/src/road_runtime.rs b/bin/n42/src/road_runtime.rs
+index 53c63aa06..641074317 100644
+--- a/bin/n42/src/road_runtime.rs
++++ b/bin/n42/src/road_runtime.rs
+@@ -87,6 +87,7 @@ pub fn handle() -> Option<tokio::runtime::Handle> {
+ }
+ 
+ /// The calling thread's nice value, 0 when it cannot be read.
++#[cfg(target_os = "linux")]
+ fn current_nice() -> i32 {
+     // SAFETY: gettid and getpriority on the calling thread are plain syscalls
+     // with no memory effects. getpriority can legitimately return -1, so errno
+@@ -110,13 +111,17 @@ pub fn measure_dispatch_wait() -> bool {
+ pub fn enable_receive_timestamps(stream: &TcpStream) -> std::io::Result<()> {
+     use std::os::fd::AsRawFd as _;
+     let on: libc::c_int = 1;
++    #[cfg(target_os = "linux")]
++    let timestamp_option = libc::SO_TIMESTAMPNS;
++    #[cfg(not(target_os = "linux"))]
++    let timestamp_option = libc::SO_TIMESTAMP;
+     // SAFETY: setsockopt on an open socket with a c_int option value of the
+     // size given.
+     let rc = unsafe {
+         libc::setsockopt(
+             stream.as_raw_fd(),
+             libc::SOL_SOCKET,
+-            libc::SO_TIMESTAMPNS,
++            timestamp_option,
+             (&on as *const libc::c_int).cast(),
+             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+         )
+@@ -173,13 +178,23 @@ fn recv_one_stamped(stream: &TcpStream) -> std::io::Result<(u8, Option<std::time
+         return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "early eof"));
+     }
+     let mut stamp = None;
++    #[cfg(target_os = "linux")]
++    let timestamp_message = libc::SCM_TIMESTAMPNS;
++    #[cfg(not(target_os = "linux"))]
++    let timestamp_message = libc::SCM_TIMESTAMP;
+     // SAFETY: walking the control messages the kernel wrote into `control`,
+     // bounded by `msg.msg_controllen`, with the libc macros meant for it.
+     unsafe {
+         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+         while !cmsg.is_null() {
+-            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_TIMESTAMPNS {
++            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == timestamp_message {
++                #[cfg(target_os = "linux")]
+                 let ts: libc::timespec = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast());
++                #[cfg(not(target_os = "linux"))]
++                let ts = {
++                    let tv: libc::timeval = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast());
++                    libc::timespec { tv_sec: tv.tv_sec, tv_nsec: tv.tv_usec as libc::c_long * 1000 }
++                };
+                 if ts.tv_sec >= 0 && (0..1_000_000_000).contains(&ts.tv_nsec) {
+                     stamp = Some(
+                         std::time::UNIX_EPOCH + Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32),
+@@ -210,9 +225,14 @@ mod tests {
+         tokio::time::sleep(Duration::from_millis(60)).await;
+         let (kind, waited) = read_kind_timed(&server).await.unwrap();
+         assert_eq!(kind, 7);
+-        let waited = waited.expect("the kernel stamps a loopback segment");
+-        assert!(waited >= Duration::from_millis(50), "waited {waited:?}");
+-        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
++        #[cfg(target_os = "linux")]
++        {
++            let waited = waited.expect("the kernel stamps a loopback segment");
++            assert!(waited >= Duration::from_millis(50), "waited {waited:?}");
++            assert!(waited < Duration::from_secs(5), "waited {waited:?}");
++        }
++        #[cfg(not(target_os = "linux"))]
++        assert!(waited.is_none(), "TCP receive timestamps are unavailable on macOS");
+         let mut rest = [0u8; 3];
+         server.read_exact(&mut rest).await.unwrap();
+         assert_eq!(rest, [1, 2, 3]);
+@@ -262,3 +282,6 @@ mod tests {
+         assert!(waited.is_none(), "no SO_TIMESTAMPNS, no stamp");
+     }
+ }
++
++#[cfg(not(target_os = "linux"))]
++fn current_nice() -> i32 { 0 }
+diff --git a/crates/n42/h2-node/examples/h2_validator.rs b/crates/n42/h2-node/examples/h2_validator.rs
+index 57a34f245..594e1eac9 100644
+--- a/crates/n42/h2-node/examples/h2_validator.rs
++++ b/crates/n42/h2-node/examples/h2_validator.rs
+@@ -75,6 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+     // `N42_V_THP_DISABLE=1` does it for the validator alone, leaving the
+     // execution layer's builder its huge pages (measured +15-20% on its
+     // execution phase without them).
++    #[cfg(target_os = "linux")]
+     if std::env::var("N42_THP_DISABLE").is_ok_and(|v| v == "1")
+         || std::env::var("N42_V_THP_DISABLE").is_ok_and(|v| v == "1")
+     {
+diff --git a/crates/n42/qmdb-reth/src/node_state.rs b/crates/n42/qmdb-reth/src/node_state.rs
+index af561ea99..f420096e6 100644
+--- a/crates/n42/qmdb-reth/src/node_state.rs
++++ b/crates/n42/qmdb-reth/src/node_state.rs
+@@ -126,6 +126,7 @@ fn compact_nice() -> i32 {
+ }
+ 
+ /// Lowers the calling thread's priority to [`compact_nice`].
++#[cfg(target_os = "linux")]
+ fn apply_compact_nice() {
+     let nice = compact_nice();
+     if nice == 0 {
+@@ -549,7 +550,11 @@ struct RootCounters {
+ impl RootCounters {
+     fn now() -> Self {
+         let (seals, seal_us) = n42_twig_core::entry_store::seal_stats();
++        #[cfg(target_os = "linux")]
+         let (thread_faults, _) = rusage(libc::RUSAGE_THREAD);
++        // macOS has no getrusage thread selector; this diagnostic is unavailable.
++        #[cfg(not(target_os = "linux"))]
++        let thread_faults = 0;
+         let (_, process_majflt) = rusage(libc::RUSAGE_SELF);
+         Self {
+             thread_faults,
+@@ -2883,3 +2888,6 @@ mod tests {
+ #[cfg(test)]
+ #[path = "node_state_tests.rs"]
+ mod more_tests;
++
++#[cfg(not(target_os = "linux"))]
++fn apply_compact_nice() {}
+diff --git a/crates/n42/tx-ingest/src/lib.rs b/crates/n42/tx-ingest/src/lib.rs
+index 9f72d1d08..e790d448d 100644
+--- a/crates/n42/tx-ingest/src/lib.rs
++++ b/crates/n42/tx-ingest/src/lib.rs
+@@ -223,6 +223,7 @@ fn async_frames_in_flight() -> usize {
+ /// engine's threads the core whenever they are runnable and recovery the
+ /// cycles nobody else wants -- a budget that follows the load instead of a
+ /// fixed one. Unset, the node-wide `N42_BACKGROUND_NICE` applies instead.
++#[cfg(target_os = "linux")]
+ fn recovery_nice() -> i32 {
+     static NICE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+     *NICE.get_or_init(|| {
+@@ -237,6 +238,7 @@ fn recovery_nice() -> i32 {
+ /// Lowers the calling thread's priority to [`recovery_nice`], once per
+ /// thread; blocking-pool threads are reused, so this is a few syscalls a
+ /// frame at most.
++#[cfg(target_os = "linux")]
+ fn apply_recovery_nice() {
+     thread_local! {
+         static APPLIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+@@ -273,11 +275,13 @@ fn apply_recovery_nice() {
+ /// `=2` pins over every logical CPU of the set instead (one thread per SMT
+ /// thread, no migration); `=1` measured a loss -- 16 physical cores could not
+ /// carry 20 slots, 12.7 cores of recovery against 20 unpinned.
++#[cfg(target_os = "linux")]
+ fn recovery_pin() -> u8 {
+     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+     *MODE.get_or_init(|| std::env::var("N42_TX_INGEST_RECOVER_PIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+ }
+ 
++#[cfg(target_os = "linux")]
+ fn physical_cores() -> &'static [usize] {
+     static CORES: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+     CORES.get_or_init(|| {
+@@ -308,6 +312,7 @@ fn physical_cores() -> &'static [usize] {
+ 
+ /// Pins the calling thread to its core (see [`recovery_pin`]), once per
+ /// thread.
++#[cfg(target_os = "linux")]
+ fn apply_recovery_affinity() {
+     thread_local! {
+         static PINNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+@@ -2429,3 +2434,9 @@ mod tests {
+ 
+ #[cfg(test)]
+ mod coverage_tests;
++
++#[cfg(not(target_os = "linux"))]
++fn apply_recovery_nice() {}
++
++#[cfg(not(target_os = "linux"))]
++fn apply_recovery_affinity() {}

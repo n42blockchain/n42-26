@@ -1,0 +1,269 @@
+commit 1c365ed9ffc049ecc915c379da706e18851a9682
+Author:     MiraWells <1020080523@qq.com>
+AuthorDate: Fri Sep 11 16:05:08 2026 -0400
+Commit:     MiraWells <1020080523@qq.com>
+CommitDate: Fri Sep 11 16:05:08 2026 -0400
+
+    perf(state): read a block's delta-credited recipients across the workers before the fold
+    
+    Round 35zzh's B1 profile put 1.28 s of 25 on a follower in the two
+    block-end system calls' FinalizeTx, and none of it in the flag loop: it
+    is the balanceInc pre-fold. The parallel processor credits a recipient the
+    block never read as a balance delta, so ~23k accounts a full block reach
+    the block end unread, and FinalizeTx -- then IntermediateRoot -- walks
+    them in sorted order reading each from the store through the state's
+    single reader: 23k serial QMDB lookups, ~85 ms of the follower's import
+    and the same on the leader's build.
+    
+    A new reader layer, AccountPrefetch, sits directly under the state's
+    reader (below the mobile read-log recorder and the JMT tracer, so what
+    they observe is unchanged). After the multi-version store is applied the
+    processor lists the pending increases the state has not read, reads them
+    across up to 16 goroutines -- each on its own read transaction through
+    the reader stack the workers used, post-state layers included -- and
+    seeds the layer. The fold's reads, in the same order as before, are map
+    hits. Sets under 256 addresses read through as before. The import and
+    the build both wire the layer; a state without one is unchanged.
+    
+    "parallel block" gains prefetched and prefetchMs; finalizeMs now starts
+    after the prefetch.
+    
+    Tests: TestAccountPrefetchServesTheFold (a known and an absent account,
+    credited as deltas, fold to old + delta and delta with zero store reads;
+    seeded values are copied out; unseeded reads fall through) and
+    TestPostStateLayersSeeThroughPrefetch (the layer walk that recovers the
+    unwritten-parent snapshots is not blocked by the new layer).
+
+diff --git a/modules/state/account_prefetch.go b/modules/state/account_prefetch.go
+new file mode 100644
+index 00000000..60ddfb0d
+--- /dev/null
++++ b/modules/state/account_prefetch.go
+@@ -0,0 +1,110 @@
++// Copyright 2022-2026 The N42 Authors
++// This file is part of the N42 library.
++
++package state
++
++import (
++	"github.com/n42blockchain/N42/common/account"
++	"github.com/n42blockchain/N42/common/types"
++)
++
++// AccountPrefetch is a reader layer that serves accounts a caller fetched
++// ahead of time, in parallel, and falls through to base for everything else.
++//
++// The parallel processor leaves a block's delta-credited recipients (an
++// account only ever credited during the block is never read by a worker --
++// the balance delta goes to the multi-version store) as pending balance
++// increases on the IntraBlockState. The block end folds them: FinalizeTx
++// and IntermediateRoot walk the pending addresses in sorted order and
++// getStateObject reads each one from the store, serially -- ~23k QMDB
++// lookups a full block, 85 ms of a follower's import and the same on the
++// leader's build (round 35zzh's profile). The processor now reads them
++// across its workers first and seeds this layer; the fold's reads, still
++// in the same order through the same chain (the mobile read-log recorder
++// sits above this layer and logs exactly what it logged before), become
++// map hits.
++//
++// A seeded nil means the account is absent. Values are copied on the way
++// out so a caller that mutates the returned account cannot poison a later
++// read.
++type AccountPrefetch struct {
++	base  StateReader
++	accts map[types.Address]*account.StateAccount
++	hits  int
++}
++
++// NewAccountPrefetch wraps base. Until Seed is called every read falls
++// through.
++func NewAccountPrefetch(base StateReader) *AccountPrefetch {
++	return &AccountPrefetch{base: base}
++}
++
++// Seed installs the prefetched accounts, replacing any earlier set.
++func (p *AccountPrefetch) Seed(accts map[types.Address]*account.StateAccount) {
++	p.accts = accts
++	p.hits = 0
++}
++
++// Hits reports how many reads the seeded set answered since the last Seed.
++func (p *AccountPrefetch) Hits() int { return p.hits }
++
++// Base returns the wrapped reader.
++func (p *AccountPrefetch) Base() StateReader { return p.base }
++
++func (p *AccountPrefetch) ReadAccountData(address types.Address) (*account.StateAccount, error) {
++	if p.accts != nil {
++		if a, ok := p.accts[address]; ok {
++			p.hits++
++			if a == nil {
++				return nil, nil
++			}
++			c := new(account.StateAccount)
++			c.Copy(a)
++			return c, nil
++		}
++	}
++	return p.base.ReadAccountData(address)
++}
++
++func (p *AccountPrefetch) ReadAccountStorage(address types.Address, key *types.Hash) ([]byte, error) {
++	return p.base.ReadAccountStorage(address, key)
++}
++
++func (p *AccountPrefetch) ReadAccountCode(address types.Address, codeHash types.Hash) ([]byte, error) {
++	return p.base.ReadAccountCode(address, codeHash)
++}
++
++func (p *AccountPrefetch) ReadAccountCodeSize(address types.Address, codeHash types.Hash) (int, error) {
++	return p.base.ReadAccountCodeSize(address, codeHash)
++}
++
++// SetAccountPrefetch records the prefetch layer under this state's reader
++// so the parallel processor can seed it without walking the reader chain.
++func (sdb *IntraBlockState) SetAccountPrefetch(p *AccountPrefetch) { sdb.accountPrefetch = p }
++
++// AccountPrefetch returns what SetAccountPrefetch recorded, or nil.
++func (sdb *IntraBlockState) AccountPrefetch() *AccountPrefetch { return sdb.accountPrefetch }
++
++// PendingBalanceIncreases lists the addresses whose balance increases are
++// still unfolded and whose accounts this state has not read yet -- the
++// reads the block-end fold would make from the store. Order is not
++// significant; the fold itself iterates sorted.
++func (sdb *IntraBlockState) PendingBalanceIncreases() []types.Address {
++	if len(sdb.balanceInc) == 0 {
++		return nil
++	}
++	out := make([]types.Address, 0, len(sdb.balanceInc))
++	for addr, bi := range sdb.balanceInc {
++		if bi == nil || bi.transferred {
++			continue
++		}
++		if _, cached := sdb.stateObjects[addr]; cached {
++			continue
++		}
++		if _, absent := sdb.nilAccounts[addr]; absent {
++			continue
++		}
++		out = append(out, addr)
++	}
++	return out
++}
+diff --git a/modules/state/account_prefetch_test.go b/modules/state/account_prefetch_test.go
+new file mode 100644
+index 00000000..11fdf7aa
+--- /dev/null
++++ b/modules/state/account_prefetch_test.go
+@@ -0,0 +1,111 @@
++// Copyright 2022-2026 The N42 Authors
++// This file is part of the N42 library.
++
++package state
++
++import (
++	"testing"
++
++	"github.com/holiman/uint256"
++
++	"github.com/n42blockchain/N42/common/account"
++	"github.com/n42blockchain/N42/common/types"
++)
++
++// countingReader serves a fixed account set and counts store reads.
++type countingReader struct {
++	accts map[types.Address]*account.StateAccount
++	reads int
++}
++
++func (r *countingReader) ReadAccountData(a types.Address) (*account.StateAccount, error) {
++	r.reads++
++	if acc, ok := r.accts[a]; ok {
++		c := new(account.StateAccount)
++		c.Copy(acc)
++		return c, nil
++	}
++	return nil, nil
++}
++func (r *countingReader) ReadAccountStorage(types.Address, *types.Hash) ([]byte, error) {
++	return nil, nil
++}
++func (r *countingReader) ReadAccountCode(types.Address, types.Hash) ([]byte, error) { return nil, nil }
++func (r *countingReader) ReadAccountCodeSize(types.Address, types.Hash) (int, error) {
++	return 0, nil
++}
++
++// A delta-credited account (AddBalance without a prior read) is folded at
++// the block end through the reader. With the prefetch layer seeded, the
++// fold's read is a hit, the balance is old + delta, an account seeded as
++// absent is created with just the delta, and the store sees no read.
++func TestAccountPrefetchServesTheFold(t *testing.T) {
++	var known, absent types.Address
++	known[19], absent[19] = 1, 2
++	store := &countingReader{accts: map[types.Address]*account.StateAccount{
++		known: {Initialised: true, Nonce: 7, Balance: *uint256.NewInt(1000)},
++	}}
++	pf := NewAccountPrefetch(store)
++	ibs := New(pf)
++	ibs.SetAccountPrefetch(pf)
++
++	ibs.AddBalance(known, uint256.NewInt(5))
++	ibs.AddBalance(absent, uint256.NewInt(9))
++	pending := ibs.PendingBalanceIncreases()
++	if len(pending) != 2 {
++		t.Fatalf("pending increases: %d, want 2", len(pending))
++	}
++
++	// What the parallel prefetch would produce: the store's view of both.
++	seed := map[types.Address]*account.StateAccount{}
++	for _, a := range pending {
++		acc, _ := store.ReadAccountData(a)
++		seed[a] = acc
++	}
++	store.reads = 0
++	pf.Seed(seed)
++
++	if got := ibs.GetBalance(known); got.Uint64() != 1005 {
++		t.Fatalf("known balance %s, want 1005", got)
++	}
++	if got := ibs.GetNonce(known); got != 7 {
++		t.Fatalf("known nonce %d, want 7", got)
++	}
++	if got := ibs.GetBalance(absent); got.Uint64() != 9 {
++		t.Fatalf("absent balance %s, want 9", got)
++	}
++	if store.reads != 0 {
++		t.Fatalf("store reads during the fold: %d, want 0", store.reads)
++	}
++	if pf.Hits() != 2 {
++		t.Fatalf("prefetch hits %d, want 2", pf.Hits())
++	}
++	if len(ibs.PendingBalanceIncreases()) != 0 {
++		t.Fatal("increases still pending after the fold")
++	}
++	// A seeded value cannot be poisoned by a caller mutating what it got.
++	seed[known].Balance.SetUint64(1)
++	acc, _ := pf.ReadAccountData(known)
++	if acc.Balance.Uint64() != 1 {
++		t.Fatalf("seed mutation not observed (copy semantics on Seed?): %s", acc.Balance.String())
++	}
++	// An unseeded address still reads through.
++	var other types.Address
++	other[19] = 3
++	if _, err := pf.ReadAccountData(other); err != nil || store.reads != 1 {
++		t.Fatalf("unseeded read did not fall through: reads=%d err=%v", store.reads, err)
++	}
++}
++
++// The layer walk that recovers post-state layers sees through the prefetch
++// layer.
++func TestPostStateLayersSeeThroughPrefetch(t *testing.T) {
++	store := &countingReader{}
++	post := &PostState{}
++	var r StateReader = NewPostStateReader(post, store)
++	r = NewAccountPrefetch(r)
++	layers, base := PostStateLayers(r)
++	if len(layers) != 1 || layers[0] != post || base != StateReader(store) {
++		t.Fatalf("walk through the prefetch layer: %d layers, base %T", len(layers), base)
++	}
++}

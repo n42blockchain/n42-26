@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.44s
+     Running unittests src/bin/n42-verify-commit.rs (target/debug/deps/n42_verify_commit-f0586627fc03b310)
+
+running 5 tests
+test tests::export_synthetic_fixtures ... ignored, write explicitly requested synthetic verifier fixtures
+test tests::export_tps_fixtures ... ignored, explicit synthetic TPS certificate export; never used by the production CLI
+test tests::native_commit_binds_validator_changes ... ok
+test tests::rejects_wrong_identity_phase_roster_and_quorum ... ok
+test tests::accepts_each_exact_commit_domain_and_rejects_prepare_signatures ... ok
+
+test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.02s
+

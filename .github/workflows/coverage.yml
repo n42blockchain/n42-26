@@ -1,0 +1,60 @@
+name: Rust workspace coverage
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: n42-26
+
+      - uses: actions/checkout@v7
+        with:
+          repository: n42blockchain/reth
+          ref: 23316e3ff8adca8c3bd5085ff0565fcae019202a
+          path: reth
+
+      - name: Apply N42 reth patches
+        run: bash n42-26/scripts/apply-reth-patches.sh reth
+
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+          workspaces: n42-26 -> target/coverage
+
+      - name: Verify coverage gate behavior
+        working-directory: n42-26
+        run: python3 -m unittest discover -s scripts -p test_workspace_coverage.py
+
+      - name: Test workspace and require 70% line coverage
+        working-directory: n42-26
+        run: python3 scripts/workspace-coverage.py
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/n42-26/target/coverage
+          RUST_LOG: error
+
+      - name: Upload coverage reports and test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: workspace-coverage
+          path: |
+            n42-26/.artifacts/coverage/run-*/summary.txt
+            n42-26/.artifacts/coverage/run-*/coverage.json
+            n42-26/.artifacts/coverage/run-*/tests.log
+            n42-26/.artifacts/coverage/run-*/unmapped-sources.json

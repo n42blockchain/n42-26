@@ -1,0 +1,28 @@
+   Compiling n42-network v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-network)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.11s
+     Running unittests src/lib.rs (target/debug/deps/n42_network-4ebe3f03612d79b8)
+
+running 20 tests
+test gov5_block::tests::only_header_profile_verdicts_are_permanent ... ok
+test gov5_block::tests::rejects_header_without_canonical_h2_view_prefix ... ok
+test gov5_block::tests::a_body_that_fails_validation_still_names_its_block ... ok
+test gov5_block::tests::decodes_gov5_eth_style_block_and_binds_transaction_root ... ok
+test gov5_block::tests::rejects_body_that_does_not_match_authenticated_transaction_root ... ok
+test gov5_block::tests::unattributable_responses_name_no_block ... ok
+test service::tests::fulfilled_gov5_block_suppresses_reordered_request_until_expiry ... ok
+test gov5_block::tests::rejects_schema_shifted_auxiliary_fields ... ok
+test service::tests::gov5_block_fetch_fanout_ignores_unconnected_preferred_peer ... ok
+test service::tests::gov5_block_fetch_uses_one_preferred_peer_per_attempt ... ok
+test service::tests::stale_gov5_block_fetch_is_rearmed_after_transport_deadline ... ok
+test gov5_block::tests::corrupted_body_cannot_permanently_reject_a_valid_header ... ok
+test gov5_block::tests::missing_transactions_are_retryable_even_when_header_hash_matches ... ok
+test service::tests::test_handle_cancel_gov5_block_fetch_uses_priority_lane ... ok
+test gov5_block::tests::locally_built_execution_payload_round_trips_through_gov5_block_wire ... ok
+test gov5_block::tests::normalizes_local_zero_ommers_payload_hidden_by_engine_shape ... ok
+test gov5_block::tests::normalization_strips_empty_withdrawals_for_pre_shanghai_gov5 ... ok
+test gov5_block::tests::normalizes_standard_engine_payload_for_gov5_h2_leader ... ok
+test gov5_block::tests::cancun_genesis_bootstraps_the_native_first_child ... ok
+test gov5_block::tests::native_producer_preserves_rewards_committee_and_mobile_header ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 190 filtered out; finished in 0.00s
+

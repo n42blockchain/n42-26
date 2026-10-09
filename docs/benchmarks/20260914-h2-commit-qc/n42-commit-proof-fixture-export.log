@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.41s
+     Running unittests src/bin/n42-verify-commit.rs (target/debug/deps/n42_verify_commit-f0586627fc03b310)
+
+running 1 test
+test tests::export_synthetic_fixtures ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.01s
+

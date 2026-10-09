@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "path": "/home/n42/src/n42/n42-26/.artifacts/native-four-20260914/presigned-minute-72m-interleaved.bin",
+  "sha256": "ffea0e0f6ab912313d37211ae6bfd7a89ea46c0356d45d2443019a0a8213cf85",
+  "bytes": 10149233021,
+  "version": 2,
+  "chainId": 941004,
+  "rpcGroups": 4,
+  "transactions": 72000000,
+  "minimumTransactions": 60000000,
+  "scope": "file identity and header capacity; signatures, full framing, running-chain nonces and execution not verified"
+}

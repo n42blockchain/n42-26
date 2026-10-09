@@ -1,0 +1,16 @@
+   Compiling n42-node v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-node)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.15s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/deps/n42_node-f6af4eaa96fd0678)
+
+running 1 test
+test qmdb_state_reader::canonical_bench::bench_canonical_qmdb_execution_and_commit ... canonical_qmdb_config {"accounts":20000,"allocator":"system","baseFee":7,"blocks":3,"chainId":4242,"disjointAddresses":true,"distinctRecipients":5000,"distinctSenders":5000,"fork":"cancun","gasPrice":9,"reads":"only","scope":"execution_delta_qmdb_durable_commit","signatureRecoveryIncluded":false,"strategy":"canonical_sequential","transactions":5000}
+canonical_qmdb_sample {"accountReads":10002,"blockHash":"0xa49cff26390cf4338692a984ebdfb088b072b8980a81cd7657e05a23df6ff435","commitMs":27.498653,"deltaMs":31.492506000000002,"executionMs":101.115659,"number":1,"operations":10001,"recoveryMsExcluded":1150.164247,"root":"0x580ba114b4e338a90335faeeb569317824ccd48df02ca994af1ed1b25f9a5262","storageReads":0,"successful":5000,"totalMs":160.107738,"transactions":5000,"walBytes":480211}
+canonical_qmdb_sample {"accountReads":10002,"blockHash":"0x696fdae9c3874e686a9bf1d66420d360a6f4dda7cba0ad4238f3dfccf06792d8","commitMs":27.644704,"deltaMs":31.749695000000003,"executionMs":99.52811799999999,"number":2,"operations":10001,"recoveryMsExcluded":1147.902397,"root":"0xfb454411623333cc954f0aeabd1e8b05333ff4c4a9b2b6730e9631fa14ccc23c","storageReads":0,"successful":5000,"totalMs":158.923127,"transactions":5000,"walBytes":960422}
+canonical_qmdb_sample {"accountReads":10002,"blockHash":"0xf8bced671d61d61e9a7437b8235098a97c09510759107894cf41e1f11c7f2903","commitMs":27.097793,"deltaMs":31.279545,"executionMs":98.98248799999999,"number":3,"operations":10001,"recoveryMsExcluded":1158.8837409999999,"root":"0x1d01e0b9a247e3a1e474e3a56b9818171dd15ebcdc60fdc4246b09cb2516569e","storageReads":0,"successful":5000,"totalMs":157.360206,"transactions":5000,"walBytes":1440633}
+canonical_qmdb_restart_verified=true
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 244 filtered out; finished in 8.17s
+

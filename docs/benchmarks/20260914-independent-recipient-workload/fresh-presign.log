@@ -1,0 +1,29 @@
+2026-09-15T03:41:05.718333Z  INFO n42_stress: === N42 TPS Stress Test v10 (Burst Mode + Optimized Submission) ===
+2026-09-15T03:41:05.718356Z  INFO n42_stress: Configuration target_tps=2000 duration=60 accounts=5000 batch_size=500 accounts_per_batch=100 erc20_ratio=0 concurrency=1024 max_pool=200000 resume_pool=100000 burst=0 rpc_count=4
+2026-09-15T03:41:05.952199Z  INFO n42_stress: Recipient mapping: (nonce * total_senders + global_sender_index) modulo recipients path=".artifacts/native-four-20260914/recipients.json" recipients=147000 recipients_blake3=6bc55f1607193df1038dd702b474f6dcf341c4509ab3b4948287d7da9807b30e sender_stride=5000
+2026-09-15T03:41:06.081572Z  INFO n42_stress: Offline signing: fresh genesis nonces only; running-chain state has not been checked genesis=".artifacts/native-four-20260914/artifacts/genesis.json" genesis_blake3=b8bc777e8b7ea19325331e067e2aefb8a07dd226e96b91bd05615478c59fd693 total=220000
+2026-09-15T03:41:06.110727Z  INFO n42_stress: === N42 Pre-sign Save Mode ===
+2026-09-15T03:41:06.908785Z  INFO n42_stress: Pre-signed file atomically published path=.artifacts/native-four-20260914/presigned-startup-220k.bin total=220000 total_bytes=30577467 signing_threads=16 elapsed_ms=798
+	Command being timed: "target/release/n42-stress --presign-genesis .artifacts/native-four-20260914/artifacts/genesis.json --recipients-file .artifacts/native-four-20260914/recipients.json --presign-save .artifacts/native-four-20260914/presigned-startup-220k.bin --presign 220000 --accounts 5000 --rpc http://127.0.0.1:23400,http://127.0.0.1:23401,http://127.0.0.1:23402,http://127.0.0.1:23403"
+	User time (seconds): 12.67
+	System time (seconds): 0.11
+	Percent of CPU this job got: 1051%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:01.21
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 162576
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 43355
+	Voluntary context switches: 7744
+	Involuntary context switches: 135
+	Swaps: 0
+	File system inputs: 12920
+	File system outputs: 59728
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

@@ -188,8 +188,27 @@ fn payload_zstd_level() -> i32 {
 /// Backward-compatible with old nodes that sent uncompressed JSON.
 pub fn decompress_payload(data: &[u8]) -> std::io::Result<Vec<u8>> {
     if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
-        zstd_decompress_pooled(data, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        match zstd_decompress_pooled(data, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE) {
+            Ok(payload) => Ok(payload),
+            Err(pooled_error) => {
+                // An error can leave a reused DCtx in a bad state. Retry the
+                // same frame with an independent context before declaring a
+                // committed block unexecutable. A genuinely damaged frame is
+                // still rejected by both decoders.
+                let independent = zstd::bulk::decompress(
+                    data,
+                    MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE,
+                );
+                if independent.is_ok() {
+                    ZSTD_DECOMPRESSOR.with(|slot| *slot.borrow_mut() = None);
+                    tracing::warn!(target: "n42::cl", error = %pooled_error,
+                        "pooled zstd decompression failed; independent retry succeeded");
+                }
+                independent.map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                })
+            }
+        }
     } else {
         Ok(data.to_vec())
     }
@@ -461,6 +480,26 @@ pub struct BlockDataBroadcast {
     /// for broadcast. Used only for cross-task timing diagnostics.
     #[serde(default)]
     pub leader_ready_unix_ms: u64,
+    /// Canonical Gov5 native header for this payload. The direct block path
+    /// can arrive before the separate Gov5 block gossip under load.
+    #[serde(default)]
+    pub native_header_rlp: Option<Vec<u8>>,
+}
+
+fn remember_direct_native_header(hash: B256, raw: &[u8]) -> bool {
+    // The direct path may win the race against native block gossip. Only
+    // register a canonical header whose own hash matches this envelope; the
+    // engine subsequently checks every payload field against that header.
+    if raw.len() > 4096 {
+        return false;
+    }
+    let Ok(header) = n42_consensus::Gov5NativeHeader::decode(raw) else {
+        return false;
+    };
+    if header.encode() != raw || header.hash() != hash {
+        return false;
+    }
+    n42_consensus::remember_gov5_native_header(raw) == hash
 }
 
 /// Consensus context captured when a leader starts an asynchronous payload build.
@@ -1607,6 +1646,7 @@ impl ConsensusService {
                     timestamp: block_timestamp,
                     execution_output: None,
                     leader_ready_unix_ms: 0,
+                    native_header_rlp: None,
                 };
                 self.complete_deferred_finalization(&imported).await;
                 if let Err(error) = self.engine.process_event(
@@ -1661,6 +1701,7 @@ impl ConsensusService {
             timestamp: block.header.timestamp,
             execution_output: None,
             leader_ready_unix_ms: 0,
+            native_header_rlp: None,
         };
         match bincode::serialize(&broadcast) {
             Ok(data) => self.handle_block_data(data).await,
@@ -4325,6 +4366,17 @@ mod tests {
     use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
 
+    #[test]
+    fn direct_block_header_requires_canonical_matching_hash() {
+        let (hash, block_rlp) = test_gov5_block_rlp(B256::ZERO, 1, 1);
+        let decoded = n42_network::decode_gov5_block_rlp(&block_rlp).unwrap();
+        assert_eq!(decoded.block_hash, hash);
+        let raw = n42_consensus::gov5_native_header_rlp(&hash).unwrap();
+        assert!(remember_direct_native_header(hash, &raw));
+        assert!(!remember_direct_native_header(B256::repeat_byte(0x42), &raw));
+        assert!(!remember_direct_native_header(hash, &[0xc0]));
+    }
+
     fn test_gov5_block_rlp(parent_hash: B256, number: u64, view: u64) -> (B256, Vec<u8>) {
         let mut extra_data = Vec::with_capacity(12);
         extra_data.extend_from_slice(b"N42H");
@@ -4713,6 +4765,7 @@ mod tests {
             timestamp: 1,
             execution_output: None,
             leader_ready_unix_ms: 0,
+            native_header_rlp: None,
         })
         .expect("serialize test block broadcast")
     }
@@ -4736,6 +4789,7 @@ mod tests {
             timestamp: 1,
             execution_output: None,
             leader_ready_unix_ms: 0,
+            native_header_rlp: None,
         })
         .expect("serialize test block broadcast")
     }
@@ -4796,6 +4850,7 @@ mod tests {
             timestamp: 1,
             execution_output: Some(execution_output),
             leader_ready_unix_ms: 0,
+            native_header_rlp: None,
         })
         .expect("serialize test block broadcast")
     }
@@ -7832,6 +7887,7 @@ mod tests {
             timestamp: 0,
             execution_output: None,
             leader_ready_unix_ms: 0,
+            native_header_rlp: None,
         };
         let _ = orch.import_and_notify(broadcast).await;
 
@@ -8277,6 +8333,7 @@ mod tests {
             timestamp: 0,
             execution_output: None,
             leader_ready_unix_ms: 0,
+            native_header_rlp: None,
         };
         let _ = orch.import_and_notify(broadcast).await;
 
@@ -8327,6 +8384,7 @@ mod tests {
                 timestamp: 0,
                 execution_output: None,
                 leader_ready_unix_ms: 0,
+                native_header_rlp: None,
             })
             .await;
 
@@ -8408,6 +8466,7 @@ mod tests {
             // a peer-supplied bundle keyed by the honest block's declared hash.
             execution_output: Some(vec![0xFA, 0xCE]),
             leader_ready_unix_ms: 0,
+            native_header_rlp: None,
         };
         assert!(!orch.import_and_notify(forged).await);
         assert_eq!(cache.evicted(), vec![honest_hash]);
@@ -8424,6 +8483,7 @@ mod tests {
             timestamp: 1,
             execution_output: None,
             leader_ready_unix_ms: 0,
+            native_header_rlp: None,
         };
         assert!(orch.import_and_notify(honest).await);
         assert_eq!(orch.head_block_hash, honest_hash);
@@ -8466,6 +8526,7 @@ mod tests {
             timestamp: 1,
             execution_output: Some(vec![0xBA, 0xD0, 0x00, 0x01]),
             leader_ready_unix_ms: 0,
+            native_header_rlp: None,
         };
         assert!(!orch.import_and_notify(forged_compact).await);
         assert_eq!(cache.evicted(), vec![honest_hash]);
@@ -8482,6 +8543,7 @@ mod tests {
             timestamp: 1,
             execution_output: None,
             leader_ready_unix_ms: 0,
+            native_header_rlp: None,
         };
         assert!(orch.import_and_notify(honest).await);
         assert_eq!(orch.head_block_hash, honest_hash);
@@ -8620,6 +8682,7 @@ mod tests {
                 timestamp: 0,
                 execution_output: None,
                 leader_ready_unix_ms: 0,
+                native_header_rlp: None,
             })
             .await;
 
@@ -8806,6 +8869,17 @@ mod tests {
             zstd_compress_pooled(&payload, level).unwrap(),
             zstd::bulk::compress(&payload, level).unwrap()
         );
+    }
+
+    #[test]
+    fn corrupt_zstd_frame_is_rejected_without_poisoning_later_decodes() {
+        let payload = codec_sample(1 << 20, 212);
+        let encoded = compress_payload(&payload);
+        let mut corrupt = encoded.clone();
+        corrupt.truncate(corrupt.len() / 2);
+
+        assert!(decompress_payload(&corrupt).is_err());
+        assert_eq!(decompress_payload(&encoded).unwrap(), payload);
     }
 
     /// Timing only. `cargo test -p n42-consensus-service zstd_pool_bench --release -- --ignored --nocapture`

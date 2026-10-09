@@ -1,0 +1,13 @@
+   Compiling tikv-jemalloc-sys v0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8
+   Compiling tikv-jemallocator v0.7.0
+   Compiling n42-node v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-node)
+    Finished `release` profile [optimized] target(s) in 1m 17s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/release/deps/n42_node-76ba8a55e1956387)
+
+running 1 test
+test qmdb_state_reader::canonical_bench::canonical_qmdb_execution_commits_consecutive_blocks ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 244 filtered out; finished in 0.03s
+

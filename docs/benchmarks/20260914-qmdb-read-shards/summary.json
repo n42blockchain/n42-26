@@ -1,0 +1,242 @@
+[
+  {
+    "keys": 200000,
+    "kind": "account",
+    "version": "baseline",
+    "initialize_ms": {
+      "median": 44.191,
+      "min": 43.073,
+      "max": 59.869
+    },
+    "derive_ms": {
+      "median": 52.3365,
+      "min": 49.891,
+      "max": 52.734
+    },
+    "process_max_rss_kib": {
+      "median": 129720.0,
+      "min": 127672.0,
+      "max": 129720.0
+    },
+    "reads_per_second_1": {
+      "median": 3825924.0,
+      "min": 3643839.0,
+      "max": 3970088.0
+    },
+    "reads_per_second_16": {
+      "median": 31504248.5,
+      "min": 26217064.0,
+      "max": 32274186.0
+    }
+  },
+  {
+    "keys": 200000,
+    "kind": "account",
+    "version": "qmdb_read_view",
+    "initialize_ms": {
+      "median": 41.2735,
+      "min": 36.446,
+      "max": 42.282
+    },
+    "derive_ms": {
+      "median": 37.769000000000005,
+      "min": 33.005,
+      "max": 38.749
+    },
+    "process_max_rss_kib": {
+      "median": 213688.0,
+      "min": 211640.0,
+      "max": 213688.0
+    },
+    "reads_per_second_1": {
+      "median": 3877139.0,
+      "min": 3717582.0,
+      "max": 4089335.0
+    },
+    "reads_per_second_16": {
+      "median": 34302912.5,
+      "min": 31972861.0,
+      "max": 35412490.0
+    }
+  },
+  {
+    "keys": 200000,
+    "kind": "storage",
+    "version": "baseline",
+    "initialize_ms": {
+      "median": 51.6125,
+      "min": 51.219,
+      "max": 52.561
+    },
+    "derive_ms": {
+      "median": 60.439,
+      "min": 58.947,
+      "max": 66.419
+    },
+    "process_max_rss_kib": {
+      "median": 145124.0,
+      "min": 145124.0,
+      "max": 145124.0
+    },
+    "reads_per_second_1": {
+      "median": 3858890.0,
+      "min": 3719316.0,
+      "max": 3947818.0
+    },
+    "reads_per_second_16": {
+      "median": 32956611.0,
+      "min": 31830534.0,
+      "max": 34629619.0
+    }
+  },
+  {
+    "keys": 200000,
+    "kind": "storage",
+    "version": "qmdb_read_view",
+    "initialize_ms": {
+      "median": 37.1465,
+      "min": 36.276,
+      "max": 42.504
+    },
+    "derive_ms": {
+      "median": 33.6385,
+      "min": 32.759,
+      "max": 38.626
+    },
+    "process_max_rss_kib": {
+      "median": 222948.0,
+      "min": 220900.0,
+      "max": 222948.0
+    },
+    "reads_per_second_1": {
+      "median": 4285238.0,
+      "min": 4188788.0,
+      "max": 4375458.0
+    },
+    "reads_per_second_16": {
+      "median": 35756958.0,
+      "min": 35004084.0,
+      "max": 36616108.0
+    }
+  },
+  {
+    "keys": 2000000,
+    "kind": "account",
+    "version": "baseline",
+    "initialize_ms": {
+      "median": 897.5129999999999,
+      "min": 882.46,
+      "max": 915.865
+    },
+    "derive_ms": {
+      "median": 172.23700000000002,
+      "min": 168.037,
+      "max": 177.31
+    },
+    "process_max_rss_kib": {
+      "median": 1195768.0,
+      "min": 1193720.0,
+      "max": 1195812.0
+    },
+    "reads_per_second_1": {
+      "median": 1533107.0,
+      "min": 1530530.0,
+      "max": 1548913.0
+    },
+    "reads_per_second_16": {
+      "median": 20695316.5,
+      "min": 20408877.0,
+      "max": 20793009.0
+    }
+  },
+  {
+    "keys": 2000000,
+    "kind": "account",
+    "version": "qmdb_read_view",
+    "initialize_ms": {
+      "median": 345.6735,
+      "min": 323.732,
+      "max": 363.148
+    },
+    "derive_ms": {
+      "median": 103.8365,
+      "min": 102.649,
+      "max": 105.072
+    },
+    "process_max_rss_kib": {
+      "median": 1302256.0,
+      "min": 1296224.0,
+      "max": 1303220.0
+    },
+    "reads_per_second_1": {
+      "median": 2090145.5,
+      "min": 2026630.0,
+      "max": 2130628.0
+    },
+    "reads_per_second_16": {
+      "median": 25519894.5,
+      "min": 24573015.0,
+      "max": 26094177.0
+    }
+  },
+  {
+    "keys": 2000000,
+    "kind": "storage",
+    "version": "baseline",
+    "initialize_ms": {
+      "median": 950.0585,
+      "min": 914.758,
+      "max": 1014.092
+    },
+    "derive_ms": {
+      "median": 172.2265,
+      "min": 167.515,
+      "max": 193.029
+    },
+    "process_max_rss_kib": {
+      "median": 1296648.0,
+      "min": 1294600.0,
+      "max": 1296648.0
+    },
+    "reads_per_second_1": {
+      "median": 1582518.0,
+      "min": 1573682.0,
+      "max": 1649770.0
+    },
+    "reads_per_second_16": {
+      "median": 21022701.0,
+      "min": 20514189.0,
+      "max": 21345775.0
+    }
+  },
+  {
+    "keys": 2000000,
+    "kind": "storage",
+    "version": "qmdb_read_view",
+    "initialize_ms": {
+      "median": 346.903,
+      "min": 324.942,
+      "max": 370.264
+    },
+    "derive_ms": {
+      "median": 104.1755,
+      "min": 102.041,
+      "max": 120.131
+    },
+    "process_max_rss_kib": {
+      "median": 1303272.0,
+      "min": 1300184.0,
+      "max": 1309520.0
+    },
+    "reads_per_second_1": {
+      "median": 2134423.0,
+      "min": 2087934.0,
+      "max": 2179105.0
+    },
+    "reads_per_second_16": {
+      "median": 26272095.0,
+      "min": 25747153.0,
+      "max": 27065207.0
+    }
+  }
+]

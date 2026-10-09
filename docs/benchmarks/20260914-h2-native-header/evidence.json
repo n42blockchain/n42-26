@@ -1,0 +1,36 @@
+{
+  "scope": "Offline native-header binding and receipt audit; no real fleet or TPS measurement",
+  "validation": {
+    "python_passed": 35,
+    "node_rpc_passed": 18,
+    "native_header_codec_passed": 7,
+    "workspace_clippy": "passed"
+  },
+  "source_and_log_sha256": {
+    "README.md": "a1263164eebe4ca6de119596cc0d9439a8afbb408e56789042b9feb690489e8f",
+    "fixtures/gov5-native-header-audit.json": "cdfc1b8d9135a80afd3c89efc97241bbd058115ddcf611ee31715839fb41ee74",
+    "fixtures/gov5-receipt-audit.json": "28e8b994b80300a245dab3234bdf4dee72e70167088183c1751e30286b75a8d3",
+    "gov5_native_header.rs": "bdac1cc0673cc1ba7b364fefc9c4ded6ba48abc7bf2f72cbf5d954adf7459280",
+    "h2-tps-audit.py": "cfef2d0c565423cb182cbb24c94e947a2ef71bd81fb59e13bc810d0405db9ae0",
+    "header-codec-tests.log": "94e3431c93a25fe35230d4cc8738eeafada39c5b9e04fdcbf47e32b0751d3758",
+    "python-tests.log": "a9a8690fef263cb878a28ca9ee4cc17a92ef94d53b82461e4a0cfda9683ebe4d",
+    "qualify-1m-tps.sh": "ea5d375962b28537452cbc3300fb384806368b0d4cfd810e693290dc10661066",
+    "rpc-tests.log": "31639012b3515e58c31e1e45e3c9345442726f1a36b945f297ae3972a0eee9e0",
+    "rpc.rs": "d98e35f0ef2edde95bb18ff1b288069be0c67d952f98ac77f7165764f47a3f98",
+    "synthetic-forged-root.json": "c122052827dfa95353ad1ddd2639e02dafd56030a08d9fd970b8f6cc982165f2",
+    "synthetic-report.json": "fc41b5277a6d4b5dc01fbed3fa693932a2e347a9df9708bc60009e1e37cedaaa",
+    "test-h2-tps-audit.py": "fc2ab1c01107086d6514fda20c2db7a2f73b41cfa0ca312fea2545a8d04628ba",
+    "workspace-clippy.log": "a31015d19a7379249f8e16819c839754577f4cc175b83d695792c0d8103b59e3"
+  },
+  "keccak_binary_sha256": "1d1d6cc94133024b74cd3865576e70f11eef5433082deb363fb9e53c385b8b81",
+  "reth_baseline": "23316e3ff8adca8c3bd5085ff0565fcae019202a",
+  "header_registry_records": 8192,
+  "header_registry_persistent": false,
+  "remaining": [
+    "Independent BLS commit proofs",
+    "Reconstruct transaction roots and expected business state",
+    "Target-scale receipt/header audit resources",
+    "Real four-node continuous successful 1M TPS",
+    "Restart/catch-up and durability"
+  ]
+}

@@ -63,6 +63,51 @@ const DEFAULT_INGEST_TARGET_PENDING: usize = 82_000;
 const DEFAULT_INGEST_VIRTUAL_BLOCK_CREDIT_MS: u64 = 0;
 const DEFAULT_POOL_MAX_TXS: usize = 100_000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IngestFrameHeader {
+    Close,
+    CreditProbe,
+    Batch(usize),
+    Oversized,
+}
+
+/// Classify a wire header before it is used for any allocation or accounting.
+fn classify_ingest_header(header: u32) -> IngestFrameHeader {
+    match header {
+        0 => IngestFrameHeader::Close,
+        CREDIT_WAIT_SENTINEL => IngestFrameHeader::CreditProbe,
+        count if count as usize > MAX_INGEST_BATCH_TXS => IngestFrameHeader::Oversized,
+        count => IngestFrameHeader::Batch(count as usize),
+    }
+}
+
+/// Compute a probe grant without mutating the process-wide lease.
+/// Returns (dynamic high-water, dynamic credit limit, granted credit).
+fn credit_probe_allowance(
+    base_high_water: usize,
+    pending: usize,
+    pool_limit: usize,
+    virtual_available: usize,
+) -> (usize, usize, usize) {
+    let base_credit = base_high_water.saturating_sub(pending);
+    let extra_headroom = pool_limit.saturating_sub(base_high_water);
+    let virtual_available = virtual_available.min(extra_headroom);
+    let dynamic_high_water = base_high_water.saturating_add(virtual_available);
+    if pending >= dynamic_high_water {
+        return (dynamic_high_water, dynamic_high_water, 0);
+    }
+
+    let virtual_grant = dynamic_high_water
+        .saturating_sub(pending)
+        .saturating_sub(base_credit);
+    let reserved_virtual = virtual_grant.min(virtual_available);
+    (
+        dynamic_high_water,
+        dynamic_high_water,
+        base_credit.saturating_add(reserved_virtual),
+    )
+}
+
 #[derive(Clone, Copy, Default)]
 struct VirtualBlockCreditState {
     available_txs: usize,
@@ -289,25 +334,18 @@ fn reserve_credit_probe_allowance(base_high_water: usize, pending: usize) -> (us
     reset_expired_virtual_block_credit(&mut state, now_ms);
 
     let virtual_available = state.available_txs.min(extra_headroom);
-    let dynamic_high_water = base_high_water.saturating_add(virtual_available);
-    if pending >= dynamic_high_water {
-        return (dynamic_high_water, dynamic_high_water, 0);
+    let (dynamic_high_water, dynamic_credit_limit, credit) =
+        credit_probe_allowance(base_high_water, pending, pool_limit, virtual_available);
+    if credit == 0 {
+        return (dynamic_high_water, dynamic_credit_limit, 0);
     }
-
-    let virtual_grant = dynamic_high_water
-        .saturating_sub(pending)
-        .saturating_sub(base_credit);
-    let reserved_virtual = virtual_grant.min(state.available_txs);
+    let reserved_virtual = credit.saturating_sub(base_credit);
     state.available_txs = state.available_txs.saturating_sub(reserved_virtual);
     if state.available_txs == 0 {
         state.until_ms = 0;
     }
 
-    (
-        dynamic_high_water,
-        dynamic_high_water,
-        base_credit.saturating_add(reserved_virtual),
-    )
+    (dynamic_high_water, dynamic_credit_limit, credit)
 }
 
 /// Start the binary TCP ingest server.
@@ -605,8 +643,10 @@ where
     // Set TCP_NODELAY for low latency
     stream.set_nodelay(true)?;
 
-    // Reusable buffer for reading tx data
-    let mut tx_buf = vec![0u8; 65536];
+    // Reuse one contiguous batch buffer and transaction offsets per connection.
+    // A credit-gated batch still has to be drained to preserve wire framing.
+    let mut batch_data = Vec::new();
+    let mut raw_txs = Vec::new();
     let base_high_water = ingest_high_water();
     let target_pending = ingest_target_pending(base_high_water);
     let credit_probe_enabled = ingest_credit_probe_enabled();
@@ -622,10 +662,11 @@ where
             break; // Connection closed
         }
         let header_value = u32::from_le_bytes(header);
-        if header_value == 0 {
+        let frame_header = classify_ingest_header(header_value);
+        if frame_header == IngestFrameHeader::Close {
             break; // Graceful close
         }
-        if header_value == CREDIT_WAIT_SENTINEL {
+        if frame_header == IngestFrameHeader::CreditProbe {
             if !credit_probe_enabled {
                 let pending = pool.pending_count();
                 warn!(
@@ -658,22 +699,24 @@ where
             .await?;
             continue;
         }
-        let num_txs = header_value as usize;
-        if num_txs > MAX_INGEST_BATCH_TXS {
+        let IngestFrameHeader::Batch(num_txs) = frame_header else {
             warn!(
                 target: "n42::ingest",
-                num_txs,
+                num_txs = header_value,
                 max = MAX_INGEST_BATCH_TXS,
                 "batch header claims more transactions than allowed; dropping connection"
             );
             break;
-        }
+        };
 
         stats.received.fetch_add(num_txs as u64, Ordering::Relaxed);
 
         // Read the batch into memory first. This lets the sender use credit probes
         // without requiring a second decode pass when only a prefix is admissible.
-        let mut raw_txs = Vec::with_capacity(num_txs);
+        let read_start = Instant::now();
+        raw_txs.clear();
+        raw_txs.reserve(num_txs);
+        batch_data.clear();
         let mut batch_bytes = 0usize;
 
         for _ in 0..num_txs {
@@ -696,20 +739,28 @@ where
                 return Ok(());
             }
 
-            // Read tx data
-            if tx_len > tx_buf.len() {
-                tx_buf.resize(tx_len, 0);
-            }
-            stream.read_exact(&mut tx_buf[..tx_len]).await?;
+            // Read directly into the batch arena; no per-transaction allocation
+            // or copy from a temporary socket buffer. The byte cap above also
+            // bounds the reusable arena for this connection.
+            let start = batch_data.len();
+            let end = start + tx_len;
+            batch_data.resize(end, 0);
+            stream.read_exact(&mut batch_data[start..end]).await?;
 
             // Read pre-recovered sender address (20 bytes)
             let mut sender_buf = [0u8; 20];
             stream.read_exact(&mut sender_buf).await?;
             let sender = Address::from(sender_buf);
-            raw_txs.push((tx_buf[..tx_len].to_vec(), sender));
+            raw_txs.push((start..end, sender));
         }
 
+        metrics::histogram!("n42_ingest_batch_duration_ms", "phase" => "socket_read")
+            .record(read_start.elapsed().as_secs_f64() * 1_000.0);
+        metrics::histogram!("n42_ingest_batch_bytes").record(batch_bytes as f64);
+        metrics::histogram!("n42_ingest_batch_transactions").record(num_txs as f64);
+
         let pending_before = pool.pending_count();
+        metrics::histogram!("n42_ingest_pending_at_admission").record(pending_before as f64);
         let dynamic_high_water = effective_high_water(base_high_water, credit_probe_enabled);
         let dynamic_credit_limit =
             effective_credit_limit(base_high_water, target_pending, credit_probe_enabled);
@@ -726,6 +777,7 @@ where
         if pending_before >= dynamic_high_water
             && (!credit_probe_enabled || leased_credit_remaining == 0)
         {
+            metrics::counter!("n42_ingest_batches_total", "outcome" => "hard_gate").increment(1);
             if !hard_gate_logged {
                 info!(
                     target: "n42::ingest",
@@ -753,6 +805,7 @@ where
         hard_gate_logged = false;
 
         if extended_ack_enabled && take_limit == 0 {
+            metrics::counter!("n42_ingest_batches_total", "outcome" => "soft_gate").increment(1);
             stats.soft_gated.fetch_add(1, Ordering::Relaxed);
             if !soft_gate_logged {
                 info!(
@@ -781,9 +834,11 @@ where
         soft_gate_logged = false;
 
         // Decode only the prefix that the current credit window can consume.
+        let decode_start = Instant::now();
         let mut pooled_txs = Vec::with_capacity(take_limit);
         let mut batch_decode_errors = 0u64;
-        for (tx_bytes, sender) in raw_txs.iter().take(take_limit) {
+        for (range, sender) in raw_txs.iter().take(take_limit) {
+            let tx_bytes = &batch_data[range.clone()];
             let tx: TransactionSigned =
                 match alloy_eips::eip2718::Decodable2718::decode_2718(&mut &tx_bytes[..]) {
                     Ok(tx) => tx,
@@ -806,12 +861,27 @@ where
                 .fetch_add(batch_decode_errors, Ordering::Relaxed);
         }
 
+        metrics::histogram!("n42_ingest_batch_duration_ms", "phase" => "decode")
+            .record(decode_start.elapsed().as_secs_f64() * 1_000.0);
+
         // Trusted direct pool submission path.
+        let admission_start = Instant::now();
         let batch_size = pooled_txs.len();
         let results = pool.add_prevalidated(pooled_txs);
+        metrics::histogram!("n42_ingest_batch_duration_ms", "phase" => "pool_admission")
+            .record(admission_start.elapsed().as_secs_f64() * 1_000.0);
+        metrics::counter!("n42_ingest_batches_total", "outcome" => "submitted").increment(1);
         let accepted = results.iter().filter(|r| r.is_ok()).count();
         let pool_errors = batch_size - accepted;
         let consumed = take_limit;
+        metrics::counter!("n42_ingest_transactions_total", "outcome" => "accepted")
+            .increment(accepted as u64);
+        metrics::counter!("n42_ingest_transactions_total", "outcome" => "decode_error")
+            .increment(batch_decode_errors);
+        metrics::counter!("n42_ingest_transactions_total", "outcome" => "pool_error")
+            .increment(pool_errors as u64);
+        metrics::counter!("n42_ingest_transactions_total", "outcome" => "deferred")
+            .increment((num_txs - consumed) as u64);
 
         stats.accepted.fetch_add(accepted as u64, Ordering::Relaxed);
         if pool_errors > 0 {
@@ -848,6 +918,81 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_virtual_credit_cannot_be_reused() {
+        for (until_ms, now_ms) in [(0, 0), (99, 100)] {
+            let mut state = VirtualBlockCreditState {
+                available_txs: 42,
+                until_ms,
+            };
+            reset_expired_virtual_block_credit(&mut state, now_ms);
+            assert_eq!(state.available_txs, 0);
+            assert_eq!(state.until_ms, 0);
+        }
+    }
+
+    #[test]
+    fn virtual_credit_remains_available_through_its_deadline() {
+        let mut state = VirtualBlockCreditState {
+            available_txs: 42,
+            until_ms: 100,
+        };
+        for now_ms in [99, 100] {
+            reset_expired_virtual_block_credit(&mut state, now_ms);
+            assert_eq!(state.available_txs, 42);
+            assert_eq!(state.until_ms, 100);
+        }
+    }
+
+    #[test]
+    fn pool_credit_saturates_when_pending_reaches_or_exceeds_the_limit() {
+        for (limit, pending, expected) in [
+            (10, 0, 10),
+            (10, 9, 1),
+            (10, 10, 0),
+            (10, 11, 0),
+            (0, usize::MAX, 0),
+        ] {
+            assert_eq!(credit_available(limit, pending), expected);
+        }
+    }
+
+    #[test]
+    fn legacy_credit_mode_preserves_the_soft_pending_target() {
+        assert_eq!(effective_high_water(90_000, false), 90_000);
+        assert_eq!(effective_credit_limit(90_000, 82_000, false), 82_000);
+    }
+
+    #[test]
+    fn ingest_header_classification_preserves_control_frames_and_caps_batches() {
+        assert_eq!(classify_ingest_header(0), IngestFrameHeader::Close);
+        assert_eq!(
+            classify_ingest_header(CREDIT_WAIT_SENTINEL),
+            IngestFrameHeader::CreditProbe
+        );
+        assert_eq!(
+            classify_ingest_header(MAX_INGEST_BATCH_TXS as u32),
+            IngestFrameHeader::Batch(MAX_INGEST_BATCH_TXS)
+        );
+        assert_eq!(
+            classify_ingest_header(MAX_INGEST_BATCH_TXS as u32 + 1),
+            IngestFrameHeader::Oversized
+        );
+    }
+
+    #[test]
+    fn credit_probe_grant_is_bounded_by_pool_headroom_and_pending() {
+        // Base pool credit is always available below the base high-water mark.
+        assert_eq!(credit_probe_allowance(10, 4, 20, 6), (16, 16, 12));
+        // Above the base mark, only the unused virtual lease is granted.
+        assert_eq!(credit_probe_allowance(10, 13, 20, 6), (16, 16, 3));
+        // The virtual lease cannot raise the dynamic mark beyond the pool cap.
+        assert_eq!(credit_probe_allowance(10, 9, 12, 50), (12, 12, 3));
+        // At or beyond the dynamic high-water mark no credit is granted.
+        assert_eq!(credit_probe_allowance(10, 12, 12, 50), (12, 12, 0));
+        assert_eq!(credit_probe_allowance(10, 13, 12, 50), (12, 12, 0));
+    }
 
     /// Pool stub: the oversized-header test never reaches a pool call, so the
     /// methods only have to exist.

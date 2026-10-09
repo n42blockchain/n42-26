@@ -1,0 +1,18 @@
+[
+  {
+    "reads": 1,
+    "version": "baseline",
+    "count": 18,
+    "median_ms": 450.23,
+    "min_ms": 423.166,
+    "max_ms": 526.518
+  },
+  {
+    "reads": 1,
+    "version": "optimized",
+    "count": 18,
+    "median_ms": 236.6635,
+    "min_ms": 212.812,
+    "max_ms": 320.841
+  }
+]

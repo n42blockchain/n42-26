@@ -1,0 +1,15 @@
+[package]
+name = "n42-qmdb-readbench"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+[lib]
+path = "lib.rs"
+[dependencies]
+n42-twig-core = { path = "/home/n42/src/n42/n42-26/crates/n42-twig-core" }
+alloy-primitives = "=1.6.1"
+reth-primitives-traits = "=0.6.0"
+imbl = "=7.0.1"
+thiserror = "=2.0.19"
+[profile.release]
+lto = "thin"

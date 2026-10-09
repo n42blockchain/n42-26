@@ -49,7 +49,7 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 
 - **HotStuff-2 Consensus**: 2-round optimistic commit with 3-round timeout recovery
 - **BLS12-381 Signatures**: Aggregated signatures for compact quorum certificates
-- **reth v2.4.1 Integration**: Uses `n42blockchain/reth` commit `23316e3ff` from `chore/reth-upstream-20260804`, plus the checked-in transaction-root cache patch; aligned with Alloy 2.3.0 / REVM 42.0.1. LLVM JIT remains explicit opt-in.
+- **reth v2.7.0 Integration**: Uses upstream commit `3d592ece6de8c4559987416a544fc215fd6d6921` plus the six checked-in N42 integration patches; aligned with Alloy 2.5.0 / REVM 43.0.3. LLVM JIT remains explicit opt-in.
 - **Reserve SBMT Path**: `N42_JMT=1` explicitly selects the legacy-compatible 16-shard sparse binary backend and RPC surface
 - **Compact Block Propagation**: Leader caches execution output; the default follower path skips duplicate EVM execution (cache hit ~3ms)
 - **QMDB Binary Twig Backend**: The QMDB-style 16-shard binary twig tree is the default N42 state-proof backend (`N42_TWIG` defaults on)
@@ -186,7 +186,60 @@ Rewards are injected as `Withdrawal` entries in `PayloadAttributes` — no trans
 
 ## Performance Benchmarks
 
-### TPS Records (7 nodes, LAN, Apple Silicon)
+### Latest seven-node records and four-node plan
+
+The latest controlled N42-26 record is **170,546.56 committed TPS over
+60.001068 seconds** (10,232,976 transactions, round53, Linux). This run enabled
+trusted-ingest signature bypass and deferred state-root benchmark options;
+it does not establish throughput with QMDB-only execution reads and full validation.
+The native chain-94 seven-node fleet separately passed startup, commitment and
+restart checks on an authenticated QMDB snapshot, with an empty transaction workload.
+
+See the [original round53 report](docs/devlog-141-one-minute-rerun-20260901.md)
+and the [reuse plan and upstream record comparison](docs/devlog-165-fleet-records-and-reuse-plan-20260914.md).
+The first execution adaptation is available behind `N42_FAST_TRANSFER=1`:
+eligible Cancun/Prague/Osaka plain transfers use the existing N42 EVM factory's fast
+transition, with other transactions retaining the interpreter. QMDB-only
+consecutive-block and full-state differential checks are described in the
+[fast-transfer implementation notes](docs/devlog-166-fast-transfer-adaptation-20260914.md).
+The parallel transfer block adapter now preserves system calls, receipts, withdrawals
+and complete revert records, with consecutive QMDB-only commit/restart checks.
+`N42_PARALLEL_BUILD=1` now enables a parallel prefix in the online payload builder,
+followed by the standard serial tail and complete synchronous root calculation.
+`N42_PARALLEL_IMPORT=1` now enables complete eligible transfer batches in the
+production Engine import loop and BasicBlockExecutor. Imports retain recovered
+signatures, sealed order, indexed receipts, complete state notifications, QMDB root
+validation and rollback records; other blocks fall back to serial execution.
+See the [follower integration](docs/devlog-170-parallel-engine-import-20260914.md), the
+[parallel execution adaptation](docs/devlog-167-parallel-transfer-adaptation-20260914.md)
+and [online builder integration](docs/devlog-168-parallel-payload-builder-20260914.md).
+The default Cancun chain is now eligible; production QMDB-only provider reads and
+native candidate-root preparation are covered by the
+[Cancun integration checks](docs/devlog-169-cancun-parallel-qmdb-20260914.md).
+A fresh four-validator native H2/QMDB genesis can now be generated with
+`n42-native-fleet`; the existing fleet lifecycle supports its authenticated inputs.
+See the [four-node bootstrap notes](docs/devlog-171-native-four-node-genesis-20260914.md)
+for the first-block fork fix and actual startup evidence. The
+[independent-recipient workload](docs/devlog-172-independent-recipient-workload-20260914.md)
+now uses bounded signing workers and atomic file publication; a generated 220k-transaction
+startup file passed full signature/nonce/distribution checks. A subsequent
+[native Engine and full-size workload check](docs/devlog-173-native-engine-and-minute-workload-20260914.md)
+found and fixed account-major publication and the launcher's inherited 5K pool limit.
+The interleaved 72M file passes complete framing and a 220k signature/distribution audit;
+the native first-block payload path passes Debug and Release Engine integration tests.
+Qualification rejects wrong-chain or undersized workloads before contacting nodes.
+Full four-node execution remains unmeasured. TCP/UDP binding is now available;
+heavy work is paused pending shared-hardware coordination with the Claude n42-rs
+and n42-gov5 sessions. Shared claim writes and host-wide process visibility are
+not available in the current sandbox; see the
+[coordination status and A/B procedure](docs/devlog-174-shared-box-coordination-20260915.md).
+The [latest upstream payload audit](docs/devlog-175-upstream-payload-count-audit-20260915.md)
+checks n42-rs's own-block transaction-list fix against this project's complete-payload
+Engine path and records the still-unresolved upstream handover stalls.
+The 3.27M average / 13.33M peak batch-transfer experiment omits EVM execution,
+receipts, state roots and canonical persistence; it is not full-chain TPS.
+
+### Earlier TPS records (seven-node experiments; see each report for hardware and scope)
 
 | Mode | TPS | Block Cap | Notes |
 |------|----:|----------:|-------|
@@ -230,22 +283,131 @@ Both configurations are well within the **8-second slot target**.
 ### Prerequisites
 
 - Rust 1.97+ (development and CI are pinned to Rust 1.97.1)
-- N42 `reth` 2.4.1 fork checked out at `../reth` (`23316e3ff8ad`), with the patch below applied
+- N42 `reth` v2.7.0 source checked out at `../reth` (`3d592ece6de8c4559987416a544fc215fd6d6921`), with the pinned N42 patch set applied
 - Android local builds: JDK 17 recommended for Gradle/Kotlin
 - SP1 toolchain v4.2.1 (optional, for ZK proof guest build): `curl -L https://sp1up.succinct.xyz | bash && sp1up --version v4.2.1`
 
 ### Prepare `reth`
 
 ```bash
-git clone https://github.com/n42blockchain/reth.git ../reth
-git -C ../reth checkout 23316e3ff8adca8c3bd5085ff0565fcae019202a
+git clone https://github.com/paradigmxyz/reth.git ../reth
+git -C ../reth checkout 3d592ece6de8c4559987416a544fc215fd6d6921
 bash scripts/apply-reth-patches.sh ../reth
+bash scripts/check-reth-source.sh ../reth
 ```
 
-The patch supplies the transaction-root cache APIs used by `n42-node` and
-records the root when reth builds a payload. CI and Docker apply this same patch
-before compiling. Re-running the script on an already patched checkout is safe;
-an incompatible checkout fails before building.
+The patch series restores N42's QMDB provider integration, execution cache,
+transaction-root reuse, import batching and state-root job accessors. The adapted
+source identity is recorded in [`reth-source.lock`](reth-source.lock). CI and
+Docker apply the same patch set.
+Re-running the script on an already patched checkout is safe; an incompatible
+checkout fails before any missing patch is applied.
+
+On an authenticated Gov5 QMDB execution configuration, `N42_QMDB_READS=verify`
+compares account/storage reads with the matching reth provider and rejects a
+mismatch. `on` answers available versions from QMDB and counts unavailable
+fallbacks; `only` rejects unavailable versions. The default is `off` while fleet
+qualification is pending. Views are pinned by block hash and published after
+root validation and WAL durability. This currently covers the exact-block
+provider path used by the payload builder and engine; latest/pending RPC paths
+are not yet fully migrated. Do not disable the original state table writes.
+
+The derived read index uses 64 shards and at most eight dedicated build workers;
+small updates stay sequential. Values up to 32 bytes, including storage words,
+are stored inline. Provider
+views are retained by LRU, with limits of 64 versions and 512 MiB of logical
+key/value bytes, charging shared versions in full. This is not an RSS limit:
+active providers retain their pinned views, allocator overhead is additional,
+and one oversized most recent view is kept to avoid repeated full rebuilds.
+Inspect `n42_qmdb_read_cache_logical_bytes`, `n42_qmdb_read_cache_over_budget_bytes`
+and `n42_qmdb_read_view_build_ms` along with process RSS during qualification.
+
+QMDB undo retention is capped at 8,192 records and 256 MiB of charged vector/value
+capacity; the newest oversized record is retained for rollback. Historical
+branches outside the available undo/leaf-heap window rebuild from the authenticated
+base. Persistent stores create a separate `<checkpoint>.replay.base.qmdb` anchor
+on open, while memory-only stores retain a base-tree copy. The anchor is separate
+from the rolling checkpoint and is checked against the original base hash/root
+on load. Monitor `n42_qmdb_undo_heap_bytes`, `n42_qmdb_undo_over_budget_bytes` and
+`n42_qmdb_replay_base_load_ms`. This does not bound total RSS: block metadata still
+grows, and a cold replay loads a base tree before replacing the current one.
+See [the retention notes](docs/devlog-152-qmdb-undo-budget-20260914.md).
+Restart validation uses the same bounded undo and base replay path. Checkpoints
+and WAL records are read incrementally, avoiding a complete encoded-file copy. See
+[the recovery notes](docs/devlog-153-qmdb-streaming-recovery-20260914.md).
+Persistent stores retain at most 128 MiB of charged decoded operation capacity
+after each durable commit. Older operations are read from validated WAL locations;
+eviction happens only after successful synchronization. Legacy checkpoint records
+gain durable WAL locations on open. Memory-only stores retain their sole copy,
+and pending commits, cold decode buffers, legacy checkpoint loading, metadata,
+and WAL growth are outside this budget. Monitor
+`n42_qmdb_operations_resident_bytes`, `n42_qmdb_operations_over_budget_bytes`,
+and `n42_qmdb_cold_operations_read_ms`. See
+[the cold-operation notes](docs/devlog-154-qmdb-cold-operations-20260914.md).
+
+`n42_stateReadStatus([blockHashOrNull])` reports the registered adapter's mode,
+chain identity, process instance, local validator public key, and monotonic
+account/storage read and error counters. Supplying a block hash also returns
+its known durable QMDB root; unknown or still-pending blocks have no root.
+The counters are process-local and independent of the Prometheus recorder.
+
+`scripts/qualify-1m-tps.sh` requires four distinct active validator processes
+with `N42_QMDB_READS=only` and persistent QMDB stores before loading the workload.
+Every node must show account reads and pinned providers during the window,
+with no QMDB errors, unavailable versions, counter resets, or identity changes.
+Its QMDB root must match its H2-committed execution block. The default threshold
+is 1,000,000 successful common committed transactions per second. The audit
+fetches exact native headers and receipts from every node, recomputes header
+hashes, checks transaction/log identity and gas accounting, and recomputes the
+Gov5 receipt root before counting success. Inclusion TPS remains a diagnostic field; failures return
+nonzero. Build `cargo build --release --bin n42-keccak --bin n42-verify-commit`
+before qualification, or set `N42_KECCAK_BIN` and `N42_COMMIT_VERIFY_BIN`.
+Set `N42_BENCH_TRUSTED_CONFIG` to an operator-authenticated JSON file containing
+the static H2-v4 chain identity, four ordered validator public keys and f=1.
+The script freezes this input before observations; it never derives trust from RPC.
+Header/receipt support and commit certificates are checked before load.
+`n42_nativeHeader(blockHash)` serves exact bytes from the existing 8,192-header
+registry; unavailable headers fail qualification. It does not reconstruct
+lossy headers from standard RPC fields or provide a persistent archive.
+Evidence is saved in `h2-audit.json` and `summary.tsv`. Boundary BLS commit
+certificates are verified against the supplied trust configuration, and native
+parent chains connect their actual signed blocks to the common measured interval.
+These reports do not authenticate the operator's trust source, verify transaction
+trie roots, independently replay EVM execution, cover all state-read paths, or
+establish hardware durability. See
+[the H2-v4 qualification notes and trust-file format](docs/devlog-160-h2-trusted-qc-gate-20260914.md).
+
+`n42_consensusStatus` also exports `commitQc` (view, block hash, signature and
+explicit signer bits) from the same QC snapshot as its existing status fields.
+The standalone `n42-verify-commit` binary checks the commit signing domain against
+caller-authenticated profile, chain/changes context, validator keys and fault
+tolerance. Schema 5 qualification requires H2-v4 certificate verification; older
+boundaries and diagnostic Native/Gov5 legacy profiles cannot satisfy this gate. See
+[the commit verifier notes](docs/devlog-159-h2-commit-verifier-20260914.md).
+
+The QMDB leaf tree now deduplicates dirty twig marking with membership bits and
+reuses its work buffer to fold shared upper ancestors once. The measured account
+update workload improves by 5.2–5.7%; this is not whole-node TPS. Empty-tree
+rollback also invalidates stale upper caches before refilling. See
+[the dirty-twig comparison and regression evidence](docs/devlog-161-qmdb-dirty-twigs-20260914.md).
+
+Gov5 normalization can retain one bounded QMDB candidate calculation. Import
+still executes the payload and must match the exact parent and full operations
+before reusing the applied tree; root checks, read-view publication and WAL sync
+remain mandatory. The measured local candidate-plus-durable-commit path improves
+by 46–47%, with no claim about fleet hit rate or whole-node TPS. See
+[the prepared-candidate checks and persistent comparison](docs/devlog-162-qmdb-prepared-candidate-20260914.md).
+
+Profiling now separates immutable read-view construction from WAL encoding and
+sync. Alternative indexes and larger shard counts exposed update/read tradeoffs,
+so the production reader remains unchanged. See
+[the read-cost measurements and rejected alternatives](docs/devlog-163-qmdb-read-cost-20260914.md).
+
+Large QMDB imports with a cached exact parent can now derive the immutable read
+view while the committing thread computes the binary root. Both finish before
+root validation and durable publication; unavailable workers or parents use
+the sequential path. Prepared candidate hits stay sequential. See
+[the concurrency checks and durable comparison](docs/devlog-164-qmdb-overlap-20260914.md).
 
 ### Build
 
@@ -266,12 +428,13 @@ JAVA_HOME=$(/usr/libexec/java_home -v 17) \
 
 ```bash
 git -C ../reth fetch origin
-git -C ../reth checkout 23316e3ff8adca8c3bd5085ff0565fcae019202a
+git -C ../reth checkout 3d592ece6de8c4559987416a544fc215fd6d6921
 bash scripts/apply-reth-patches.sh ../reth
+bash scripts/check-reth-source.sh ../reth
 ```
 
-When upgrading the baseline, update the CI refs and validate the patch and
-`Cargo.lock` together before changing this commit.
+When upgrading the baseline, update `reth-source.lock`, the patch series, CI
+refs and `Cargo.lock` together.
 
 ### Run
 
@@ -335,6 +498,18 @@ cargo test -p n42-jmt
 cargo test -p n42-zkproof
 cargo test -p n42-node
 ```
+
+### Workspace coverage
+
+```bash
+rustup component add llvm-tools-preview
+python3 scripts/workspace-coverage.py
+```
+
+The coverage CI requires at least **70% aggregate Rust source line coverage** and
+passing workspace tests. Reports include inline test modules and all production
+crate/bin sources for the default host features. See
+[coverage scope, prerequisites, and reports](docs/testing-coverage.md).
 
 ### Real-bin E2E and LAN test lanes
 

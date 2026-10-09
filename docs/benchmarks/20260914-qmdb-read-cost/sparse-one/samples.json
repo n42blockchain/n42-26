@@ -1,0 +1,230 @@
+[
+  {
+    "keys": 200000,
+    "pair": 0,
+    "version": "qmdb",
+    "initialize_ms": 38.684,
+    "derive_ms": 0.011,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 256.863,
+        "per_second": 3893119
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 27.884,
+        "per_second": 35862491
+      }
+    }
+  },
+  {
+    "keys": 200000,
+    "pair": 0,
+    "version": "hash4096",
+    "initialize_ms": 56.281,
+    "derive_ms": 0.068,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 242.629,
+        "per_second": 4121517
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 26.87,
+        "per_second": 37216632
+      }
+    }
+  },
+  {
+    "keys": 200000,
+    "pair": 1,
+    "version": "hash4096",
+    "initialize_ms": 45.574,
+    "derive_ms": 0.06,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 244.779,
+        "per_second": 4085325
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 26.948,
+        "per_second": 37108041
+      }
+    }
+  },
+  {
+    "keys": 200000,
+    "pair": 1,
+    "version": "qmdb",
+    "initialize_ms": 41.8,
+    "derive_ms": 0.011,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 238.958,
+        "per_second": 4184845
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 28.071,
+        "per_second": 35623805
+      }
+    }
+  },
+  {
+    "keys": 200000,
+    "pair": 2,
+    "version": "qmdb",
+    "initialize_ms": 36.536,
+    "derive_ms": 0.011,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 243.093,
+        "per_second": 4113644
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 27.836,
+        "per_second": 35925015
+      }
+    }
+  },
+  {
+    "keys": 200000,
+    "pair": 2,
+    "version": "hash4096",
+    "initialize_ms": 50.524,
+    "derive_ms": 0.058,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 240.054,
+        "per_second": 4165736
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 27.217,
+        "per_second": 36742205
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 0,
+    "version": "qmdb",
+    "initialize_ms": 334.809,
+    "derive_ms": 0.014,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 469.421,
+        "per_second": 2130283
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 37.441,
+        "per_second": 26708781
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 0,
+    "version": "hash4096",
+    "initialize_ms": 178.473,
+    "derive_ms": 0.098,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 400.806,
+        "per_second": 2494971
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 34.839,
+        "per_second": 28703688
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 1,
+    "version": "hash4096",
+    "initialize_ms": 172.182,
+    "derive_ms": 0.102,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 398.802,
+        "per_second": 2507508
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 34.205,
+        "per_second": 29235706
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 1,
+    "version": "qmdb",
+    "initialize_ms": 340.96,
+    "derive_ms": 0.014,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 468.319,
+        "per_second": 2135297
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 37.068,
+        "per_second": 26977535
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 2,
+    "version": "qmdb",
+    "initialize_ms": 351.858,
+    "derive_ms": 0.012,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 483.338,
+        "per_second": 2068943
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 38.733,
+        "per_second": 25817545
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 2,
+    "version": "hash4096",
+    "initialize_ms": 171.632,
+    "derive_ms": 0.103,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 401.44,
+        "per_second": 2491030
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 34.03,
+        "per_second": 29385941
+      }
+    }
+  }
+]

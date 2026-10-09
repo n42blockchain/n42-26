@@ -1,0 +1,10 @@
+
+running 1 test
+test hash4096_read_view::tests::bench_immutable_read_views ... read_view keys=200000 initialize_ms=50.474
+read_view updates=147000 derive_ms=39.884
+read_view threads=1 reads=1000000 elapsed_ms=263.085 reads_per_second=3801046
+read_view threads=16 reads=1000000 elapsed_ms=27.934 reads_per_second=35798903
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 0.65s
+

@@ -1,0 +1,66 @@
+[
+  {
+    "accounts": 200000,
+    "samples": 9,
+    "metrics": {
+      "executionMs": {
+        "median": 188.99434200000002,
+        "minimum": 185.58566000000002,
+        "maximum": 196.416625
+      },
+      "deltaMs": {
+        "median": 22.058081,
+        "minimum": 21.889581000000003,
+        "maximum": 22.609091000000003
+      },
+      "commitMs": {
+        "median": 61.334219000000004,
+        "minimum": 59.269728,
+        "maximum": 166.944141
+      },
+      "totalMs": {
+        "median": 274.591033,
+        "minimum": 267.207519,
+        "maximum": 385.251597
+      },
+      "recoveryMsExcluded": {
+        "median": 1511.596242,
+        "minimum": 1501.0384669999999,
+        "maximum": 1548.3457999999998
+      }
+    },
+    "local_successful_execution_and_commit_per_second": 174811.9969616774
+  },
+  {
+    "accounts": 2000000,
+    "samples": 9,
+    "metrics": {
+      "executionMs": {
+        "median": 198.846617,
+        "minimum": 190.672723,
+        "maximum": 209.644201
+      },
+      "deltaMs": {
+        "median": 22.187951,
+        "minimum": 22.054081,
+        "maximum": 24.806812
+      },
+      "commitMs": {
+        "median": 116.591326,
+        "minimum": 99.059748,
+        "maximum": 189.452542
+      },
+      "totalMs": {
+        "median": 342.582376,
+        "minimum": 319.69235499999996,
+        "maximum": 410.478929
+      },
+      "recoveryMsExcluded": {
+        "median": 1516.888655,
+        "minimum": 1507.574441,
+        "maximum": 1530.7033809999998
+      }
+    },
+    "local_successful_execution_and_commit_per_second": 144388.94917573163
+  }
+]

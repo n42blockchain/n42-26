@@ -1,0 +1,31 @@
+[package]
+name = "n42-tx-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "N42 native Ed25519 transactions, blocks, receipts and authenticated frames"
+
+[dependencies]
+alloy-evm = { version = "0.39.0", default-features = false }
+revm = { version = "43.0.3", default-features = false, features = ["std", "serde"] }
+alloy-consensus = { version = "2.5.0", default-features = false, features = ["std", "serde", "secp256k1"] }
+alloy-eips = { version = "2.5.0", default-features = false, features = ["std", "serde"] }
+alloy-primitives = { workspace = true, features = ["std", "serde", "rlp"] }
+alloy-rlp.workspace = true
+alloy-serde = { version = "2.5.0", default-features = false }
+reth-primitives-traits = { version = "0.8.2", default-features = false, features = ["std", "serde", "reth-codec"] }
+reth-ethereum-primitives = { workspace = true, features = ["std", "serde", "reth-codec"] }
+reth-codecs = { version = "0.8.2", default-features = false, features = ["std", "alloy"] }
+ed25519-dalek = { version = "3.0", default-features = false, features = ["fast", "batch", "zeroize"] }
+curve25519-dalek = { version = "5.0", default-features = false, features = ["alloc", "zeroize", "precomputed-tables"] }
+merlin = { version = "3", default-features = false }
+rand_core = { version = "0.6", default-features = false }
+sha2.workspace = true
+serde = { workspace = true, features = ["derive"] }
+bytes.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+hex.workspace = true

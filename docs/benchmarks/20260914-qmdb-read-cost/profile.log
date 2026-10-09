@@ -1,0 +1,50 @@
+
+running 1 test
+test store::tests::bench_persistent_commit_path ... phase generation=2 name=n42_qmdb_read_view_build_ms labels=operation=restore value=332.244877
+phase generation=2 name=n42_qmdb_lock_wait_ms labels=operation=prepare value=0.000180
+phase generation=2 name=n42_qmdb_candidate_compute_ms labels=operation=prepare value=76.286780
+phase generation=2 name=n42_qmdb_lock_hold_ms labels=operation=prepare value=76.288110
+phase generation=2 name=n42_qmdb_lock_wait_ms labels=operation=commit value=0.000110
+phase generation=2 name=n42_qmdb_operations_per_block labels= value=147000.000000
+phase generation=2 name=n42_qmdb_candidate_compute_ms labels=operation=commit value=5.535302
+phase generation=2 name=n42_qmdb_read_view_build_ms labels=operation=commit value=116.700150
+phase generation=2 name=n42_qmdb_read_view_updates labels= value=147000.000000
+phase generation=2 name=profile_wal_encoding_ms labels= value=8.276932
+phase generation=2 name=n42_qmdb_wal_fsync_ms labels= value=128.740804
+phase generation=2 name=n42_qmdb_wal_append_ms labels= value=184.968898
+phase generation=2 name=n42_qmdb_lock_hold_ms labels=operation=commit value=131.123405
+commit_bench reads=1 keys=2000000 updates=147000 generation=2 elapsed_ms=409.956 root=0x738e7bfd3d8357bd3cec19298b715cd83c9d1537f90a4d173ac6a613eb71bd1b wal_bytes=7056164
+prepare_bench mode=retain retained=true generation=2 candidate_ms=93.855 commit_ms=316.100
+phase generation=3 name=n42_qmdb_lock_wait_ms labels=operation=prepare value=0.000180
+phase generation=3 name=n42_qmdb_candidate_compute_ms labels=operation=prepare value=76.894430
+phase generation=3 name=n42_qmdb_lock_hold_ms labels=operation=prepare value=76.896570
+phase generation=3 name=n42_qmdb_lock_wait_ms labels=operation=commit value=0.000030
+phase generation=3 name=n42_qmdb_operations_per_block labels= value=147000.000000
+phase generation=3 name=n42_qmdb_candidate_compute_ms labels=operation=commit value=5.772772
+phase generation=3 name=n42_qmdb_read_view_build_ms labels=operation=commit value=113.496409
+phase generation=3 name=n42_qmdb_read_view_updates labels= value=147000.000000
+phase generation=3 name=profile_wal_encoding_ms labels= value=9.371593
+phase generation=3 name=n42_qmdb_wal_fsync_ms labels= value=8.537942
+phase generation=3 name=n42_qmdb_wal_append_ms labels= value=11.528383
+phase generation=3 name=n42_qmdb_lock_hold_ms labels=operation=commit value=129.207314
+commit_bench reads=1 keys=2000000 updates=147000 generation=3 elapsed_ms=235.589 root=0xe7946dbee3a37e6ea5da593679fc6893a8c0899551aafe2cd162fe57f4b1a8d6 wal_bytes=14112328
+prepare_bench mode=retain retained=true generation=3 candidate_ms=94.539 commit_ms=141.050
+phase generation=4 name=n42_qmdb_lock_wait_ms labels=operation=prepare value=0.000240
+phase generation=4 name=n42_qmdb_candidate_compute_ms labels=operation=prepare value=80.241411
+phase generation=4 name=n42_qmdb_lock_hold_ms labels=operation=prepare value=80.243471
+phase generation=4 name=n42_qmdb_lock_wait_ms labels=operation=commit value=0.000100
+phase generation=4 name=n42_qmdb_operations_per_block labels= value=147000.000000
+phase generation=4 name=n42_qmdb_candidate_compute_ms labels=operation=commit value=5.659642
+phase generation=4 name=n42_qmdb_read_view_build_ms labels=operation=commit value=103.413337
+phase generation=4 name=n42_qmdb_read_view_updates labels= value=147000.000000
+phase generation=4 name=profile_wal_encoding_ms labels= value=10.153273
+phase generation=4 name=n42_qmdb_wal_fsync_ms labels= value=9.900443
+phase generation=4 name=n42_qmdb_wal_append_ms labels= value=26.871567
+phase generation=4 name=n42_qmdb_lock_hold_ms labels=operation=commit value=119.794762
+commit_bench reads=1 keys=2000000 updates=147000 generation=4 elapsed_ms=244.592 root=0x58dc3632e9cb64993db337c8fdb8a7e243f2e3cbb2062de315f99182d4930b39 wal_bytes=21168492
+prepare_bench mode=retain retained=true generation=4 candidate_ms=97.918 commit_ms=146.673
+commit_bench restart_verified=true
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 6.78s
+

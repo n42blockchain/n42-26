@@ -1,0 +1,12 @@
+[package]
+name = "n42-twig-core-batch"
+version = "0.5.1"
+edition = "2024"
+[dependencies]
+blake3 = "1"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.19"
+rayon = { version = "1.10", optional = true }
+[features]
+default = []
+rayon = ["dep:rayon"]

@@ -1,0 +1,21 @@
+{
+  "scope": "Complete node dependency graph: large persistent history recovery, branch validation, streamed checkpoint/WAL decoding; no fleet or throughput measurement",
+  "tests": {
+    "node_passed": 48,
+    "node_ignored": 6,
+    "workspace_clippy": "passed"
+  },
+  "source_sha256": {
+    "qmdb_state_root.rs": "74fb213dd20de4b0201ea6c4b4997453591b6607b270d1e55b546cdb10a9283e"
+  },
+  "logs_sha256": {
+    "before.log": "7a46ac9758fe26d8ffe51acfe37a5f27f4f9897fa54a41fd5a4716bceaa77087",
+    "node-tests.log": "4e3d36a4d46fa46f3e371eb7d99f5f09e657d9c790c7a4186b0ae56f5868c4c5",
+    "workspace-clippy.log": "035078ef48b096e26f3e0fac9f260404a354acfea9d8f2842b8abe96dc68b86f"
+  },
+  "reth_baseline": "23316e3ff8adca8c3bd5085ff0565fcae019202a",
+  "upstream_refs": {
+    "n42-rs": "466c1839791afadba7f1dd4d48c5518440dcafba",
+    "gov5-cached-origin-main": "a8e353cac7a00c7f6ca2816cc8e4634c45a4f337"
+  }
+}

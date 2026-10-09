@@ -1,0 +1,10 @@
+
+running 1 test
+test qmdb_read_view::tests::bench_immutable_read_views ... read_view keys=200000 initialize_ms=41.933
+read_view updates=147000 derive_ms=38.141
+read_view threads=1 reads=1000000 elapsed_ms=230.194 reads_per_second=4344158
+read_view threads=16 reads=1000000 elapsed_ms=28.211 reads_per_second=35446717
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 0.65s
+

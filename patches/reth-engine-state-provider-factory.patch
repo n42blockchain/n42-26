@@ -1,0 +1,16 @@
+diff --git a/crates/engine/tree/src/tree/state_root_strategy/mod.rs b/crates/engine/tree/src/tree/state_root_strategy/mod.rs
+index 20f9bf5ef..29cad6b52 100644
+--- a/crates/engine/tree/src/tree/state_root_strategy/mod.rs
++++ b/crates/engine/tree/src/tree/state_root_strategy/mod.rs
+@@ -316,6 +316,11 @@ where
+         self.executor
+     }
+ 
++    /// Returns the state provider factory for the parent state, including its in-memory overlay.
++    pub fn state_provider_factory(&self) -> &OverlayStateProviderFactory<P, N> {
++        &self.state_provider_factory
++    }
++
+     /// Returns true when validation will use the parallel BAL execution path.
+     pub const fn parallel_bal_execution(&self) -> bool {
+         self.parallel_bal_execution

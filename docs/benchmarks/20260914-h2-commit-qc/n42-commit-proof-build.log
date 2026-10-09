@@ -1,0 +1,141 @@
+   Compiling smallvec v1.15.2
+   Compiling rand_chacha v0.9.0
+   Compiling rand v0.9.5
+   Compiling parking_lot_core v0.9.12
+   Compiling rand v0.8.7
+   Compiling ruint v1.20.0
+   Compiling secp256k1 v0.31.1
+   Compiling alloy-primitives v1.6.1
+   Compiling parking_lot v0.12.5
+   Compiling c-kzg v2.1.8
+   Compiling secp256k1 v0.30.0
+   Compiling alloy-eip7928 v0.4.5
+   Compiling alloy-eip7702 v0.6.3
+   Compiling alloy-eip2930 v0.2.3
+   Compiling revm-primitives v42.0.0
+   Compiling alloy-eip2124 v0.2.0
+   Compiling revm-bytecode v42.0.0
+   Compiling ethereum_serde_utils v0.8.1
+   Compiling revm-state v42.0.0
+   Compiling ethereum_ssz v0.10.4
+   Compiling alloy-serde v2.3.0
+   Compiling tinystr v0.8.3
+   Compiling nybbles v0.4.8
+   Compiling icu_locale_core v2.2.0
+   Compiling alloy-trie v0.9.5
+   Compiling alloy-eips v2.3.0
+   Compiling zerotrie v0.2.4
+   Compiling icu_collections v2.2.0
+   Compiling tokio v1.53.1
+   Compiling icu_provider v2.2.0
+   Compiling alloy-tx-macros v2.3.0
+   Compiling alloy-consensus v2.3.0
+   Compiling ark-std v0.6.0
+   Compiling ark-serialize v0.6.0
+   Compiling icu_properties v2.2.0
+   Compiling icu_normalizer v2.2.0
+   Compiling ark-ff v0.6.0
+   Compiling idna_adapter v1.2.2
+   Compiling revm-database-interface v42.0.0
+   Compiling idna v1.1.0
+   Compiling url v2.5.8
+   Compiling revm-context-interface v42.0.0
+   Compiling dashmap v6.2.1
+   Compiling ark-poly v0.6.0
+   Compiling alloy-sol-types v1.6.1
+   Compiling ark-ec v0.6.0
+   Compiling alloy-network-primitives v2.3.0
+   Compiling alloy-consensus-any v2.3.0
+   Compiling alloy-genesis v2.3.0
+   Compiling crypto-bigint v0.7.5
+   Compiling reth-codecs v0.6.0
+   Compiling alloy-rpc-types-eth v2.3.0
+   Compiling ark-bls12-381 v0.6.0
+   Compiling ark-bn254 v0.6.0
+   Compiling revm-context v42.0.0
+   Compiling revm-precompile v42.0.1
+   Compiling revm-interpreter v42.0.0
+   Compiling revm-handler v42.0.1
+   Compiling reth-primitives-traits v0.6.0
+   Compiling elliptic-curve v0.14.1
+   Compiling revm-inspector v42.0.1
+   Compiling revm-database v42.0.0
+   Compiling rfc6979 v0.6.0
+   Compiling primefield v0.14.0
+   Compiling primeorder v0.14.0
+   Compiling revm v42.0.1
+   Compiling ecdsa v0.17.0
+   Compiling alloy-chains v0.2.36
+   Compiling k256 v0.14.0
+   Compiling multistream-select v0.14.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-identity v0.3.0
+   Compiling alloy-hardforks v0.4.7
+   Compiling multiaddr v0.19.0
+   Compiling reth-trie-common v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/trie/common)
+   Compiling libp2p-core v0.44.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling alloy-evm v0.38.0
+   Compiling reth-ethereum-primitives v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/primitives)
+   Compiling reth-stages-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/stages/types)
+   Compiling libp2p-swarm v0.48.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling reth-static-file-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/static-file/types)
+   Compiling enr v0.13.0
+   Compiling reth-prune-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/prune/types)
+   Compiling tokio-util v0.7.19
+   Compiling reth-storage-errors v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/errors)
+   Compiling reth-network-peers v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/net/peers)
+   Compiling reth-ethereum-forks v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/hardforks)
+   Compiling netlink-sys v0.8.8
+   Compiling asn1-rs v0.7.2
+   Compiling netlink-proto v0.12.1
+   Compiling reth-chainspec v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/chainspec)
+   Compiling reth-execution-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/evm/execution-types)
+   Compiling rtnetlink v0.20.0
+   Compiling simple_asn1 v0.6.4
+   Compiling reth-metrics v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/metrics)
+   Compiling if-watch v3.2.2
+   Compiling jsonwebtoken v10.4.0
+   Compiling oid-registry v0.8.1
+   Compiling der-parser v10.0.0
+   Compiling reth-execution-errors v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/evm/execution-errors)
+   Compiling tokio-stream v0.1.19
+   Compiling reth-db-models v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/db-models)
+   Compiling x509-parser v0.18.1
+   Compiling reth-db-api v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/db-api)
+   Compiling reth-tokio-util v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/tokio-util)
+   Compiling alloy-rpc-types-engine v2.3.0
+   Compiling prefix-trie v0.8.4
+   Compiling yamux v0.14.0
+   Compiling libp2p-tls v0.7.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling reth-storage-api v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/storage-api)
+   Compiling hickory-proto v0.26.1
+   Compiling quinn v0.11.11
+   Compiling libp2p-gossipsub v0.50.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-mdns v0.49.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-noise v0.47.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling reth-trie-sparse v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/trie/sparse)
+   Compiling libp2p-quic v0.14.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-kad v0.49.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-yamux v0.48.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-request-response v0.30.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-identify v0.48.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-tcp v0.45.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-allow-block-list v0.7.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-connection-limits v0.7.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling n42-primitives v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-primitives)
+   Compiling libp2p v0.57.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling reth-trie v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/trie/trie)
+   Compiling reth-evm v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/evm/evm)
+   Compiling alloy-rpc-types-debug v2.3.0
+   Compiling reth-evm-ethereum v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/evm)
+   Compiling n42-chainspec v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-chainspec)
+   Compiling reth-revm v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/revm)
+   Compiling reth-consensus v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/consensus/consensus)
+   Compiling n42-parallel-evm v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-parallel-evm)
+   Compiling jmt v0.12.0
+   Compiling n42-execution v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-execution)
+   Compiling reth-libmdbx v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/libmdbx-rs)
+   Compiling reth-consensus-common v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/consensus/common)
+   Compiling n42-jmt v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-jmt)
+   Compiling reth-ethereum-consensus v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/consensus)
+   Compiling n42-consensus v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-consensus)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 34.72s

@@ -1,0 +1,34 @@
+[
+  {
+    "accounts": 200000,
+    "samples": 3,
+    "metrics": {
+      "executionMs": {
+        "median": 185.56396999999998,
+        "minimum": 185.28861999999998,
+        "maximum": 187.31773099999998
+      },
+      "deltaMs": {
+        "median": 21.876031,
+        "minimum": 21.839489999999998,
+        "maximum": 21.90648
+      },
+      "commitMs": {
+        "median": 61.71092,
+        "minimum": 58.286108000000006,
+        "maximum": 81.15167
+      },
+      "totalMs": {
+        "median": 269.151731,
+        "minimum": 267.444299,
+        "maximum": 288.34801999999996
+      },
+      "recoveryMsExcluded": {
+        "median": 1500.9349169999998,
+        "minimum": 1500.5576369999999,
+        "maximum": 1501.658877
+      }
+    },
+    "local_successful_execution_and_commit_per_second": 181830.51323298836
+  }
+]

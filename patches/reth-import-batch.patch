@@ -1,0 +1,256 @@
+diff --git a/crates/engine/tree/src/tree/mod.rs b/crates/engine/tree/src/tree/mod.rs
+index c2cb7dc1b..f77ae4941 100644
+--- a/crates/engine/tree/src/tree/mod.rs
++++ b/crates/engine/tree/src/tree/mod.rs
+@@ -121,7 +121,8 @@ pub struct EngineApiTreeState<N: NodePrimitives> {
+ }
+ 
+ impl<N: NodePrimitives> EngineApiTreeState<N> {
+-    fn new(
++    /// Creates Engine API tree state rooted at the canonical block.
++    pub fn new(
+         block_buffer_limit: u32,
+         max_invalid_header_cache_length: u32,
+         invalid_header_hit_eviction_threshold: u8,
+diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
+index 354ca3b30..1f805a451 100644
+--- a/crates/engine/tree/src/tree/payload_validator.rs
++++ b/crates/engine/tree/src/tree/payload_validator.rs
+@@ -1062,6 +1062,7 @@ where
+     {
+         debug!(target: "engine::tree::payload_validator", "Executing block");
+ 
++        let batch_env = self.evm_config.batch_import_enabled().then(|| env.evm_env.clone());
+         let has_bal = input.has_block_access_list();
+         let mut db = debug_span!(target: "engine::tree", "build_state_db").in_scope(|| {
+             State::builder()
+@@ -1110,14 +1111,61 @@ where
+         let execution_start = Instant::now();
+ 
+         // Execute all transactions and finalize
+-        let (executor, senders) = self.execute_transactions(
+-            executor,
+-            transaction_count,
+-            handle.iter_transactions(),
+-            &receipt_tx,
+-            &executed_tx_index,
+-            has_bal,
+-        )?;
++        let mut batch_finalize = None;
++        let (executor, senders) = if !has_bal && batch_env.is_some() {
++            // Collect once so a declined batch attempt can continue with the
++            // same recovered transactions in the ordinary ordered path.
++            let transactions = handle
++                .iter_transactions()
++                .collect::<Result<Vec<_>, _>>()
++                .map_err(BlockExecutionError::other)?;
++            let recovered: Vec<_> = transactions
++                .iter()
++                .map(|tx| {
++                    alloy_consensus::transaction::Recovered::new_unchecked(
++                        alloy_evm::RecoveredTx::tx(tx).clone(),
++                        *alloy_evm::RecoveredTx::signer(tx),
++                    )
++                })
++                .collect();
++            let pre_exec_start = Instant::now();
++            executor.apply_pre_execution_changes()?;
++            self.metrics.record_pre_execution(pre_exec_start.elapsed());
++            if let Some(finalize) = self.evm_config.try_execute_import_batch(
++                &mut executor,
++                batch_env.as_ref().expect("batch environment enabled"),
++                input.parent_hash(),
++                &recovered,
++            )? {
++                batch_finalize = Some(finalize);
++                let senders = recovered.iter().map(|tx| tx.signer()).collect();
++                for (index, receipt) in executor.receipts().iter().enumerate() {
++                    let _ = receipt_tx.send(IndexedReceipt::new(index, receipt.clone()));
++                }
++                executed_tx_index.store(transaction_count, Ordering::Relaxed);
++                (executor, senders)
++            } else {
++                self.execute_transactions(
++                    executor,
++                    transaction_count,
++                    transactions.into_iter().map(Ok::<_, Err>),
++                    &receipt_tx,
++                    &executed_tx_index,
++                    false,
++                    true,
++                )?
++            }
++        } else {
++            self.execute_transactions(
++                executor,
++                transaction_count,
++                handle.iter_transactions(),
++                &receipt_tx,
++                &executed_tx_index,
++                has_bal,
++                false,
++            )?
++        };
+         drop(receipt_tx);
+ 
+         // Finish execution and get the result
+@@ -1138,7 +1186,11 @@ where
+             alloy: revm_bal.clone().into_alloy_bal(),
+             revm: Arc::new(revm_bal),
+         });
+-        let output = BlockExecutionOutput { result, state: db.take_bundle() };
++        let mut state = db.take_bundle();
++        if let Some(finalize) = batch_finalize {
++            finalize(&mut state);
++        }
++        let output = BlockExecutionOutput { result, state };
+ 
+         let execution_duration = execution_start.elapsed();
+         self.metrics.record_block_execution(&output, execution_duration);
+@@ -1277,6 +1329,7 @@ where
+         receipt_tx: &crossbeam_channel::Sender<IndexedReceipt<N::Receipt>>,
+         executed_tx_index: &AtomicUsize,
+         has_bal: bool,
++        pre_execution_applied: bool,
+     ) -> Result<(E, Vec<Address>), BlockExecutionError>
+     where
+         E: BlockExecutor<Receipt = N::Receipt, Evm: alloy_evm::Evm<DB = &'a mut State<DB>>>,
+@@ -1288,10 +1341,12 @@ where
+         let mut senders = Vec::with_capacity(transaction_count);
+ 
+         // Apply pre-execution changes (e.g., beacon root update)
+-        let pre_exec_start = Instant::now();
+-        debug_span!(target: "engine::tree", "pre_execution")
+-            .in_scope(|| executor.apply_pre_execution_changes())?;
+-        self.metrics.record_pre_execution(pre_exec_start.elapsed());
++        if !pre_execution_applied {
++            let pre_exec_start = Instant::now();
++            debug_span!(target: "engine::tree", "pre_execution")
++                .in_scope(|| executor.apply_pre_execution_changes())?;
++            self.metrics.record_pre_execution(pre_exec_start.elapsed());
++        }
+ 
+         // Bump BAL index after pre-execution changes (EIP-7928: index 0 is pre-execution)
+         if has_bal {
+diff --git a/crates/evm/evm/src/execute.rs b/crates/evm/evm/src/execute.rs
+index 5edee39ea..e25f715be 100644
+--- a/crates/evm/evm/src/execute.rs
++++ b/crates/evm/evm/src/execute.rs
+@@ -611,22 +611,50 @@ where
+             executor.evm_mut().db_mut().bal_state.bal_builder = None;
+         }
+ 
+-        executor.apply_pre_execution_changes()?;
+-
+-        if has_bal {
+-            executor.evm_mut().db_mut().bump_bal_index();
++        let batch_enabled = !has_bal && self.strategy_factory.batch_import_enabled();
++        if batch_enabled {
++            executor.apply_pre_execution_changes()?;
+         }
+ 
+-        for tx in block.transactions_recovered() {
+-            executor.execute_transaction(tx)?;
++        let batch_finalize = if batch_enabled {
++            let env = self
++                .strategy_factory
++                .evm_env(block.header())
++                .map_err(BlockExecutionError::other)?;
++            let transactions = block.transactions_recovered().map(|tx| tx.cloned()).collect::<Vec<_>>();
++            self.strategy_factory.try_execute_import_batch(
++                &mut executor,
++                &env,
++                block.parent_hash(),
++                &transactions,
++            )?
++        } else {
++            None
++        };
++
++        if !batch_enabled || batch_finalize.is_none() {
++            if !batch_enabled {
++                executor.apply_pre_execution_changes()?;
++            }
++
+             if has_bal {
+                 executor.evm_mut().db_mut().bump_bal_index();
+             }
++
++            for tx in block.transactions_recovered() {
++                executor.execute_transaction(tx)?;
++                if has_bal {
++                    executor.evm_mut().db_mut().bump_bal_index();
++                }
++            }
+         }
+ 
+         let result = executor.apply_post_execution_changes()?;
+ 
+         self.db.merge_transitions(BundleRetention::Reverts);
++        if let Some(finalize) = batch_finalize {
++            finalize(&mut self.db.bundle_state);
++        }
+ 
+         Ok(result)
+     }
+@@ -639,18 +667,9 @@ where
+     where
+         H: OnStateHook + 'static,
+     {
+-        let mut executor = self
+-            .strategy_factory
+-            .executor_for_block(&mut self.db, block)
+-            .map_err(BlockExecutionError::other)?;
+-
+-        executor.evm_mut().db_mut().set_state_hook(Some(Box::new(state_hook)));
+-
+-        let result = executor.execute_block(block.transactions_recovered());
+-
++        self.db.set_state_hook(Some(Box::new(state_hook)));
++        let result = self.execute_one(block);
+         self.db.set_state_hook(None);
+-        self.db.merge_transitions(BundleRetention::Reverts);
+-
+         result
+     }
+ 
+diff --git a/crates/evm/evm/src/lib.rs b/crates/evm/evm/src/lib.rs
+index d86083947..755f536bd 100644
+--- a/crates/evm/evm/src/lib.rs
++++ b/crates/evm/evm/src/lib.rs
+@@ -351,6 +351,24 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
+         self.evm_factory().create_evm_with_inspector(db, evm_env, inspector)
+     }
+ 
++    /// Whether normal block import should offer a recovered transaction batch
++    /// to a chain-specific executor. This is disabled by default.
++    fn batch_import_enabled(&self) -> bool {
++        false
++    }
++
++    /// Attempts chain-specific batch execution. Returning `None` must leave
++    /// `executor` unchanged so the caller can use ordinary serial execution.
++    fn try_execute_import_batch<'a, DB: Database + 'a>(
++        &self,
++        _executor: &mut BlockExecutorForEvm<'a, Self, DB>,
++        _env: &EvmEnvFor<Self>,
++        _parent_hash: B256,
++        _transactions: &[alloy_consensus::transaction::Recovered<TxTy<Self::Primitives>>],
++    ) -> Result<Option<ImportBatchFinalize>, execute::BlockExecutionError> {
++        Ok(None)
++    }
++
+     /// Creates a strategy with given EVM and execution context.
+     fn create_executor<'a, DB, I>(
+         &'a self,
+@@ -504,6 +522,10 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
+     }
+ }
+ 
++/// Finalizes chain-specific bookkeeping after batch-import transitions merge.
++pub type ImportBatchFinalize =
++    alloc::boxed::Box<dyn FnOnce(&mut revm::database::BundleState) + Send + 'static>;
++
+ /// JIT backend controls exposed by an EVM configuration.
+ pub trait JitBackend: Send + Sync {
+     /// Enables or disables JIT compilation.

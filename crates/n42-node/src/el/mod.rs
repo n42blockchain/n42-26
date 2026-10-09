@@ -4,6 +4,7 @@
 //! [`RethExecutionLayer`] over reth's engine + payload-builder handles (Caplin
 //! EL-seam refactor, stage 6).
 
+mod import_gate;
 mod reth_engine;
 pub use reth_engine::RethExecutionLayer;
 

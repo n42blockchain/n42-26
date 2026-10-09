@@ -1,0 +1,16 @@
+{
+  "previousPath": "/tmp/n42-ci-repro-j5wu4xcf",
+  "newPhysicalPath": "/home/n42/src/n42/n42-26/.artifacts/ci-repro-j5wu4xcf",
+  "oldPathRetainedAsSymlink": true,
+  "selectedSourceSha256": {
+    "n42-26/Cargo.lock": "6b05f1626d4c76636c228131c89cab3214c0f6266cf7ed6d2af427bed03a8a2f",
+    "n42-26/bin/n42-stress/src/main.rs": "7a32dd488e5a928c57d8180f0b5bfa1bdba26d407a251ab560918ff286caf200",
+    "n42-26/crates/n42-node/tests/common/parallel_qmdb_builder.rs": "49c7778790b4a7f2e32ad682fb137213e8eb9030cab4d768ffb2847cb7816df8",
+    "reth/crates/engine/tree/src/tree/payload_validator.rs": "12868e1123101106287a5f401732938cfd965e5c7c0984499f0720b5331e0446"
+  },
+  "tmpUsedBeforeBytes": 37566316544,
+  "tmpUsedAfterBytes": 32493965312,
+  "netTmpUsageDecreaseBytes": 5072351232,
+  "elapsedSeconds": 6.156,
+  "scope": "relocated only this goal\u2019s clean build reproduction directory; no other session data changed"
+}

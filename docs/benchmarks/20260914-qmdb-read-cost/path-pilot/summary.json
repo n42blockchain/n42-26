@@ -1,0 +1,83 @@
+[
+  {
+    "keys": 2000000,
+    "version": "qmdb",
+    "count": 1,
+    "metrics": {
+      "initialize_ms": {
+        "median": 353.031,
+        "minimum": 353.031,
+        "maximum": 353.031
+      },
+      "derive_ms": {
+        "median": 102.497,
+        "minimum": 102.497,
+        "maximum": 102.497
+      },
+      "read_1_ms": {
+        "median": 476.314,
+        "minimum": 476.314,
+        "maximum": 476.314
+      },
+      "read_16_ms": {
+        "median": 38.801,
+        "minimum": 38.801,
+        "maximum": 38.801
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "version": "paths",
+    "count": 1,
+    "metrics": {
+      "initialize_ms": {
+        "median": 321.157,
+        "minimum": 321.157,
+        "maximum": 321.157
+      },
+      "derive_ms": {
+        "median": 98.664,
+        "minimum": 98.664,
+        "maximum": 98.664
+      },
+      "read_1_ms": {
+        "median": 481.331,
+        "minimum": 481.331,
+        "maximum": 481.331
+      },
+      "read_16_ms": {
+        "median": 39.892,
+        "minimum": 39.892,
+        "maximum": 39.892
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "version": "foldpaths",
+    "count": 1,
+    "metrics": {
+      "initialize_ms": {
+        "median": 362.427,
+        "minimum": 362.427,
+        "maximum": 362.427
+      },
+      "derive_ms": {
+        "median": 115.497,
+        "minimum": 115.497,
+        "maximum": 115.497
+      },
+      "read_1_ms": {
+        "median": 471.047,
+        "minimum": 471.047,
+        "maximum": 471.047
+      },
+      "read_16_ms": {
+        "median": 37.953,
+        "minimum": 37.953,
+        "maximum": 37.953
+      }
+    }
+  }
+]

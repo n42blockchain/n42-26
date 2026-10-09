@@ -8,8 +8,7 @@ use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_ethereum_engine_primitives::{EthBuiltPayload, EthPayloadAttributes};
 use reth_ethereum_payload_builder::{EthereumBuilderConfig, default_ethereum_payload};
 use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
-use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
-use reth_node_api::{FullNodeTypes, NodeTypes, PrimitivesTy, TxTy};
+use reth_node_api::{FullNodeTypes, NodeTypes, TxTy};
 use reth_node_builder::{
     BuilderContext, PayloadBuilderConfig, PayloadTypes, components::PayloadBuilderBuilder,
 };
@@ -402,25 +401,24 @@ impl N42PayloadBuilder {
     }
 }
 
-impl<Types, Node, Pool, Evm> PayloadBuilderBuilder<Node, Pool, Evm> for N42PayloadBuilder
+impl<Types, Node, Pool> PayloadBuilderBuilder<Node, Pool, n42_execution::N42EvmConfig>
+    for N42PayloadBuilder
 where
     Types: NodeTypes<ChainSpec: EthereumHardforks, Primitives = EthPrimitives>,
     Node: FullNodeTypes<Types = Types>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
         + Unpin
         + 'static,
-    Evm: ConfigureEvm<Primitives = PrimitivesTy<Types>, NextBlockEnvCtx = NextBlockEnvAttributes>
-        + 'static,
     Types::Payload:
         PayloadTypes<BuiltPayload = EthBuiltPayload, PayloadAttributes = EthPayloadAttributes>,
 {
-    type PayloadBuilder = N42InnerPayloadBuilder<Pool, Node::Provider, Evm>;
+    type PayloadBuilder = N42InnerPayloadBuilder<Pool, Node::Provider, n42_execution::N42EvmConfig>;
 
     async fn build_payload_builder(
         self,
         ctx: &BuilderContext<Node>,
         pool: Pool,
-        evm_config: Evm,
+        evm_config: n42_execution::N42EvmConfig,
     ) -> eyre::Result<Self::PayloadBuilder> {
         let conf = ctx.payload_builder_config();
         let gas_limit = conf.gas_limit_for(ctx.chain_spec().chain());
@@ -434,6 +432,7 @@ where
                 .with_max_blobs_per_block(conf.max_blobs_per_block()),
             consensus_state: self.consensus_state,
             eof_guard: self.eof_guard,
+            parallel_transfers: crate::parallel_payload::enabled(),
         })
     }
 }
@@ -454,11 +453,39 @@ pub struct N42InnerPayloadBuilder<Pool, Client, Evm> {
     consensus_state: Arc<SharedConsensusState>,
     /// Skip EOF initcode transactions and refuse a built block that carries one.
     eof_guard: bool,
+    parallel_transfers: bool,
 }
 
-impl<Pool, Client, Evm> PayloadBuilder for N42InnerPayloadBuilder<Pool, Client, Evm>
+impl<Pool, Client> N42InnerPayloadBuilder<Pool, Client, n42_execution::N42EvmConfig> {
+    /// Construct the same builder used by the node with explicit execution settings.
+    pub fn new(
+        client: Client,
+        pool: Pool,
+        evm_config: n42_execution::N42EvmConfig,
+        base_config: EthereumBuilderConfig,
+        consensus_state: Arc<SharedConsensusState>,
+    ) -> Self {
+        Self {
+            client,
+            pool,
+            evm_config,
+            base_config,
+            consensus_state,
+            eof_guard: false,
+            parallel_transfers: crate::parallel_payload::enabled(),
+        }
+    }
+
+    /// Select the parallel prefix without changing process-global environment.
+    pub const fn with_parallel_transfers(mut self, enabled: bool) -> Self {
+        self.parallel_transfers = enabled;
+        self
+    }
+}
+
+impl<Pool, Client> PayloadBuilder
+    for N42InnerPayloadBuilder<Pool, Client, n42_execution::N42EvmConfig>
 where
-    Evm: ConfigureEvm<Primitives = EthPrimitives, NextBlockEnvCtx = NextBlockEnvAttributes>,
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks> + Clone,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
 {
@@ -478,7 +505,7 @@ where
         metrics::gauge!("n42_pool_queued_at_build").set(pool_queued as f64);
 
         let build_start = std::time::Instant::now();
-        let result = default_ethereum_payload(
+        let result = crate::parallel_payload::build_with_parallel(
             self.evm_config.clone(),
             self.client.clone(),
             self.pool.clone(),
@@ -499,6 +526,7 @@ where
                     best
                 }
             },
+            self.parallel_transfers,
         );
         let result = match result {
             Ok(BuildOutcome::Better {
@@ -517,6 +545,11 @@ where
         };
 
         let elapsed_ms = build_start.elapsed().as_millis() as u64;
+        let path = if self.parallel_transfers {
+            "live_parallel_transfer_builder"
+        } else {
+            ExecutionPath::LIVE_SEQUENTIAL.label()
+        };
         let outcome = match &result {
             Ok(BuildOutcome::Better { .. }) => "better",
             Ok(BuildOutcome::Aborted { .. }) => "aborted",
@@ -526,13 +559,13 @@ where
         };
         metrics::histogram!(
             "n42_evm_path_duration_ms",
-            "path" => ExecutionPath::LIVE_SEQUENTIAL.label(),
+            "path" => path,
             "phase" => "payload_build",
         )
         .record(build_start.elapsed().as_secs_f64() * 1_000.0);
         metrics::counter!(
             "n42_evm_path_calls_total",
-            "path" => ExecutionPath::LIVE_SEQUENTIAL.label(),
+            "path" => path,
             "phase" => "payload_build",
             "outcome" => outcome,
         )

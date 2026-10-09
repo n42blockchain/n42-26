@@ -20,7 +20,7 @@ pub const GOV5_BODIES_BY_RANGE_PROTOCOL: &str = "/rpc/bodies_by_range/1/ssz_snap
 /// Gov5's one-way Rotor/leader-direct HotStuff stream.
 pub const GOV5_HOTSTUFF_DIRECT_PROTOCOL: &str = "/rpc/hotstuff_direct/1";
 
-const MAX_GOV5_BLOCK_SIZE: usize = 1 << 20;
+const MAX_GOV5_BLOCK_SIZE: usize = 32 * 1024 * 1024;
 const MAX_SNAPPY_FRAME_SIZE: usize = MAX_GOV5_BLOCK_SIZE + (MAX_GOV5_BLOCK_SIZE / 6) + 1024;
 const MAX_GOV5_HOTSTUFF_SIZE: usize = 16 * 1024;
 
@@ -727,8 +727,8 @@ fn decode_chunked_block(encoded: &[u8]) -> io::Result<Vec<u8>> {
         .get(5 + prefix_len..)
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing gov5 Snappy frame"))?;
     // Cap the decompressed stream at the declaration, as the Status paths do.
-    // The wire frame is bounded, but Snappy expansion is not: a ~1 MiB frame of
-    // minimal chunks expands to several GiB, and decoding it to the end would
+    // The wire frame is bounded, but Snappy expansion is not: a small frame of
+    // minimal chunks can expand far beyond the block cap, and decoding it would
     // exhaust memory before the length check below ever runs. The pooled frame
     // decoder refuses the first chunk that would cross the declaration.
     let decoded = crate::snappy_pool::frame_decode(frame, declared_len)?;
@@ -1472,6 +1472,44 @@ mod tests {
     }
 
     #[test]
+    fn block_by_hash_roundtrips_a_large_block_without_weakening_the_bound() {
+        let protocol = StreamProtocol::new(GOV5_BLOCK_BY_HASH_PROTOCOL);
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut large = vec![0u8; 24 * 1024 * 1024];
+        for byte in &mut large {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *byte = seed as u8;
+        }
+        let mut wire = futures::io::Cursor::new(Vec::new());
+        futures::executor::block_on(Gov5BlockByHashCodec.write_response(
+            &protocol,
+            &mut wire,
+            Gov5BlockByHashResponse { rlp: large.clone() },
+        ))
+        .unwrap();
+        let decoded = futures::executor::block_on(
+            Gov5BlockByHashCodec
+                .read_response(&protocol, &mut futures::io::Cursor::new(wire.into_inner())),
+        )
+        .unwrap();
+        assert_eq!(decoded.rlp, large);
+    }
+
+    #[test]
+    fn block_by_hash_rejects_payloads_above_32_mib() {
+        let oversized = vec![0u8; 32 * 1024 * 1024 + 1];
+        let error = encode_chunked_block(&oversized, [1, 2, 3, 4]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let mut encoded = vec![0, 1, 2, 3, 4];
+        encode_uvarint(oversized.len(), &mut encoded);
+        let error = decode_chunked_block(&encoded).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn hotstuff_direct_codec_preserves_exact_one_way_payload() {
         let protocol = StreamProtocol::new(GOV5_HOTSTUFF_DIRECT_PROTOCOL);
         let payload = vec![0xff, 0x06, 0, 0, 0, 0x42, 0x24];
@@ -1504,8 +1542,8 @@ mod tests {
     /// A peer controls both the declared length and the Snappy frame, and the
     /// two need not agree. Repetitive input compresses about 21x here, so
     /// decoding to the end of the frame — rather than to the declaration — lets
-    /// one wire-legal response allocate roughly twenty times the 1 MiB block
-    /// cap, and every concurrent request multiplies that. Stop at the
+    /// one wire-legal response allocate far beyond its declared block length;
+    /// every concurrent request multiplies that. Stop at the
     /// declaration instead.
     #[test]
     fn rejects_snappy_expansion_beyond_the_declared_length() {

@@ -1,0 +1,131 @@
+{
+  "scope": "QMDB leaf-tree recorded account updates, sorting and root; excludes WAL/read views/EVM/network/H2 and input generation; allocation count is a separate instrumented binary",
+  "source_sha256": {
+    "200000-0-after.log": "d99b08f085cb12872b1c6a2d2ac96c4b09f72f13109a1bb56629dcf997e84def",
+    "200000-0-before.log": "7355a8ead555c3601ca2150615cc2f93cf77181e8cd3f3b9776a11cd08f9d94d",
+    "200000-1-after.log": "c6623dfdf4f6f865c72dfe303b63663acaabae5340bdabc0f4f7873c1b2e07f5",
+    "200000-1-before.log": "f71901a33954a9b0bd65fe44b1a10dc83a8b6e5ad7d8b5c9f982806f9b6032a2",
+    "200000-2-after.log": "3f89b46bf4d24e1d3024b270ee1febd5e05840d49294cd88a6debbbd01dfbea7",
+    "200000-2-before.log": "2ae3d7c2f63afdce471643148b6f47ab25fbddc7da3b0d8489b4643685aabe75",
+    "200000-3-after.log": "7f820bd781cd0398843c3eb45160c206f4cbad2c139d84ed814c838608dc32b5",
+    "200000-3-before.log": "b299ec2885931a4f7bfc75deeeea4475d3ef05ae277ef25dce59155a074c29e5",
+    "200000-4-after.log": "33c1a00d5e471218ca56fe062ffb0d15f3f69e53b306e08cbd71af9961036455",
+    "200000-4-before.log": "352d84cf0add60af916a03ed23b2285d6a525442f293e79170b9f4cf2b538493",
+    "200000-5-after.log": "df182e2dfc73f2f1cb5768a424d83af2c6f1d4196e5959eceaf1ca29f72e666f",
+    "200000-5-before.log": "34ff1f6c7b5845452db803846b96075c69eeb6e78039a84c52fa51c57b580c74",
+    "2000000-0-after.log": "9960f31207a9c73e37eeeb7e208ca04dd072d1a6124c6068da1edab054720fca",
+    "2000000-0-before.log": "a02a38293ae3fc00ee510dbb41393a915dae5db2ba00374461c477cb61f8704f",
+    "2000000-1-after.log": "6520a54aed9bfaff12cf4eaf9af5060d7f6430383f6f490508f449ca0167376b",
+    "2000000-1-before.log": "db87d6dc8f1cd00d386a839f7471834f625536dca2ebc7ad886dad1e42540431",
+    "2000000-2-after.log": "4024ec6d1af35682e250849950a777664ba62e09c170d5fa2711011652c3be8c",
+    "2000000-2-before.log": "23a3bb93f5d9852562cdbbc64ac3d21759551f570e4a00a7529468f83d155d6d",
+    "2000000-3-after.log": "aa9dceea1a2c5affed30071acef1dd07a7b157a63032ac975621c357b200fa73",
+    "2000000-3-before.log": "b4eb23e33ce4cccc512b2d41ef2e22be83499bf6b358a1c157b03714114c2447",
+    "2000000-4-after.log": "bba87d80415603fb146bc4c7f65be2517789a84b1fa7a267b8b8a76dc6abb240",
+    "2000000-4-before.log": "e39d452bd121318151c20db59ed9a1c66fb94dab7f7384f808dbbdeec32881ac",
+    "2000000-5-after.log": "75e8926b79866df3e767effdd7dbde4f3139f7f20355fcbcd8d85a99529468dc",
+    "2000000-5-before.log": "548a423e29ecb8202b53a6adecaf352158377d9a52cbf38fb6f12c52aa7c0ba1",
+    "Cargo.lock": "9b08be13eb831873d1ac5cf4bdbb29749ef3ba35148b793dcf4ca20c333af3b0",
+    "Cargo.toml": "cc6d64a4be4cde3457b8ca0dd9b2e12f3e7409796bf74f875109d95345732859",
+    "README.md": "c7f0a630cfdd0bf08ffbed7689f546fb7c5306b364685a1d1e3025e5137416c1",
+    "after/Cargo.toml": "4aa02cde44058be44d8b0f3e2188dc8cbf68fc1755451f296d5218691a41ba02",
+    "after/src/flat.rs": "32f8afe2372693fb6cf7c4b4c1e3d21f6ef8b00899745022edba597cf7ac3e6a",
+    "after/src/lib.rs": "59d9702f0eddcf37521756b78d8a2e96786510809e392aa37359dc52a29231df",
+    "after/src/qmdb_compat.rs": "eca4c540b02a399ef8d298fa54f6acedbc5d7ad79e9ec71a2dd76d0ae145edb0",
+    "after/src/qmdb_leaf_tree.rs": "0d7c5ece4378cee16d248b0fc62e1ad320b3a23f4a61d794f9d0d31eb36540b3",
+    "after/src/simd.rs": "7ee7611769a48d1610f4fb7178b46b37fde7dfc0edbfdfc06f790b6b494ae487",
+    "allocation-after.log": "4bf33ae279089bedf822af229089bd760bcc785f1bcf093fdb4b397e701a8aaf",
+    "allocation-before.log": "8bff564681af6e37510ec588347e3e0f56f0bf65042c29838b3f7d629f22afbc",
+    "archive-build.log": "c0f65763026ac5a4e0ea5c8cb8d1eca12add5c50e24d94ef5baed7a7a74a1e02",
+    "before/Cargo.toml": "0b0a961f58e1a1f1bd6bde6c92122d648761030410bf49a8524a3443091a8e31",
+    "before/src/flat.rs": "32f8afe2372693fb6cf7c4b4c1e3d21f6ef8b00899745022edba597cf7ac3e6a",
+    "before/src/lib.rs": "59d9702f0eddcf37521756b78d8a2e96786510809e392aa37359dc52a29231df",
+    "before/src/qmdb_compat.rs": "eca4c540b02a399ef8d298fa54f6acedbc5d7ad79e9ec71a2dd76d0ae145edb0",
+    "before/src/qmdb_leaf_tree.rs": "76186e0afddca7111b0781eb97844db2ed065ce943d0e680af6da266241030eb",
+    "before/src/simd.rs": "7ee7611769a48d1610f4fb7178b46b37fde7dfc0edbfdfc06f790b6b494ae487",
+    "binary.json": "1570daad8c4167316cde99c8ef9c7778a2ac05d4f6ff4325bc5a210e1787fead",
+    "build.log": "7c3adb9c861ecd876156554c04779ddfc1f7b0892c44041e63de43a3876001fb",
+    "core-tests.log": "8736018f741ea34549fe481a2461695174d386cedbe51bfa3406d925c8172243",
+    "counted.rs": "9267e69f0862fe7b1a853e0c9be4c27db88829fe7aa54eb45f9504416bff2800",
+    "main.rs": "e7c46ebea2a9ad0a2e92a5a645e0b08f2f6009b34f3e12c932887b5475546ae8",
+    "node-tests.log": "27a09b0e0b416ad97b76fd0460022ff73d67c81c4425cffd85f7d61ae431fae3",
+    "results.json": "e41c4514b7479ddaa7eeb09f9df86c1ad6421bfc0a98b52536d1d7ba8c1d5741",
+    "run.log": "5cd21df049b70ea2ed8c0018028a91d48bc1e8a463e382b15825d733cac40643",
+    "run.py": "08ddbaad6e5a56c4e701f60fc11f79a5cbbb09a5f296588bb4da988d9f006f1d",
+    "summary.json": "157ae6421d4e6db92ca4fa2001a2abde1e5c5078522995b37fcb2052ef0068e4",
+    "timing-Cargo.lock": "12f98235dc7d3ebb36815785c00fc8e116f399e0d58dd15bb90b368c7c120bec",
+    "workspace-clippy.log": "fd7638d4642aff2d59823d1848697d3f4953cf388c2637a898c0c433ce272712"
+  },
+  "allocation_measurements": [
+    {
+      "version": "before",
+      "keys": 200000,
+      "generation": 2,
+      "requests": 294139,
+      "requested_bytes": 70164144
+    },
+    {
+      "version": "before",
+      "keys": 200000,
+      "generation": 3,
+      "requests": 294130,
+      "requested_bytes": 70061128
+    },
+    {
+      "version": "before",
+      "keys": 200000,
+      "generation": 4,
+      "requests": 294133,
+      "requested_bytes": 70134856
+    },
+    {
+      "version": "after",
+      "keys": 200000,
+      "generation": 2,
+      "requests": 147139,
+      "requested_bytes": 69135144
+    },
+    {
+      "version": "after",
+      "keys": 200000,
+      "generation": 3,
+      "requests": 147130,
+      "requested_bytes": 69032128
+    },
+    {
+      "version": "after",
+      "keys": 200000,
+      "generation": 4,
+      "requests": 147133,
+      "requested_bytes": 69105856
+    }
+  ],
+  "allocation_binary_sha256": "a80fb1a604125a3a37da4c0637f031703023a36539e0036a6d145defe933bd9c",
+  "validation": {
+    "core_passed": 64,
+    "core_ignored": 2,
+    "node_qmdb_passed": 51,
+    "node_qmdb_ignored": 7,
+    "workspace_clippy": "passed",
+    "paired_samples": 72,
+    "all_roots_and_undo_digests_equal_per_generation": true
+  },
+  "measurement_environment": {
+    "profile": "release + thin LTO",
+    "host_isolated": false,
+    "cpu_pinned": false,
+    "note": "Full-node QMDB test build/run overlapped the beginning of the timing run; alternating order and all samples retained."
+  },
+  "reth_test_baseline": "23316e3ff8adca8c3bd5085ff0565fcae019202a",
+  "upstream_refs": {
+    "n42-rs": "466c1839791afadba7f1dd4d48c5518440dcafba",
+    "gov5-cached-origin-main": "a8e353cac7a00c7f6ca2816cc8e4634c45a4f337"
+  },
+  "archive_validation": {
+    "standalone_locked_offline_release_build": "passed",
+    "differing_core_files": [
+      "qmdb_leaf_tree.rs"
+    ],
+    "after_leaf_matches_worktree": true
+  }
+}

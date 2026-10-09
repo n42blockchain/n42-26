@@ -1,0 +1,14 @@
+     Locking 323 packages to latest Rust 1.97.1 compatible versions
+      Adding alloy-json-abi v1.6.1 (available: v1.7.1)
+      Adding alloy-primitives v1.6.1 (available: v1.7.3)
+      Adding alloy-sol-types v1.6.1 (available: v1.7.1)
+      Adding crypto-common v0.1.6 (available: v0.1.7)
+      Adding thiserror v2.0.19 (available: v2.0.20)
+      Adding thiserror-impl v2.0.19 (available: v2.0.20)
+   Compiling rand_core v0.10.1
+   Compiling getrandom v0.4.3
+   Compiling chacha20 v0.10.2
+   Compiling rand v0.10.2
+   Compiling n42-read-counterbench v0.1.0 (/tmp/n42-read-counterbench)
+    Finished `release` profile [optimized] target(s) in 5.94s
+  Executable unittests lib.rs (/tmp/n42-qmdb-readbench/target/release/deps/n42_read_counterbench-86f22d6e1e874d0f)

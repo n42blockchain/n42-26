@@ -1,0 +1,12 @@
+{
+  "binary_sha256": "0afd1bdff3edeaaf6e91204ae44f3b8dace92896d812db1b026481f3332c2f87",
+  "keys": [
+    200000,
+    2000000
+  ],
+  "pairs": 6,
+  "blocks": 3,
+  "read_views": true,
+  "preparation": "none",
+  "tmpdir": "/home/n42/src/n42/n42-26/target/qmdb-prepared-temp"
+}

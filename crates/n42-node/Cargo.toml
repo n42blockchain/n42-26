@@ -22,6 +22,10 @@ n42-zkproof.workspace = true
 
 reth-chainspec.workspace = true
 reth-consensus.workspace = true
+reth-consensus-common.workspace = true
+reth-errors.workspace = true
+reth-execution-cache.workspace = true
+alloy-evm.workspace = true
 reth-ethereum-consensus.workspace = true
 reth-ethereum-engine-primitives.workspace = true
 reth-ethereum-primitives.workspace = true
@@ -62,6 +66,7 @@ reth-trie.workspace = true
 reth-rpc-builder.workspace = true
 
 arc-swap.workspace = true
+imbl = "7.0.1"
 jsonrpsee.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -80,6 +85,7 @@ tokio.workspace = true
 tracing.workspace = true
 metrics.workspace = true
 rayon.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
@@ -92,3 +98,7 @@ reth-testing-utils.workspace = true
 # Keep key types identical to the Reth 2.4.1 / Alloy dependency graph.
 secp256k1 = { version = "0.30", features = ["global-context"] }
 tempfile.workspace = true
+
+# Match the production node's default allocator in its library-test benchmarks.
+[target.'cfg(unix)'.dev-dependencies]
+tikv-jemallocator = "0.7"

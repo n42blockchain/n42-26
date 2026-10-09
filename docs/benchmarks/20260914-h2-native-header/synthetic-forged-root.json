@@ -1,0 +1,5 @@
+{
+  "fixture_only": true,
+  "status": "failed",
+  "error": "native header differs from RPC receiptsRoot"
+}

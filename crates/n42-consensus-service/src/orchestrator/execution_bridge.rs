@@ -68,6 +68,41 @@ fn mark_eager_import_valid(guard: &std::sync::atomic::AtomicU64, block_number: u
     guard.fetch_max(block_number, std::sync::atomic::Ordering::AcqRel)
 }
 
+/// Only Engine API `VALID` means the payload was fully executed and may advance
+/// the eager-import watermark. `ACCEPTED` and `SYNCING` are not validation.
+fn payload_was_fully_validated(status: &PayloadStatusEnum) -> bool {
+    matches!(status, PayloadStatusEnum::Valid)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BuiltPayloadLinkError {
+    Parent { actual: B256, required: B256 },
+    Hash { declared: B256, payload: B256 },
+}
+
+/// Check the two identity links that must hold before a built block is
+/// broadcast: the requested parent and the payload's own declared hash.
+fn validate_built_payload_linkage(
+    declared_hash: B256,
+    payload_hash: B256,
+    actual_parent: B256,
+    required_parent: B256,
+) -> Result<(), BuiltPayloadLinkError> {
+    if actual_parent != required_parent {
+        return Err(BuiltPayloadLinkError::Parent {
+            actual: actual_parent,
+            required: required_parent,
+        });
+    }
+    if payload_hash != declared_hash {
+        return Err(BuiltPayloadLinkError::Hash {
+            declared: declared_hash,
+            payload: payload_hash,
+        });
+    }
+    Ok(())
+}
+
 impl ConsensusService {
     /// The `parentBeaconRoot` a payload built on `parent` must carry. Without
     /// a committee pool it is the zero placeholder every node agrees on; with
@@ -510,6 +545,12 @@ impl ConsensusService {
         };
 
         let hash = broadcast.block_hash;
+        if let Some(raw) = broadcast.native_header_rlp.as_deref()
+            && !super::remember_direct_native_header(hash, raw)
+        {
+            warn!(target: "n42::cl::exec_bridge", %hash, "block data carries an invalid native header");
+            return;
+        }
         let payload_len = broadcast.payload_json.len();
         // The Gov5 fetch is NOT retired here. At this point `hash` is only a
         // self-declared field of an unauthenticated bincode envelope — the
@@ -730,7 +771,7 @@ impl ConsensusService {
                     // Only `Valid` marks the block eager-validated. `Accepted`
                     // (stored, not executed) must fall through to the stale arm
                     // so a later commit never promotes an unexecuted block (F3).
-                    Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
+                    Ok(status) if payload_was_fully_validated(&status.status) => {
                         mark_eager_import_valid(block_guard.as_ref(), block_number);
                         let np_elapsed = import_start.elapsed().as_millis() as u64;
                         let follower_import_ms = block_data_received.elapsed().as_millis() as u64;
@@ -1413,7 +1454,7 @@ async fn handle_built_payload(
     } = built;
     let original_hash = hash;
     if h2_v4_participant {
-        let (gov5_state_root, gov5_receipts_root, _execution_output) = match exec_output_cache
+        let (gov5_state_root, gov5_receipts_root) = match exec_output_cache
             .as_ref()
             .and_then(|cache| cache.take_gov5_normalization(&execution_data))
         {
@@ -1429,7 +1470,7 @@ async fn handle_built_payload(
                 return;
             }
         };
-        execution_data = match n42_network::normalize_execution_payload_for_gov5_h2(
+        let normalized = match n42_network::normalize_execution_payload_for_gov5_h2(
             &execution_data,
             current_view,
             gov5_state_root,
@@ -1441,34 +1482,41 @@ async fn handle_built_payload(
                 return;
             }
         };
-        hash = execution_data.block_hash();
-        // Header normalization necessarily changes the block hash, so the
-        // builder's execution result remains keyed by a hash that can never be
-        // submitted or broadcast. Drop it before validating the normalized
-        // payload to avoid an unbounded stale-cache tail on every Rust-led
-        // Gov5 view.
+        hash = normalized.block_hash();
+        // Native Cancun normalization changes commitments and H2 metadata,
+        // but preserves the EVM inputs. Move the builder result to the new
+        // hash only after the adapter checks that invariant. newPayload still
+        // performs full post-execution and QMDB validation before proposal.
         if hash != original_hash
             && let Some(ref cache) = exec_output_cache
         {
-            cache.evict(original_hash);
+            let reuse_enabled = std::env::var_os("N42_GOV5_REUSE_BUILDER_EXECUTION")
+                .is_none_or(|value| value != "0");
+            if !reuse_enabled || !cache.rekey_gov5_normalized(&execution_data, &normalized) {
+                cache.evict(original_hash);
+            }
         }
+        execution_data = normalized;
     }
     let actual_parent = execution_data.parent_hash();
-    if actual_parent != build_context.parent_hash {
-        error!(target: "n42::cl::exec_bridge", %hash, %actual_parent,
-            required_parent = %build_context.parent_hash, view = build_context.view,
-            "payload builder returned a block outside the requested LockedQC branch");
-        metrics::counter!("n42_payload_parent_mismatch_total").increment(1);
-        return;
-    }
-    if execution_data.block_hash() != hash {
-        error!(
-            target: "n42::cl::exec_bridge",
-            %hash,
-            payload_hash = %execution_data.block_hash(),
-            "built payload hash mismatch; refusing to broadcast"
-        );
-        metrics::counter!("n42_built_payload_hash_mismatch_total").increment(1);
+    let payload_hash = execution_data.block_hash();
+    if let Err(link_error) =
+        validate_built_payload_linkage(hash, payload_hash, actual_parent, build_context.parent_hash)
+    {
+        match link_error {
+            BuiltPayloadLinkError::Parent { actual, required } => {
+                error!(target: "n42::cl::exec_bridge", %hash, %actual,
+                    required_parent = %required, view = build_context.view,
+                    "payload builder returned a block outside the requested LockedQC branch");
+                metrics::counter!("n42_payload_parent_mismatch_total").increment(1);
+            }
+            BuiltPayloadLinkError::Hash { declared, payload } => {
+                error!(target: "n42::cl::exec_bridge", %declared,
+                    payload_hash = %payload,
+                    "built payload hash mismatch; refusing to broadcast");
+                metrics::counter!("n42_built_payload_hash_mismatch_total").increment(1);
+            }
+        }
         return;
     }
     if bad_blocks.should_skip(hash, "leader_built_payload") {
@@ -1480,7 +1528,7 @@ async fn handle_built_payload(
             .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, execution_data.clone())
             .await
         {
-            Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
+            Ok(status) if payload_was_fully_validated(&status.status) => {
                 mark_eager_import_valid(block_guard.as_ref(), block_number);
                 info!(
                     target: "n42::interop::h2v4",
@@ -1640,7 +1688,8 @@ async fn handle_built_payload(
         has_compact_block = execution_output_bytes.is_some(),
         "N42_TIMEOUT_VIEW: leader_ready"
     );
-    if h2_v4_participant {
+    let native_header_rlp = if h2_v4_participant {
+        let encode_start = Instant::now();
         let gov5_rlp = match n42_network::encode_gov5_block_rlp(&execution_data) {
             Ok(encoded) => encoded,
             Err(error) => {
@@ -1648,11 +1697,24 @@ async fn handle_built_payload(
                 return;
             }
         };
+        let gov5_encode_ms = encode_start.elapsed().as_millis() as u64;
+        metrics::histogram!("n42_gov5_block_encode_ms").record(gov5_encode_ms as f64);
+        info!(target: "n42::cl::exec_bridge", %hash, tx_count, gov5_encode_ms,
+            gov5_bytes = gov5_rlp.len(), "N42_LEADER_GOV5_ENCODE: native block encoded");
         if let Err(error) = network.broadcast_gov5_block_reliable(gov5_rlp).await {
             error!(target: "n42::interop::h2v4", %hash, %error, "refusing to propose after gov5 block broadcast failed");
             return;
         }
-    }
+        match n42_consensus::gov5_native_header_rlp(&hash) {
+            Some(raw) => Some(raw.to_vec()),
+            None => {
+                error!(target: "n42::interop::h2v4", %hash, "normalized native header is unavailable for direct block broadcast");
+                return;
+            }
+        }
+    } else {
+        None
+    };
     // 1. Broadcast block data + blob sidecars to followers
     broadcast_block_data(
         network.clone(),
@@ -1663,6 +1725,7 @@ async fn handle_built_payload(
         block_timestamp,
         execution_output_bytes,
         leader_ready_unix_ms,
+        native_header_rlp,
         build_start,
     )
     .await;
@@ -1711,7 +1774,7 @@ async fn handle_built_payload(
         // Only `Valid` marks the block eager-validated. `Accepted` (stored, not
         // executed) falls through to the stale arm so a later commit never
         // promotes an unexecuted block (F3).
-        Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
+        Ok(status) if payload_was_fully_validated(&status.status) => {
             mark_eager_import_valid(block_guard.as_ref(), block_number);
             let np_elapsed = import_start.elapsed().as_millis() as u64;
             info!(target: "n42::cl::exec_bridge", %hash, np_elapsed, "eager import: new_payload accepted (no FCU)");
@@ -1787,6 +1850,7 @@ async fn broadcast_block_data(
     timestamp: u64,
     execution_output: Option<Vec<u8>>,
     leader_ready_unix_ms: u64,
+    native_header_rlp: Option<Vec<u8>>,
     build_start: Instant,
 ) {
     if payload_wire.is_empty() {
@@ -1820,6 +1884,7 @@ async fn broadcast_block_data(
         timestamp,
         execution_output,
         leader_ready_unix_ms,
+        native_header_rlp,
     };
     let encoded = match bincode::serialize(&broadcast) {
         Ok(enc) => Arc::new(enc),
@@ -2332,8 +2397,12 @@ mod blob_frame_tests {
 #[cfg(test)]
 mod eager_import_guard_tests {
     use super::{
-        eager_import_already_validated, mark_eager_import_valid, should_broadcast_execution_output,
+        BuiltPayloadLinkError, eager_import_already_validated, mark_eager_import_valid,
+        payload_was_fully_validated, should_broadcast_execution_output,
+        validate_built_payload_linkage,
     };
+    use alloy_primitives::B256;
+    use alloy_rpc_types_engine::PayloadStatusEnum;
     use std::sync::atomic::AtomicU64;
 
     #[test]
@@ -2363,5 +2432,65 @@ mod eager_import_guard_tests {
         // state-root profile. A builder-side Ethereum execution result is not
         // valid compact data for that normalized payload.
         assert!(!should_broadcast_execution_output(true));
+    }
+
+    #[test]
+    fn only_engine_valid_advances_the_eager_validation_watermark() {
+        for non_valid in [
+            PayloadStatusEnum::Syncing,
+            PayloadStatusEnum::Accepted,
+            PayloadStatusEnum::Invalid {
+                validation_error: "bad state root".into(),
+            },
+        ] {
+            assert!(
+                !payload_was_fully_validated(&non_valid),
+                "{non_valid:?} must not mark a block fully validated"
+            );
+
+            // Model the caller's state transition: stale/syncing/invalid
+            // responses leave the watermark untouched, so missing parents
+            // remain eligible for import.
+            let guard = AtomicU64::new(41);
+            if payload_was_fully_validated(&non_valid) {
+                mark_eager_import_valid(&guard, 42);
+            }
+            assert_eq!(eager_import_already_validated(&guard, 42), None);
+        }
+
+        assert!(payload_was_fully_validated(&PayloadStatusEnum::Valid));
+        let guard = AtomicU64::new(41);
+        if payload_was_fully_validated(&PayloadStatusEnum::Valid) {
+            mark_eager_import_valid(&guard, 42);
+        }
+        assert_eq!(eager_import_already_validated(&guard, 42), Some(42));
+    }
+
+    #[test]
+    fn built_payload_must_match_locked_parent_and_its_declared_hash() {
+        let parent = B256::repeat_byte(0x11);
+        let other_parent = B256::repeat_byte(0x12);
+        let declared_hash = B256::repeat_byte(0x21);
+        let payload_hash = B256::repeat_byte(0x22);
+
+        assert_eq!(
+            validate_built_payload_linkage(declared_hash, declared_hash, parent, parent),
+            Ok(())
+        );
+        assert_eq!(
+            validate_built_payload_linkage(declared_hash, declared_hash, other_parent, parent),
+            Err(BuiltPayloadLinkError::Parent {
+                actual: other_parent,
+                required: parent,
+            }),
+            "parent mismatch is rejected before any hash comparison"
+        );
+        assert_eq!(
+            validate_built_payload_linkage(declared_hash, payload_hash, parent, parent),
+            Err(BuiltPayloadLinkError::Hash {
+                declared: declared_hash,
+                payload: payload_hash,
+            })
+        );
     }
 }

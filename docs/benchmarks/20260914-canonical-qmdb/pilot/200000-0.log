@@ -1,0 +1,11 @@
+
+running 1 test
+test qmdb_state_reader::canonical_bench::bench_canonical_qmdb_execution_and_commit ... canonical_qmdb_config {"accounts":200000,"allocator":"system","baseFee":7,"blocks":3,"chainId":4242,"disjointAddresses":true,"distinctRecipients":50000,"distinctSenders":50000,"fork":"cancun","gasPrice":9,"reads":"only","scope":"execution_delta_qmdb_durable_commit","signatureRecoveryIncluded":false,"strategy":"canonical_sequential","transactions":50000}
+canonical_qmdb_sample {"accountReads":100002,"blockHash":"0x65bcec938a85092e4e352193d377fdb0270cde641b1d174d2272f4d5059e6b5a","commitMs":81.15167,"deltaMs":21.90648,"executionMs":185.28861999999998,"number":1,"operations":100001,"recoveryMsExcluded":1500.9349169999998,"root":"0x622c630b2ad73167c029cdbb7a1eba774fbbfd0e58635b0905c91b3e999c0cdb","storageReads":0,"successful":50000,"totalMs":288.34801999999996,"transactions":50000,"walBytes":4800211}
+canonical_qmdb_sample {"accountReads":100002,"blockHash":"0x48799e449fec1d168c3ffdbe7e8e504d6ff89c3622cc9c02acb7e661364489da","commitMs":61.71092,"deltaMs":21.876031,"executionMs":185.56396999999998,"number":2,"operations":100001,"recoveryMsExcluded":1501.658877,"root":"0x21be7bf627bc360ab3d63c21fc9b921af859dbaa76fa23751d3c89b43a0c1b50","storageReads":0,"successful":50000,"totalMs":269.151731,"transactions":50000,"walBytes":9600422}
+canonical_qmdb_sample {"accountReads":100002,"blockHash":"0x02a8cb6c3cd107da51e38764e5a9307b81338ef969a592b6861ccef399734a6b","commitMs":58.286108000000006,"deltaMs":21.839489999999998,"executionMs":187.31773099999998,"number":3,"operations":100001,"recoveryMsExcluded":1500.5576369999999,"root":"0x79d536f9828b7fee4878293859263f50145be9092edff181528d3faeefbe6095","storageReads":0,"successful":50000,"totalMs":267.444299,"transactions":50000,"walBytes":14400634}
+canonical_qmdb_restart_verified=true
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 244 filtered out; finished in 10.37s
+

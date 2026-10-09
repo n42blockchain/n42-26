@@ -1,0 +1,30 @@
+
+running 1 test
+read_counter threads=1 round=0 enabled=false reads=1000000 elapsed_ms=270.193
+read_counter threads=1 round=0 enabled=true reads=1000000 elapsed_ms=249.726
+read_counter threads=1 round=1 enabled=true reads=1000000 elapsed_ms=262.070
+read_counter threads=1 round=1 enabled=false reads=1000000 elapsed_ms=219.329
+read_counter threads=1 round=2 enabled=false reads=1000000 elapsed_ms=269.045
+read_counter threads=1 round=2 enabled=true reads=1000000 elapsed_ms=253.454
+read_counter threads=1 round=3 enabled=true reads=1000000 elapsed_ms=286.834
+read_counter threads=1 round=3 enabled=false reads=1000000 elapsed_ms=258.483
+read_counter threads=1 round=4 enabled=false reads=1000000 elapsed_ms=248.971
+read_counter threads=1 round=4 enabled=true reads=1000000 elapsed_ms=248.171
+read_counter threads=1 round=5 enabled=true reads=1000000 elapsed_ms=222.168
+read_counter threads=1 round=5 enabled=false reads=1000000 elapsed_ms=254.651
+read_counter threads=16 round=0 enabled=false reads=1000000 elapsed_ms=29.407
+read_counter threads=16 round=0 enabled=true reads=1000000 elapsed_ms=27.902
+read_counter threads=16 round=1 enabled=true reads=1000000 elapsed_ms=20.387
+read_counter threads=16 round=1 enabled=false reads=1000000 elapsed_ms=21.247
+read_counter threads=16 round=2 enabled=false reads=1000000 elapsed_ms=16.642
+read_counter threads=16 round=2 enabled=true reads=1000000 elapsed_ms=15.614
+read_counter threads=16 round=3 enabled=true reads=1000000 elapsed_ms=16.361
+read_counter threads=16 round=3 enabled=false reads=1000000 elapsed_ms=15.336
+read_counter threads=16 round=4 enabled=false reads=1000000 elapsed_ms=26.797
+read_counter threads=16 round=4 enabled=true reads=1000000 elapsed_ms=17.937
+read_counter threads=16 round=5 enabled=true reads=1000000 elapsed_ms=18.288
+read_counter threads=16 round=5 enabled=false reads=1000000 elapsed_ms=27.542
+test qmdb_read_status::tests::bench_read_counter_overhead ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 3.46s
+

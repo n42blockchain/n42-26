@@ -1,0 +1,155 @@
+diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
+index 89f5f7fc5..354ca3b30 100644
+--- a/crates/engine/tree/src/tree/payload_validator.rs
++++ b/crates/engine/tree/src/tree/payload_validator.rs
+@@ -609,21 +609,36 @@ where
+ 
+         // Get an iterator over the transactions in the payload
+         let txs = self.tx_iterator_for(&input)?;
++        type CachedPayloadData<R> = (BlockExecutionOutput<R>, Vec<Address>);
++        let cached_execution = if input.has_block_access_list() {
++            None
++        } else {
++            reth_evm::payload_cache::take_payload_execution::<CachedPayloadData<N::Receipt>>(
++                &env.hash,
++            )
++        };
++        let is_cache_hit = cached_execution.is_some();
+ 
+         let parallel_bal_execution = ensure_ok!(self.bal_path_eligible(env.decoded_bal.as_deref()));
+ 
+         // Prepare the state-root job before execution so it can provide streaming hooks.
+-        let mut state_root_job =
+-            ensure_ok!(self.state_root_strategy.prepare(StateRootJobContext::new(
+-                &self.runtime,
+-                &self.overlay_manager,
+-                &env,
+-                &parent_block,
+-                state_provider_factory.clone(),
+-                &self.config,
+-                parallel_bal_execution,
+-                ctx.state_mut(),
+-            )));
++        let state_root_context = StateRootJobContext::new(
++            &self.runtime,
++            &self.overlay_manager,
++            &env,
++            &parent_block,
++            state_provider_factory.clone(),
++            &self.config,
++            parallel_bal_execution,
++            ctx.state_mut(),
++        );
++        let mut state_root_job = ensure_ok!(if is_cache_hit
++            && !self.state_root_strategy.supports_cached_output()
++        {
++            self.state_root_strategy.prepare_cached_output(state_root_context)
++        } else {
++            self.state_root_strategy.prepare(state_root_context)
++        });
+         let state_root_job_name = state_root_job.name();
+ 
+         debug!(
+@@ -725,26 +740,39 @@ where
+         // The receipt root task is spawned before execution and receives receipts incrementally
+         // as transactions complete, allowing parallel computation during execution.
+         let execute_block_start = Instant::now();
+-        let execution_result = if parallel_bal_execution {
+-            self.execute_block_bal(env, &input, &handle, &make_state_provider)
+-        } else {
+-            let state_provider = make_state_provider(false);
+-            match state_provider {
+-                Ok(state_provider) => self.execute_block(
+-                    state_provider,
+-                    env,
+-                    &input,
+-                    &mut handle,
+-                    execution_state_hook,
+-                ),
+-                Err(err) => Err(err.into()),
+-            }
+-        };
++        let (output, senders, receipt_root_rx, executed_bal) =
++            if let Some((output, senders)) = cached_execution {
++                tracing::info!(
++                    target: "engine::tree::payload_validator",
++                    block_hash = ?input.hash(),
++                    "N42_PAYLOAD_CACHE_HIT: reusing leader execution output"
++                );
++                // A closed receiver tells post-execution validation to derive
++                // the receipt root and bloom from the cached receipts.
++                let (_receipt_tx, receipt_root_rx) = tokio::sync::oneshot::channel();
++                (output, senders, receipt_root_rx, None)
++            } else {
++                let execution_result = if parallel_bal_execution {
++                    self.execute_block_bal(env, &input, &handle, &make_state_provider)
++                } else {
++                    let state_provider = make_state_provider(false);
++                    match state_provider {
++                        Ok(state_provider) => self.execute_block(
++                            state_provider,
++                            env,
++                            &input,
++                            &mut handle,
++                            execution_state_hook,
++                        ),
++                        Err(err) => Err(err.into()),
++                    }
++                };
++                ensure_ok!(execution_result)
++            };
+         let execution_duration = execute_block_start.elapsed();
+         if let (Some(metrics), Some(stats)) = (&state_provider_metrics, &state_provider_stats) {
+             metrics.record_totals(stats);
+         }
+-        let (output, senders, receipt_root_rx, executed_bal) = ensure_ok!(execution_result);
+         let (built_bal, revm_bal) =
+             executed_bal.map(|ExecutedBal { alloy, revm }| (alloy, revm)).unzip();
+ 
+diff --git a/crates/engine/tree/src/tree/state_root_strategy/mod.rs b/crates/engine/tree/src/tree/state_root_strategy/mod.rs
+index aefd61b06..20f9bf5ef 100644
+--- a/crates/engine/tree/src/tree/state_root_strategy/mod.rs
++++ b/crates/engine/tree/src/tree/state_root_strategy/mod.rs
+@@ -116,6 +116,23 @@ where
+         ctx: StateRootJobContext<'_, N, P, Evm>,
+     ) -> ProviderResult<PreparedStateRootJob<N>>;
+ 
++    /// Whether `prepare` can finish from a complete cached execution output
++    /// without execution-hook updates. Custom state-root formats must opt in.
++    fn supports_cached_output(&self) -> bool {
++        false
++    }
++
++    /// Prepares state-root work when EVM execution will be skipped due to a
++    /// cached output. The default strategy overrides this to use a serial root;
++    /// custom strategies may keep their normal job when they support the full
++    /// cached output.
++    fn prepare_cached_output(
++        &self,
++        ctx: StateRootJobContext<'_, N, P, Evm>,
++    ) -> ProviderResult<PreparedStateRootJob<N>> {
++        self.prepare(ctx)
++    }
++
+     /// Prepares the optional payload-builder state-root handle used for FCU-triggered block
+     /// building.
+     ///
+@@ -810,6 +827,18 @@ where
+         + 'static,
+     Evm: ConfigureEvm<Primitives = N> + 'static,
+ {
++    fn prepare_cached_output(
++        &self,
++        ctx: StateRootJobContext<'_, N, P, Evm>,
++    ) -> ProviderResult<PreparedStateRootJob<N>> {
++        Ok(PreparedStateRootJob::new(
++            Box::new(SynchronousStateRootJob {
++                state_provider_factory: ctx.state_provider_factory,
++            }),
++            None,
++        ))
++    }
++
+     fn prepare(
+         &self,
+         mut ctx: StateRootJobContext<'_, N, P, Evm>,

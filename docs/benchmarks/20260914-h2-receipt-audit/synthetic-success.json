@@ -1,0 +1,130 @@
+{
+  "schema": 3,
+  "scope": "h2_rpc_commits_qmdb_only_and_gov5_receipt_roots",
+  "nodes": 4,
+  "read_evidence": [
+    {
+      "url": "node0",
+      "instance_id": "0x00000000000000000000000000000000000000000000000000000000000001f4",
+      "validator_public_key": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000064",
+      "counters_delta": {
+        "accountReads": 6100,
+        "storageReads": 0,
+        "accountComparisons": 0,
+        "storageComparisons": 0,
+        "mismatches": 0,
+        "readErrors": 0,
+        "providerErrors": 0,
+        "pinnedProviders": 61,
+        "unavailableProviders": 0
+      }
+    },
+    {
+      "url": "node1",
+      "instance_id": "0x00000000000000000000000000000000000000000000000000000000000001f5",
+      "validator_public_key": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000065",
+      "counters_delta": {
+        "accountReads": 6100,
+        "storageReads": 0,
+        "accountComparisons": 0,
+        "storageComparisons": 0,
+        "mismatches": 0,
+        "readErrors": 0,
+        "providerErrors": 0,
+        "pinnedProviders": 61,
+        "unavailableProviders": 0
+      }
+    },
+    {
+      "url": "node2",
+      "instance_id": "0x00000000000000000000000000000000000000000000000000000000000001f6",
+      "validator_public_key": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000066",
+      "counters_delta": {
+        "accountReads": 6100,
+        "storageReads": 0,
+        "accountComparisons": 0,
+        "storageComparisons": 0,
+        "mismatches": 0,
+        "readErrors": 0,
+        "providerErrors": 0,
+        "pinnedProviders": 61,
+        "unavailableProviders": 0
+      }
+    },
+    {
+      "url": "node3",
+      "instance_id": "0x00000000000000000000000000000000000000000000000000000000000001f7",
+      "validator_public_key": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000067",
+      "counters_delta": {
+        "accountReads": 6100,
+        "storageReads": 0,
+        "accountComparisons": 0,
+        "storageComparisons": 0,
+        "mismatches": 0,
+        "readErrors": 0,
+        "providerErrors": 0,
+        "pinnedProviders": 61,
+        "unavailableProviders": 0
+      }
+    }
+  ],
+  "keccak_binary_sha256": "1d1d6cc94133024b74cd3865576e70f11eef5433082deb363fb9e53c385b8b81",
+  "start_block": 10,
+  "end_block": 13,
+  "committed_blocks": 3,
+  "committed_transactions": 9,
+  "measurement_seconds": 63.0,
+  "successful_committed_transactions": 9,
+  "failed_committed_transactions": 0,
+  "successful_committed_tps": 0.14285714285714285,
+  "strict_committed_tps": 0.14285714285714285,
+  "blocks": [
+    {
+      "hash": "0x000000000000000000000000000000000000000000000000000000000000000b",
+      "parentHash": "0x000000000000000000000000000000000000000000000000000000000000000a",
+      "stateRoot": "0x000000000000000000000000000000000000000000000000000000000000006f",
+      "receiptsRoot": "0x4950d7e9ba32686c02364273219589201cb73fab56b61f342f8e9b5d6ee5584b",
+      "transactionsRoot": "0x0000000000000000000000000000000000000000000000000000000000000137",
+      "number": 11,
+      "transactions": 3,
+      "gasUsed": 63000,
+      "successful_transactions": 3,
+      "failed_transactions": 0,
+      "verified_receipts_root": "0x4950d7e9ba32686c02364273219589201cb73fab56b61f342f8e9b5d6ee5584b",
+      "receipt_nodes_verified": 4
+    },
+    {
+      "hash": "0x000000000000000000000000000000000000000000000000000000000000000c",
+      "parentHash": "0x000000000000000000000000000000000000000000000000000000000000000b",
+      "stateRoot": "0x0000000000000000000000000000000000000000000000000000000000000070",
+      "receiptsRoot": "0x4950d7e9ba32686c02364273219589201cb73fab56b61f342f8e9b5d6ee5584b",
+      "transactionsRoot": "0x0000000000000000000000000000000000000000000000000000000000000138",
+      "number": 12,
+      "transactions": 3,
+      "gasUsed": 63000,
+      "successful_transactions": 3,
+      "failed_transactions": 0,
+      "verified_receipts_root": "0x4950d7e9ba32686c02364273219589201cb73fab56b61f342f8e9b5d6ee5584b",
+      "receipt_nodes_verified": 4
+    },
+    {
+      "hash": "0x000000000000000000000000000000000000000000000000000000000000000d",
+      "parentHash": "0x000000000000000000000000000000000000000000000000000000000000000c",
+      "stateRoot": "0x0000000000000000000000000000000000000000000000000000000000000071",
+      "receiptsRoot": "0x4950d7e9ba32686c02364273219589201cb73fab56b61f342f8e9b5d6ee5584b",
+      "transactionsRoot": "0x0000000000000000000000000000000000000000000000000000000000000139",
+      "number": 13,
+      "transactions": 3,
+      "gasUsed": 63000,
+      "successful_transactions": 3,
+      "failed_transactions": 0,
+      "verified_receipts_root": "0x4950d7e9ba32686c02364273219589201cb73fab56b61f342f8e9b5d6ee5584b",
+      "receipt_nodes_verified": 4
+    }
+  ],
+  "start_boundary_seconds": 1.0,
+  "end_boundary_seconds": 2.0,
+  "fixture_only": true,
+  "min_tps": 0.1,
+  "status": "passed"
+}

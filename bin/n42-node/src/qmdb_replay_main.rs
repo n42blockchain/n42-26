@@ -29,6 +29,7 @@ use reth_evm::{ConfigureEvm, execute::Executor};
 use reth_primitives_traits::{SealedBlock, SealedHeader};
 use reth_provider::{BlockHashReader, BlockNumReader};
 use reth_revm::database::StateProviderDatabase;
+use reth_storage_api::StateProvider;
 use revm::{
     bytecode::Bytecode,
     database::states::BundleState,
@@ -402,7 +403,7 @@ fn main() -> eyre::Result<()> {
         let state_provider = provider_factory.latest()?;
         let loaded = Arc::new(std::sync::Mutex::new(Vec::new()));
         let db = ReplayDb {
-            inner: StateProviderDatabase::new(state_provider),
+            inner: StateProviderDatabase::new(state_provider.into_evm_state_provider()),
             overlay: Arc::clone(&overlay),
             hashes: Arc::clone(&hashes),
             loaded: Arc::clone(&loaded),

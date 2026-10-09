@@ -1,0 +1,13 @@
+{
+  "binary_sha256": "5054060b0be4a8286d6e39b083e800f39716ddf5b73d5baf0673d48d2eca26c2",
+  "accounts": [
+    200000,
+    2000000
+  ],
+  "transactions": 50000,
+  "blocks": 3,
+  "runs": 3,
+  "tmpdir": "/home/n42/src/n42/n42-26/target/qmdb-prepared-temp",
+  "scope": "canonical_execution_delta_qmdb_durable_commit",
+  "status": "complete"
+}

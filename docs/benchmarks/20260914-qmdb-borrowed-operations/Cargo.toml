@@ -1,0 +1,19 @@
+[package]
+name = "n42-borrowed-ops-bench"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+[dependencies]
+n42-twig-core = { path = "after" }
+n42-twig-core-before = { path = "before" }
+blake3 = "1"
+bincode = "1.3"
+[profile.release]
+lto = "thin"
+[[bin]]
+name = "borrowed-ops"
+path = "main.rs"
+
+[[bin]]
+name = "borrowed-ops-allocations"
+path = "counted.rs"

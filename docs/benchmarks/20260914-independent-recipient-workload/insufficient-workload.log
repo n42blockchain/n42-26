@@ -1,0 +1,9 @@
+Traceback (most recent call last):
+  File "/home/n42/src/n42/n42-26/scripts/presign-workload-preflight.py", line 77, in <module>
+    main()
+    ~~~~^^
+  File "/home/n42/src/n42/n42-26/scripts/presign-workload-preflight.py", line 72, in main
+    result = inspect(args.file, args.chain_id, args.duration, args.minimum_tps)
+  File "/home/n42/src/n42/n42-26/scripts/presign-workload-preflight.py", line 36, in inspect
+    raise ValueError(f"workload has {count} transactions; at least {required} required for {duration}s at {rate} successful TPS")
+ValueError: workload has 220000 transactions; at least 60000000 required for 60s at 1000000 successful TPS

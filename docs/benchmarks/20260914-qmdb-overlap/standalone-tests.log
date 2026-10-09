@@ -1,0 +1,29 @@
+   Compiling n42-overlap-bench v0.1.0 (/home/n42/src/n42/n42-26/docs/benchmarks/20260914-qmdb-overlap)
+    Finished `release` profile [optimized] target(s) in 8.33s
+     Running unittests lib.rs (target/release/deps/n42_overlap_bench-ea42b97a16b0e7ef)
+
+running 15 tests
+test qmdb_read_view::tests::bench_immutable_read_views ... ignored
+test qmdb_read_view::tests::account_codec_covers_nonce_and_balance_boundaries ... ok
+test store::tests::bench_persistent_commit_path ... ignored, measurement
+test qmdb_read_view::tests::corrupt_accounts_are_errors_not_absence ... ok
+test store::tests::prepared_candidate_adopts_only_the_complete_delta_and_checks_header_root ... ok
+test store::tests::prepared_child_is_discarded_if_pending_parent_wal_fails ... ok
+test store::tests::prepared_candidate_is_invisible_to_historical_reads_and_capacity_fallback ... ok
+test store::tests::prepared_sibling_parent_and_changed_operations_never_reuse_a_root ... ok
+test store::tests::prepared_admission_wal_faults_rollback_and_retry_without_publication ... ok
+test store::tests::prepared_candidate_is_never_written_into_a_durable_base ... ok
+test qmdb_read_view::tests::account_decode_agrees_with_canonical_encoder_on_generated_inputs ... ok
+test qmdb_read_view::tests::sharded_versions_match_tree_and_sequential_updates ... ok
+test store::tests::overlapping_read_view_errors_never_publish_and_can_retry ... ok
+test store::tests::overlapping_read_views_preserve_siblings_and_fallbacks ... ok
+test store::tests::wal_append_does_not_hold_the_state_lock ... ok
+
+test result: ok. 13 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.44s
+
+   Doc-tests n42_overlap_bench
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

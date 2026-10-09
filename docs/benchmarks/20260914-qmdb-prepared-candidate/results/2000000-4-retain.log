@@ -1,0 +1,13 @@
+
+running 1 test
+test store::tests::bench_persistent_commit_path ... commit_bench reads=1 keys=2000000 updates=147000 generation=2 elapsed_ms=219.391 root=0x738e7bfd3d8357bd3cec19298b715cd83c9d1537f90a4d173ac6a613eb71bd1b wal_bytes=7056164
+prepare_bench mode=retain retained=true generation=2 candidate_ms=92.264 commit_ms=127.127
+commit_bench reads=1 keys=2000000 updates=147000 generation=3 elapsed_ms=224.555 root=0xe7946dbee3a37e6ea5da593679fc6893a8c0899551aafe2cd162fe57f4b1a8d6 wal_bytes=14112328
+prepare_bench mode=retain retained=true generation=3 candidate_ms=91.619 commit_ms=132.936
+commit_bench reads=1 keys=2000000 updates=147000 generation=4 elapsed_ms=241.797 root=0x58dc3632e9cb64993db337c8fdb8a7e243f2e3cbb2062de315f99182d4930b39 wal_bytes=21168492
+prepare_bench mode=retain retained=true generation=4 candidate_ms=95.204 commit_ms=146.592
+commit_bench restart_verified=true
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 11 filtered out; finished in 6.45s
+

@@ -20,8 +20,11 @@ use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
 use clap::{Parser, ValueEnum};
 use eyre::Result;
+use rayon::prelude::*;
+use std::collections::HashSet;
 use std::hint::black_box;
 use std::io::{BufReader, BufWriter, Read as IoRead, Write as IoWrite};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -44,6 +47,19 @@ struct Cli {
     /// Number of sender accounts
     #[arg(long, default_value = "5000")]
     accounts: usize,
+
+    /// JSON address array of passive recipients, disjoint from the sender accounts.
+    #[arg(long)]
+    recipients_file: Option<String>,
+
+    /// Sign offline against an explicitly supplied fresh genesis (zero nonces only).
+    #[arg(
+        long,
+        requires = "presign_save",
+        requires = "recipients_file",
+        conflicts_with = "presign_load"
+    )]
+    presign_genesis: Option<String>,
 
     /// Batch size for JSON-RPC batch requests
     #[arg(long, default_value = "500")]
@@ -92,7 +108,7 @@ struct Cli {
 
     /// Save pre-signed transactions to binary file for reuse.
     /// Usage: --presign-save txdata.bin --presign 5000000 --accounts 5000
-    /// Requires chain connection to sync nonces. File can be reused with --presign-load.
+    /// Syncs chain nonces unless --presign-genesis explicitly selects fresh offline signing.
     #[arg(long)]
     presign_save: Option<String>,
 
@@ -275,6 +291,8 @@ struct TestAccount {
     address: Address,
     nonce: AtomicU64,
     rpc_idx: usize,
+    recipient_offset: usize,
+    recipient_stride: usize,
 }
 
 fn derive_private_key(index: usize) -> [u8; 32] {
@@ -297,9 +315,208 @@ fn create_accounts(count: usize, num_rpcs: usize) -> Vec<Arc<TestAccount>> {
                 address,
                 nonce: AtomicU64::new(0),
                 rpc_idx: i % num_rpcs,
+                recipient_offset: 0,
+                recipient_stride: 1,
             })
         })
         .collect()
+}
+
+// Use global sender coordinates, even when the caller supplies an RPC-local subset.
+fn recipient_index(account: &TestAccount, nonce: u64, count: usize) -> usize {
+    ((u128::from(nonce) * account.recipient_stride as u128 + account.recipient_offset as u128)
+        % count as u128) as usize
+}
+
+fn configure_recipients(accounts: &mut [Arc<TestAccount>], targets: &[Address]) -> Result<()> {
+    eyre::ensure!(!accounts.is_empty(), "at least one sender is required");
+    eyre::ensure!(
+        !targets.is_empty() && targets.len() <= 1_000_000,
+        "recipient count must be 1..=1000000"
+    );
+    let senders: HashSet<_> = accounts.iter().map(|a| a.address).collect();
+    let mut seen = HashSet::with_capacity(targets.len());
+    for target in targets {
+        eyre::ensure!(
+            !senders.contains(target),
+            "recipient overlaps sender: {target}"
+        );
+        eyre::ensure!(seen.insert(*target), "duplicate recipient: {target}");
+    }
+    let stride = accounts.len();
+    for (offset, account) in accounts.iter_mut().enumerate() {
+        let account = Arc::get_mut(account)
+            .ok_or_else(|| eyre::eyre!("configure recipients before sharing accounts"))?;
+        account.recipient_offset = offset;
+        account.recipient_stride = stride;
+    }
+    Ok(())
+}
+
+// Round-robin publication exposes every sender before advancing to its next nonce.
+// This matters for long files: account-major order can otherwise put thousands
+// of consecutive transactions from just a few accounts into the first block.
+fn interleave_senders<T>(groups: Vec<Vec<T>>) -> Vec<T> {
+    let capacity = groups.iter().map(Vec::len).sum();
+    let mut active: std::collections::VecDeque<_> = groups
+        .into_iter()
+        .map(Vec::into_iter)
+        .filter(|g| g.len() > 0)
+        .collect();
+    let mut output = Vec::with_capacity(capacity);
+    while let Some(mut group) = active.pop_front() {
+        output.push(group.next().expect("nonempty sender group"));
+        if group.len() > 0 {
+            active.push_back(group);
+        }
+    }
+    output
+}
+
+fn independent_recipient_order(accounts: &[Arc<TestAccount>]) -> bool {
+    accounts.iter().any(|a| a.recipient_stride > 1)
+}
+
+fn signing_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(16);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("n42-presign-{i}"))
+            .build()
+            .expect("bounded signing pool")
+    })
+}
+
+fn reserve_nonces(account: &TestAccount, count: usize) -> Result<u64> {
+    account
+        .nonce
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |nonce| {
+            nonce.checked_add(count as u64)
+        })
+        .map_err(|_| eyre::eyre!("nonce range overflows for {}", account.address))
+}
+
+fn sign_transaction(
+    account: &TestAccount,
+    targets: &[Address],
+    nonce: u64,
+    contract: bool,
+) -> Vec<u8> {
+    let tx = TxEip1559 {
+        chain_id: chain_id(),
+        nonce,
+        gas_limit: if contract {
+            CONTRACT_CALL_GAS
+        } else {
+            TRANSFER_GAS
+        },
+        max_fee_per_gas: MAX_FEE_PER_GAS,
+        max_priority_fee_per_gas: MAX_PRIORITY_FEE,
+        to: TxKind::Call(if contract {
+            STRESS_CONTRACT
+        } else {
+            targets[recipient_index(account, nonce, targets.len())]
+        }),
+        value: if contract {
+            U256::ZERO
+        } else {
+            U256::from(TRANSFER_VALUE)
+        },
+        input: Bytes::new(),
+        access_list: Default::default(),
+    };
+    let sig = account
+        .signer
+        .sign_hash_sync(&tx.signature_hash())
+        .expect("sign");
+    let mut buf = Vec::with_capacity(128);
+    tx.into_signed(sig).encode_2718(&mut buf);
+    buf
+}
+
+// Offline signing is deliberately limited to a fresh, funded transfer-only genesis.
+// This validates signing inputs, not whether any running chain is still at genesis.
+fn validate_presign_genesis(
+    path: &str,
+    accounts: &[Arc<TestAccount>],
+    targets: &[Address],
+    total: u64,
+    erc20_ratio: u8,
+) -> Result<()> {
+    eyre::ensure!(
+        erc20_ratio == 0,
+        "offline genesis signing supports plain transfers only"
+    );
+    let raw = std::fs::read(path)?;
+    let genesis: serde_json::Value = serde_json::from_slice(&raw)?;
+    eyre::ensure!(
+        genesis["config"]["chainId"].as_u64() == Some(chain_id()),
+        "genesis chain ID does not match N42_CHAIN_ID"
+    );
+    let alloc = genesis["alloc"]
+        .as_object()
+        .ok_or_else(|| eyre::eyre!("missing genesis alloc"))?;
+    let parse_quantity = |value: &serde_json::Value| -> Result<U256> {
+        if let Some(n) = value.as_u64() {
+            return Ok(U256::from(n));
+        }
+        let text = value
+            .as_str()
+            .ok_or_else(|| eyre::eyre!("invalid genesis quantity"))?;
+        Ok(if let Some(hex) = text.strip_prefix("0x") {
+            U256::from_str_radix(hex, 16)?
+        } else {
+            U256::from_str_radix(text, 10)?
+        })
+    };
+    let mut entries = std::collections::HashMap::with_capacity(alloc.len());
+    for (key, value) in alloc {
+        eyre::ensure!(
+            entries.insert(key.parse::<Address>()?, value).is_none(),
+            "duplicate genesis address"
+        );
+    }
+    for (index, address) in accounts
+        .iter()
+        .map(|a| a.address)
+        .chain(targets.iter().copied())
+        .enumerate()
+    {
+        let entry = entries
+            .get(&address)
+            .ok_or_else(|| eyre::eyre!("account missing from genesis: {address}"))?;
+        let nonce = entry
+            .get("nonce")
+            .map(parse_quantity)
+            .transpose()?
+            .unwrap_or_default();
+        eyre::ensure!(
+            nonce.is_zero(),
+            "offline signing requires zero genesis nonces: {address}"
+        );
+        eyre::ensure!(
+            entry.get("code").is_none_or(|v| v.as_str() == Some("0x")),
+            "genesis account has code: {address}"
+        );
+        let balance = parse_quantity(&entry["balance"])?;
+        eyre::ensure!(!balance.is_zero(), "genesis account is empty: {address}");
+        if index < accounts.len() {
+            let count = total / accounts.len() as u64
+                + u64::from((index as u64) < total % accounts.len() as u64);
+            let budget = U256::from(count)
+                * U256::from(TRANSFER_VALUE + u128::from(TRANSFER_GAS) * MAX_FEE_PER_GAS);
+            eyre::ensure!(
+                balance >= budget,
+                "genesis sender cannot fund requested transactions: {address}"
+            );
+        }
+    }
+    tracing::info!(genesis = path, genesis_blake3 = %blake3::hash(&raw), total, "Offline signing: fresh genesis nonces only; running-chain state has not been checked");
+    Ok(())
 }
 
 const BATCH_TRANSFER_RECORD_BYTES: usize = 12;
@@ -603,41 +820,20 @@ fn sign_mixed_batch(
             let is_contract_call = erc20_ratio > 0 && (tx_index % 100) < erc20_ratio as usize;
             tx_index += 1;
 
-            let tx = if is_contract_call {
-                TxEip1559 {
-                    chain_id: chain_id(),
-                    nonce,
-                    gas_limit: CONTRACT_CALL_GAS,
-                    max_fee_per_gas: MAX_FEE_PER_GAS,
-                    max_priority_fee_per_gas: MAX_PRIORITY_FEE,
-                    to: TxKind::Call(STRESS_CONTRACT),
-                    value: U256::ZERO,
-                    input: Bytes::new(),
-                    access_list: Default::default(),
-                }
-            } else {
-                let to = targets[(nonce as usize) % targets.len()];
-                TxEip1559 {
-                    chain_id: chain_id(),
-                    nonce,
-                    gas_limit: TRANSFER_GAS,
-                    max_fee_per_gas: MAX_FEE_PER_GAS,
-                    max_priority_fee_per_gas: MAX_PRIORITY_FEE,
-                    to: TxKind::Call(to),
-                    value: U256::from(TRANSFER_VALUE),
-                    input: Bytes::new(),
-                    access_list: Default::default(),
-                }
-            };
-            let sig_hash = tx.signature_hash();
-            let sig = account.signer.sign_hash_sync(&sig_hash).expect("sign");
-            let signed = tx.into_signed(sig);
-            let mut buf = Vec::with_capacity(128);
-            signed.encode_2718(&mut buf);
+            let buf = sign_transaction(account, targets, nonce, is_contract_call);
             result.push(format!("0x{}", hex::encode(&buf)));
         }
     }
 
+    if independent_recipient_order(accounts) {
+        let mut records = result.into_iter();
+        result = interleave_senders(
+            nonce_info
+                .iter()
+                .map(|(_, _, count)| records.by_ref().take(*count as usize).collect())
+                .collect(),
+        );
+    }
     (result, start.elapsed(), nonce_info)
 }
 
@@ -748,7 +944,20 @@ async fn get_nonce(client: &reqwest::Client, rpc_url: &str, address: &Address) -
         serde_json::json!([format!("{address:?}"), "pending"]),
     )
     .await?;
-    Ok(parse_hex_u64(resp["result"].as_str().unwrap_or("0x0")))
+    parse_nonce_response(&resp)
+}
+
+fn parse_nonce_response(resp: &serde_json::Value) -> Result<u64> {
+    eyre::ensure!(
+        resp.get("error").is_none(),
+        "nonce RPC returned an error: {}",
+        resp["error"]
+    );
+    let raw = resp["result"]
+        .as_str()
+        .and_then(|v| v.strip_prefix("0x"))
+        .ok_or_else(|| eyre::eyre!("missing or invalid nonce RPC result"))?;
+    Ok(u64::from_str_radix(raw, 16)?)
 }
 
 async fn get_block_number(client: &reqwest::Client, rpc_url: &str) -> Result<u64> {
@@ -799,7 +1008,7 @@ async fn sync_nonces_parallel(
     accounts: &[Arc<TestAccount>],
     rpc_urls: &[String],
     client: &reqwest::Client,
-) {
+) -> Result<()> {
     let start = Instant::now();
     let mut handles = Vec::new();
 
@@ -808,14 +1017,17 @@ async fn sync_nonces_parallel(
         let rpc_url = rpc_urls[account.rpc_idx].clone();
         let account = account.clone();
         handles.push(tokio::spawn(async move {
-            if let Ok(nonce) = get_nonce(&client, &rpc_url, &account.address).await {
-                account.nonce.store(nonce, Ordering::Relaxed);
-            }
+            let nonce = get_nonce(&client, &rpc_url, &account.address).await?;
+            Ok::<_, eyre::Report>((account, nonce))
         }));
     }
 
+    let mut synced = Vec::with_capacity(accounts.len());
     for handle in handles {
-        let _ = handle.await;
+        synced.push(handle.await??);
+    }
+    for (account, nonce) in synced {
+        account.nonce.store(nonce, Ordering::Relaxed);
     }
 
     tracing::info!(
@@ -823,6 +1035,7 @@ async fn sync_nonces_parallel(
         elapsed_ms = start.elapsed().as_millis(),
         "Nonces synced (parallel)"
     );
+    Ok(())
 }
 
 /// Resync nonces for a subset of accounts
@@ -1361,76 +1574,48 @@ fn presign_all(
 
     let start = Instant::now();
 
-    // Parallel signing using std::thread::scope (CPU-bound work)
-    let per_account_results: Vec<(usize, Vec<String>)> = std::thread::scope(|s| {
-        let handles: Vec<_> = accounts
-            .iter()
+    let per_account_results: Vec<(usize, Vec<String>)> = signing_pool().install(|| {
+        accounts
+            .par_iter()
             .enumerate()
             .map(|(acct_idx, account)| {
-                s.spawn(move || {
-                    let count = txs_per_account + if acct_idx < remainder { 1 } else { 0 };
-                    if count == 0 {
-                        return (account.rpc_idx, Vec::new());
-                    }
-                    let nonce_start = account.nonce.fetch_add(count as u64, Ordering::Relaxed);
-                    let mut txs = Vec::with_capacity(count);
-                    for j in 0..count {
-                        let nonce = nonce_start + j as u64;
-                        let tx_index = acct_idx * txs_per_account + j;
-                        let is_contract_call =
-                            erc20_ratio > 0 && (tx_index % 100) < erc20_ratio as usize;
-
-                        let tx = if is_contract_call {
-                            TxEip1559 {
-                                chain_id: chain_id(),
-                                nonce,
-                                gas_limit: CONTRACT_CALL_GAS,
-                                max_fee_per_gas: MAX_FEE_PER_GAS,
-                                max_priority_fee_per_gas: MAX_PRIORITY_FEE,
-                                to: TxKind::Call(STRESS_CONTRACT),
-                                value: U256::ZERO,
-                                input: Bytes::new(),
-                                access_list: Default::default(),
-                            }
-                        } else {
-                            let to = targets[(nonce as usize) % targets.len()];
-                            TxEip1559 {
-                                chain_id: chain_id(),
-                                nonce,
-                                gas_limit: TRANSFER_GAS,
-                                max_fee_per_gas: MAX_FEE_PER_GAS,
-                                max_priority_fee_per_gas: MAX_PRIORITY_FEE,
-                                to: TxKind::Call(to),
-                                value: U256::from(TRANSFER_VALUE),
-                                input: Bytes::new(),
-                                access_list: Default::default(),
-                            }
-                        };
-                        let sig_hash = tx.signature_hash();
-                        let sig = account.signer.sign_hash_sync(&sig_hash).expect("sign");
-                        let signed = tx.into_signed(sig);
-                        let mut buf = Vec::with_capacity(128);
-                        signed.encode_2718(&mut buf);
-                        txs.push(format!("0x{}", hex::encode(&buf)));
-                    }
-                    (account.rpc_idx, txs)
-                })
+                let count = txs_per_account + usize::from(acct_idx < remainder);
+                let nonce_start = reserve_nonces(account, count).expect("valid nonce range");
+                let txs = (0..count)
+                    .map(|j| {
+                        let contract = erc20_ratio > 0
+                            && (acct_idx * txs_per_account + j) % 100 < erc20_ratio as usize;
+                        format!(
+                            "0x{}",
+                            hex::encode(sign_transaction(
+                                account,
+                                targets,
+                                nonce_start + j as u64,
+                                contract
+                            ))
+                        )
+                    })
+                    .collect();
+                (account.rpc_idx, txs)
             })
-            .collect();
-
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("thread join"))
             .collect()
     });
 
-    // Group by RPC endpoint
-    let mut grouped: Vec<Vec<String>> = vec![Vec::new(); num_rpcs];
-    let mut total_signed = 0usize;
+    let mut by_rpc: Vec<Vec<Vec<String>>> = vec![Vec::new(); num_rpcs];
     for (rpc_idx, txs) in per_account_results {
-        total_signed += txs.len();
-        grouped[rpc_idx].extend(txs);
+        by_rpc[rpc_idx].push(txs);
     }
+    let grouped: Vec<Vec<String>> = by_rpc
+        .into_iter()
+        .map(|groups| {
+            if independent_recipient_order(accounts) {
+                interleave_senders(groups)
+            } else {
+                groups.into_iter().flatten().collect()
+            }
+        })
+        .collect();
+    let total_signed: usize = grouped.iter().map(Vec::len).sum();
 
     let elapsed = start.elapsed();
     let sign_rate = total_signed as f64 / elapsed.as_secs_f64();
@@ -1461,8 +1646,6 @@ const FILE_VERSION: u8 = 2;
 
 /// Raw EIP-2718 encoded transaction bytes paired with 20-byte sender address.
 type RawTxWithSender = (Vec<u8>, [u8; 20]);
-type RawTxWithAddress = (Vec<u8>, Address);
-type PerAccountRawTxResults = Vec<(usize, Vec<RawTxWithAddress>)>;
 
 /// Pre-sign transactions and save to binary file (raw RLP, not hex).
 fn presign_and_save(
@@ -1473,144 +1656,144 @@ fn presign_and_save(
     erc20_ratio: u8,
     path: &str,
 ) -> Result<()> {
-    let num_accounts = accounts.len();
-    let txs_per_account = (total as usize) / num_accounts;
-    let remainder = (total as usize) % num_accounts;
-
-    tracing::info!(
-        total,
-        num_accounts,
-        txs_per_account,
-        remainder,
-        num_rpcs,
-        path,
-        "Pre-signing and saving to file..."
+    eyre::ensure!(
+        !accounts.is_empty() && !targets.is_empty(),
+        "empty signing accounts or recipients"
     );
-
+    eyre::ensure!(
+        num_rpcs > 0
+            && num_rpcs <= u32::MAX as usize
+            && accounts.iter().all(|a| a.rpc_idx < num_rpcs),
+        "invalid signing RPC groups"
+    );
+    let total = usize::try_from(total)?;
+    let per_account = total / accounts.len();
+    let remainder = total % accounts.len();
     let start = Instant::now();
-
-    // Parallel signing — returns raw RLP bytes (not hex) grouped by rpc_idx
-    let per_account_results: PerAccountRawTxResults = std::thread::scope(|s| {
-        let handles: Vec<_> = accounts
-            .iter()
-            .enumerate()
-            .map(|(acct_idx, account)| {
-                s.spawn(move || {
-                    let count = txs_per_account + if acct_idx < remainder { 1 } else { 0 };
-                    if count == 0 {
-                        return (account.rpc_idx, Vec::new());
+    let path = Path::new(path);
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut staging = tempfile::NamedTempFile::new_in(parent)?;
+    let pool = signing_pool();
+    let counts: Vec<_> = (0..accounts.len())
+        .map(|i| per_account + usize::from(i < remainder))
+        .collect();
+    let nonces: Vec<_> = accounts
+        .iter()
+        .zip(&counts)
+        .map(|(a, count)| reserve_nonces(a, *count))
+        .collect::<Result<_>>()?;
+    let mut total_bytes = 25u64;
+    {
+        let mut w = BufWriter::with_capacity(8 * 1024 * 1024, staging.as_file_mut());
+        w.write_all(FILE_MAGIC)?;
+        w.write_all(&[FILE_VERSION])?;
+        w.write_all(&chain_id().to_le_bytes())?;
+        w.write_all(&(num_rpcs as u32).to_le_bytes())?;
+        w.write_all(&(total as u64).to_le_bytes())?;
+        for rpc_idx in 0..num_rpcs {
+            let count: usize = accounts
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.rpc_idx == rpc_idx)
+                .map(|(i, _)| counts[i])
+                .sum();
+            w.write_all(&(count as u64).to_le_bytes())?;
+            total_bytes += 8;
+            let indices: Vec<_> = accounts
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.rpc_idx == rpc_idx)
+                .map(|(i, _)| i)
+                .collect();
+            let max_count = indices.iter().map(|&i| counts[i]).max().unwrap_or(0);
+            let mut jobs: Box<dyn Iterator<Item = (usize, usize)> + '_> =
+                if independent_recipient_order(accounts) {
+                    Box::new((0..max_count).flat_map(|j| {
+                        indices.iter().copied().filter_map({
+                            let counts = &counts;
+                            move |i| (j < counts[i]).then_some((i, j))
+                        })
+                    }))
+                } else {
+                    Box::new(
+                        indices
+                            .iter()
+                            .copied()
+                            .flat_map(|i| (0..counts[i]).map(move |j| (i, j))),
+                    )
+                };
+            // Bound memory by 1024 records per worker while retaining the chosen
+            // global order across chunk boundaries and parallel completion order.
+            loop {
+                let batch: Vec<_> = jobs
+                    .by_ref()
+                    .take(1024 * pool.current_num_threads())
+                    .collect();
+                if batch.is_empty() {
+                    break;
+                }
+                let signed: Vec<Vec<_>> = pool.install(|| {
+                    batch
+                        .par_chunks(1024)
+                        .map(|chunk| {
+                            chunk
+                                .iter()
+                                .map(|&(i, j)| {
+                                    let contract = erc20_ratio > 0
+                                        && (i * per_account + j) % 100 < erc20_ratio as usize;
+                                    (
+                                        sign_transaction(
+                                            &accounts[i],
+                                            targets,
+                                            nonces[i] + j as u64,
+                                            contract,
+                                        ),
+                                        accounts[i].address,
+                                    )
+                                })
+                                .collect()
+                        })
+                        .collect()
+                });
+                for chunk in signed {
+                    for (tx, sender) in chunk {
+                        w.write_all(&u16::try_from(tx.len())?.to_le_bytes())?;
+                        w.write_all(&tx)?;
+                        w.write_all(sender.as_slice())?;
+                        total_bytes += 2 + tx.len() as u64 + 20;
                     }
-                    let nonce_start = account.nonce.fetch_add(count as u64, Ordering::Relaxed);
-                    let mut txs = Vec::with_capacity(count);
-                    for j in 0..count {
-                        let nonce = nonce_start + j as u64;
-                        let tx_index = acct_idx * txs_per_account + j;
-                        let is_contract_call =
-                            erc20_ratio > 0 && (tx_index % 100) < erc20_ratio as usize;
-
-                        let tx = if is_contract_call {
-                            TxEip1559 {
-                                chain_id: chain_id(),
-                                nonce,
-                                gas_limit: CONTRACT_CALL_GAS,
-                                max_fee_per_gas: MAX_FEE_PER_GAS,
-                                max_priority_fee_per_gas: MAX_PRIORITY_FEE,
-                                to: TxKind::Call(STRESS_CONTRACT),
-                                value: U256::ZERO,
-                                input: Bytes::new(),
-                                access_list: Default::default(),
-                            }
-                        } else {
-                            let to = targets[(nonce as usize) % targets.len()];
-                            TxEip1559 {
-                                chain_id: chain_id(),
-                                nonce,
-                                gas_limit: TRANSFER_GAS,
-                                max_fee_per_gas: MAX_FEE_PER_GAS,
-                                max_priority_fee_per_gas: MAX_PRIORITY_FEE,
-                                to: TxKind::Call(to),
-                                value: U256::from(TRANSFER_VALUE),
-                                input: Bytes::new(),
-                                access_list: Default::default(),
-                            }
-                        };
-                        let sig_hash = tx.signature_hash();
-                        let sig = account.signer.sign_hash_sync(&sig_hash).expect("sign");
-                        let signed = tx.into_signed(sig);
-                        let mut buf = Vec::with_capacity(128);
-                        signed.encode_2718(&mut buf);
-                        txs.push((buf, account.address));
-                    }
-                    (account.rpc_idx, txs)
-                })
-            })
-            .collect();
-
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("thread join"))
-            .collect()
-    });
-
-    // Group by RPC: each entry is (tx_bytes, sender_address)
-    let mut grouped: Vec<Vec<(Vec<u8>, Address)>> = vec![Vec::new(); num_rpcs];
-    let mut total_signed = 0usize;
-    for (rpc_idx, txs) in per_account_results {
-        total_signed += txs.len();
-        grouped[rpc_idx].extend(txs);
-    }
-
-    let sign_elapsed = start.elapsed();
-    let sign_rate = total_signed as f64 / sign_elapsed.as_secs_f64();
-    tracing::info!(
-        total_signed,
-        sign_ms = sign_elapsed.as_millis(),
-        sign_rate = format!("{:.0}/s", sign_rate),
-        "Signing complete, writing file..."
-    );
-
-    // Write binary file
-    let file = std::fs::File::create(path)?;
-    let mut w = BufWriter::with_capacity(8 * 1024 * 1024, file);
-
-    // Header
-    w.write_all(FILE_MAGIC)?;
-    w.write_all(&[FILE_VERSION])?;
-    w.write_all(&chain_id().to_le_bytes())?;
-    w.write_all(&(num_rpcs as u32).to_le_bytes())?;
-    w.write_all(&(total_signed as u64).to_le_bytes())?;
-
-    // Per-RPC tx data: v2 format includes 20-byte sender after each tx
-    let mut total_bytes = 25u64; // header size
-    for rpc_txs in &grouped {
-        w.write_all(&(rpc_txs.len() as u64).to_le_bytes())?;
-        total_bytes += 8;
-        for (tx_bytes, sender) in rpc_txs {
-            let len = tx_bytes.len() as u16;
-            w.write_all(&len.to_le_bytes())?;
-            w.write_all(tx_bytes)?;
-            w.write_all(sender.as_slice())?;
-            total_bytes += 2 + tx_bytes.len() as u64 + 20;
+                }
+            }
         }
+        w.flush()?;
     }
-    w.flush()?;
+    staging.as_file().sync_all()?;
+    staging.persist(path)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    tracing::info!(path = %path.display(), total, total_bytes, signing_threads = pool.current_num_threads(), elapsed_ms = start.elapsed().as_millis(), "Pre-signed file atomically published");
+    Ok(())
+}
 
-    let total_elapsed = start.elapsed();
-    tracing::info!(
-        path,
-        total_txs = total_signed,
-        file_size_mb = total_bytes / (1024 * 1024),
-        sign_ms = sign_elapsed.as_millis(),
-        write_ms = (total_elapsed - sign_elapsed).as_millis(),
-        total_ms = total_elapsed.as_millis(),
-        per_rpc = grouped
-            .iter()
-            .map(|g| g.len().to_string())
-            .collect::<Vec<_>>()
-            .join(","),
-        "Pre-signed transactions saved"
+fn validate_file_counts(file_size: u64, groups: usize, total: u64, version: u8) -> Result<()> {
+    let minimum_record = if version == 2 { 23 } else { 3 };
+    let minimum_size = 25u128 + groups as u128 * 8 + u128::from(total) * minimum_record;
+    eyre::ensure!(
+        groups > 0 && minimum_size <= u128::from(file_size),
+        "invalid or truncated presign file counts"
     );
+    Ok(())
+}
 
+fn validate_file_end(r: &mut impl IoRead, loaded: u64, total: u64) -> Result<()> {
+    eyre::ensure!(
+        loaded == total,
+        "presign transaction count mismatch: {loaded} != {total}"
+    );
+    let mut tail = [0u8; 1];
+    eyre::ensure!(r.read(&mut tail)? == 0, "trailing bytes in presign file");
     Ok(())
 }
 
@@ -1663,6 +1846,8 @@ fn load_presigned(path: &str) -> Result<Vec<Vec<String>>> {
         "Loading pre-signed transactions..."
     );
 
+    validate_file_counts(file_size, num_rpcs, total_txs, file_version)?;
+
     // Read per-RPC tx data (v2 has 20-byte sender after each tx, skip it for hex mode)
     let mut grouped: Vec<Vec<String>> = Vec::with_capacity(num_rpcs);
     let mut loaded = 0u64;
@@ -1671,13 +1856,18 @@ fn load_presigned(path: &str) -> Result<Vec<Vec<String>>> {
     for rpc_idx in 0..num_rpcs {
         let mut count_buf = [0u8; 8];
         r.read_exact(&mut count_buf)?;
-        let tx_count = u64::from_le_bytes(count_buf) as usize;
+        let tx_count = usize::try_from(u64::from_le_bytes(count_buf))?;
+        eyre::ensure!(
+            tx_count as u64 <= total_txs - loaded,
+            "RPC group exceeds declared total"
+        );
 
         let mut txs = Vec::with_capacity(tx_count);
         for _ in 0..tx_count {
             let mut len_buf = [0u8; 2];
             r.read_exact(&mut len_buf)?;
             let tx_len = u16::from_le_bytes(len_buf) as usize;
+            eyre::ensure!(tx_len > 0, "empty signed transaction");
             r.read_exact(&mut tx_buf[..tx_len])?;
             if file_version >= 2 {
                 // Skip 20-byte sender in v2 format (not needed for RPC hex mode)
@@ -1694,6 +1884,7 @@ fn load_presigned(path: &str) -> Result<Vec<Vec<String>>> {
         grouped.push(txs);
     }
 
+    validate_file_end(&mut r, loaded, total_txs)?;
     let elapsed = start.elapsed();
     let load_rate = loaded as f64 / elapsed.as_secs_f64();
     tracing::info!(
@@ -1710,6 +1901,10 @@ fn load_presigned(path: &str) -> Result<Vec<Vec<String>>> {
 /// Load pre-signed transactions as raw binary bytes with sender addresses (v2 format).
 /// Returns Vec[rpc_idx] = Vec<(tx_bytes, sender_20bytes)>.
 fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<RawTxWithSender>>> {
+    eyre::ensure!(
+        num_endpoints > 0,
+        "at least one ingest endpoint is required"
+    );
     let start = Instant::now();
     let file = std::fs::File::open(path)?;
     let file_size = file.metadata()?.len();
@@ -1760,6 +1955,9 @@ fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<Raw
         "Loading pre-signed transactions (binary v2 with sender)..."
     );
 
+    validate_file_counts(file_size, file_num_rpcs, total_txs, version[0])?;
+    let mut loaded = 0u64;
+
     // Read per-RPC tx data with sender, preserving nonce ordering per account.
     let mut file_groups: Vec<Vec<RawTxWithSender>> = Vec::with_capacity(file_num_rpcs);
     let mut tx_buf = vec![0u8; 65536];
@@ -1767,13 +1965,19 @@ fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<Raw
     for _ in 0..file_num_rpcs {
         let mut count_buf = [0u8; 8];
         r.read_exact(&mut count_buf)?;
-        let tx_count = u64::from_le_bytes(count_buf) as usize;
+        let tx_count = usize::try_from(u64::from_le_bytes(count_buf))?;
+        eyre::ensure!(
+            tx_count as u64 <= total_txs - loaded,
+            "RPC group exceeds declared total"
+        );
+        loaded += tx_count as u64;
 
         let mut txs = Vec::with_capacity(tx_count);
         for _ in 0..tx_count {
             let mut len_buf = [0u8; 2];
             r.read_exact(&mut len_buf)?;
             let tx_len = u16::from_le_bytes(len_buf) as usize;
+            eyre::ensure!(tx_len > 0, "empty signed transaction");
             r.read_exact(&mut tx_buf[..tx_len])?;
             let mut sender = [0u8; 20];
             r.read_exact(&mut sender)?;
@@ -1781,6 +1985,8 @@ fn load_presigned_binary(path: &str, num_endpoints: usize) -> Result<Vec<Vec<Raw
         }
         file_groups.push(txs);
     }
+
+    validate_file_end(&mut r, loaded, total_txs)?;
 
     // Map file RPC groups to ingest endpoints.
     // When file has fewer groups than endpoints, redistribute by sender address
@@ -3286,13 +3492,38 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(60))
         .build()?;
 
-    let accounts = create_accounts(cli.accounts, rpc_urls.len());
-    let targets: Vec<Address> = accounts.iter().map(|a| a.address).collect();
+    eyre::ensure!(
+        cli.accounts > 0 && cli.accounts <= 100_000,
+        "accounts must be 1..=100000"
+    );
+    let mut accounts = create_accounts(cli.accounts, rpc_urls.len());
+    let targets: Vec<Address> = if let Some(path) = &cli.recipients_file {
+        let raw = std::fs::read(path)?;
+        let targets = serde_json::from_slice::<Vec<Address>>(&raw)?;
+        configure_recipients(&mut accounts, &targets)?;
+        tracing::info!(path, recipients = targets.len(), recipients_blake3 = %blake3::hash(&raw), sender_stride = accounts.len(), "Recipient mapping: (nonce * total_senders + global_sender_index) modulo recipients");
+        targets
+    } else {
+        accounts.iter().map(|a| a.address).collect()
+    };
     let semaphore = Arc::new(Semaphore::new(cli.concurrency));
     let stop = Arc::new(AtomicBool::new(false));
 
-    // Parallel nonce sync
-    sync_nonces_parallel(&accounts, &rpc_urls, &client).await;
+    if let Some(path) = &cli.presign_genesis {
+        validate_presign_genesis(
+            path,
+            &accounts,
+            &targets,
+            if cli.presign > 0 {
+                cli.presign
+            } else {
+                5_000_000
+            },
+            cli.erc20_ratio,
+        )?;
+    } else if cli.presign_load.is_none() {
+        sync_nonces_parallel(&accounts, &rpc_urls, &client).await?;
+    }
 
     // === Pre-sign save mode: sign and save to file, then exit ===
     if let Some(ref save_path) = cli.presign_save {
@@ -3965,7 +4196,7 @@ async fn main() -> Result<()> {
 
         // Wait for all in-flight prefill requests
         tokio::time::sleep(Duration::from_secs(2)).await;
-        sync_nonces_parallel(&accounts, &rpc_urls, &client).await;
+        sync_nonces_parallel(&accounts, &rpc_urls, &client).await?;
 
         if let Ok((pending, queued)) = get_txpool_status(&client, &rpc_urls[0]).await {
             tracing::info!(
@@ -4003,7 +4234,7 @@ async fn main() -> Result<()> {
         let step_duration = Duration::from_secs(cli.duration);
 
         for &target_tps in &tps_levels {
-            sync_nonces_parallel(&accounts, &rpc_urls, &client).await;
+            sync_nonces_parallel(&accounts, &rpc_urls, &client).await?;
 
             stats.reset();
             let sb = get_block_number(&client, &rpc_urls[0]).await?;
@@ -4200,4 +4431,346 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::{Transaction, TxEnvelope, transaction::SignerRecoverable};
+    use alloy_eips::eip2718::Decodable2718;
+
+    fn targets(count: usize) -> Vec<Address> {
+        (0..count)
+            .map(|i| {
+                Address::from_slice(
+                    &alloy_primitives::keccak256(format!("n42-recipient-{i}")).as_slice()[12..],
+                )
+            })
+            .collect()
+    }
+
+    fn configured(count: usize, rpcs: usize, targets: &[Address]) -> Vec<Arc<TestAccount>> {
+        let mut accounts = create_accounts(count, rpcs);
+        configure_recipients(&mut accounts, targets).unwrap();
+        accounts
+    }
+
+    fn check_tx(
+        raw: &[u8],
+        accounts: &[Arc<TestAccount>],
+        targets: &[Address],
+        counts: &mut [u64],
+    ) -> Address {
+        let mut bytes = raw;
+        let tx = TxEnvelope::decode_2718(&mut bytes).unwrap();
+        assert!(bytes.is_empty());
+        let sender = tx.recover_signer().unwrap();
+        let i = accounts.iter().position(|a| a.address == sender).unwrap();
+        assert_eq!(tx.chain_id(), Some(chain_id()));
+        assert_eq!(tx.nonce(), counts[i]);
+        assert_eq!(
+            tx.to(),
+            Some(
+                targets[((tx.nonce() as u128 * accounts.len() as u128 + i as u128)
+                    % targets.len() as u128) as usize]
+            )
+        );
+        assert_eq!(tx.gas_limit(), TRANSFER_GAS);
+        assert_eq!(tx.value(), U256::from(TRANSFER_VALUE));
+        counts[i] += 1;
+        sender
+    }
+
+    #[test]
+    fn passive_mapping_covers_full_recipient_set_across_windows() {
+        let targets = targets(147_000);
+        let accounts = configured(5000, 4, &targets);
+        for start in [0, 44, 88] {
+            let mut counts = vec![0; targets.len()];
+            for nonce in start..start + 44 {
+                for a in &accounts {
+                    counts[recipient_index(a, nonce, targets.len())] += 1;
+                }
+            }
+            assert!(counts.iter().all(|&c| c == 1 || c == 2));
+            assert_eq!(counts.iter().sum::<usize>(), 220_000);
+        }
+        let a = &accounts[4999];
+        assert_eq!(
+            recipient_index(a, u64::MAX, targets.len()),
+            ((u128::from(u64::MAX) * 5000 + 4999) % 147_000) as usize
+        );
+        let legacy = create_accounts(2, 1);
+        assert_eq!(recipient_index(&legacy[1], 123, 17), 123 % 17);
+    }
+
+    #[test]
+    fn rejects_empty_duplicate_and_sender_recipients() {
+        assert!(configure_recipients(&mut create_accounts(2, 1), &[]).is_err());
+        let t = targets(1);
+        assert!(configure_recipients(&mut create_accounts(2, 1), &[t[0], t[0]]).is_err());
+        let mut accounts = create_accounts(2, 1);
+        let sender = accounts[0].address;
+        assert!(configure_recipients(&mut accounts, &[sender]).is_err());
+        let a = &accounts[0];
+        a.nonce.store(u64::MAX - 1, Ordering::Relaxed);
+        assert!(reserve_nonces(a, 2).is_err());
+        assert_eq!(a.nonce.load(Ordering::Relaxed), u64::MAX - 1);
+    }
+
+    #[test]
+    fn signed_online_memory_and_file_paths_match() {
+        let t = targets(37);
+        let accounts = configured(8, 4, &t);
+        let mut online = Vec::new();
+        // RPC-local, noncontiguous subsets must retain the GLOBAL sender index.
+        for rpc in 0..4 {
+            let subset: Vec<_> = accounts
+                .iter()
+                .filter(|a| a.rpc_idx == rpc)
+                .cloned()
+                .collect();
+            online.push(sign_mixed_batch(&subset, &t, 10, 2, 0).0);
+        }
+        let memory = presign_all(&configured(8, 4, &t), &t, 40, 4, 0);
+        assert_eq!(online, memory);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("txs.bin");
+        let path = path.to_str().unwrap();
+        presign_and_save(&configured(8, 4, &t), &t, 40, 4, 0, path).unwrap();
+        assert_eq!(load_presigned(path).unwrap(), memory);
+        for endpoints in [1, 4, 7] {
+            let loaded = load_presigned_binary(path, endpoints).unwrap();
+            let mut counts = vec![0; 8];
+            for (raw, recorded) in loaded.iter().flatten() {
+                assert_eq!(
+                    check_tx(raw, &accounts, &t, &mut counts).as_slice(),
+                    recorded
+                );
+            }
+            assert_eq!(counts, vec![5; 8]);
+        }
+    }
+
+    #[test]
+    fn bounded_file_jobs_preserve_nonce_order_and_exact_replacement() {
+        let t = targets(7);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("txs.bin");
+        let path = path.to_str().unwrap();
+        let total = 3 * 1024 + 7;
+        let accounts = configured(3, 2, &t);
+        presign_and_save(&accounts, &t, total, 2, 0, path).unwrap();
+        assert_eq!(
+            load_presigned(path).unwrap(),
+            presign_all(&configured(3, 2, &t), &t, total, 2, 0)
+        );
+        let original = std::fs::read(path).unwrap();
+        assert!(presign_and_save(&accounts, &t, 1, 0, 0, path).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        presign_and_save(&configured(3, 2, &t), &t, 4, 2, 0, path).unwrap();
+        assert!(std::fs::metadata(path).unwrap().len() < original.len() as u64);
+        assert_eq!(
+            load_presigned_binary(path, 2)
+                .unwrap()
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>(),
+            4
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn long_workload_exposes_all_senders_in_each_nonce_round() {
+        let t = targets(37);
+        let accounts = configured(8, 4, &t);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("txs.bin");
+        let path = path.to_str().unwrap();
+        presign_and_save(&accounts, &t, 8 * 1025, 4, 0, path).unwrap();
+        let groups = load_presigned_binary(path, 4).unwrap();
+        for (rpc, group) in groups.iter().enumerate() {
+            for (position, (raw, recorded)) in group.iter().enumerate() {
+                let tx = TxEnvelope::decode_2718(&mut raw.as_slice()).unwrap();
+                let sender = accounts[rpc + (position % 2) * 4].address;
+                assert_eq!(recorded, sender.as_slice());
+                assert_eq!(tx.nonce(), (position / 2) as u64);
+            }
+        }
+        assert_eq!(
+            interleave_senders(vec![vec![1, 2, 3], vec![], vec![4]]),
+            vec![1, 4, 2, 3]
+        );
+    }
+
+    #[test]
+    fn loaders_reject_tails_truncation_and_forged_counts() {
+        let t = targets(3);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("txs.bin");
+        let path = path.to_str().unwrap();
+        presign_and_save(&configured(2, 2, &t), &t, 8, 2, 0, path).unwrap();
+        let original = std::fs::read(path).unwrap();
+        let mut cases = Vec::new();
+        let mut tail = original.clone();
+        tail.push(0);
+        cases.push(tail);
+        cases.push(original[..original.len() - 1].to_vec());
+        let mut count = original.clone();
+        count[17..25].copy_from_slice(&7u64.to_le_bytes());
+        cases.push(count);
+        let mut group = original.clone();
+        group[25..33].copy_from_slice(&u64::MAX.to_le_bytes());
+        cases.push(group);
+        let mut chain = original.clone();
+        chain[5..13].copy_from_slice(&(chain_id() + 1).to_le_bytes());
+        cases.push(chain);
+        for bytes in cases {
+            std::fs::write(path, bytes).unwrap();
+            assert!(load_presigned(path).is_err());
+            assert!(load_presigned_binary(path, 2).is_err());
+        }
+    }
+
+    #[test]
+    fn offline_genesis_checks_chain_nonce_and_funding() {
+        let t = targets(2);
+        let a = configured(2, 2, &t);
+        let mut alloc = serde_json::Map::new();
+        for addr in a.iter().map(|a| a.address).chain(t.iter().copied()) {
+            alloc.insert(
+                format!("{addr}"),
+                serde_json::json!({"balance": "0x100000000000000000000"}),
+            );
+        }
+        let mut genesis = serde_json::json!({"config": {"chainId": chain_id()}, "alloc": alloc});
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("genesis.json");
+        let path = path.to_str().unwrap();
+        let check = |g: &serde_json::Value| {
+            std::fs::write(path, serde_json::to_vec(g).unwrap()).unwrap();
+            validate_presign_genesis(path, &a, &t, 12, 0)
+        };
+        check(&genesis).unwrap();
+        genesis["config"]["chainId"] = (chain_id() + 1).into();
+        assert!(check(&genesis).is_err());
+        genesis["config"]["chainId"] = chain_id().into();
+        let key = format!("{}", a[0].address);
+        genesis["alloc"][&key]["nonce"] = "0x1".into();
+        assert!(check(&genesis).is_err());
+        genesis["alloc"][&key]["nonce"] = "0x0".into();
+        genesis["alloc"][&key]["balance"] = "0x1".into();
+        assert!(check(&genesis).is_err());
+        genesis["alloc"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&t[0].to_string());
+        assert!(check(&genesis).is_err());
+    }
+
+    #[test]
+    fn malformed_nonce_responses_fail_closed() {
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({"error": {"code": -1}}),
+            serde_json::json!({"result": "0xno"}),
+            serde_json::json!({"result": "0x10000000000000000"}),
+        ] {
+            assert!(parse_nonce_response(&response).is_err());
+        }
+        assert_eq!(
+            parse_nonce_response(&serde_json::json!({"result":"0x2a"})).unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    #[ignore = "requires explicitly generated fresh four-node workload files"]
+    fn audit_generated_fresh_four_workload() {
+        audit_workload(220_000);
+    }
+
+    #[test]
+    #[ignore = "requires explicitly generated 72M four-node workload file"]
+    fn audit_generated_fresh_four_minute() {
+        audit_workload(72_000_000);
+    }
+
+    fn audit_workload(expected_total: usize) {
+        let runtime = std::env::var("N42_TEST_FRESH_RUNTIME").expect("N42_TEST_FRESH_RUNTIME");
+        let path = std::env::var("N42_TEST_PRESIGNED_FILE").expect("N42_TEST_PRESIGNED_FILE");
+        let t: Vec<Address> = serde_json::from_slice(
+            &std::fs::read(Path::new(&runtime).join("recipients.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(t.len(), 147_000);
+        let accounts = configured(5000, 4, &t);
+        let by_sender: std::collections::HashMap<_, _> = accounts
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (a.address, i))
+            .collect();
+        let by_target: std::collections::HashMap<_, _> =
+            t.iter().enumerate().map(|(i, a)| (*a, i)).collect();
+        let file = load_presigned_binary(&path, 4).unwrap();
+        let total: usize = file.iter().map(Vec::len).sum();
+        assert_eq!(total, expected_total);
+        validate_presign_genesis(
+            Path::new(&runtime)
+                .join("artifacts/genesis.json")
+                .to_str()
+                .unwrap(),
+            &accounts,
+            &t,
+            total as u64,
+            0,
+        )
+        .unwrap();
+        let mut counts = vec![0u64; 5000];
+        let mut coverage = vec![0usize; t.len()];
+        for (rpc, group) in file.iter().enumerate() {
+            assert_eq!(group.len(), expected_total / 4);
+            for (raw, recorded) in group.iter().take(55_000) {
+                let mut bytes = raw.as_slice();
+                let tx = TxEnvelope::decode_2718(&mut bytes).unwrap();
+                assert!(bytes.is_empty());
+                let sender = tx.recover_signer().unwrap();
+                assert_eq!(sender.as_slice(), recorded);
+                let i = by_sender[&sender];
+                assert_eq!(i % 4, rpc);
+                assert_eq!(tx.nonce(), counts[i]);
+                assert_eq!(tx.chain_id(), Some(941004));
+                assert_eq!(tx.gas_limit(), TRANSFER_GAS);
+                assert_eq!(tx.value(), U256::from(TRANSFER_VALUE));
+                let target = tx.to().unwrap();
+                let index = ((counts[i] * 5000 + i as u64) % 147_000) as usize;
+                assert_eq!(target, t[index]);
+                assert_eq!(by_target[&target], index);
+                coverage[index] += 1;
+                counts[i] += 1;
+            }
+        }
+        assert_eq!(counts, vec![44; 5000]);
+        assert!(coverage.iter().all(|&c| c == 1 || c == 2));
+        println!(
+            "loaded complete framing of {expected_total} records; verified first 55000 per RPC: 220000 secp256k1 signatures, chain 941004, 5000 senders, all 147000 recipients, contiguous nonces 0..43; no chain execution measured"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonce_sync_errors_do_not_silently_sign_from_zero() {
+        let accounts = create_accounts(1, 1);
+        accounts[0].nonce.store(9, Ordering::Relaxed);
+        assert!(
+            sync_nonces_parallel(
+                &accounts,
+                &["not-a-url".to_owned()],
+                &reqwest::Client::new()
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(accounts[0].nonce.load(Ordering::Relaxed), 9);
+    }
 }

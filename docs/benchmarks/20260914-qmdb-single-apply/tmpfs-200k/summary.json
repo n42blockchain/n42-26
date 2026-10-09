@@ -1,0 +1,34 @@
+[
+  {
+    "reads": 0,
+    "version": "baseline",
+    "count": 18,
+    "median_ms": 245.346,
+    "min_ms": 229.061,
+    "max_ms": 280.061
+  },
+  {
+    "reads": 0,
+    "version": "optimized",
+    "count": 18,
+    "median_ms": 94.3215,
+    "min_ms": 91.691,
+    "max_ms": 99.599
+  },
+  {
+    "reads": 1,
+    "version": "baseline",
+    "count": 18,
+    "median_ms": 285.926,
+    "min_ms": 267.691,
+    "max_ms": 295.914
+  },
+  {
+    "reads": 1,
+    "version": "optimized",
+    "count": 18,
+    "median_ms": 130.68849999999998,
+    "min_ms": 126.09,
+    "max_ms": 140.767
+  }
+]

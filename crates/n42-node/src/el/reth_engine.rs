@@ -19,6 +19,7 @@ use reth_payload_primitives::{PayloadKind, PayloadTypes};
 pub struct RethExecutionLayer {
     engine: ConsensusEngineHandle<EthEngineTypes>,
     payload_builder: Option<PayloadBuilderHandle<EthEngineTypes>>,
+    import_gate: Option<super::import_gate::ImportGate>,
 }
 
 impl RethExecutionLayer {
@@ -30,6 +31,7 @@ impl RethExecutionLayer {
         Self {
             engine,
             payload_builder: Some(payload_builder),
+            import_gate: super::import_gate::ImportGate::configured(),
         }
     }
 
@@ -38,6 +40,7 @@ impl RethExecutionLayer {
         Self {
             engine,
             payload_builder: None,
+            import_gate: super::import_gate::ImportGate::configured(),
         }
     }
 }
@@ -45,6 +48,10 @@ impl RethExecutionLayer {
 #[async_trait::async_trait]
 impl ExecutionLayer for RethExecutionLayer {
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError> {
+        let _import_guard = match &self.import_gate {
+            Some(gate) => Some(gate.acquire(payload.block_hash()).await),
+            None => None,
+        };
         // consensus_loop::background_import / execution_bridge eager import.
         self.engine
             .new_payload(payload)
@@ -57,10 +64,15 @@ impl ExecutionLayer for RethExecutionLayer {
         state: ForkchoiceState,
     ) -> Result<ForkchoiceUpdated, ElError> {
         // consensus_loop::finalize_committed_block (the finalize/import FCU).
-        self.engine
+        let started = std::time::Instant::now();
+        let result = self
+            .engine
             .fork_choice_updated(state, None)
             .await
-            .map_err(|e| ElError(e.to_string()))
+            .map_err(|e| ElError(e.to_string()));
+        metrics::histogram!("n42_engine_boundary_duration_ms", "phase" => "canonical_update")
+            .record(started.elapsed().as_secs_f64() * 1_000.0);
+        result
     }
 
     async fn fork_choice_updated_with_attrs(
@@ -84,11 +96,17 @@ impl ExecutionLayer for RethExecutionLayer {
         let reth_kind = match kind {
             ResolveKind::WaitForPending => PayloadKind::WaitForPending,
         };
-        self.payload_builder
-            .as_ref()?
+        let builder = self.payload_builder.as_ref()?;
+        let started = std::time::Instant::now();
+        let result = builder
             .resolve_kind(id, reth_kind)
             .await
-            .map(|r| r.map_err(|e| ElError(e.to_string())).map(to_built_block))
+            .map(|r| r.map_err(|e| ElError(e.to_string())).map(to_built_block));
+        // Includes waiting for the pending build and converting its completed
+        // output. This is a builder boundary, not a consensus seal timestamp.
+        metrics::histogram!("n42_engine_boundary_duration_ms", "phase" => "payload_resolve")
+            .record(started.elapsed().as_secs_f64() * 1_000.0);
+        result
     }
 }
 

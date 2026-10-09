@@ -1,0 +1,11 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.45s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/deps/n42_node-f6af4eaa96fd0678)
+
+running 2 tests
+test exec_cache::tests::gov5_normalization_consumes_exact_output_and_only_prices_roots ... ok
+test exec_cache::tests::transaction_root_survives_compact_round_trip_and_is_evicted_by_hash ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 238 filtered out; finished in 0.62s
+

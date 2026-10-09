@@ -1,0 +1,28 @@
+   Compiling n42-node v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-node)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.64s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/deps/n42_node-f6af4eaa96fd0678)
+
+running 18 tests
+test rpc::tests::test_equivocations_with_data ... ok
+test rpc::tests::test_attestation_stats_empty ... ok
+test rpc::tests::test_consensus_status_empty ... ok
+test rpc::tests::test_block_attestation_lookup ... ok
+test rpc::tests::test_equivocations_empty ... ok
+test rpc::tests::native_header_rpc_preserves_optional_slots_and_refuses_malformed_data ... ok
+test rpc::tests::test_submit_attestation_wrong_pubkey_length ... ok
+test rpc::tests::test_submit_attestation_wrong_sig_length ... ok
+test rpc::tests::test_health_ok ... ok
+test rpc::tests::test_submit_attestation_invalid_hex ... ok
+test rpc::tests::test_health_syncing ... ok
+test rpc::tests::test_consensus_status_with_qc ... ok
+test rpc::tests::test_validator_set_response ... ok
+test rpc::tests::test_health_reports_validator_count ... ok
+test rpc::tests::test_twig_root_and_proof_roundtrip ... ok
+test rpc::tests::test_submit_attestation_valid ... ok
+test rpc::tests::test_submit_attestation_unauthorized_pubkey ... ok
+test rpc::tests::test_submit_attestation_unknown_block ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 216 filtered out; finished in 0.01s
+

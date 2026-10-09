@@ -1,64 +1,93 @@
-diff --git a/crates/evm/evm/src/payload_cache.rs b/crates/evm/evm/src/payload_cache.rs
---- a/crates/evm/evm/src/payload_cache.rs
-+++ b/crates/evm/evm/src/payload_cache.rs
-@@ -27,6 +27,14 @@
+diff --git a/crates/ethereum/payload/Cargo.toml b/crates/ethereum/payload/Cargo.toml
+index b19a384fc..a447d242b 100644
+--- a/crates/ethereum/payload/Cargo.toml
++++ b/crates/ethereum/payload/Cargo.toml
+@@ -41,4 +41,5 @@ alloy-consensus.workspace = true
+ alloy-primitives.workspace = true
  
- /// Secondary cache for broadcast to followers (Compact Block).
- static BROADCAST_CACHE: CacheSlot = OnceLock::new();
-+
-+/// Transaction root for the payload in [`CACHE`].  Engine payloads carry raw
-+/// transactions but not the root as a separate field, so the generic Engine API
-+/// conversion normally rebuilds the whole trie.  N42's compact-block path
-+/// already authenticated this root when the leader built the block; retaining
-+/// it lets followers avoid repeating that serial work while the final block-hash
-+/// comparison still validates the supplied root.
-+static TRANSACTION_ROOT_CACHE: OnceLock<Mutex<Option<(B256, B256)>>> = OnceLock::new();
- 
- fn store(slot: &CacheSlot, block_hash: B256, data: impl Any + Send + Sync + 'static) {
-     let cache = slot.get_or_init(|| Mutex::new(None));
-@@ -64,6 +72,30 @@
-     take::<T>(&CACHE, block_hash)
- }
- 
-+/// Store the transaction root belonging to a locally built or compact-injected
-+/// payload.
-+pub fn store_payload_transactions_root(block_hash: B256, transactions_root: B256) {
-+    let cache = TRANSACTION_ROOT_CACHE.get_or_init(|| Mutex::new(None));
-+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-+    *guard = Some((block_hash, transactions_root));
-+}
-+
-+/// Return the cached transaction root when it belongs to `block_hash`.
-+pub fn payload_transactions_root(block_hash: &B256) -> Option<B256> {
-+    let cache = TRANSACTION_ROOT_CACHE.get_or_init(|| Mutex::new(None));
-+    let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-+    guard.as_ref().and_then(|(cached_hash, root)| (cached_hash == block_hash).then_some(*root))
-+}
-+
-+/// Remove a cached transaction root for a rejected payload.
-+pub fn remove_payload_transactions_root(block_hash: &B256) {
-+    let cache = TRANSACTION_ROOT_CACHE.get_or_init(|| Mutex::new(None));
-+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-+    if guard.as_ref().is_some_and(|(cached_hash, _)| cached_hash == block_hash) {
-+        *guard = None;
-+    }
-+}
-+
- /// Store a clone of execution data for broadcast to followers (Compact Block).
- pub fn store_broadcast_execution(block_hash: B256, data: impl Any + Send + Sync + 'static) {
-     store(&BROADCAST_CACHE, block_hash, data);
+ # misc
++rayon.workspace = true
+ tracing.workspace = true
 diff --git a/crates/ethereum/payload/src/lib.rs b/crates/ethereum/payload/src/lib.rs
+index ec28b52ff..61e1696a0 100644
 --- a/crates/ethereum/payload/src/lib.rs
 +++ b/crates/ethereum/payload/src/lib.rs
-@@ -567,9 +567,11 @@
-     {
-         let bundle_state = db.take_bundle();
-         let block_hash = block.hash();
-+        let transactions_root = block.header().transactions_root();
-         let senders = block.senders().to_vec();
-         let execution_output =
-             BlockExecutionOutput { state: bundle_state, result: execution_result };
-+        reth_evm::payload_cache::store_payload_transactions_root(block_hash, transactions_root);
-         reth_evm::payload_cache::store_broadcast_execution(
-             block_hash,
-             (execution_output.clone(), senders.clone()),
+@@ -22,7 +22,7 @@ use reth_errors::{BlockExecutionError, BlockValidationError, ConsensusError};
+ use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
+ use reth_evm::{
+     block::TxResult,
+-    execute::{BlockBuilder, BlockBuilderOutcome},
++    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput},
+     ConfigureEvm, Evm, NextBlockEnvAttributes,
+ };
+ use reth_evm_ethereum::EthEvmConfig;
+@@ -492,7 +492,20 @@ where
+ 
+     let requests = chain_spec
+         .is_prague_active_at_timestamp(attributes.timestamp)
+-        .then_some(execution_result.requests);
++        .then(|| execution_result.requests.clone());
++
++    // Retain the transaction root and execution output so compact followers
++    // can reuse work already authenticated by the leader's sealed block hash.
++    let block_hash = block.hash();
++    let transactions_root = block.header().transactions_root();
++    let senders = block.senders().to_vec();
++    let execution_output = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
++    reth_evm::payload_cache::store_payload_transactions_root(block_hash, transactions_root);
++    reth_evm::payload_cache::store_broadcast_execution(
++        block_hash,
++        (execution_output.clone(), senders.clone()),
++    );
++    reth_evm::payload_cache::store_payload_execution(block_hash, (execution_output, senders));
+ 
+     debug!(target: "payload_builder", id=%payload_id, sealed_block_header = ?block.sealed_header(), "sealed built block");
+ 
+diff --git a/crates/ethereum/payload/src/validator.rs b/crates/ethereum/payload/src/validator.rs
+index 84f8ccecf..b2d1b0733 100644
+--- a/crates/ethereum/payload/src/validator.rs
++++ b/crates/ethereum/payload/src/validator.rs
+@@ -1,7 +1,8 @@
+ //! Validates execution payload wrt Ethereum consensus rules
+ 
+-use alloy_consensus::Block;
++use alloy_consensus::{Block, BlockBody};
+ use alloy_rpc_types_engine::{ExecutionData, PayloadError};
++use rayon::prelude::*;
+ use reth_chainspec::EthereumHardforks;
+ use reth_payload_validator::{amsterdam, cancun, prague, shanghai};
+ use reth_primitives_traits::{Block as _, SealedBlock, SignedTransaction};
+@@ -75,8 +76,31 @@ where
+ 
+     let expected_hash = payload.block_hash();
+ 
+-    // First parse the block
+-    let sealed_block = payload.try_into_block_with_sidecar(&sidecar)?.seal_slow();
++    // A locally built or compact-injected payload may carry the transaction
++    // root already authenticated for this exact sealed hash. Reuse it while
++    // decoding independent envelopes in parallel, then retain the normal hash
++    // comparison below to bind the root to the supplied header.
++    let sealed_block = if let Some(transactions_root) =
++        reth_evm::payload_cache::payload_transactions_root(&expected_hash)
++    {
++        let Block { header, body } =
++            payload.into_block_with_sidecar_raw_with_transactions_root(&sidecar, transactions_root)?;
++        let BlockBody { transactions, ommers, withdrawals } = body;
++        let decode = |tx: alloy_primitives::Bytes| {
++            T::decode_2718_exact(tx.as_ref())
++                .map_err(alloy_rlp::Error::from)
++                .map_err(PayloadError::from)
++        };
++        let transaction_count = transactions.len();
++        let transactions = if transaction_count >= 1_024 {
++            transactions.into_par_iter().map(decode).collect::<Result<Vec<_>, _>>()?
++        } else {
++            transactions.into_iter().map(decode).collect::<Result<Vec<_>, _>>()?
++        };
++        Block { header, body: BlockBody { transactions, ommers, withdrawals } }.seal_slow()
++    } else {
++        payload.try_into_block_with_sidecar(&sidecar)?.seal_slow()
++    };
+ 
+     // Ensure the hash included in the payload matches the block hash
+     if expected_hash != sealed_block.hash() {

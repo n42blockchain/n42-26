@@ -1,0 +1,7 @@
+{
+  "path": "/home/n42/src/n42/n42-26/.artifacts/native-four-20260914/presigned-minute-72m-rejected-account-major.bin",
+  "bytes": 10149233021,
+  "sha256": "01f3492746f2a34fc981dae2606b36c82c5ec381e3b2d273ea0ea3bc9a9e3c8d",
+  "status": "rejected for first-window sender distribution; do not qualify with this file",
+  "originalPath": "/home/n42/src/n42/n42-26/.artifacts/native-four-20260914/presigned-minute-72m.bin"
+}

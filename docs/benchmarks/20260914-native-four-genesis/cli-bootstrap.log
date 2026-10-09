@@ -1,0 +1,45 @@
+2026-09-15T03:21:21.216672Z  INFO Initialized tracing, debug log directory: /tmp/n42-four-cli-bootstrap/logs/941004
+2026-09-15T03:21:21.223179Z  INFO Starting Reth version="2.4.1-dev (3e97b01)"
+2026-09-15T03:21:21.223221Z  INFO Opening database path="/tmp/n42-four-cli-bootstrap/reth/db"
+2026-09-15T03:21:21.227128Z  INFO Launching N42 node
+2026-09-15T03:21:21.227157Z  INFO loading consensus config from file path="/home/n42/src/n42/n42-26/.artifacts/native-four-20260914/consensus.json"
+2026-09-15T03:21:22.290533Z  INFO QMDB split commitment rebuilt from the leaf form and verified against its root source=/home/n42/src/n42/n42-26/.artifacts/native-four-20260914/artifacts/snapshot.qmdb from_base_file=false block=0 base_block_hash=0x9e94c7fa149c40589c37184ce38a28bd7c8e4d3816fc2d7dedb1d370cca9b8d5 base_root=0x1310a80b8aaa0663766cc8737b2f5ba3c555f84f79c27dd3e648a21634564d26 live=152004 next_slot=152004 twigs=75 execution_profile="native" elapsed_ms=174
+2026-09-15T03:21:22.325443Z  INFO QMDB base file written; later starts read it instead of the export path=/tmp/n42-four-cli-bootstrap/consensus/gov5_qmdb_branches.bin.base.qmdb block=0 at=0x9e94c7fa149c40589c37184ce38a28bd7c8e4d3816fc2d7dedb1d370cca9b8d5 elapsed_ms=34
+2026-09-15T03:21:22.361030Z  INFO prepared Gov5 checkpoint-anchored QMDB Engine Tree execution base (leaf form); state roots are recomputed genesis_range="/home/n42/src/n42/n42-26/.artifacts/native-four-20260914/artifacts/genesis-range.n42frng" base_block=0 base_hash=0x9e94c7fa149c40589c37184ce38a28bd7c8e4d3816fc2d7dedb1d370cca9b8d5 base_root=0x1310a80b8aaa0663766cc8737b2f5ba3c555f84f79c27dd3e648a21634564d26 execution_profile="native" slots=152004 live=152004 archive_floor=0
+2026-09-15T03:21:22.361098Z  INFO H2-v4 static-schedule epoch profile enabled; committee changes activate at view boundaries with changes_hash=0 epoch_length=1000 scheduled=false
+2026-09-15T03:21:22.361355Z  INFO validator identity resolved validator_index=0 validator_count=4 fee_recipient=0x82649D58540D53dF8Ac56dCF85ee9eBEcDFC66f9
+2026-09-15T03:21:22.362120Z  INFO EvidenceStore initialized path=/tmp/n42-four-cli-bootstrap/consensus/evidence
+2026-09-15T03:21:22.362143Z  INFO QMDB exact-block execution state reads enabled mode=Only
+2026-09-15T03:21:22.362165Z  INFO StakingManager initialized
+2026-09-15T03:21:22.362166Z  INFO generic Twig/JMT compact-output sidecar disabled; authenticated Gov5 QMDB execution store is authoritative
+2026-09-15T03:21:22.375576Z  INFO Configuration loaded path="/tmp/n42-four-cli-bootstrap/reth/reth.toml"
+2026-09-15T03:21:22.399917Z  INFO check_consistency: Healing static file inconsistencies.
+2026-09-15T03:21:22.400287Z  INFO check_consistency:check_consistency{read_only=false}: Verifying storage consistency.
+2026-09-15T03:21:22.400395Z  INFO Database opened
+2026-09-15T03:21:22.904144Z  INFO 
+Pre-merge hard forks (block based):
+- Frontier                         @0
+- Homestead                        @0
+- Tangerine                        @0
+- SpuriousDragon                   @0
+- Byzantium                        @0
+- Constantinople                   @0
+- Petersburg                       @0
+- Istanbul                         @0
+- MuirGlacier                      @0
+- Berlin                           @0
+- London                           @0
+- ArrowGlacier                     @0
+- GrayGlacier                      @0
+Merge hard forks:
+- Paris                            @0 (network is known to be merged)
+Post-merge hard forks (timestamp based):
+- Shanghai                         @0          blob: (target: 3, max: 6, fraction: 3338477)
+- Cancun                           @0          blob: (target: 3, max: 6, fraction: 3338477)
+2026-09-15T03:21:22.904168Z  INFO Loaded storage settings settings=StorageSettings { storage_v2: true } pruning_mode="archive"
+2026-09-15T03:21:22.904800Z  INFO TX pool validation running on dedicated runtime threads=4 auxiliary_rayon_threads=3
+2026-09-15T03:21:22.925339Z ERROR shutting down due to error err=Operation not permitted (os error 1)
+Error: Operation not permitted (os error 1)
+
+Location:
+    /tmp/n42-ci-repro-j5wu4xcf/reth/crates/node/builder/src/builder/mod.rs:999:23

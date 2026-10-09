@@ -1,0 +1,33 @@
+{
+  "scope": "Synthetic offline H2 receipt qualification tests; no real four-node run or throughput measurement",
+  "validation": {
+    "python_passed": 30,
+    "production_receipt_vectors_passed": 2,
+    "workspace_clippy": "passed",
+    "native_helper_build": "locked offline"
+  },
+  "source_and_log_sha256": {
+    "README.md": "69b6b075ecce6212bddf768ffa2e156d0f312c5a1260720ab4cd206c1de0bc7d",
+    "fixtures/gov5-receipt-audit.json": "28e8b994b80300a245dab3234bdf4dee72e70167088183c1751e30286b75a8d3",
+    "h2-tps-audit.py": "b35d31d7061baa640e8c15a170bd028732cd61624aadc3de6b31d43098dadc0e",
+    "helper-build.log": "ba0807dd4b16eeabe9f947a79c60e06a507fd530c00ef963b466f0a1be332175",
+    "n42-keccak.rs": "be249a52d2373975df362ee84daa9bc4bb6f9ca112969ce9caa4d0c1a72bb65a",
+    "native-tests.log": "bce20724c1f039062d0d2ea6b960040ba795b2edf1302aba766206d91bb0d6fa",
+    "python-tests.log": "439ac397353bcffdc9ef128f5f4cc7e1c40191dd9c0039e368929e42759a7223",
+    "qualify-1m-tps.sh": "e2d3aa2b5a7bbb66e8e0dae1e3d228dd4a2c0a388dfed9b0c555879eec8c9250",
+    "receipt.rs": "dc38bd34669095ce08644787f51b9487dc48dc3be46f4636dd8d98a9f3fd3df8",
+    "synthetic-failed-transactions.json": "9fdac8c112b96052b36724c63e116a060fa4ca0ed8b7b6597ac8dbe24920bc85",
+    "synthetic-success.json": "f432d15aa3b7c1327139616b8adcc1487dec4ad1d66b2f4d5c7908ba3dbbcd4c",
+    "test-h2-tps-audit.py": "f59b951ba0c7983b0ec6aa87ac2b34bdf22858bd6af4be4d92c6e1ab423768d2",
+    "workspace-clippy.log": "14a575e097055bb11051e7ff68c914984f36d486096861c3072352f9d90636db"
+  },
+  "keccak_binary_sha256": "1d1d6cc94133024b74cd3865576e70f11eef5433082deb363fb9e53c385b8b81",
+  "reth_baseline": "23316e3ff8adca8c3bd5085ff0565fcae019202a",
+  "remaining": [
+    "Real four-node sustained 1M successful committed TPS",
+    "Independent BLS and header-hash verification",
+    "Transaction-root reconstruction and EVM/business-state verification",
+    "Restart/catch-up and hardware durability",
+    "Receipt audit scaling at target load"
+  ]
+}

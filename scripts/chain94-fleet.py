@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated seven-Rust-node fleet on an explicitly selected, frozen Gov5 snapshot.
+"""Isolated native H2 fleet: frozen seven-node Gov5 snapshot or fresh four-node genesis.
 
 No command stops, opens for writing, or seeds from the live Gov5 node directories.
 prepare needs Python cryptography for fresh, fleet-specific libp2p identities.
@@ -186,24 +186,110 @@ def owned_process(runtime, index):
     return pid
 
 
+def public_key_hex(value):
+    # ConsensusConfig's Rust serializer writes BLS bytes as an array.
+    return bytes(value).hex() if isinstance(value, list) else value.removeprefix("0x").lower()
+
+
+def fleet_size(manifest):
+    count = manifest.get("node_count", 7)
+    if type(count) is not int or count not in (4, 7) or len(manifest["peers"]) != count:
+        raise ValueError("fleet must have exactly four or seven matching peer identities")
+    fresh = manifest.get("profile") == "fresh-native-h2-qmdb-cancun"
+    if (count == 4 or fresh) and (not fresh
+                                 or manifest.get("snapshot", {}).get("block_number") != 0
+                                 or manifest["snapshot"].get("block_hash") != manifest.get("genesis_hash")):
+        raise ValueError("fresh fleets require a newly generated native genesis, not a truncated signed roster")
+    return count
+
+
+def shutdown_children(children):
+    """Keep the supervisor (and its enclosing hardware claim) until all nodes exit."""
+    for child in children:
+        if child.poll() is None:
+            # Popen tracks our own unreaped child; do not signal a persisted PID
+            # from another exec's PID namespace or an unrelated process group.
+            child.send_signal(signal.SIGINT)
+    warned = False
+    deadline = time.monotonic() + 60
+    while any(child.poll() is None for child in children):
+        if not warned and time.monotonic() >= deadline:
+            print("Nodes still shutting down; retaining supervisor ownership, no SIGKILL sent.", flush=True)
+            warned = True
+        time.sleep(0.2)
+    for child in children:
+        child.wait()
+
+
 def start(args):
+    foreground = bool(getattr(args, "foreground", False))
+    children = []
+    cancelled = []
+
+    def cancel(signum, _frame):
+        # Defer cancellation until Popen's returned handle has been registered.
+        # Raising inside Popen could leave a successfully spawned node unowned.
+        if not cancelled:
+            cancelled.append(signum)
+
+    previous = {sig: signal.signal(sig, cancel) for sig in (signal.SIGINT, signal.SIGTERM)}
+    launched = False
+    try:
+        _start(args, children, cancelled)
+        launched = True
+        if foreground:
+            print("Supervising fleet in foreground; signal this process to stop all nodes.", flush=True)
+            while not cancelled:
+                for index, child in enumerate(children):
+                    code = child.poll()
+                    if code is not None:
+                        raise RuntimeError(f"node{index} exited with status {code}; stopping remaining nodes")
+                time.sleep(0.2)
+        if cancelled:
+            raise SystemExit(128 + cancelled[0])
+    finally:
+        try:
+            if foreground or not launched or cancelled:
+                shutdown_children(children)
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+
+def _start(args, children, cancelled):
     runtime = args.runtime
     manifest = read_json(runtime / "manifest.json")
+    count = fleet_size(manifest)
+    fresh = manifest.get("profile") == "fresh-native-h2-qmdb-cancun"
     binary = args.binary.resolve()
     if not binary.is_file():
         raise ValueError(f"binary missing: {binary}")
-    if any(owned_process(runtime, i) for i in range(7)):
+    if any(owned_process(runtime, i) for i in range(count)):
         raise ValueError("fleet is already running; stop it gracefully before restarting")
     for name, expected in manifest["artifacts_sha256"].items():
         if digest(runtime / "artifacts" / name) != expected:
             raise ValueError(f"frozen artifact changed: {name}")
+    for name, expected in manifest.get("runtime_sha256", {}).items():
+        if digest(runtime / name) != expected:
+            raise ValueError(f"fleet configuration changed: {name}")
+    consensus_config = read_json(runtime / "consensus.json")
+    if fresh:
+        genesis = read_json(runtime / "artifacts/genesis.json")
+        validators = consensus_config.get("initial_validators", [])
+        configured = genesis["config"]["hotstuff"]["validators"]
+        if (consensus_config.get("validator_set_size") != count
+                or consensus_config.get("fault_tolerance") != (count - 1) // 3
+                or len(validators) != count or len(configured) != count
+                or [(v["address"].lower(), public_key_hex(v["bls_public_key"])) for v in validators]
+                   != [(v["address"].lower(), v["blsKey"].removeprefix("0x").lower()) for v in configured]):
+            raise ValueError("fresh genesis and H2 consensus roster must match exactly")
     # Check every TCP/UDP port before starting any node. No existing process is stopped.
     ports = manifest["ports"]
     for kind, base in ports.items():
         types = [socket.SOCK_DGRAM] if kind == "mobile" else [socket.SOCK_STREAM]
         if kind == "consensus":
             types.append(socket.SOCK_DGRAM)
-        for index in range(7):
+        for index in range(count):
             for socktype in types:
                 with socket.socket(socket.AF_INET, socktype) as sock:
                     if socktype == socket.SOCK_STREAM:
@@ -219,13 +305,36 @@ def start(args):
                         raise RuntimeError(f"port preflight failed: {kind} node{index} port {base + index}: {error}") from error
     snapshot = manifest["snapshot"]
     consensus_config = read_json(runtime / "consensus.json")
-    run = dict(binary=str(binary), sha256=digest(binary), started=time.time(),
+    max_txs = getattr(args, "max_txs_per_block", None)
+    build_budget = getattr(args, "build_budget_ms", None)
+    if max_txs is None:
+        max_txs = manifest.get("max_txs_per_block", 80000)
+    if build_budget is None:
+        build_budget = manifest.get("build_budget_ms", 1000)
+    if max_txs <= 0 or build_budget <= 0:
+        raise ValueError("transaction cap and build budget must be positive")
+    rpc_max_response_mb = getattr(args, "rpc_max_response_mb", 160)
+    if not 16 <= rpc_max_response_mb <= 512:
+        raise ValueError("RPC response size must be between 16 and 512 MiB")
+    # Historical snapshot fleets use a small pool; fresh funded throughput
+    # fleets need the adaptive pool sized by the requested block cap.
+    low_memory = not fresh
+    disable_forward = bool(getattr(args, "disable_tx_forward", False))
+    single_flight = bool(getattr(args, "import_single_flight", False))
+    gov5_reuse = os.environ.get("N42_GOV5_REUSE_BUILDER_EXECUTION", "1")
+    if gov5_reuse not in {"0", "1"}:
+        raise ValueError("N42_GOV5_REUSE_BUILDER_EXECUTION must be 0 or 1")
+    run = dict(foreground=bool(getattr(args, "foreground", False)), low_memory=low_memory, disable_tx_forward=disable_forward, max_txs_per_block=max_txs, build_budget_ms=build_budget, rpc_max_response_mb=rpc_max_response_mb, binary=str(binary), sha256=digest(binary), started=time.time(),
                block_interval_ms=consensus_config["slot_time_ms"],
+               immediate_persistence=dict(persistence_threshold=0, state_masking_blocks=0, memory_block_buffer_target=0),
+               import_single_flight=single_flight, fast_transfers=args.fast_transfers, parallel_build=args.parallel_build, parallel_import=args.parallel_import, qmdb_reads=args.qmdb_reads, gov5_reuse_builder_execution=gov5_reuse,
                log_offsets={str(i): (runtime / f"logs/node{i}.log").stat().st_size
-                            if (runtime / f"logs/node{i}.log").exists() else 0 for i in range(7)})
+                            if (runtime / f"logs/node{i}.log").exists() else 0 for i in range(count)})
     write_json(runtime / "run.json", run)
     write_json(runtime / f"run-{int(run['started'])}.json", run)
-    for index in range(7):
+    for index in range(count):
+        if cancelled:
+            raise SystemExit(128 + cancelled[0])
         node = runtime / f"node{index}"
         # Do not inherit another experiment's N42 mode, keys, peers or ports.
         env = {key: value for key, value in os.environ.items() if not key.startswith("N42_")}
@@ -235,8 +344,14 @@ def start(args):
             "N42_VALIDATOR_KEY": "@" + str(node / "bls.key"),
             "N42_P2P_KEY": "@" + str(node / "p2p.key"),
             "N42_GOV5_H2_PARTICIPANT": "1", "N42_GOV5_HEADER_PROFILE": "1",
-            "N42_GOV5_LEGACY_SIGNING": "1", "N42_GOV5_NATIVE_PRODUCER": "1",
-            "N42_GOV5_QMDB_EXECUTION": "1", "N42_GOV5_PRAGUE_TIME": "1746612311",
+            "N42_GOV5_LEGACY_SIGNING": "0" if fresh else "1", "N42_GOV5_NATIVE_PRODUCER": "1",
+            "N42_GOV5_QMDB_EXECUTION": "1",
+            "N42_GOV5_REUSE_BUILDER_EXECUTION": gov5_reuse,
+            "N42_FAST_TRANSFER": "1" if args.fast_transfers else "0",
+            "N42_PARALLEL_BUILD": "1" if args.parallel_build else "0",
+            "N42_PARALLEL_IMPORT": "1" if args.parallel_import else "0",
+            "N42_IMPORT_SINGLE_FLIGHT": "1" if single_flight else "0",
+            "N42_QMDB_READS": args.qmdb_reads,
             "N42_GOV5_QMDB_LEAF_FORM": str(runtime / "artifacts/snapshot.qmdb"),
             "N42_GOV5_GENESIS_BOOTSTRAP": str(runtime / "artifacts/genesis-range.n42frng"),
             "N42_QMDB_BOOTSTRAP_BLOCK": str(snapshot["block_number"]),
@@ -247,31 +362,50 @@ def start(args):
             "N42_STARHUB_PORT": str(ports["mobile"] + index),
             "N42_LISTEN_IP": "127.0.0.1", "N42_NO_AUTO_CONNECT": "1",
             "N42_ENABLE_MDNS": "0", "N42_ENABLE_DHT": "0", "N42_ENABLE_HTTP_RPC": "1",
-            "N42_LOW_MEMORY": "1", "N42_COMPACT_BLOCK": "0",
+            "N42_LOW_MEMORY": "1" if low_memory else "0", "N42_COMPACT_BLOCK": "0",
+            "N42_DISABLE_TX_FORWARD": "1" if disable_forward else "0",
             "N42_BLOCK_INTERVAL_MS": str(consensus_config["slot_time_ms"]),
             "N42_TRUSTED_PEERS": ",".join(f"/ip4/127.0.0.1/tcp/{ports['consensus']+i}/p2p/{peer}" for i, peer in enumerate(manifest["peers"]) if i != index),
             "RAYON_NUM_THREADS": "8", "TOKIO_WORKER_THREADS": "8",
             "RUST_LOG": "info",
         })
+        if "max_txs_per_block" in manifest or getattr(args, "max_txs_per_block", None) is not None:
+            env["N42_MAX_TXS_PER_BLOCK"] = str(max_txs)
+        if "build_budget_ms" in manifest or getattr(args, "build_budget_ms", None) is not None:
+            env["N42_BUILD_TIME_BUDGET_MS"] = str(build_budget)
+        if "ingest" in ports:
+            env["N42_INGEST_PORT"] = str(ports["ingest"] + index)
+        prague_time = manifest.get("prague_time", 1746612311)
+        if prague_time is not None:
+            env["N42_GOV5_PRAGUE_TIME"] = str(prague_time)
         command = [str(binary), "node", "--chain", str(runtime / "artifacts/genesis.json"),
                    "--datadir", str(node / "reth"), "--disable-discovery",
                    "--addr", "127.0.0.1", "--port", str(ports["p2p"] + index),
                    "--max-inbound-peers", "0", "--max-outbound-peers", "0",
                    "--http", "--http.addr", "127.0.0.1", "--http.port", str(ports["http"] + index),
                    "--authrpc.addr", "127.0.0.1", "--authrpc.port", str(ports["auth"] + index),
+                   "--rpc.max-response-size", str(rpc_max_response_mb),
+                   "--engine.persistence-threshold", "0",
+                   "--engine.num-state-masking-blocks", "0",
+                   "--engine.memory-block-buffer-target", "0",
                    "--metrics", f"127.0.0.1:{ports['metrics'] + index}",
                    "--ipcdisable", "--log.file.directory", str(node / "logs"),
                    "--log.file.max-files", "0", "--color", "never"]
+        if fresh:
+            command.extend(["--builder.gaslimit", str(manifest["gas_limit"]),
+                            "--builder.interval", "50ms", "--builder.max-tasks", "1"])
         with open(runtime / f"logs/node{index}.log", "ab", buffering=0) as log:
             child = subprocess.Popen(command, cwd=REPO, env=env, stdin=subprocess.DEVNULL,
                                      stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            children.append(child)
         identity = process_identity(child.pid)
         write_json(runtime / f"pids/node{index}.json", dict(pid=child.pid, starttime=identity))
         print(f"node{index}: PID {child.pid}, RPC {ports['http'] + index}", flush=True)
 
 
 def stop(args):
-    targets = [(i, owned_process(args.runtime, i)) for i in range(7)]
+    count = fleet_size(read_json(args.runtime / "manifest.json"))
+    targets = [(i, owned_process(args.runtime, i)) for i in range(count)]
     for _, pid in targets:
         if pid:
             os.kill(pid, signal.SIGINT)
@@ -298,12 +432,13 @@ def rpc(port, method, params):
 
 def sample(runtime):
     manifest = read_json(runtime / "manifest.json")
-    ports = [manifest["ports"]["http"] + i for i in range(7)]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=7) as pool:
+    count = fleet_size(manifest)
+    ports = [manifest["ports"]["http"] + i for i in range(count)]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
         heads = list(pool.map(lambda p: int(rpc(p, "eth_blockNumber", []), 16), ports))
         consensus = list(pool.map(lambda p: rpc(p, "n42_consensusStatus", []), ports))
-        if not all(s["hasCommittedQc"] and s["validatorCount"] == 7 for s in consensus):
-            raise ValueError("all seven nodes must report a committed QC and seven validators")
+        if not all(s["hasCommittedQc"] and s["validatorCount"] == count for s in consensus):
+            raise ValueError(f"all {count} nodes must report a committed QC and matching validator count")
         commits = list(pool.map(committed_block, zip(ports, consensus)))
         committed_heights = [int(block["number"], 16) for block in commits]
         number = min(heads + committed_heights)
@@ -347,15 +482,18 @@ def verify(args):
               for number in range(baseline["comparison_height"] + 1, samples[-1]["comparison_height"] + 1)]
     producers = {block["miner"].lower() for block in blocks}
     expected = {v["address"].lower() for v in read_json(args.runtime / "consensus.json")["initial_validators"]}
-    result = dict(status="PASS" if advanced >= args.min_blocks and all(s["identical"] for s in samples) and producers == expected else "FAIL",
+    rotation_required = not getattr(args, "no_require_rotation", False)
+    result = dict(status="PASS" if advanced >= args.min_blocks and all(s["identical"] for s in samples) and (not rotation_required or producers == expected) else "FAIL",
                   advanced=advanced, snapshot=manifest["snapshot"], samples=samples,
-                  producers=sorted(producers), all_seven_produced=producers == expected,
-                  scope="seven committed-QC RPCs; matching block/state/receipt/transaction roots, progress and all seven producers")
+                  producers=sorted(producers), all_validators_produced=producers == expected,
+                  scope=f"{fleet_size(manifest)} committed-QC RPCs; matching block/state/receipt/transaction roots, progress" + (" and full producer rotation" if rotation_required else ""))
+    if fleet_size(manifest) == 7:
+        result["all_seven_produced"] = producers == expected
     write_json(args.runtime / "verification.json", result)
     write_json(args.runtime / f"verification-{int(time.time())}.json", result)
     if result["status"] != "PASS":
         raise RuntimeError("insufficient common committed progress or incomplete producer rotation")
-    print(f"PASS: {advanced} common blocks, all seven roots/hashes agree")
+    print(f"PASS: {advanced} common blocks, all {fleet_size(manifest)} roots/hashes agree")
 
 
 def main():
@@ -368,12 +506,23 @@ def main():
     prep.add_argument("--validators", type=Path, required=True)
     prep.add_argument("--resume-prepare", action="store_true", help="resume a never-started incomplete preparation, checking every copied file")
     start_parser = sub.add_parser("start")
+    start_parser.add_argument("--foreground", action="store_true", help="supervise nodes until signalled; stop all owned children on failure and wait for cleanup before exiting (does not acquire a shared hardware claim)")
     start_parser.add_argument("--binary", type=Path, default=REPO / "target/release/n42-node")
+    start_parser.add_argument("--fast-transfers", action="store_true", help="enable eligible plain-transfer execution; other transactions still use the interpreter")
+    start_parser.add_argument("--parallel-build", action="store_true", help="execute eligible payload prefixes in parallel; retain the serial tail and complete state-root calculation")
+    start_parser.add_argument("--disable-tx-forward", action="store_true", help="keep transactions in the receiving validator pool for per-node continuous ingest; block gossip remains enabled")
+    start_parser.add_argument("--import-single-flight", action="store_true", help="serialize same-hash imports at the Engine adapter; all requests retain full validation")
+    start_parser.add_argument("--parallel-import", action="store_true", help="execute eligible sealed transfer blocks in parallel with full receipts and QMDB root validation")
+    start_parser.add_argument("--rpc-max-response-mb", type=int, default=160, help="bounded JSON-RPC response limit in MiB (16..512)")
+    start_parser.add_argument("--max-txs-per-block", type=int, help="explicit block transaction cap; defaults to the fleet manifest")
+    start_parser.add_argument("--build-budget-ms", type=int, help="explicit payload build time budget; defaults to the fleet manifest")
+    start_parser.add_argument("--qmdb-reads", choices=("off", "verify", "on", "only"), default="off", help="explicit state-reader mode, recorded in run.json and passed to every node")
     sub.add_parser("stop")
     sub.add_parser("status")
     check = sub.add_parser("verify")
     check.add_argument("--seconds", type=int, default=60)
     check.add_argument("--min-blocks", type=int, default=7)
+    check.add_argument("--no-require-rotation", action="store_true", help="check common committed progress and roots after a qualified workload; the preflight still requires full rotation")
     args = parser.parse_args()
     args.runtime = args.runtime.resolve()
     if args.command == "status":

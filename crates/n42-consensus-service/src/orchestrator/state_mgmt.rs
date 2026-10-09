@@ -1026,6 +1026,7 @@ impl ConsensusService {
                     timestamp: 0,
                     execution_output: None,
                     leader_ready_unix_ms: 0,
+                    native_header_rlp: None,
                 });
 
             if !self.import_and_notify(broadcast).await {
