@@ -1,0 +1,417 @@
+   Compiling syn v3.0.3
+   Compiling indexmap v2.14.0
+   Compiling num-traits v0.2.19
+   Compiling derive_more v2.1.1
+   Compiling c-kzg v2.1.8
+   Compiling alloy-tx-macros v2.3.0
+   Compiling num-integer v0.1.46
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.19
+   Compiling thiserror v2.0.19
+   Compiling tokio-macros v2.7.2
+   Compiling displaydoc v0.2.7
+   Compiling serde v1.0.229
+   Compiling tinystr v0.8.3
+   Compiling icu_locale_core v2.2.0
+   Compiling bytes v1.12.1
+   Compiling smallvec v1.15.2
+   Compiling rand_core v0.9.5
+   Compiling rand_chacha v0.9.0
+   Compiling serdect v0.2.0
+   Compiling rand v0.9.5
+   Compiling sec1 v0.7.3
+   Compiling parking_lot_core v0.9.12
+   Compiling lock_api v0.4.14
+   Compiling arrayvec v0.7.8
+   Compiling elliptic-curve v0.13.8
+   Compiling alloy-rlp v0.3.16
+   Compiling either v1.17.0
+   Compiling ecdsa v0.16.9
+   Compiling ruint v1.20.0
+   Compiling k256 v0.13.4
+   Compiling secp256k1 v0.31.1
+   Compiling alloy-primitives v1.6.1
+   Compiling parking_lot v0.12.5
+   Compiling tokio v1.53.1
+   Compiling rand v0.8.7
+   Compiling itertools v0.14.0
+   Compiling alloy-eip7928 v0.4.5
+   Compiling alloy-eip2930 v0.2.3
+   Compiling alloy-eip7702 v0.6.3
+   Compiling zerotrie v0.2.4
+   Compiling icu_provider v2.2.0
+   Compiling alloy-eip2124 v0.2.0
+   Compiling icu_collections v2.2.0
+   Compiling secp256k1 v0.30.0
+   Compiling icu_properties v2.2.0
+   Compiling icu_normalizer v2.2.0
+   Compiling idna_adapter v1.2.2
+   Compiling ethereum_serde_utils v0.8.1
+   Compiling ethereum_ssz v0.10.4
+   Compiling idna v1.1.0
+   Compiling url v2.5.8
+   Compiling alloy-serde v2.3.0
+   Compiling nybbles v0.4.8
+   Compiling alloy-eips v2.3.0
+   Compiling alloy-trie v0.9.5
+   Compiling alloy-consensus v2.3.0
+   Compiling alloy-sol-types v1.6.1
+   Compiling num-bigint v0.4.8
+   Compiling bitvec v1.1.1
+   Compiling tokio-util v0.7.19
+   Compiling revm-primitives v42.0.0
+   Compiling nonmax v0.5.5
+   Compiling alloy-consensus-any v2.3.0
+   Compiling revm-bytecode v42.0.0
+   Compiling alloy-network-primitives v2.3.0
+   Compiling revm-state v42.0.0
+   Compiling alloy-rpc-types-eth v2.3.0
+   Compiling dashmap v6.2.1
+   Compiling enum-ordinalize-derive v4.4.2
+   Compiling enum-ordinalize v4.4.2
+   Compiling alloy-genesis v2.3.0
+   Compiling ark-std v0.6.0
+   Compiling parity-scale-codec v3.7.5
+   Compiling ark-serialize v0.6.0
+   Compiling educe v0.6.0
+   Compiling reth-codecs v0.6.0
+   Compiling ark-ff v0.6.0
+   Compiling rayon v1.12.0
+   Compiling revm-database-interface v42.0.0
+   Compiling revm-context-interface v42.0.0
+   Compiling reth-primitives-traits v0.6.0
+   Compiling num-rational v0.4.2
+   Compiling ark-poly v0.6.0
+   Compiling num-iter v0.1.46
+   Compiling num-complex v0.4.6
+   Compiling num v0.4.3
+   Compiling primeorder v0.13.6
+   Compiling ark-ec v0.6.0
+   Compiling p256 v0.13.2
+   Compiling aurora-engine-modexp v1.2.0
+   Compiling revm-context v42.0.0
+   Compiling ark-bn254 v0.6.0
+   Compiling ark-bls12-381 v0.6.0
+   Compiling revm-interpreter v42.0.0
+   Compiling revm-precompile v42.0.1
+   Compiling revm-database v42.0.0
+   Compiling revm-handler v42.0.1
+   Compiling tokio-stream v0.1.19
+   Compiling revm-inspector v42.0.1
+   Compiling ipnet v2.12.1
+   Compiling revm v42.0.1
+   Compiling http v1.5.0
+   Compiling alloy-chains v0.2.36
+   Compiling reth-trie-common v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/trie/common)
+   Compiling alloy-hardforks v0.4.7
+   Compiling enr v0.13.0
+   Compiling clap_derive v4.6.4
+   Compiling clap v4.6.5
+   Compiling alloy-evm v0.38.0
+   Compiling reth-ethereum-primitives v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/primitives)
+   Compiling prost v0.14.4
+   Compiling reth-network-peers v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/net/peers)
+   Compiling reth-stages-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/stages/types)
+   Compiling reth-static-file-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/static-file/types)
+   Compiling reth-prune-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/prune/types)
+   Compiling reth-ethereum-forks v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/hardforks)
+   Compiling reth-storage-errors v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/errors)
+   Compiling http-body v1.1.0
+   Compiling hdrhistogram v7.6.0
+   Compiling reth-chainspec v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/chainspec)
+   Compiling tower v0.5.3
+   Compiling simple_asn1 v0.6.4
+   Compiling jsonwebtoken v10.4.0
+   Compiling async-trait v0.1.91
+   Compiling reth-execution-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/evm/execution-types)
+   Compiling alloy-rpc-types-engine v2.3.0
+   Compiling reth-metrics v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/metrics)
+   Compiling http-body-util v0.1.4
+   Compiling h2 v0.4.15
+   Compiling reth-execution-errors v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/evm/execution-errors)
+   Compiling hyper v1.11.0
+   Compiling hyper-util v0.1.20
+   Compiling reth-db-models v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/db-models)
+   Compiling reth-db-api v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/db-api)
+   Compiling tokio-rustls v0.26.4
+   Compiling reth-tokio-util v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/tokio-util)
+   Compiling reth-storage-api v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/storage-api)
+   Compiling reth-consensus v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/consensus/consensus)
+   Compiling hyper-rustls v0.27.9
+   Compiling reth-trie-sparse v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/trie/sparse)
+   Compiling async-compression v0.4.43
+   Compiling reth-trie v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/trie/trie)
+   Compiling tower-http v0.6.11
+   Compiling data-encoding-macro-internal v0.1.19
+   Compiling serde_urlencoded v0.7.1
+   Compiling reth-evm v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/evm/evm)
+   Compiling reqwest v0.13.4
+   Compiling data-encoding-macro v0.1.21
+   Compiling multibase v0.9.3
+   Compiling reth-errors v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/errors)
+   Compiling bincode v1.3.3
+   Compiling tracing-serde v0.2.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling chrono v0.4.45
+   Compiling reth-tasks v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/tasks)
+   Compiling reth-chain-state v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/chain-state)
+   Compiling hyper-timeout v0.5.2
+   Compiling reth-fs-util v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/fs-util)
+   Compiling opentelemetry v0.32.0
+   Compiling tonic v0.14.6
+   Compiling reth-libmdbx v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/libmdbx-rs)
+   Compiling tonic-prost v0.14.6
+   Compiling opentelemetry_sdk v0.32.1
+   Compiling prost-types v0.14.4
+   Compiling tonic-types v0.14.6
+   Compiling opentelemetry-proto v0.32.0
+   Compiling opentelemetry-http v0.32.0
+   Compiling opentelemetry-otlp v0.32.0
+   Compiling tracing-opentelemetry v0.33.0
+   Compiling reth-payload-primitives v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/payload/primitives)
+   Compiling reth-tracing-otlp v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/tracing-otlp)
+   Compiling tracing-appender v0.2.5
+   Compiling reth-payload-builder-primitives v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/payload/builder-primitives)
+   Compiling tracing-samply v0.1.5
+   Compiling rolling-file v0.2.0
+   Compiling tracing-chrome v0.7.2
+   Compiling tracing-journald v0.3.2
+   Compiling tracing-logfmt v0.3.7
+   Compiling reth-nippy-jar v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/nippy-jar)
+   Compiling reth-tracing v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/tracing)
+   Compiling reth-engine-primitives v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/engine/primitives)
+   Compiling alloy-rpc-types-debug v2.3.0
+   Compiling reth-db v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/db)
+   Compiling reth-trie-db v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/trie/db)
+   Compiling reth-net-banlist v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/net/banlist)
+   Compiling humantime-serde v1.1.1
+   Compiling reth-storage-overlay v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/storage-overlay)
+   Compiling reth-revm v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/revm)
+   Compiling reth-node-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/node/types)
+   Compiling crypto-bigint v0.7.5
+   Compiling reth-eth-wire-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/net/eth-wire-types)
+   Compiling prefix-trie v0.8.4
+   Compiling reth-provider v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/provider)
+   Compiling hickory-proto v0.26.1
+   Compiling reth-network-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/net/network-types)
+   Compiling reth-evm-ethereum v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/evm)
+   Compiling jsonrpsee-types v0.26.0
+   Compiling alloy-json-rpc v2.3.0
+   Compiling elliptic-curve v0.14.1
+   Compiling jsonrpsee-core v0.26.0
+   Compiling rfc6979 v0.6.0
+   Compiling primefield v0.14.0
+   Compiling rand_xoshiro v0.7.0
+   Compiling primeorder v0.14.0
+   Compiling ecdsa v0.17.0
+   Compiling reth-network-p2p v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/net/p2p)
+   Compiling k256 v0.14.0
+   Compiling libp2p-identity v0.3.0
+   Compiling alloy-transport v2.3.0
+   Compiling imbl v7.0.1
+   Compiling multiaddr v0.19.0
+   Compiling reth-config v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/config)
+   Compiling reth-execution-cache v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/engine/execution-cache)
+   Compiling reth-trie-parallel v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/trie/parallel)
+   Compiling tungstenite v0.29.0
+   Compiling reth-ethereum-engine-primitives v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/engine-primitives)
+   Compiling multistream-select v0.14.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling alloy-rpc-types v2.3.0
+   Compiling alloy-signer v2.3.0
+   Compiling alloy-rpc-types-any v2.3.0
+   Compiling moka v0.12.15
+   Compiling alloy-network v2.3.0
+   Compiling interprocess v2.4.3
+   Compiling alloy-pubsub v2.3.0
+   Compiling libp2p-identity v0.2.14
+   Compiling libp2p-core v0.44.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling reth-payload-builder v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/payload/builder)
+   Compiling tokio-tungstenite v0.29.0
+   Compiling reth-transaction-pool v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/transaction-pool)
+   Compiling alloy-rpc-types-admin v2.3.0
+   Compiling rustix v1.1.4
+   Compiling reth-network-api v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/net/network-api)
+   Compiling multiaddr v0.18.2
+   Compiling delay_map v0.4.1
+   Compiling discv5 v0.10.4 (https://github.com/sigp/discv5?rev=7663c00#7663c00e)
+   Compiling alloy-transport-ws v2.3.0
+   Compiling alloy-transport-ipc v2.3.0
+   Compiling alloy-transport-http v2.3.0
+   Compiling hickory-net v0.26.1
+   Compiling alloy-rpc-types-trace v2.3.0
+   Compiling hickory-resolver v0.26.1
+   Compiling reth-net-nat v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/net/nat)
+   Compiling reth-ecies v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/net/ecies)
+   Compiling alloy-rpc-client v2.3.0
+   Compiling reth-rpc-traits v0.6.0
+   Compiling reth-rpc-convert v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/rpc/rpc-convert)
+   Compiling reth-eth-wire v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/net/eth-wire)
+   Compiling reth-discv4 v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/net/discv4)
+   Compiling reth-dns-discovery v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/net/dns)
+   Compiling revm-inspectors v0.42.0
+   Compiling reth-discv5 v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/net/discv5)
+   Compiling reth-rpc-server-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/rpc/rpc-server-types)
+   Compiling reth-rpc-eth-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/rpc/rpc-eth-types)
+   Compiling reth-network v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/net/network)
+   Compiling reth-engine-local v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/engine/local)
+   Compiling reth-basic-payload-builder v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/payload/basic)
+   Compiling soketto v0.8.1
+   Compiling reth-cli-util v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/cli/util)
+   Compiling libp2p-swarm-derive v0.36.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-swarm v0.48.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling reth-node-core v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/node/core)
+   Compiling tree_hash v0.12.1
+   Compiling alloy-rpc-types-beacon v2.3.0
+   Compiling reth-node-api v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/node/api)
+   Compiling netlink-sys v0.8.8
+   Compiling jsonrpsee-server v0.26.0
+   Compiling asn1-rs v0.7.2
+   Compiling netlink-proto v0.12.1
+   Compiling jsonrpsee-http-client v0.26.0
+   Compiling jsonrpsee-client-transport v0.26.0
+   Compiling asynchronous-codec v0.7.0
+   Compiling jsonrpsee-ws-client v0.26.0
+   Compiling rtnetlink v0.20.0
+   Compiling alloy-sol-type-parser v1.6.1
+   Compiling jsonrpsee v0.26.0
+   Compiling blake3 v1.8.5
+   Compiling alloy-json-abi v1.6.1
+   Compiling prost-codec v0.4.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling oid-registry v0.8.1
+   Compiling der-parser v10.0.0
+   Compiling reth-exex-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/exex/types)
+   Compiling if-watch v3.2.2
+   Compiling reth-consensus-common v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/consensus/common)
+   Compiling quinn-proto v0.11.16
+   Compiling reth-prune v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/prune/prune)
+   Compiling x509-parser v0.18.1
+   Compiling alloy-dyn-abi v1.6.1
+   Compiling reth-static-file v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/static-file/static-file)
+   Compiling alloy-rpc-types-mev v2.3.0
+   Compiling coins-core v0.12.0
+   Compiling yamux v0.14.0
+   Compiling reth-rpc-eth-api v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/rpc/rpc-eth-api)
+   Compiling libp2p-tls v0.7.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling reth-stages-api v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/stages/api)
+   Compiling quinn v0.11.11
+   Compiling tempfile v3.27.0
+   Compiling alloy-rpc-types-anvil v2.3.0
+   Compiling alloy-rpc-types-txpool v2.3.0
+   Compiling libp2p-gossipsub v0.50.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling reth-rpc-api v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/rpc/rpc-api)
+   Compiling reth-etl v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/etl)
+   Compiling libp2p-noise v0.47.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-quic v0.14.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-yamux v0.48.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling coins-bip32 v0.12.0
+   Compiling libp2p-tcp v0.45.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-mdns v0.49.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-request-response v0.30.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-kad v0.49.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-identify v0.48.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling reth-era v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/era)
+   Compiling libp2p-allow-block-list v0.7.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling libp2p-connection-limits v0.7.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling rmp v0.8.15
+   Compiling signal-hook v0.3.18
+   Compiling rmp-serde v1.3.1
+   Compiling coins-bip39 v0.12.0
+   Compiling libp2p v0.57.0 (https://github.com/libp2p/rust-libp2p.git?rev=6348a0be4aeb5b48eecf17a5d0aae15ff8239984#6348a0be)
+   Compiling reth-era-downloader v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/era-downloader)
+   Compiling procfs-core v0.18.0
+   Compiling n42-primitives v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-primitives)
+   Compiling darling_core v0.24.0
+   Compiling unicode-segmentation v1.13.3
+   Compiling unicode-width v0.2.2
+   Compiling metrics-util v0.20.4
+   Compiling evmap v11.0.0
+   Compiling darling_macro v0.24.0
+   Compiling procfs v0.18.0
+   Compiling prost v0.13.5
+   Compiling n42-chainspec v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-chainspec)
+   Compiling alloy-provider v2.3.0
+   Compiling reth-era-utils v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/era-utils)
+   Compiling reth-exex v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/exex/exex)
+   Compiling alloy-signer-local v2.3.0
+   Compiling reth-rpc-engine-api v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/rpc/rpc-engine-api)
+   Compiling informalsystems-pbjson v0.7.0
+   Compiling n42-parallel-evm v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-parallel-evm)
+   Compiling strum_macros v0.28.0
+   Compiling castaway v0.2.4
+   Compiling inout v0.2.2
+   Compiling litrs v1.0.0
+   Compiling instability v0.3.13
+   Compiling compact_str v0.9.1
+   Compiling document-features v0.2.12
+   Compiling strum v0.28.0
+   Compiling n42-execution v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-execution)
+   Compiling ics23 v0.12.0
+   Compiling reth-rpc v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/rpc/rpc)
+   Compiling signal-hook-mio v0.2.5
+   Compiling reth-stages v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/stages/stages)
+   Compiling metrics-process v2.4.3
+   Compiling darling v0.24.0
+   Compiling metrics-exporter-prometheus v0.18.3
+   Compiling unicode-truncate v2.0.1
+   Compiling reth-engine-tree v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/engine/tree)
+   Compiling reth-ethereum-consensus v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/consensus)
+   Compiling n42-bmt-core v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-bmt-core)
+   Compiling n42-twig-core v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-twig-core)
+   Compiling reth-ipc v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/rpc/ipc)
+   Compiling reth-rpc-layer v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/rpc/rpc-layer)
+   Compiling kasuari v0.4.12
+   Compiling itertools v0.10.5
+   Compiling indoc v2.0.7
+   Compiling reth-consensus-debug-client v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/consensus/debug-client)
+   Compiling jmt v0.12.0
+   Compiling ratatui-core v0.1.2
+   Compiling reth-rpc-builder v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/rpc/rpc-builder)
+   Compiling reth-engine-util v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/engine/util)
+   Compiling reth-node-metrics v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/node/metrics)
+   Compiling reth-node-events v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/node/events)
+   Compiling crossterm v0.29.0
+   Compiling reth-invalid-block-hooks v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/engine/invalid-block-hooks)
+   Compiling reth-db-common v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/db-common)
+   Compiling cipher v0.5.2
+   Compiling reth-node-ethstats v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/node/ethstats)
+   Compiling reth-downloaders v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/net/downloaders)
+   Compiling reth-node-builder v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/node/builder)
+   Compiling n42-jmt v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-jmt)
+   Compiling reth-payload-validator v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/payload/validator)
+   Compiling line-clipping v0.3.8
+   Compiling n42-consensus v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-consensus)
+   Compiling ratatui-widgets v0.3.2
+   Compiling reth-ethereum-payload-builder v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/payload)
+   Compiling ratatui-crossterm v0.1.2
+   Compiling n42-mobile v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-mobile)
+   Compiling xattr v1.6.1
+   Compiling reth-cli-runner v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/cli/runner)
+   Compiling universal-hash v0.6.1
+   Compiling filetime v0.2.29
+   Compiling tar v0.4.46
+   Compiling polyval v0.7.3
+   Compiling n42-network v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-network)
+   Compiling reth-cli v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/cli/cli)
+   Compiling ratatui v0.30.2
+   Compiling reth-node-ethereum v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/node)
+   Compiling comfy-table v7.2.2
+   Compiling backon v1.6.0
+   Compiling lz4 v1.28.1
+   Compiling n42-zkproof v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-zkproof)
+   Compiling human_bytes v0.4.3
+   Compiling reth-cli-commands v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/cli/commands)
+   Compiling n42-consensus-service v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-consensus-service)
+   Compiling ghash v0.6.0
+   Compiling ctr v0.10.1
+   Compiling salsa20 v0.11.0
+   Compiling aes v0.9.2
+   Compiling aead v0.6.1
+   Compiling pbkdf2 v0.13.0
+   Compiling scrypt v0.12.0
+   Compiling aes-gcm v0.11.0
+   Compiling reth-ethereum-cli v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/cli)
+   Compiling n42-node v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-node)
+   Compiling n42-node-bin v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/bin/n42-node)
+    Finished `release` profile [optimized] target(s) in 11m 15s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

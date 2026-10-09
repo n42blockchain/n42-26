@@ -1,0 +1,37 @@
+{
+  "scope": "selected files, not complete workspace; correctness checks, no fleet TPS",
+  "rethBaseline": "23316e3ff8adca8c3bd5085ff0565fcae019202a",
+  "rethPatches": [
+    "patches/reth-payload-transactions-root.patch",
+    "patches/reth-qmdb-state-reader.patch"
+  ],
+  "sourceSha256": {
+    "Cargo.toml": "f1994cb885df3ce78969f2829862946242db85e53f4761cea092b8885e7de3b7",
+    "Cargo.lock": "0544b34f24e643ba767d5d4302c72672c2721f465944c5ad88c65ae024758940",
+    "crates/n42-execution/src/fast_transfer.rs": "72bade79adf0db5bfa87cd7143f0ad23e4272fa7222beec3936b51a1ccb95e21",
+    "crates/n42-execution/src/parallel_transfer.rs": "2a702bc1edb5ddd054d2983185d1dfcce837c77b16491ab8af15f3bb3bbafa20",
+    "crates/n42-execution/src/parallel_block.rs": "86a0d8677b1b670a6c1865511270b9a77b0b1efb19fb7ae3df91f023c2fe7986",
+    "crates/n42-node/src/payload.rs": "62b4c055ad7414c82b89ff83a50cebeee1d11107fa4fe66a52e74ea374a3d31e",
+    "crates/n42-node/src/parallel_payload.rs": "af8bd7b415518437ea8a0e029a586b58e2d4613606ab1f140edc4af103e8c40b",
+    "crates/n42-node/src/qmdb_canonical_bench.rs": "27601d60f7203a5fc126480c8df6f8051295a51e197b79d9329f90e3787fb7d3",
+    "crates/n42-node/tests/parallel_qmdb_builder.rs": "0a2aaae2658be4e10182888bc2f6c9433f01f1b376302e2a6efa68521a501b33",
+    "docs/devlog-169-cancun-parallel-qmdb-20260914.md": "dbf9f03169b4699e2859a4afe59990e17dde14f2b515c4be6902a4bb0c069621"
+  },
+  "forks": [
+    "Cancun",
+    "Prague",
+    "Osaka"
+  ],
+  "genesisChanged": false,
+  "productionProviderBuilderTest": "passed debug and release",
+  "canonicalHeadAdvanced": false,
+  "fleetTPS": null,
+  "productionBinaryBuild": {
+    "status": "complete, exit 0",
+    "session": 78678,
+    "log": "binary-build.log",
+    "sha256": "4273bbe289ebdc69bacb7dcf4d858585c9cef2ab36dd8261be32c87d341bfd84",
+    "version": "Reth Version: 2.4.1-dev\nCommit SHA: 3e97b0195e6f6f815d80ac6aa9d67e8b0039a1ac\nBuild Timestamp: 2026-09-15T00:55:58.573110251Z\nBuild Features:\nBuild Profile: release",
+    "versionRevisionNote": "temporary reproduction checkout identifier, not source provenance; use source manifests"
+  }
+}

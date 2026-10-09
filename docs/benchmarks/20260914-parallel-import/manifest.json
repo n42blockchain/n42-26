@@ -1,0 +1,52 @@
+{
+  "scope": "selected changed sources and integration correctness; no fleet TPS",
+  "sourceSha256": {
+    "Cargo.lock": "40dc5a02e155496f67fd1b91bc531772e8ec4b634876f1d58d8775ecb76e5b57",
+    "crates/n42-execution/Cargo.toml": "c9992f55f95a8befdb2a7cbbe05b22c5596a9d27fbc0639a8a93a2b62a32ed2c",
+    "crates/n42-execution/src/evm_config.rs": "b037f4e34ff2a83993fb6daeb497ff7579dfccadc072aec310bc73558fa18223",
+    "crates/n42-execution/src/parallel_transfer.rs": "06b36c48718bc3f4226a862fa46585c18b0c2e92350821e5ffaef5a78f5fd0fb",
+    "crates/n42-execution/src/parallel_block.rs": "b06c0140b631bdbe8a528ea32abe1ac4fb01a72fb66e07a76875856b4e363ce8",
+    "crates/n42-node/src/components.rs": "b254351f88779686ac894d4b817fd745583e4dd3e5c061d970ca22bf8dbb0a76",
+    "crates/n42-node/tests/parallel_qmdb_builder.rs": "d514bf44a5c1fbb1be607284371b85a221b81920952c714034eff39f3c85bd7b",
+    "patches/reth-import-batch.patch": "fb6a665e2b96cdba0b0d371923d6d37bf354b607f996ef10eb8829b991f246c4",
+    "scripts/apply-reth-patches.sh": "a8b34b8ab49f819decd083416370e0e7847ffa2618fc96308de554ec9aa20b80",
+    "scripts/chain94-fleet.py": "71921b5984c0edc7d85bf077741720e360b954c12d26f71d358ee6af64788c48",
+    "scripts/test_chain94_fleet.py": "d89dcbd5fd6771c022d70d2d6a8a98e6fcb456f1ea8ce6bb9ea7e0387ecc7992",
+    "scripts/qualify-1m-tps.sh": "e2d7c284a62825b5a15af041eac34a58346b4d00b770dda9876adc3d65a67c14",
+    "scripts/testnet.sh": "f46e935b0098823be6c00dcc7dd9d8b8c3e7d2f72b95c5ffca7d865d3515ae03",
+    "docs/devlog-170-parallel-engine-import-20260914.md": "a74aa37d384cb731cff2759c2caf5da6b4a326a0a8324b84348cf468c457b032",
+    "README.md": "dbaa9fe16c06b4d932bc292d003d607cc02f70ef045f8b41d7be44db597736a7"
+  },
+  "rethBaseline": "23316e3ff8adca8c3bd5085ff0565fcae019202a",
+  "rethProof": "reth-source-verification.json",
+  "checks": {
+    "execution": "126 passed",
+    "engineDebug": "passed, valid root + wrong-root rejection + duplicate-nonce serial-fallback rejection",
+    "engineRelease": "passed",
+    "workspaceAllTargetsClippy": "passed -D warnings",
+    "changedFileFormat": "passed; Reth changed hunks formatted with nightly",
+    "wholeWorkspaceStableFormat": "fails on existing N42 and Reth formatting; retained log, no wholesale reformat",
+    "builderRegression": "passed, full online builder matrix",
+    "rethNightlyAllFeaturesClippy": {
+      "status": "failed, exit 101, unchanged baseline lint",
+      "session": 12576,
+      "error": "clippy::redundant_field_names from unchanged crates/net/eth-wire-types/src/broadcast.rs:1270",
+      "log": "reth-nightly-all-features.log",
+      "baselineUnchangedVerified": true
+    },
+    "fleetLauncher": "6 tests passed; four explicit execution flag combinations"
+  },
+  "engineTransactions": 4096,
+  "engineRootCommitted": true,
+  "h2VotesOrQC": false,
+  "canonicalForkchoiceAdvanced": false,
+  "fleetTPS": null,
+  "productionBinaryBuild": {
+    "status": "complete, exit 0",
+    "session": 9961,
+    "log": "binary-build.log",
+    "sha256": "b94e2d0c371163e3cd41a0ed64ac629fddf46602fd42d00acf18ff69ef03da73",
+    "version": "Reth Version: 2.4.1-dev\nCommit SHA: 3e97b0195e6f6f815d80ac6aa9d67e8b0039a1ac\nBuild Timestamp: 2026-09-15T00:55:58.573110251Z\nBuild Features:\nBuild Profile: release",
+    "versionRevisionNote": "temporary reproduction checkout identifier; source identity is the frozen manifest"
+  }
+}

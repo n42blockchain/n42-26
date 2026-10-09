@@ -1,0 +1,27 @@
+   Compiling n42-execution v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-execution)
+   Compiling n42-jmt v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-jmt)
+   Compiling n42-mobile v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-mobile)
+   Compiling n42-consensus v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-consensus)
+   Compiling n42-network v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-network)
+   Compiling n42-consensus-service v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-consensus-service)
+   Compiling n42-node v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-node)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.49s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/deps/n42_node-d55245dd13285371)
+
+running 1 test
+canonical_qmdb_config {"accounts":8200,"allocator":"jemalloc","baseFee":7,"blocks":3,"chainId":4242,"disjointAddresses":true,"distinctRecipients":4096,"distinctSenders":4096,"fork":"prague","gasPrice":9,"reads":"only","scope":"execution_delta_qmdb_durable_commit","signatureRecoveryIncluded":false,"strategy":"canonical_sequential","transactions":4096}
+canonical_qmdb_sample {"accountReads":8197,"blockHash":"0x2a28dd8a01dcb063d1912c759adeaf02cdd886cc56179aaf9f34a6dd58ba3537","commitMs":22.004721,"deltaMs":26.989162,"executionMs":86.860011,"number":1,"operations":8193,"recoveryMsExcluded":947.7302990000001,"root":"0xc26756854b73038e1c181f5f639a8bfdd0461fb540e0f246cbb136b63483e452","storageReads":0,"successful":4096,"totalMs":135.854864,"transactions":4096,"walBytes":393427}
+canonical_qmdb_sample {"accountReads":8197,"blockHash":"0x6decf01f431979ab63640433539696c9f6af7c4e582cfa8cc1037ff5f612fc48","commitMs":21.846541000000002,"deltaMs":26.836222,"executionMs":84.22864,"number":2,"operations":8193,"recoveryMsExcluded":946.000348,"root":"0x1e225433f300aab193fc26c10768854435866dcb292e67e81bd086fd5fed3089","storageReads":0,"successful":4096,"totalMs":132.911903,"transactions":4096,"walBytes":786854}
+canonical_qmdb_sample {"accountReads":8197,"blockHash":"0xf6ec66dd900ddf54826d3c4e21b67b9ede664d912f7cbe6a8c7229799f7af2a2","commitMs":22.13525,"deltaMs":27.097713,"executionMs":88.123322,"number":3,"operations":8193,"recoveryMsExcluded":946.317957,"root":"0x58d71849cc99b8acf149e8047c5759d750d7b654cb6eeb9072e175ff96a0c16a","storageReads":0,"successful":4096,"totalMs":137.356945,"transactions":4096,"walBytes":1180281}
+canonical_qmdb_restart_verified=true
+canonical_qmdb_config {"accounts":8200,"allocator":"jemalloc","baseFee":7,"blocks":3,"chainId":4242,"disjointAddresses":true,"distinctRecipients":4096,"distinctSenders":4096,"fork":"prague","gasPrice":9,"reads":"only","scope":"execution_delta_qmdb_durable_commit","signatureRecoveryIncluded":false,"strategy":"parallel_transfer_block","transactions":4096}
+canonical_qmdb_sample {"accountReads":8199,"blockHash":"0x2a28dd8a01dcb063d1912c759adeaf02cdd886cc56179aaf9f34a6dd58ba3537","commitMs":22.100030999999998,"deltaMs":25.952642,"executionMs":79.907258,"number":1,"operations":8193,"recoveryMsExcluded":944.955797,"root":"0xc26756854b73038e1c181f5f639a8bfdd0461fb540e0f246cbb136b63483e452","storageReads":0,"successful":4096,"totalMs":127.96063099999999,"transactions":4096,"walBytes":393427}
+canonical_qmdb_sample {"accountReads":8199,"blockHash":"0x6decf01f431979ab63640433539696c9f6af7c4e582cfa8cc1037ff5f612fc48","commitMs":21.659709999999997,"deltaMs":25.219421999999998,"executionMs":67.867492,"number":2,"operations":8193,"recoveryMsExcluded":944.306227,"root":"0x1e225433f300aab193fc26c10768854435866dcb292e67e81bd086fd5fed3089","storageReads":0,"successful":4096,"totalMs":114.747294,"transactions":4096,"walBytes":786854}
+canonical_qmdb_sample {"accountReads":8199,"blockHash":"0xf6ec66dd900ddf54826d3c4e21b67b9ede664d912f7cbe6a8c7229799f7af2a2","commitMs":21.629531,"deltaMs":25.648462000000002,"executionMs":68.721222,"number":3,"operations":8193,"recoveryMsExcluded":945.024367,"root":"0x58d71849cc99b8acf149e8047c5759d750d7b654cb6eeb9072e175ff96a0c16a","storageReads":0,"successful":4096,"totalMs":115.999805,"transactions":4096,"walBytes":1180281}
+canonical_qmdb_restart_verified=true
+test qmdb_state_reader::canonical_bench::parallel_qmdb_transfer_blocks_match_interpreter_and_restart ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 246 filtered out; finished in 13.31s
+

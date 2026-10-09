@@ -1,0 +1,64 @@
+diff --git a/crates/evm/evm/src/payload_cache.rs b/crates/evm/evm/src/payload_cache.rs
+--- a/crates/evm/evm/src/payload_cache.rs
++++ b/crates/evm/evm/src/payload_cache.rs
+@@ -27,6 +27,14 @@
+ 
+ /// Secondary cache for broadcast to followers (Compact Block).
+ static BROADCAST_CACHE: CacheSlot = OnceLock::new();
++
++/// Transaction root for the payload in [`CACHE`].  Engine payloads carry raw
++/// transactions but not the root as a separate field, so the generic Engine API
++/// conversion normally rebuilds the whole trie.  N42's compact-block path
++/// already authenticated this root when the leader built the block; retaining
++/// it lets followers avoid repeating that serial work while the final block-hash
++/// comparison still validates the supplied root.
++static TRANSACTION_ROOT_CACHE: OnceLock<Mutex<Option<(B256, B256)>>> = OnceLock::new();
+ 
+ fn store(slot: &CacheSlot, block_hash: B256, data: impl Any + Send + Sync + 'static) {
+     let cache = slot.get_or_init(|| Mutex::new(None));
+@@ -64,6 +72,30 @@
+     take::<T>(&CACHE, block_hash)
+ }
+ 
++/// Store the transaction root belonging to a locally built or compact-injected
++/// payload.
++pub fn store_payload_transactions_root(block_hash: B256, transactions_root: B256) {
++    let cache = TRANSACTION_ROOT_CACHE.get_or_init(|| Mutex::new(None));
++    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
++    *guard = Some((block_hash, transactions_root));
++}
++
++/// Return the cached transaction root when it belongs to `block_hash`.
++pub fn payload_transactions_root(block_hash: &B256) -> Option<B256> {
++    let cache = TRANSACTION_ROOT_CACHE.get_or_init(|| Mutex::new(None));
++    let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
++    guard.as_ref().and_then(|(cached_hash, root)| (cached_hash == block_hash).then_some(*root))
++}
++
++/// Remove a cached transaction root for a rejected payload.
++pub fn remove_payload_transactions_root(block_hash: &B256) {
++    let cache = TRANSACTION_ROOT_CACHE.get_or_init(|| Mutex::new(None));
++    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
++    if guard.as_ref().is_some_and(|(cached_hash, _)| cached_hash == block_hash) {
++        *guard = None;
++    }
++}
++
+ /// Store a clone of execution data for broadcast to followers (Compact Block).
+ pub fn store_broadcast_execution(block_hash: B256, data: impl Any + Send + Sync + 'static) {
+     store(&BROADCAST_CACHE, block_hash, data);
+diff --git a/crates/ethereum/payload/src/lib.rs b/crates/ethereum/payload/src/lib.rs
+--- a/crates/ethereum/payload/src/lib.rs
++++ b/crates/ethereum/payload/src/lib.rs
+@@ -567,9 +567,11 @@
+     {
+         let bundle_state = db.take_bundle();
+         let block_hash = block.hash();
++        let transactions_root = block.header().transactions_root();
+         let senders = block.senders().to_vec();
+         let execution_output =
+             BlockExecutionOutput { state: bundle_state, result: execution_result };
++        reth_evm::payload_cache::store_payload_transactions_root(block_hash, transactions_root);
+         reth_evm::payload_cache::store_broadcast_execution(
+             block_hash,
+             (execution_output.clone(), senders.clone()),

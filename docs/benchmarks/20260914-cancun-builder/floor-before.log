@@ -1,0 +1,24 @@
+   Compiling n42-execution v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-execution)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.83s
+     Running unittests src/lib.rs (target/debug/deps/n42_execution-a49a44152b84fa0a)
+
+running 1 test
+test fast_transfer::tests::supported_forks_and_transaction_types_match_complete_bundles ... FAILED
+
+failures:
+
+---- fast_transfer::tests::supported_forks_and_transaction_types_match_complete_bundles stdout ----
+
+thread 'fast_transfer::tests::supported_forks_and_transaction_types_match_complete_bundles' (299) panicked at crates/n42-execution/src/fast_transfer.rs:694:9:
+assertion `left == right` failed: result or validation error differs for TxEnv { tx_type: 0, caller: 0x1000000000000000000000000000000000000001, gas_limit: 50000, gas_price: 5000, kind: Call(0x2000000000000000000000000000000000000002), value: 1, data: 0x, nonce: 7, chain_id: Some(1), access_list: AccessList([]), gas_priority_fee: None, blob_hashes: [], max_fee_per_blob_gas: 0, authorization_list: [] }
+  left: Ok(Success { reason: Stop, gas: ResultGas { total_gas_spent: 21000, state_gas_spent: 0, refunded: 0, floor_gas: 21000 }, logs: [], output: Call(0x) })
+ right: Ok(Success { reason: Stop, gas: ResultGas { total_gas_spent: 21000, state_gas_spent: 0, refunded: 0, floor_gas: 0 }, logs: [], output: Call(0x) })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    fast_transfer::tests::supported_forks_and_transaction_types_match_complete_bundles
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 124 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p n42-execution --lib`

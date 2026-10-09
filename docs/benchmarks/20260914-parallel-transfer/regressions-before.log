@@ -1,0 +1,40 @@
+   Compiling n42-execution v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-execution)
+warning: use of deprecated method `revm::revm_context::result::ExecutionResult::<HaltReasonTy>::gas_used`: Use `tx_gas_used()` instead, `gas_used` is ambiguous after EIP-8037 state gas split
+   --> crates/n42-execution/src/parallel_transfer.rs:663:63
+    |
+663 | ...                   let gas_used = out.result.gas_used();
+    |                                                 ^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: `n42-execution` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.84s
+     Running unittests src/lib.rs (target/debug/deps/n42_execution-a49a44152b84fa0a)
+
+running 2 tests
+test parallel_transfer::tests::cached_recipient_receives_every_batch_credit ... FAILED
+test parallel_transfer::tests::a_future_credit_cannot_fund_an_earlier_spend ... FAILED
+
+failures:
+
+---- parallel_transfer::tests::cached_recipient_receives_every_batch_credit stdout ----
+
+thread 'parallel_transfer::tests::cached_recipient_receives_every_batch_credit' (309) panicked at crates/n42-execution/src/parallel_transfer.rs:823:9:
+assertion `left == right` failed
+  left: 17
+ right: 22
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- parallel_transfer::tests::a_future_credit_cannot_fund_an_earlier_spend stdout ----
+
+thread 'parallel_transfer::tests::a_future_credit_cannot_fund_an_earlier_spend' (308) panicked at crates/n42-execution/src/parallel_transfer.rs:793:9:
+future credit funded an invalid earlier transaction
+
+
+failures:
+    parallel_transfer::tests::a_future_credit_cannot_fund_an_earlier_spend
+    parallel_transfer::tests::cached_recipient_receives_every_batch_credit
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 115 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p n42-execution --lib`

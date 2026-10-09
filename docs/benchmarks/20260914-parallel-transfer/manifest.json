@@ -1,0 +1,25 @@
+{
+  "scope": "selected source files, not a complete workspace snapshot; correctness checks only",
+  "workspaceHead": "dbbcb540f2228d1c3133f14bd8b0cf2cb980ab4c",
+  "upstreamRs": "466c1839791afadba7f1dd4d48c5518440dcafba",
+  "rethBaseline": "23316e3ff8adca8c3bd5085ff0565fcae019202a",
+  "rethPatches": [
+    "patches/reth-payload-transactions-root.patch",
+    "patches/reth-qmdb-state-reader.patch"
+  ],
+  "sourceSha256": {
+    "Cargo.lock": "4aebfb672d87b9fd07b312f0d6f2f0da39ab6cf8741e19e4be1b57ab88ab7ffb",
+    "crates/n42-execution/Cargo.toml": "dad603f0a33d3d119beedd96e416625951a1dd8901fb3a680569ff5a387cab6e",
+    "crates/n42-execution/src/lib.rs": "f30666fa420f703594c10101fd547b9101ba6ce107defaded981a4fa85c0e3a4",
+    "crates/n42-execution/src/evm_config.rs": "d5b39903f0774ed342983c7f723e26e93f8a98efd5a9f4df02e939df19a4a82a",
+    "crates/n42-execution/src/evm_factory.rs": "686a9730ca6b2f6785c4b2802097d80ae94d22b91a0c1797acf1efd4ecb1f6cb",
+    "crates/n42-execution/src/fast_transfer.rs": "3ce20924aaf78c16fdcc97e34ba2b0327558dcf12ddee255da985f5b110c739b",
+    "crates/n42-execution/src/parallel_transfer.rs": "befcac43fd48ac6df2820cfc052a7dea649b5958edeeeea7715c981a39e93dd0",
+    "crates/n42-execution/src/parallel_block.rs": "4e9e4074fce289a813cb6c0210e18280f40dcc095131c249aee565a04846a062",
+    "crates/n42-execution/src/restored_slots.rs": "2a59f9bcbfdcd9a2905cfdfa8e1fe107108cf6a8f501a5f2cdac5fe567eb96d2",
+    "crates/n42-node/src/qmdb_canonical_bench.rs": "3afeb4af776f93152d529c27d346f9cda9b534a4b2f60ff39668f8f4ea2d73e4",
+    "docs/devlog-167-parallel-transfer-adaptation-20260914.md": "2b719fd7d20252eda3712e568fc5a1e30fecb9201922f47782c5d0a61ebcb2b2"
+  },
+  "onlineIntegration": false,
+  "fleetTPS": null
+}

@@ -1,0 +1,20 @@
+{
+  "upstream_ref": "466c1839791afadba7f1dd4d48c5518440dcafba",
+  "upstream_sha256": "53f9245ffd463f442e13bf7a606ccd14d30cce8ba0b4c87ab575d749c5b86336",
+  "files": {
+    "Cargo.toml": "ef7c82869461ec856f303419daadc52f7b01c34a06136d8c3c0fee319be143ea",
+    "Cargo.lock": "beba4ce2f13dd585d01e5e21a79619b63c3d1d8bd769aa891bf25f05360952be",
+    "crates/n42-execution/Cargo.toml": "67008c0040bbfe375cf1b57cdb62550c748d17c1145828ef4e525afa8e300231",
+    "crates/n42-execution/src/lib.rs": "24caa6058dbfdf941ef380809c36b5cbe41e916a271fdb8ca96f521b853bd780",
+    "crates/n42-execution/src/evm_factory.rs": "686a9730ca6b2f6785c4b2802097d80ae94d22b91a0c1797acf1efd4ecb1f6cb",
+    "crates/n42-execution/src/evm_config.rs": "d5b39903f0774ed342983c7f723e26e93f8a98efd5a9f4df02e939df19a4a82a",
+    "crates/n42-execution/src/fast_transfer.rs": "3ce20924aaf78c16fdcc97e34ba2b0327558dcf12ddee255da985f5b110c739b",
+    "crates/n42-node/src/qmdb_canonical_bench.rs": "61f91ec12bbc93bcdd5bd202271fbb78532574457bd2d6bb2988af215ee9a320",
+    "scripts/chain94-fleet.py": "a384172d13377ed4bd4d010f9e63570f6d9e5749087ee200831dff6579ad9ce5",
+    "scripts/test_chain94_fleet.py": "cc3a3a6f72927d2d94d79ca2f68786f1de18c0c92a058ee0d17ee997583ae80a",
+    "scripts/testnet.sh": "ceac9d842f714af047ea589b7194753e6f656c6598ee217feaa025e6f5de9957",
+    "scripts/qualify-1m-tps.sh": "27f4318282803b7c35231f9ffa8f42f0b1a58de11a0e8cf7eb3ed060ed1bccca"
+  },
+  "scope": "changed source inputs; not a complete standalone workspace snapshot",
+  "node_benchmark": "correctness only; no performance qualification"
+}

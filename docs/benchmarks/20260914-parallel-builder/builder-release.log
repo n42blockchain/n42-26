@@ -1,0 +1,24 @@
+   Compiling reth-consensus-common v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/consensus/common)
+   Compiling n42-execution v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-execution)
+   Compiling reth-ethereum-consensus v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/consensus)
+   Compiling reth-rpc v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/rpc/rpc)
+   Compiling n42-jmt v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-jmt)
+   Compiling n42-consensus v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-consensus)
+   Compiling reth-rpc-builder v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/rpc/rpc-builder)
+   Compiling n42-mobile v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-mobile)
+   Compiling reth-ethereum-payload-builder v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/payload)
+   Compiling reth-node-builder v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/node/builder)
+   Compiling n42-network v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-network)
+   Compiling reth-node-ethereum v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/node)
+   Compiling n42-consensus-service v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-consensus-service)
+   Compiling n42-node v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-node)
+    Finished `release` profile [optimized] target(s) in 1m 14s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/release/deps/n42_node-c15500b3af4fa567)
+
+running 1 test
+test parallel_payload::tests::online_builder_parallel_prefix_matches_serial_payload_and_published_execution ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.14s
+
