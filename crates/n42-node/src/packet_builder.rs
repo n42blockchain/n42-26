@@ -238,7 +238,7 @@ mod tests {
         let mut hashed_state = HashedPostState::default();
         hashed_state.accounts.insert(hashed_addr, Some(account));
 
-        let mut hashed_storage = HashedStorage::new(false);
+        let mut hashed_storage = HashedStorage::default();
         hashed_storage.storage.insert(hashed_slot, U256::from(42));
         hashed_state.storages.insert(hashed_addr, hashed_storage);
 

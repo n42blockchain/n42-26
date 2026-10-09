@@ -27,11 +27,17 @@ where
     type EVM = N42EvmConfig;
 
     async fn build_evm(self, ctx: &BuilderContext<Node>) -> eyre::Result<Self::EVM> {
-        let mut evm = N42EvmConfig::new(ctx.chain_spec());
+        let mut config = N42EvmConfig::new(ctx.chain_spec());
         if let Some(cache) = ctx.sender_recovery_cache() {
-            evm = evm.with_sender_recovery_cache(cache.clone());
+            config = config.with_sender_recovery_cache(cache.clone());
         }
-        Ok(evm)
+        if std::env::var("N42_PARALLEL_IMPORT").as_deref() == Ok("1") {
+            use reth_storage_api::StateProviderFactory;
+            let provider = ctx.provider().clone();
+            config = config
+                .with_parallel_import_provider(move |parent| provider.state_by_block_hash(parent));
+        }
+        Ok(config)
     }
 }
 

@@ -22,7 +22,6 @@
 
 use alloy_consensus::transaction::Transaction as _;
 use alloy_primitives::{Address, B256, Bytes, KECCAK256_EMPTY as KECCAK_EMPTY};
-use reth_engine_tree::tree::StateProviderBuilder;
 use reth_engine_tree::tree::state_root_strategy::{
     LazyHashedPostState, PreparedStateRootJob, StateRootJob, StateRootJobContext,
     StateRootJobOutcome, StateRootStrategy,
@@ -31,10 +30,13 @@ use reth_ethereum_primitives::{Block, EthPrimitives, Receipt, TransactionSigned}
 use reth_evm::ConfigureEvm;
 use reth_execution_types::BlockExecutionOutput;
 use reth_primitives_traits::RecoveredBlock;
-use reth_provider::{ProviderError, ProviderResult};
-use reth_storage_api::{
-    AccountReader, BlockReader, BytecodeReader, StateProviderFactory, StateReader,
+use reth_provider::{
+    BlockNumReader, DatabaseProviderFactory, DatabaseProviderROFactory, ProviderError,
+    ProviderResult, PruneCheckpointReader, StageCheckpointReader, StorageChangeSetReader,
+    StorageSettingsCache,
 };
+use reth_storage_api::{AccountReader, BytecodeReader};
+use reth_storage_overlay::OverlayStateProviderFactory;
 use reth_transaction_pool::{
     BestTransactions, PoolTransaction, ValidPoolTransaction,
     error::{InvalidPoolTransactionError, PoolTransactionError},
@@ -369,20 +371,35 @@ impl<P, Evm> EofGuardedStateRootStrategy<P, Evm> {
 
 impl<P, Evm> StateRootStrategy<EthPrimitives, P, Evm> for EofGuardedStateRootStrategy<P, Evm>
 where
-    P: BlockReader + StateProviderFactory + StateReader + Clone + Send + Sync + 'static,
+    P: DatabaseProviderFactory + Clone + Send + Sync + 'static,
+    P::Provider: BlockNumReader
+        + PruneCheckpointReader
+        + StageCheckpointReader
+        + reth_provider::ChangeSetReader
+        + StorageChangeSetReader
+        + StorageSettingsCache
+        + 'static,
+    OverlayStateProviderFactory<P, EthPrimitives>:
+        DatabaseProviderROFactory + Clone + Send + Sync + 'static,
+    <OverlayStateProviderFactory<P, EthPrimitives> as DatabaseProviderROFactory>::Provider:
+        AccountReader + BytecodeReader + Send + 'static,
     Evm: ConfigureEvm<Primitives = EthPrimitives>,
 {
+    fn supports_cached_output(&self) -> bool {
+        self.inner.supports_cached_output()
+    }
+
     fn prepare(
         &self,
         ctx: StateRootJobContext<'_, EthPrimitives, P, Evm>,
     ) -> ProviderResult<PreparedStateRootJob<EthPrimitives>> {
-        let provider_builder = ctx.provider_builder();
+        let state_provider_factory = ctx.state_provider_factory().clone();
         let mut inner = self.inner.prepare(ctx)?;
         let hashed_state_rx = inner.take_hashed_state_rx();
         Ok(PreparedStateRootJob::new(
             Box::new(EofGuardedJob {
                 inner,
-                provider_builder,
+                state_provider_factory,
             }),
             hashed_state_rx,
         ))
@@ -391,12 +408,14 @@ where
 
 struct EofGuardedJob<P> {
     inner: PreparedStateRootJob<EthPrimitives>,
-    provider_builder: StateProviderBuilder<EthPrimitives, P>,
+    state_provider_factory: OverlayStateProviderFactory<P, EthPrimitives>,
 }
 
 impl<P> StateRootJob<EthPrimitives> for EofGuardedJob<P>
 where
-    P: BlockReader + StateProviderFactory + StateReader + Clone + Send + 'static,
+    OverlayStateProviderFactory<P, EthPrimitives>: DatabaseProviderROFactory + Send,
+    <OverlayStateProviderFactory<P, EthPrimitives> as DatabaseProviderROFactory>::Provider:
+        AccountReader + BytecodeReader,
 {
     fn name(&self) -> &'static str {
         self.inner.name()
@@ -408,7 +427,7 @@ where
         output: Arc<BlockExecutionOutput<Receipt>>,
         hashed_state: &LazyHashedPostState,
     ) -> ProviderResult<StateRootJobOutcome> {
-        let provider = self.provider_builder.build()?;
+        let provider = self.state_provider_factory.database_provider_ro()?;
         check_block(block, &output, &provider, "import").map_err(ProviderError::other)?;
         self.inner.finish(block, output, hashed_state)
     }

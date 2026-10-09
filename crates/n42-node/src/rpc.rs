@@ -27,6 +27,27 @@ pub struct ConsensusStatusResponse {
     pub latest_committed_block_hash: Option<String>,
     pub validator_count: u32,
     pub has_committed_qc: bool,
+    /// Same atomic QC snapshot as the view/hash above; no second state read.
+    pub commit_qc: Option<CommitQcResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitQcResponse {
+    pub view: u64,
+    pub block_hash: B256,
+    pub signature: String,
+    /// One explicit boolean per active validator index; avoids bit-order or
+    /// padding ambiguity at the audit boundary.
+    pub signers: Vec<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateReadStatusResponse {
+    #[serde(flatten)]
+    pub reads: crate::qmdb_read_status::QmdbReadStatus,
+    pub validator_public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +229,18 @@ pub trait N42Api {
     #[method(name = "consensusStatus")]
     async fn consensus_status(&self) -> RpcResult<ConsensusStatusResponse>;
 
+    /// Exact recent Gov5 header bytes, including nil slots/mobile root.
+    /// None means it is outside the native-header registry, not an empty header.
+    #[method(name = "nativeHeader")]
+    async fn native_header(&self, block_hash: B256) -> RpcResult<Option<String>>;
+
+    /// Actual QMDB adapter mode/counts and optional WAL-durable block root.
+    #[method(name = "stateReadStatus")]
+    async fn state_read_status(
+        &self,
+        block_hash: Option<B256>,
+    ) -> RpcResult<StateReadStatusResponse>;
+
     /// Returns the active validator set with epoch transition status.
     ///
     /// The response includes `pending_changes` (queued, not yet committed) and
@@ -332,6 +365,7 @@ pub trait N42Api {
 }
 
 pub struct N42RpcServer {
+    validator_public_key: Option<BlsPublicKey>,
     consensus_state: Arc<SharedConsensusState>,
     staking_manager: Option<Arc<Mutex<StakingManager>>>,
     jmt: Option<Arc<Mutex<PersistentSbmt>>>,
@@ -344,6 +378,7 @@ pub struct N42RpcServer {
 impl N42RpcServer {
     pub fn new(consensus_state: Arc<SharedConsensusState>) -> Self {
         Self {
+            validator_public_key: None,
             consensus_state,
             staking_manager: None,
             jmt: None,
@@ -352,6 +387,11 @@ impl N42RpcServer {
             qmdb_archive: None,
             admin_token: None,
         }
+    }
+
+    pub fn with_validator_public_key(mut self, public_key: BlsPublicKey) -> Self {
+        self.validator_public_key = Some(public_key);
+        self
     }
 
     pub fn with_staking_manager(mut self, mgr: Arc<Mutex<StakingManager>>) -> Self {
@@ -438,6 +478,47 @@ impl N42RpcServer {
 
 #[async_trait::async_trait]
 impl N42ApiServer for N42RpcServer {
+    async fn native_header(&self, block_hash: B256) -> RpcResult<Option<String>> {
+        let Some(raw) = n42_consensus::gov5_native_header_rlp(&block_hash) else {
+            return Ok(None);
+        };
+        let decoded = n42_consensus::Gov5NativeHeader::decode(&raw).map_err(|error| {
+            ErrorObjectOwned::owned(
+                -32603,
+                format!("invalid native header: {error}"),
+                None::<()>,
+            )
+        })?;
+        if decoded.encode().as_slice() != raw.as_ref() || decoded.hash() != block_hash {
+            return Err(ErrorObjectOwned::owned(
+                -32603,
+                "native header encoding/hash mismatch",
+                None::<()>,
+            ));
+        }
+        Ok(Some(format!("0x{}", hex::encode(raw.as_ref()))))
+    }
+
+    async fn state_read_status(
+        &self,
+        block_hash: Option<B256>,
+    ) -> RpcResult<StateReadStatusResponse> {
+        let reads = crate::qmdb_state_reader::status(block_hash).map_err(|error| {
+            ErrorObjectOwned::owned(
+                -32603,
+                format!("QMDB read status unavailable: {error}"),
+                None::<()>,
+            )
+        })?;
+        Ok(StateReadStatusResponse {
+            reads,
+            validator_public_key: self
+                .validator_public_key
+                .as_ref()
+                .map(|key| hex::encode(key.to_bytes())),
+        })
+    }
+
     async fn health(&self) -> RpcResult<HealthResponse> {
         let has_qc = self.consensus_state.load_committed_qc().is_some();
         Ok(HealthResponse {
@@ -459,6 +540,12 @@ impl N42ApiServer for N42RpcServer {
             latest_committed_block_hash: block_hash,
             validator_count: self.consensus_state.validator_count(),
             has_committed_qc: has_qc,
+            commit_qc: committed_qc.as_ref().as_ref().map(|qc| CommitQcResponse {
+                view: qc.view,
+                block_hash: qc.block_hash,
+                signature: format!("0x{}", hex::encode(qc.aggregate_signature.to_bytes())),
+                signers: qc.signers.iter().by_vals().collect(),
+            }),
         })
     }
 
@@ -1195,6 +1282,34 @@ mod tests {
         N42RpcServer::new(state)
     }
 
+    #[tokio::test]
+    async fn native_header_rpc_preserves_optional_slots_and_refuses_malformed_data() {
+        let rpc = make_rpc();
+        let native = n42_consensus::Gov5NativeHeader {
+            header: alloy_consensus::Header {
+                number: 876_543,
+                extra_data: vec![0x12, 0x34].into(),
+                ..Default::default()
+            },
+            mobile_registry_root: Some(B256::repeat_byte(0x75)),
+        };
+        let raw = native.encode();
+        assert!(!native.is_alloy_exact());
+        let hash = n42_consensus::remember_gov5_native_header(&raw);
+        assert_eq!(
+            rpc.native_header(hash).await.unwrap(),
+            Some(format!("0x{}", hex::encode(raw)))
+        );
+        assert!(
+            rpc.native_header(B256::repeat_byte(0xda))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let malformed = n42_consensus::remember_gov5_native_header(&[0xc0]);
+        assert!(rpc.native_header(malformed).await.is_err());
+    }
+
     fn make_qc(view: u64, block_hash: B256) -> QuorumCertificate {
         let mut qc = QuorumCertificate::genesis();
         qc.view = view;
@@ -1209,6 +1324,7 @@ mod tests {
         assert!(!status.has_committed_qc);
         assert!(status.latest_committed_view.is_none());
         assert!(status.latest_committed_block_hash.is_none());
+        assert!(status.commit_qc.is_none());
         assert_eq!(status.validator_count, 0);
     }
 
@@ -1216,13 +1332,29 @@ mod tests {
     async fn test_consensus_status_with_qc() {
         let vs = ValidatorSet::new(&[], 0);
         let state = Arc::new(SharedConsensusState::new(vs));
-        state.update_committed_qc(make_qc(42, B256::repeat_byte(0xAB)));
+        let mut qc = make_qc(42, B256::repeat_byte(0xAB));
+        qc.signers = [true, false, true, true].into_iter().collect();
+        let signature = format!("0x{}", hex::encode(qc.aggregate_signature.to_bytes()));
+        state.update_committed_qc(qc);
 
         let rpc = N42RpcServer::new(state);
         let status = rpc.consensus_status().await.unwrap();
         assert!(status.has_committed_qc);
         assert_eq!(status.latest_committed_view, Some(42));
         assert!(status.latest_committed_block_hash.is_some());
+        let serialized = serde_json::to_value(&status).unwrap();
+        let proof = status.commit_qc.unwrap();
+        assert_eq!(proof.view, status.latest_committed_view.unwrap());
+        assert_eq!(
+            Some(format!("{:?}", proof.block_hash)),
+            status.latest_committed_block_hash
+        );
+        assert_eq!(proof.signature, signature);
+        assert_eq!(proof.signers, [true, false, true, true]);
+        assert_eq!(
+            serialized["commitQc"]["signers"],
+            serde_json::json!([true, false, true, true])
+        );
     }
 
     #[tokio::test]

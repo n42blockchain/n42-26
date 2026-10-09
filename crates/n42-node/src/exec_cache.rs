@@ -40,8 +40,36 @@ impl ExecutionOutputCache for RethExecutionOutputCache {
     fn take_gov5_normalization(
         &self,
         execution: &alloy_rpc_types_engine::ExecutionData,
-    ) -> Option<(B256, B256, Vec<u8>)> {
-        take_gov5_normalization_output(execution, self.qmdb_store.as_deref(), &self.chain_spec)
+    ) -> Option<(B256, B256)> {
+        take_gov5_normalization_roots(execution, self.qmdb_store.as_deref(), &self.chain_spec)
+    }
+
+    fn rekey_gov5_normalized(
+        &self,
+        original: &alloy_rpc_types_engine::ExecutionData,
+        normalized: &alloy_rpc_types_engine::ExecutionData,
+    ) -> bool {
+        if !n42_network::gov5_normalization_preserves_execution_input(original, normalized) {
+            return false;
+        }
+        let old_hash = original.block_hash();
+        let new_hash = normalized.block_hash();
+        if old_hash == new_hash {
+            return true;
+        }
+        let Some(output) =
+            reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&old_hash)
+        else {
+            return false;
+        };
+        let transactions_root = reth_evm::payload_cache::payload_transactions_root(&old_hash);
+        reth_evm::payload_cache::remove_payload_transactions_root(&old_hash);
+        if let Some(root) = transactions_root {
+            reth_evm::payload_cache::store_payload_transactions_root(new_hash, root);
+        }
+        reth_evm::payload_cache::store_payload_execution(new_hash, output);
+        metrics::counter!("n42_gov5_normalized_execution_cache_rekeys_total").increment(1);
+        true
     }
 
     fn inject(&self, hash: B256, compressed: &[u8], source: &'static str) -> bool {
@@ -159,16 +187,16 @@ fn serialize_execution_output(
 }
 
 /// Consume the builder's broadcast copy once and bind Gov5's native receipt
-/// commitment to exactly the same execution output that will be re-keyed under
-/// the normalized H2 block hash.
-fn take_gov5_normalization_output(
+/// commitment to exactly that execution output. The normalized H2 payload is
+/// subsequently re-executed; no compact execution blob is used on this path.
+fn take_gov5_normalization_roots(
     execution: &alloy_rpc_types_engine::ExecutionData,
     qmdb_store: Option<&crate::qmdb_state_root::Gov5QmdbStateRootStore>,
     chain_spec: &reth_chainspec::ChainSpec,
-) -> Option<(B256, B256, Vec<u8>)> {
+) -> Option<(B256, B256)> {
     let hash = &execution.block_hash();
     let parent_hash = execution.parent_hash();
-    let (output, senders) =
+    let (output, _senders) =
         reth_evm::payload_cache::take_broadcast_execution::<CachedPayloadData>(hash)?;
     let receipts_root = n42_network::gov5_native_receipts_root(&output.result.receipts);
     let payload = execution.payload.as_v1();
@@ -185,8 +213,11 @@ fn take_gov5_normalization_output(
     ) {
         crate::qmdb_state::with_gov5_prague_system_caller(&mut operations);
     }
+    // Own the ordering buffer here, before entering the tree lock. The tree
+    // can borrow this canonical sequence while the operations remain ours.
+    operations.sort_unstable_by_key(|operation| operation.key);
     let state_root = match qmdb_store {
-        Some(store) => match store.compute_candidate(parent_hash, &operations) {
+        Some(store) => match store.prepare_candidate(parent_hash, operations) {
             Ok(root) => root,
             Err(error) => {
                 warn!(
@@ -208,8 +239,7 @@ fn take_gov5_normalization_output(
             return None;
         }
     };
-    let compressed = serialize_execution_output(hash, output, senders)?;
-    Some((state_root, receipts_root, compressed))
+    Some((state_root, receipts_root))
 }
 
 /// Deserialize compact block execution output and load it into the payload cache.
@@ -270,8 +300,12 @@ pub(crate) fn inject_compact_block(hash: &B256, compressed: &[u8], source: &'sta
 mod tests {
     use super::*;
 
+    // Reth's broadcast cache is one process-global slot.
+    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn transaction_root_survives_compact_round_trip_and_is_evicted_by_hash() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
         let hash = B256::repeat_byte(0x42);
         let other_hash = B256::repeat_byte(0x43);
         let root = B256::repeat_byte(0x44);
@@ -316,5 +350,157 @@ mod tests {
         assert!(
             reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&hash).is_none()
         );
+    }
+
+    #[test]
+    fn native_gov5_normalization_rekeys_exact_builder_output() {
+        use alloy_consensus::proofs::calculate_transaction_root;
+        use n42_consensus::Gov5NativeHeader;
+
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+        let parent = Gov5NativeHeader {
+            header: alloy_consensus::Header {
+                number: 0,
+                withdrawals_root: Some(alloy_consensus::constants::EMPTY_ROOT_HASH),
+                blob_gas_used: Some(0),
+                excess_blob_gas: Some(0),
+                parent_beacon_block_root: Some(B256::ZERO),
+                ..Default::default()
+            },
+            mobile_registry_root: None,
+        };
+        let parent_hash = n42_consensus::remember_gov5_native_header(&parent.encode());
+        let mut block = reth_ethereum_primitives::Block::default();
+        block.header.parent_hash = parent_hash;
+        block.header.number = 1;
+        block.header.base_fee_per_gas = Some(0);
+        block.header.blob_gas_used = Some(0);
+        block.header.excess_blob_gas = Some(0);
+        block.header.parent_beacon_block_root = Some(B256::ZERO);
+        block.header.withdrawals_root = Some(alloy_consensus::constants::EMPTY_ROOT_HASH);
+        block.header.transactions_root =
+            calculate_transaction_root::<alloy_consensus::TxEnvelope>(&[]);
+        block.body.withdrawals = Some(Default::default());
+        let old_hash = block.header.hash_slow();
+        let original =
+            alloy_rpc_types_engine::ExecutionData::from_block_unchecked(old_hash, &block);
+        let normalized = n42_network::normalize_execution_payload_for_gov5_h2(
+            &original,
+            1,
+            B256::repeat_byte(0xa1),
+            n42_network::gov5_native_receipts_root(&[]),
+        )
+        .unwrap();
+        let new_hash = normalized.block_hash();
+        assert_ne!(old_hash, new_hash);
+
+        let cache = RethExecutionOutputCache::new(None, reth_chainspec::MAINNET.clone());
+        let root = block.header.transactions_root;
+        reth_evm::payload_cache::store_payload_transactions_root(old_hash, root);
+        reth_evm::payload_cache::store_payload_execution(
+            old_hash,
+            (
+                BlockExecutionOutput::<reth_ethereum_primitives::Receipt>::default(),
+                Vec::<Address>::new(),
+            ),
+        );
+        assert!(cache.rekey_gov5_normalized(&original, &normalized));
+        assert_eq!(
+            reth_evm::payload_cache::payload_transactions_root(&old_hash),
+            None
+        );
+        assert_eq!(
+            reth_evm::payload_cache::payload_transactions_root(&new_hash),
+            Some(root)
+        );
+        assert!(
+            reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&old_hash)
+                .is_none()
+        );
+        assert!(
+            reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&new_hash)
+                .is_some()
+        );
+        cache.evict(new_hash);
+        reth_evm::payload_cache::store_payload_execution(
+            old_hash,
+            (
+                BlockExecutionOutput::<reth_ethereum_primitives::Receipt>::default(),
+                Vec::<Address>::new(),
+            ),
+        );
+        let mut changed = normalized.clone();
+        changed.payload.as_v1_mut().timestamp += 1;
+        assert!(!cache.rekey_gov5_normalized(&original, &changed));
+        assert!(
+            reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&old_hash)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn gov5_normalization_consumes_exact_output_and_only_prices_roots() {
+        use crate::qmdb_state_root::Gov5QmdbStateRootStore;
+        use alloy_primitives::U256;
+        use n42_twig_core::qmdb_compat::{
+            QmdbCompatTree, encode_gov5_account_value, gov5_account_key,
+        };
+        use revm::{
+            database::states::{AccountStatus, BundleAccount},
+            state::AccountInfo,
+        };
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+        let base = QmdbCompatTree::new();
+        let base_hash = B256::repeat_byte(0x61);
+        let base_root = B256::from(base.root());
+        let store =
+            Arc::new(Gov5QmdbStateRootStore::new(base_hash, base_root, base.snapshot()).unwrap());
+        let cache =
+            RethExecutionOutputCache::new(Some(store.clone()), reth_chainspec::MAINNET.clone());
+        let mut block = reth_ethereum_primitives::Block::default();
+        block.header.parent_hash = base_hash;
+        block.header.number = 1;
+        let hash = block.header.hash_slow();
+        let execution = alloy_rpc_types_engine::ExecutionData::from_block_unchecked(hash, &block);
+        let address = Address::repeat_byte(0x62);
+        let mut output = BlockExecutionOutput::<reth_ethereum_primitives::Receipt>::default();
+        output.state.state.insert(
+            address,
+            BundleAccount::new(
+                None,
+                Some(AccountInfo {
+                    nonce: 1,
+                    balance: U256::from(1234),
+                    ..Default::default()
+                }),
+                Default::default(),
+                AccountStatus::Changed,
+            ),
+        );
+        output.result.receipts.push(Default::default());
+        let receipts_root = n42_network::gov5_native_receipts_root(&output.result.receipts);
+        let mut oracle = base;
+        oracle.set(
+            gov5_account_key(address.as_ref()),
+            encode_gov5_account_value(
+                1,
+                &U256::from(1234).to_be_bytes(),
+                &alloy_primitives::KECCAK256_EMPTY.0,
+            ),
+        );
+        let expected = (B256::from(oracle.root()), receipts_root);
+        reth_evm::payload_cache::store_broadcast_execution(hash, (output, vec![address]));
+
+        // A sibling's hash cannot consume this execution output.
+        let sibling = alloy_rpc_types_engine::ExecutionData::from_block_unchecked(
+            B256::repeat_byte(0x63),
+            &block,
+        );
+        assert!(cache.take_gov5_normalization(&sibling).is_none());
+        assert_eq!(cache.take_gov5_normalization(&execution), Some(expected));
+        assert!(cache.take_gov5_normalization(&execution).is_none());
+        assert!(!store.contains(hash).unwrap());
+        assert_eq!(store.root_for(base_hash).unwrap(), Some(base_root));
+        assert_eq!(store.compute_candidate(base_hash, &[]).unwrap(), base_root);
     }
 }

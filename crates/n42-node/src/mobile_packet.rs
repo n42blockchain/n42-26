@@ -13,7 +13,8 @@ use reth_evm::{ConfigureEvm, execute::Executor};
 use reth_primitives_traits::{BlockBody, NodePrimitives};
 use reth_provider::BlockHashReader;
 use reth_storage_api::{
-    BlockNumReader, BlockReader, StateProviderBox, StateProviderFactory, TransactionVariant,
+    BlockNumReader, BlockReader, StateProvider, StateProviderBox, StateProviderFactory,
+    TransactionVariant,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
@@ -353,7 +354,9 @@ where
         let parent_hash = recovered_block.header().parent_hash();
         let (state_provider, state_source) = parent_state_provider(provider, parent_hash)?;
 
-        let inner_db = reth_revm::database::StateProviderDatabase::new(&state_provider);
+        let inner_db = reth_revm::database::StateProviderDatabase::new(
+            (&*state_provider).into_evm_state_provider(),
+        );
         let logged_db = ReadLogDatabase::new(inner_db);
         let log_handle = logged_db.log_handle();
         let codes_handle = logged_db.codes_handle();
@@ -624,6 +627,8 @@ mod tests {
         }
 
         impl StateProviderFactory for LaggingHead {
+            type Primitives = <MockEthProvider as StateProviderFactory>::Primitives;
+
             fn latest(&self) -> reth_provider::ProviderResult<StateProviderBox> {
                 self.tip.latest()
             }
@@ -662,6 +667,13 @@ mod tests {
             }
             fn maybe_pending(&self) -> reth_provider::ProviderResult<Option<StateProviderBox>> {
                 self.head.maybe_pending()
+            }
+            fn state_with_block_appended(
+                &self,
+                parent_hash: B256,
+                block: reth_chain_state::ExecutedBlock<Self::Primitives>,
+            ) -> reth_provider::ProviderResult<StateProviderBox> {
+                self.head.state_with_block_appended(parent_hash, block)
             }
         }
 
