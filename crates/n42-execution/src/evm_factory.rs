@@ -2,7 +2,7 @@
 
 use alloy_evm::{
     EvmEnv, EvmFactory,
-    eth::{EthEvm, EthEvmBuilder, EthEvmContext},
+    eth::{EthEvmBuilder, EthEvmContext},
     precompiles::PrecompilesMap,
 };
 use alloy_primitives::address;
@@ -47,11 +47,27 @@ fn n42_precompiles(spec: SpecId) -> &'static Precompiles {
 
 /// N42 EVM factory — produces EVMs with Ethereum precompiles + randomness at `0x0302`.
 #[derive(Debug, Clone, Default)]
-pub struct N42EvmFactory;
+pub struct N42EvmFactory {
+    fast_transfers: bool,
+}
+
+impl N42EvmFactory {
+    /// Read the optional transfer optimization once at node configuration time.
+    pub fn from_env() -> Self {
+        Self::with_fast_transfers(crate::fast_transfer::enabled())
+    }
+
+    /// Select the same factory for execution comparisons without mutating process environment.
+    pub const fn with_fast_transfers(enabled: bool) -> Self {
+        Self {
+            fast_transfers: enabled,
+        }
+    }
+}
 
 impl EvmFactory for N42EvmFactory {
     type Evm<DB: alloy_evm::Database, I: Inspector<EthEvmContext<DB>>> =
-        EthEvm<DB, I, Self::Precompiles>;
+        crate::fast_transfer::N42Evm<DB, I>;
     type Context<DB: alloy_evm::Database> = EthEvmContext<DB>;
     type Tx = TxEnv;
     type Error<DBError: DBErrorMarker> = EVMError<DBError>;
@@ -72,9 +88,10 @@ impl EvmFactory for N42EvmFactory {
             precompile_random::set_block_randomness(prevrandao);
         }
 
-        EthEvmBuilder::new(db, evm_env)
+        let inner = EthEvmBuilder::new(db, evm_env)
             .precompiles(PrecompilesMap::from_static(n42_precompiles(spec)))
-            .build()
+            .build();
+        crate::fast_transfer::N42Evm::new(inner, false, self.fast_transfers)
     }
 
     fn create_evm_with_inspector<DB: alloy_evm::Database, I: Inspector<Self::Context<DB>>>(
@@ -89,9 +106,10 @@ impl EvmFactory for N42EvmFactory {
             precompile_random::set_block_randomness(prevrandao);
         }
 
-        EthEvmBuilder::new(db, evm_env)
+        let inner = EthEvmBuilder::new(db, evm_env)
             .precompiles(PrecompilesMap::from_static(n42_precompiles(spec)))
             .activate_inspector(inspector)
-            .build()
+            .build();
+        crate::fast_transfer::N42Evm::new(inner, true, self.fast_transfers)
     }
 }

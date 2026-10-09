@@ -1,6 +1,5 @@
 use alloy_primitives::{B256, Bytes};
-use reth_revm::witness::ExecutionWitnessRecord;
-use reth_trie_common::{ExecutionWitnessMode, HashedPostState};
+use reth_trie_common::{HashedPostState, HashedStorage};
 use revm::database::State;
 use std::collections::HashSet;
 use tracing::debug;
@@ -28,13 +27,46 @@ impl ExecutionWitness {
         // `Legacy` preserves the pre-reth-v2 witness shape that the N42 mobile
         // verifier already consumes (no dedup / sort). Switching to `Canonical`
         // would break the existing mobile packet format.
-        let record =
-            ExecutionWitnessRecord::from_executed_state(state, ExecutionWitnessMode::Legacy);
+        let mut hashed_state = HashedPostState::default();
+        let codes = state
+            .cache
+            .contracts
+            .values()
+            .map(|code| code.original_bytes())
+            .collect();
+        let mut keys = Vec::new();
+
+        for (address, cached_account) in &state.cache.accounts {
+            let hashed_address = alloy_primitives::keccak256(address);
+            hashed_state.accounts.insert(
+                hashed_address,
+                cached_account
+                    .account
+                    .as_ref()
+                    .map(|account| (&account.info).into()),
+            );
+
+            let storage = hashed_state
+                .storages
+                .entry(hashed_address)
+                .or_insert_with(HashedStorage::default);
+
+            if let Some(account) = &cached_account.account {
+                keys.push(address.to_vec().into());
+                for (slot, value) in &account.storage {
+                    let slot = B256::from(*slot);
+                    storage
+                        .storage
+                        .insert(alloy_primitives::keccak256(slot), *value);
+                    keys.push(slot.into());
+                }
+            }
+        }
         Self {
-            hashed_state: record.hashed_state,
-            codes: record.codes,
-            keys: record.keys,
-            lowest_block_number: record.lowest_block_number,
+            hashed_state,
+            codes,
+            keys,
+            lowest_block_number: state.block_hashes.lowest().map(|(number, _)| number),
         }
     }
 
@@ -107,6 +139,33 @@ mod tests {
 
     fn bytecode(data: &[u8]) -> Bytes {
         Bytes::from(data.to_vec())
+    }
+
+    #[test]
+    fn test_execution_witness_reads_cached_state_without_reth_record_helper() {
+        let address = alloy_primitives::Address::with_last_byte(0x42);
+        let mut state = State::builder()
+            .with_database(revm::database::EmptyDB::default())
+            .build();
+        state.cache.insert_account(
+            address,
+            revm::state::AccountInfo {
+                balance: alloy_primitives::U256::from(9),
+                ..Default::default()
+            },
+        );
+
+        let witness = ExecutionWitness::from_state(&state);
+        let hashed_address = keccak256(address);
+        assert!(witness.hashed_state.accounts.contains_key(&hashed_address));
+        assert!(witness.hashed_state.accounts[&hashed_address].is_some());
+        assert!(
+            witness
+                .keys
+                .contains(&Bytes::copy_from_slice(address.as_slice()))
+        );
+        assert!(witness.codes.is_empty());
+        assert_eq!(witness.lowest_block_number, None);
     }
 
     #[test]

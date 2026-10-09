@@ -1,5 +1,5 @@
 use alloy_eips::Decodable2718;
-use alloy_primitives::Bytes;
+use alloy_primitives::{B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
 use reth_chainspec::ChainSpec;
 use reth_evm::{
@@ -10,7 +10,8 @@ use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{
     BlockTy, HeaderTy, SealedBlock, SealedHeader, SignedTransaction, TxTy,
 };
-use reth_storage_errors::any::AnyError;
+use reth_storage_api::{StateProvider, StateProviderBox};
+use reth_storage_errors::{any::AnyError, provider::ProviderResult};
 use std::sync::Arc;
 
 use crate::{evm_factory::N42EvmFactory, restored_slots::TrackingBlockExecutorFactory};
@@ -29,14 +30,46 @@ pub struct N42EvmConfig {
     inner: InnerConfig,
     /// The inner block executor factory, watched for restored slots.
     factory: TrackingBlockExecutorFactory<<InnerConfig as ConfigureEvm>::BlockExecutorFactory>,
+    parallel_import: Option<ParallelImportProvider>,
+}
+
+type ImportStateOpener = dyn Fn(B256) -> ProviderResult<StateProviderBox> + Send + Sync;
+
+#[derive(Clone)]
+struct ParallelImportProvider(Arc<ImportStateOpener>);
+
+impl std::fmt::Debug for ParallelImportProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ParallelImportProvider(exact parent)")
+    }
 }
 
 impl N42EvmConfig {
     /// Creates a new N42 EVM configuration from a chain spec.
     pub fn new(chain_spec: Arc<ChainSpec>) -> Self {
-        let inner = EthEvmConfig::new_with_evm_factory(chain_spec, N42EvmFactory);
+        Self::with_evm_factory(chain_spec, N42EvmFactory::from_env())
+    }
+
+    /// Configure the transaction executor while retaining block-level system calls,
+    /// receipts, withdrawals and restored-slot tracking.
+    pub fn with_evm_factory(chain_spec: Arc<ChainSpec>, evm_factory: N42EvmFactory) -> Self {
+        let inner = EthEvmConfig::new_with_evm_factory(chain_spec, evm_factory);
         let factory = TrackingBlockExecutorFactory::new(inner.block_executor_factory().clone());
-        Self { inner, factory }
+        Self {
+            inner,
+            factory,
+            parallel_import: None,
+        }
+    }
+
+    /// Enable complete transfer-block import using independent views of the exact parent.
+    /// The provider must preserve QMDB-only execution-read routing when configured.
+    pub fn with_parallel_import_provider(
+        mut self,
+        open: impl Fn(B256) -> ProviderResult<StateProviderBox> + Send + Sync + 'static,
+    ) -> Self {
+        self.parallel_import = Some(ParallelImportProvider(Arc::new(open)));
+        self
     }
 
     /// Returns a reference to the inner `EthEvmConfig`.
@@ -63,6 +96,38 @@ impl ConfigureEvm for N42EvmConfig {
     type BlockExecutorFactory =
         TrackingBlockExecutorFactory<<InnerConfig as ConfigureEvm>::BlockExecutorFactory>;
     type BlockAssembler = <InnerConfig as ConfigureEvm>::BlockAssembler;
+
+    fn batch_import_enabled(&self) -> bool {
+        self.parallel_import.is_some()
+    }
+
+    fn try_execute_import_batch<'a, DB: alloy_evm::Database + 'a>(
+        &self,
+        executor: &mut reth_evm::BlockExecutorForEvm<'a, Self, DB>,
+        env: &EvmEnvFor<Self>,
+        parent_hash: alloy_primitives::B256,
+        transactions: &[alloy_consensus::transaction::Recovered<
+            reth_ethereum_primitives::TransactionSigned,
+        >],
+    ) -> Result<Option<reth_evm::ImportBatchFinalize>, reth_evm::execute::BlockExecutionError> {
+        let Some(provider) = &self.parallel_import else {
+            return Ok(None);
+        };
+        crate::parallel_block::try_commit_import_batch(executor, env, transactions, &|| {
+            (provider.0)(parent_hash).ok().map(|provider| {
+                reth_revm::database::StateProviderDatabase::new(provider.into_evm_state_provider())
+            })
+        })
+        .map(|graft| {
+            graft.map(|graft| {
+                metrics::counter!("n42_parallel_import_executed_total")
+                    .increment(transactions.len() as u64);
+                Box::new(move |bundle: &mut revm::database::BundleState| {
+                    crate::parallel_transfer::append_reverts(bundle, graft.reverts);
+                }) as reth_evm::ImportBatchFinalize
+            })
+        })
+    }
 
     fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
         &self.factory

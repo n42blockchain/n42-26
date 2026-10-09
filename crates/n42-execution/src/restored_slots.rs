@@ -173,6 +173,24 @@ pub struct TrackingExecutor<E> {
     pending: Option<(B256, Vec<RestoredSlot>)>,
 }
 
+impl<E: BlockExecutor> TrackingExecutor<E> {
+    /// Record a locally executed transfer whose changes were already grafted.
+    /// Only the execution module may bypass the ordinary per-transaction path.
+    pub(crate) fn commit_preexecuted_transfer(
+        &mut self,
+        hash: B256,
+        output: E::Result,
+    ) -> Result<GasOutput, BlockExecutionError> {
+        if self.pending.is_some() || !output.result().state.is_empty() {
+            return Err(BlockExecutionError::other(std::io::Error::other(
+                "preexecuted transfer overlaps pending execution or contains ungrafted state",
+            )));
+        }
+        self.tx_hashes.push(hash);
+        Ok(self.inner.commit_transaction(output))
+    }
+}
+
 impl<E> BlockExecutor for TrackingExecutor<E>
 where
     E: BlockExecutor,
