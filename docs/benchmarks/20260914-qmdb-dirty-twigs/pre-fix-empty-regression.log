@@ -1,0 +1,24 @@
+   Compiling n42-twig-core v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-twig-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.28s
+     Running unittests src/lib.rs (target/debug/deps/n42_twig_core-de8e46cf43f41f19)
+
+running 1 test
+test qmdb_leaf_tree::tests::empty_rewind_then_same_capacity_refill_matches_full_tree ... FAILED
+
+failures:
+
+---- qmdb_leaf_tree::tests::empty_rewind_then_same_capacity_refill_matches_full_tree stdout ----
+
+thread 'qmdb_leaf_tree::tests::empty_rewind_then_same_capacity_refill_matches_full_tree' (276) panicked at crates/n42-twig-core/src/qmdb_leaf_tree.rs:1424:9:
+assertion `left == right` failed
+  left: [216, 51, 48, 130, 211, 161, 123, 141, 170, 193, 234, 86, 175, 110, 98, 95, 52, 149, 162, 111, 215, 34, 68, 127, 219, 98, 217, 151, 202, 43, 83, 177]
+ right: [223, 48, 185, 195, 105, 213, 0, 118, 118, 110, 97, 155, 226, 64, 26, 163, 142, 246, 174, 226, 130, 48, 217, 203, 22, 212, 105, 226, 203, 96, 180, 240]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    qmdb_leaf_tree::tests::empty_rewind_then_same_capacity_refill_matches_full_tree
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 69 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p n42-twig-core --lib`

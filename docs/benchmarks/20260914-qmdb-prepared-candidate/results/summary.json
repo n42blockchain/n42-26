@@ -1,0 +1,82 @@
+[
+  {
+    "keys": 200000,
+    "mode": "discard",
+    "samples": 18,
+    "elapsed_ms": {
+      "median": 280.769,
+      "minimum": 262.962,
+      "maximum": 318.98
+    },
+    "candidate_ms": {
+      "median": 153.204,
+      "minimum": 144.147,
+      "maximum": 168.182
+    },
+    "commit_ms": {
+      "median": 123.721,
+      "minimum": 116.15,
+      "maximum": 150.798
+    }
+  },
+  {
+    "keys": 200000,
+    "mode": "retain",
+    "samples": 18,
+    "elapsed_ms": {
+      "median": 147.6775,
+      "minimum": 141.588,
+      "maximum": 175.683
+    },
+    "candidate_ms": {
+      "median": 86.5215,
+      "minimum": 83.15,
+      "maximum": 89.999
+    },
+    "commit_ms": {
+      "median": 59.54600000000001,
+      "minimum": 57.816,
+      "maximum": 89.633
+    }
+  },
+  {
+    "keys": 2000000,
+    "mode": "discard",
+    "samples": 18,
+    "elapsed_ms": {
+      "median": 427.1995,
+      "minimum": 410.72,
+      "maximum": 446.766
+    },
+    "candidate_ms": {
+      "median": 198.683,
+      "minimum": 193.212,
+      "maximum": 205.447
+    },
+    "commit_ms": {
+      "median": 226.892,
+      "minimum": 213.148,
+      "maximum": 253.554
+    }
+  },
+  {
+    "keys": 2000000,
+    "mode": "retain",
+    "samples": 18,
+    "elapsed_ms": {
+      "median": 229.27,
+      "minimum": 219.391,
+      "maximum": 268.182
+    },
+    "candidate_ms": {
+      "median": 94.012,
+      "minimum": 89.949,
+      "maximum": 96.926
+    },
+    "commit_ms": {
+      "median": 135.8635,
+      "minimum": 127.127,
+      "maximum": 173.956
+    }
+  }
+]

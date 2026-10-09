@@ -1,0 +1,56 @@
+[
+  {
+    "keys": 200000,
+    "ordered": 0,
+    "version": "before",
+    "count": 18,
+    "median_ms": 70.6625,
+    "min_ms": 65.867,
+    "max_ms": 79.331
+  },
+  {
+    "keys": 200000,
+    "ordered": 0,
+    "version": "batch",
+    "count": 18,
+    "median_ms": 73.293,
+    "min_ms": 68.91,
+    "max_ms": 99.159
+  },
+  {
+    "keys": 200000,
+    "ordered": 0,
+    "version": "after",
+    "count": 18,
+    "median_ms": 66.6385,
+    "min_ms": 62.673,
+    "max_ms": 78.484
+  },
+  {
+    "keys": 2000000,
+    "ordered": 0,
+    "version": "before",
+    "count": 18,
+    "median_ms": 83.432,
+    "min_ms": 79.113,
+    "max_ms": 95.506
+  },
+  {
+    "keys": 2000000,
+    "ordered": 0,
+    "version": "batch",
+    "count": 18,
+    "median_ms": 82.6985,
+    "min_ms": 78.555,
+    "max_ms": 92.029
+  },
+  {
+    "keys": 2000000,
+    "ordered": 0,
+    "version": "after",
+    "count": 18,
+    "median_ms": 79.0575,
+    "min_ms": 75.313,
+    "max_ms": 87.213
+  }
+]

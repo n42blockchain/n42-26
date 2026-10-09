@@ -1,0 +1,17 @@
+
+running 1 test
+test store::tests::bench_persistent_commit_path ... overlap_bench enabled=false
+overlap_bench generation=2 joined=0
+commit_bench reads=1 keys=200000 updates=147000 generation=2 elapsed_ms=155.783 root=0xebaa4b5f8c3d9606ea2f510f16263fbf566a98e8efae8c60f45e242afab960fe wal_bytes=7056164
+prepare_bench mode=retain retained=true generation=2 candidate_ms=86.611 commit_ms=69.172
+overlap_bench generation=3 joined=0
+commit_bench reads=1 keys=200000 updates=147000 generation=3 elapsed_ms=163.810 root=0x5aa39c8745ba4fceabbfb42ae0e3a19bbda4a07d2c8e9b802ddc8dbb5834fc9e wal_bytes=14112328
+prepare_bench mode=retain retained=true generation=3 candidate_ms=89.627 commit_ms=74.183
+overlap_bench generation=4 joined=0
+commit_bench reads=1 keys=200000 updates=147000 generation=4 elapsed_ms=153.243 root=0x2c3e565419e9bf3caa2b923669779ccf3e29fa3575f16d61b57358ad00a681c2 wal_bytes=21168492
+prepare_bench mode=retain retained=true generation=4 candidate_ms=86.021 commit_ms=67.222
+commit_bench restart_verified=true
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 14 filtered out; finished in 1.96s
+

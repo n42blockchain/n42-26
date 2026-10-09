@@ -1,0 +1,458 @@
+[
+  {
+    "keys": 200000,
+    "pair": 0,
+    "version": "qmdb",
+    "initialize_ms": 41.242,
+    "derive_ms": 37.903,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 272.095,
+        "per_second": 3675191
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 28.383,
+        "per_second": 35232149
+      }
+    }
+  },
+  {
+    "keys": 200000,
+    "pair": 0,
+    "version": "hash4096",
+    "initialize_ms": 51.312,
+    "derive_ms": 44.184,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 242.589,
+        "per_second": 4122197
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 28.426,
+        "per_second": 35178793
+      }
+    }
+  },
+  {
+    "keys": 200000,
+    "pair": 1,
+    "version": "hash4096",
+    "initialize_ms": 50.131,
+    "derive_ms": 43.486,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 239.548,
+        "per_second": 4174535
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 27.476,
+        "per_second": 36395086
+      }
+    }
+  },
+  {
+    "keys": 200000,
+    "pair": 1,
+    "version": "qmdb",
+    "initialize_ms": 37.069,
+    "derive_ms": 33.491,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 231.813,
+        "per_second": 4313828
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 29.028,
+        "per_second": 34450070
+      }
+    }
+  },
+  {
+    "keys": 200000,
+    "pair": 2,
+    "version": "qmdb",
+    "initialize_ms": 41.933,
+    "derive_ms": 38.141,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 230.194,
+        "per_second": 4344158
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 28.211,
+        "per_second": 35446717
+      }
+    }
+  },
+  {
+    "keys": 200000,
+    "pair": 2,
+    "version": "hash4096",
+    "initialize_ms": 51.005,
+    "derive_ms": 44.08,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 244.479,
+        "per_second": 4090324
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 27.798,
+        "per_second": 35974449
+      }
+    }
+  },
+  {
+    "keys": 200000,
+    "pair": 3,
+    "version": "hash4096",
+    "initialize_ms": 45.983,
+    "derive_ms": 38.859,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 241.76,
+        "per_second": 4136337
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 28.536,
+        "per_second": 35042977
+      }
+    }
+  },
+  {
+    "keys": 200000,
+    "pair": 3,
+    "version": "qmdb",
+    "initialize_ms": 38.018,
+    "derive_ms": 34.24,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 229.76,
+        "per_second": 4352367
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 27.021,
+        "per_second": 37007600
+      }
+    }
+  },
+  {
+    "keys": 200000,
+    "pair": 4,
+    "version": "qmdb",
+    "initialize_ms": 41.37,
+    "derive_ms": 37.728,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 231.836,
+        "per_second": 4313397
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 28.066,
+        "per_second": 35630900
+      }
+    }
+  },
+  {
+    "keys": 200000,
+    "pair": 4,
+    "version": "hash4096",
+    "initialize_ms": 45.344,
+    "derive_ms": 38.521,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 247.109,
+        "per_second": 4046792
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 27.15,
+        "per_second": 36832050
+      }
+    }
+  },
+  {
+    "keys": 200000,
+    "pair": 5,
+    "version": "hash4096",
+    "initialize_ms": 45.967,
+    "derive_ms": 39.058,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 261.527,
+        "per_second": 3823704
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 27.199,
+        "per_second": 36766128
+      }
+    }
+  },
+  {
+    "keys": 200000,
+    "pair": 5,
+    "version": "qmdb",
+    "initialize_ms": 37.056,
+    "derive_ms": 33.384,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 234.16,
+        "per_second": 4270582
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 27.633,
+        "per_second": 36189156
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 0,
+    "version": "qmdb",
+    "initialize_ms": 330.49,
+    "derive_ms": 104.113,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 455.345,
+        "per_second": 2196136
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 37.037,
+        "per_second": 27000260
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 0,
+    "version": "hash4096",
+    "initialize_ms": 172.884,
+    "derive_ms": 74.95,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 401.839,
+        "per_second": 2488558
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 34.983,
+        "per_second": 28585068
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 1,
+    "version": "hash4096",
+    "initialize_ms": 169.364,
+    "derive_ms": 77.618,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 411.213,
+        "per_second": 2431828
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 34.65,
+        "per_second": 28859855
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 1,
+    "version": "qmdb",
+    "initialize_ms": 364.755,
+    "derive_ms": 101.741,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 456.726,
+        "per_second": 2189498
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 39.33,
+        "per_second": 25426187
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 2,
+    "version": "qmdb",
+    "initialize_ms": 330.422,
+    "derive_ms": 103.072,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 466.174,
+        "per_second": 2145120
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 36.791,
+        "per_second": 27180731
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 2,
+    "version": "hash4096",
+    "initialize_ms": 174.951,
+    "derive_ms": 78.392,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 410.439,
+        "per_second": 2436413
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 34.771,
+        "per_second": 28759484
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 3,
+    "version": "hash4096",
+    "initialize_ms": 173.506,
+    "derive_ms": 78.389,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 423.485,
+        "per_second": 2361359
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 35.161,
+        "per_second": 28440473
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 3,
+    "version": "qmdb",
+    "initialize_ms": 357.918,
+    "derive_ms": 101.861,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 461.499,
+        "per_second": 2166853
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 37.621,
+        "per_second": 26580842
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 4,
+    "version": "qmdb",
+    "initialize_ms": 363.692,
+    "derive_ms": 102.621,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 457.309,
+        "per_second": 2186704
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 37.601,
+        "per_second": 26594747
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 4,
+    "version": "hash4096",
+    "initialize_ms": 171.804,
+    "derive_ms": 79.275,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 440.091,
+        "per_second": 2272256
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 34.884,
+        "per_second": 28666717
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 5,
+    "version": "hash4096",
+    "initialize_ms": 191.82,
+    "derive_ms": 77.527,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 467.127,
+        "per_second": 2140745
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 35.276,
+        "per_second": 28347838
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 5,
+    "version": "qmdb",
+    "initialize_ms": 329.999,
+    "derive_ms": 103.953,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 480.635,
+        "per_second": 2080580
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 37.502,
+        "per_second": 26665031
+      }
+    }
+  }
+]

@@ -1,0 +1,1852 @@
+{
+  "since": "2026-09-07T00:00:00-04:00",
+  "remote_refresh": "unavailable: sandbox DNS/network; reviewed cached refs",
+  "repositories": {
+    "n42-rs": {
+      "path": "/home/n42/src/n42/n42-rs",
+      "ref": "HEAD",
+      "head": "466c1839791afadba7f1dd4d48c5518440dcafba",
+      "tree": "508c344212407b4ad22312b8014d68c4687bcebe",
+      "commits": [
+        {
+          "sha": "466c1839791afadba7f1dd4d48c5518440dcafba",
+          "date": "2026-09-14T04:37:10-04:00",
+          "subject": "docs: defect 5 root cause, the handover stall lead, and where the work stopped"
+        },
+        {
+          "sha": "b35a64e1c88f537661a8d573c4d8c73481256b9a",
+          "date": "2026-09-14T04:21:03-04:00",
+          "subject": "docs: point commit references at the second rewrite"
+        },
+        {
+          "sha": "25df5f225e7081ab3abf57c13a0b51729f970639",
+          "date": "2026-09-14T03:55:51-04:00",
+          "subject": "docs: loop156-157 -- stage 7 adopted, the verify leg holds, and five defects on the fleet path"
+        },
+        {
+          "sha": "17f1328f8f68296d84277ea1429f53ccf01a324b",
+          "date": "2026-09-14T03:55:51-04:00",
+          "subject": "fix(follower): never execute a sibling on the same parent as this node's build"
+        },
+        {
+          "sha": "c87ff65bc5e1c47868504c19301a80dd1a51514a",
+          "date": "2026-09-14T03:38:01-04:00",
+          "subject": "ci(test): free the runner's disk and drop debug info from the test build"
+        },
+        {
+          "sha": "cdb074fa21c16b915fa8a4f9210c20a49013d55e",
+          "date": "2026-09-14T03:36:04-04:00",
+          "subject": "fix(fleet7): two defects the loop156 legs found"
+        },
+        {
+          "sha": "b94012c27879fc3b011d056aebaa2abfbc257754",
+          "date": "2026-09-14T02:31:22-04:00",
+          "subject": "docs: point commit references at the rewritten history"
+        },
+        {
+          "sha": "3b2332eb88cd9f6c1a7582e6761a7be8e2513a7b",
+          "date": "2026-09-14T02:29:41-04:00",
+          "subject": "ci: run the n42-testing suite one test at a time"
+        },
+        {
+          "sha": "6dfa8a27648854c984fc30494b60d087f0aa2d6b",
+          "date": "2026-09-14T02:28:54-04:00",
+          "subject": "fix(testing): compile the test suite only under cfg(test)"
+        },
+        {
+          "sha": "abbcf7afd6f7982e10062b8360330e207786aed5",
+          "date": "2026-09-14T00:18:11-04:00",
+          "subject": "fix(apos): credit an executed block's fees to its recovered signer, as the builder and gov5 do"
+        },
+        {
+          "sha": "f9c6fcea47ac8acd9a9c55ffcb559e67933d7749",
+          "date": "2026-09-13T19:58:07-04:00",
+          "subject": "perf(builder): share one execution output between StateReady and Complete behind the seal"
+        },
+        {
+          "sha": "c66fe21c8e2c491b434c29ed589342b63a61a850",
+          "date": "2026-09-13T19:51:54-04:00",
+          "subject": "perf(follower): check a block on its parent's published execution output, behind a switch"
+        },
+        {
+          "sha": "28a94b94b3014a4b244ae3f41022230f9f23b613",
+          "date": "2026-09-13T19:36:08-04:00",
+          "subject": "perf(fleet7): remove duplicated work found by the main-path audit; make QMDB's logs durable"
+        },
+        {
+          "sha": "8a0a6ece58428080746fff1ab66b035f564f9751",
+          "date": "2026-09-13T17:43:44-04:00",
+          "subject": "feat(qmdb): a QMDB read view that answers latest-state reads, checked against the hashed tables"
+        },
+        {
+          "sha": "a8140b164192fc666550cc0bf78bbda92dd12fcc",
+          "date": "2026-09-13T16:40:05-04:00",
+          "subject": "perf(qmdb): retain 16 blocks by default; document the node-like harness numbers and the stage 6 design"
+        },
+        {
+          "sha": "eee453638801bade93a4c5e1b9276f4e16b0b5b3",
+          "date": "2026-09-13T16:31:35-04:00",
+          "subject": "docs(follower): the hashed post-state is the persisted latest state under storage v2"
+        },
+        {
+          "sha": "7439b0b2cd2bb4e13a6fa26e14ba75655cf208f4",
+          "date": "2026-09-13T16:31:18-04:00",
+          "subject": "perf(qmdb): keep a block's slot bookkeeping in vectors and file-mode undo as slot lists"
+        },
+        {
+          "sha": "2dd8d0e50f507b7b46502d1ccf8b0e73be931975",
+          "date": "2026-09-13T16:25:38-04:00",
+          "subject": "perf(qmdb): apply a block from the operations its record keeps instead of a clone"
+        },
+        {
+          "sha": "ecd4247586aad134dc3e22dd0ef41d74e540710e",
+          "date": "2026-09-13T16:21:26-04:00",
+          "subject": "perf(qmdb): replace the key index's HashMaps with a compact fingerprint index"
+        },
+        {
+          "sha": "c16fb71c2500aecd658386f0c5631d07a7d89dea",
+          "date": "2026-09-13T16:15:47-04:00",
+          "subject": "perf(qmdb): evict the leaf nodes of every full twig below the retention window"
+        },
+        {
+          "sha": "09642e0c35c91ae62b168363a2fa4221b504a3de",
+          "date": "2026-09-13T16:11:00-04:00",
+          "subject": "perf(qmdb): make a block's twig work proportional to the block and batch its hashing"
+        },
+        {
+          "sha": "255a2ec527113cc891baeabf0d9e63515881c5d1",
+          "date": "2026-09-13T16:05:56-04:00",
+          "subject": "perf(qmdb): cache the upper tree and refresh only the paths of changed twig roots"
+        },
+        {
+          "sha": "1558decc7a03b8874feda65a099031ee1663ead5",
+          "date": "2026-09-13T15:59:00-04:00",
+          "subject": "perf(qmdb): spread the key index's hash over the key, cap RocksDB's WAL, and measure reads against MDBX"
+        },
+        {
+          "sha": "21d1c68842392af1a0bfb93d136882be403a7886",
+          "date": "2026-09-13T04:09:28-04:00",
+          "subject": "docs: LayerZero's QMDB against ours -- data confirmation, performance, determinism, verdict"
+        },
+        {
+          "sha": "18c40208f6605a707070f0df482e7d0f98c6c816",
+          "date": "2026-09-13T02:36:10-04:00",
+          "subject": "docs: QMDB against its paper -- direction, storage-layer defects, alternatives"
+        },
+        {
+          "sha": "f4103784ac117b8165f6c2ee97f3f009a9a6ea1a",
+          "date": "2026-09-12T09:01:25-04:00",
+          "subject": "docs: fleet7 handoff at the pause -- state, the loop141-155 table, the method, open items, next steps"
+        },
+        {
+          "sha": "03a5972c346c56f33f05b023afbd86c1e8d1aae0",
+          "date": "2026-09-12T08:47:10-04:00",
+          "subject": "docs: loop151-155 -- the sibling chain of defects and the follower's lost commit, fixed and measured"
+        },
+        {
+          "sha": "f888c8257c33e21bdbacf16e80d781237aea18d9",
+          "date": "2026-09-12T08:29:44-04:00",
+          "subject": "fix(driver): every commit that ran before its block arrived is repeated when the import lands"
+        },
+        {
+          "sha": "df0e9f4c2c78fa35abacbdf97c07b9f64f4adebf",
+          "date": "2026-09-12T08:19:41-04:00",
+          "subject": "fix(leader): move the engine's head to the parent before handing off a forking own block"
+        },
+        {
+          "sha": "6f5007b58235490d885fbb204b9412f9a5eb1792",
+          "date": "2026-09-12T08:14:23-04:00",
+          "subject": "fix(driver): a commit that ran before the block's import is repeated when it lands"
+        },
+        {
+          "sha": "27d13a62530001efe96e004476bfa79d63ed7233",
+          "date": "2026-09-12T07:59:58-04:00",
+          "subject": "fix(consensus): an incomplete execution result records no receipts under the gate"
+        },
+        {
+          "sha": "4e55c33ed7980f00f2865901521fef5336a0103a",
+          "date": "2026-09-12T07:48:51-04:00",
+          "subject": "fix(reorg): a sibling re-proposed after a TC imports and persists on the leader"
+        },
+        {
+          "sha": "61af2de22bfa998a36a9fe580ba9838596ba9b98",
+          "date": "2026-09-12T07:35:59-04:00",
+          "subject": "fix(driver): a commit the engine answers SYNCING to waits for the import"
+        },
+        {
+          "sha": "baaecb8f0b1242158810cd1ed2bbab8918027896",
+          "date": "2026-09-12T07:24:03-04:00",
+          "subject": "fix(engine): time the engine service loop's branches and re-poll it on a tick"
+        },
+        {
+          "sha": "fd81634d757a1ecfd8a14e42c34b0d87b86a7d51",
+          "date": "2026-09-12T06:49:42-04:00",
+          "subject": "feat(watchdog): track the own-block hand-off; docs for loop143-146"
+        },
+        {
+          "sha": "9465fdb9f30dce22b47e72c0187488b5c099d619",
+          "date": "2026-09-12T06:32:21-04:00",
+          "subject": "fix(tx-queue): a build cut short mid-run keeps its sender in the rotation"
+        },
+        {
+          "sha": "98ceadeb42c7597ad3590fa0dc2a203e7bdca0ff",
+          "date": "2026-09-12T06:14:44-04:00",
+          "subject": "fix(deferred): a queued block's commit waits for its import, and a refused forkchoice is not a rejection"
+        },
+        {
+          "sha": "5c38c8798ad2870124081c5ffd3fcae8e5b6cef0",
+          "date": "2026-09-12T06:02:09-04:00",
+          "subject": "fix(deferred): a queued import counts as importing; the intrinsic gas on the worker pool; the seal-first fold keeps only the withdrawal recipients in the cache"
+        },
+        {
+          "sha": "b0bb8b279b4bcc9e155bd8d3bd2fabb4753fea7d",
+          "date": "2026-09-12T05:49:15-04:00",
+          "subject": "fix(deferred): the audit's findings -- rejected blocks, SYNCING retries, the pipeline's depth, the withdrawals guard, the build identity"
+        },
+        {
+          "sha": "c9ce11929bbcfee061e9afb284b4cf137403db41",
+          "date": "2026-09-12T05:09:22-04:00",
+          "subject": "docs: loop142 -- the Ed25519 batch size does not move the ingest (20-23 us a transaction at 128, 256 and 512)"
+        },
+        {
+          "sha": "d34e9d4017f307ec4540811bfc5c55f1a0409052",
+          "date": "2026-09-12T04:43:30-04:00",
+          "subject": "bench: pace at 350 ms; docs: loop141 -- 350 holds under seal-first (333,416, round 22,518,476), 300 collapses"
+        },
+        {
+          "sha": "2c130d2928f966bcb681f1ba7dffc3a5aa0fc341",
+          "date": "2026-09-12T04:17:27-04:00",
+          "subject": "feat(builder): seal-first on by default under deferred execution; docs: loop139-140 -- 317,086, the seal path at 295 ms"
+        },
+        {
+          "sha": "851c8ee45d46ede0478d222934f3ee304d9cfcb0",
+          "date": "2026-09-12T03:51:48-04:00",
+          "subject": "perf(builder): the batch workers fill the result slots, and the transactions root runs beside the graft"
+        },
+        {
+          "sha": "da611833dba3c120e080766f78c25bf2bb6d2faf",
+          "date": "2026-09-12T03:21:40-04:00",
+          "subject": "perf(builder): place the parallel step's results by index instead of sorting, skip the fold's cache inserts when the block seals early"
+        },
+        {
+          "sha": "0c4fb0b1c1dd65c9255c907be74d8a7d80bd635e",
+          "date": "2026-09-12T03:18:23-04:00",
+          "subject": "docs: loop138 -- the seal-first path timed from the build's start, on a box in its slow state"
+        },
+        {
+          "sha": "e34703cdec1e946b544f8bd56fdbada7922841ee",
+          "date": "2026-09-12T02:49:38-04:00",
+          "subject": "docs: loop137 -- seal-first 306,538, the key cache 2-3%, and where the leader's ~450 ms still goes"
+        },
+        {
+          "sha": "00a609d073ac7f2f1748a3ce57739e20e41623ec",
+          "date": "2026-09-12T02:49:38-04:00",
+          "subject": "feat(builder): a drained pull seals early too, and the seal-first phases are timed from the build's start"
+        },
+        {
+          "sha": "981d1c767829d1fcb84e5dd4ecee71cd77db6547",
+          "date": "2026-09-12T02:12:58-04:00",
+          "subject": "feat(builder): seal before the finish under deferred execution, and decompress each Ed25519 key once"
+        },
+        {
+          "sha": "457b17cdcd7860272ff277032c7995619d8e0152",
+          "date": "2026-09-12T02:10:43-04:00",
+          "subject": "docs: loop136 -- half of an execution layer's CPU is Ed25519 verification of the ingest; the key decompression is a third of it"
+        },
+        {
+          "sha": "0a5b6967704a7a54133a918255dc95865c1ce766",
+          "date": "2026-09-11T21:10:38-04:00",
+          "subject": "docs: loop134-135 -- deferred execution adopted on the bench genesis (302,811 on window 1, round 22,200,112)"
+        },
+        {
+          "sha": "eabc6859965f7ba4f75414352a2cdc2f0f67f5f9",
+          "date": "2026-09-11T20:36:16-04:00",
+          "subject": "fix(deferred): a new leader whose parent is still importing proposes once it lands"
+        },
+        {
+          "sha": "e28b4629826e7fb5e7073fb7331a18cff6c2ed41",
+          "date": "2026-09-11T20:14:05-04:00",
+          "subject": "docs: loop132 C2 read"
+        },
+        {
+          "sha": "67fb798d602caeb11a8619a5398b95cadfe62a0d",
+          "date": "2026-09-11T20:13:58-04:00",
+          "subject": "docs: loop132-133 -- deferred execution's first bench legs, two pipeline defects and the follower's numbers at full blocks"
+        },
+        {
+          "sha": "26d9a2dbed3eef662ff3acb2e6eb518f909d23f3",
+          "date": "2026-09-11T20:08:43-04:00",
+          "subject": "fix(deferred): blocks in flight count as the tip, and the parent wait is 3 s"
+        },
+        {
+          "sha": "2a80b6da242c05a8147db145bc4929b587f541eb",
+          "date": "2026-09-11T19:43:41-04:00",
+          "subject": "fix(deferred): a commit for a block still importing reaches the driver"
+        },
+        {
+          "sha": "e99e532e53cf35c6ac09c42e6fa1a1d14bf1aaa7",
+          "date": "2026-09-11T19:19:24-04:00",
+          "subject": "docs: loop131 -- a 16M-slot sender cache costs window 1; 4M stays (292k twice)"
+        },
+        {
+          "sha": "0aeb83a547d0379c6fd9744bf55e8994d6090b53",
+          "date": "2026-09-11T18:55:26-04:00",
+          "subject": "fix(deferred): file the leader's own result under the sealed hash at the handoff"
+        },
+        {
+          "sha": "12f7ae1d8c92c02ada0fbd7f914e3664032f85e3",
+          "date": "2026-09-11T18:40:31-04:00",
+          "subject": "feat(consensus): deferred execution, stage 2 -- check, vote, import"
+        },
+        {
+          "sha": "aa5d19bb409f1d632665507396dea944f491aeb3",
+          "date": "2026-09-11T18:22:45-04:00",
+          "subject": "test(deferred): the cross-client vector for deferred execution, F-2..F+3"
+        },
+        {
+          "sha": "a322a0642b94fad6c861c754a870ad91ed4cdd43",
+          "date": "2026-09-11T18:15:31-04:00",
+          "subject": "feat(consensus): deferred execution, stage 1 -- headers carry the parent's execution behind deferredExecutionTime"
+        },
+        {
+          "sha": "1397184f84d455e19d9353938397facac894b353",
+          "date": "2026-09-11T18:02:49-04:00",
+          "subject": "docs: phase D -- the gov5 side's reading (reuse the fields, a timestamp fork, pipeline depth 1) and the agreed names and split"
+        },
+        {
+          "sha": "9ba1470c26f2809a55dcd4515d1a4b2b16d3ebf9",
+          "date": "2026-09-11T15:43:18-04:00",
+          "subject": "fix(driver): a queued spawned import's PayloadMissing reaches the loop; a block in flight is not queued again"
+        },
+        {
+          "sha": "cf0e3275bdcfaaef3dd8c045a29b816fc098a160",
+          "date": "2026-09-11T04:34:16-04:00",
+          "subject": "docs: loop130's last leg and the phase D status in plan v3"
+        },
+        {
+          "sha": "a925c7c29c29d367720872a6dd8909ee8b9fd14a",
+          "date": "2026-09-11T04:34:03-04:00",
+          "subject": "docs: loop130 -- the supply side cannot be pushed on one box; the phase D bound here is closed"
+        },
+        {
+          "sha": "54ee7d0f16b0ea9543bf4d1c35e92d0139f1f009",
+          "date": "2026-09-11T04:09:28-04:00",
+          "subject": "docs: loop129 -- with the vote off the import the cycle is the pacing; the box's supply is the bound"
+        },
+        {
+          "sha": "55750b1eee6d9ba17e0d36e06eb452f4d3176d1f",
+          "date": "2026-09-11T03:40:38-04:00",
+          "subject": "docs: loop129 first run -- the off-loop import collects votes in 5-21 ms; void beside the ethel jobs, re-armed behind them"
+        },
+        {
+          "sha": "dcc6e4f8549de1cf24b11b7e6850796b20ffb9c7",
+          "date": "2026-09-11T03:27:55-04:00",
+          "subject": "bench(validator): under N42_VOTE_BEFORE_IMPORT=1 the follower's import runs on a task, off the loop"
+        },
+        {
+          "sha": "c9cf007a4fc14d20de74eae87f55769d6ecc35f9",
+          "date": "2026-09-11T03:27:40-04:00",
+          "subject": "docs: loop128 -- the vote-before-import bound needs the import off the loop; the round was void on the box's state"
+        },
+        {
+          "sha": "98144d230124d1bf940037310a85557b050b2a09",
+          "date": "2026-09-11T03:17:04-04:00",
+          "subject": "bench: drop gov5's datadir pages before a leg too"
+        },
+        {
+          "sha": "c1093df95d2861c6392b099286cb60119ee6940e",
+          "date": "2026-09-11T02:56:29-04:00",
+          "subject": "fix(driver): defer a commit only while that block's import is in flight"
+        },
+        {
+          "sha": "a9d0adc92522cafd49a815c3c9de9abac82473f4",
+          "date": "2026-09-11T01:55:44-04:00",
+          "subject": "bench(validator): N42_VOTE_BEFORE_IMPORT=1 votes on a verified proposal before importing it, to bound deferred execution"
+        },
+        {
+          "sha": "642e11566ce9e3825e35c6ccedc55cd02065cda2",
+          "date": "2026-09-11T01:52:45-04:00",
+          "subject": "bench: wipe the previous leg's datadirs before dropping the cache and rebuilding the huge-page pool"
+        },
+        {
+          "sha": "17feb4d0d9a8019125817d970e38f85153d4999c",
+          "date": "2026-09-11T01:27:05-04:00",
+          "subject": "docs: loop127 -- trimming and the fsync off the lock: 21,836,504, 298k on window 1, the entry log adopted for the bench"
+        },
+        {
+          "sha": "c7e40e23b20dec1d18d6c499a5cac43e4e211e5e",
+          "date": "2026-09-11T00:52:11-04:00",
+          "subject": "perf(qmdb): the entry file's fsync runs outside the forest lock"
+        },
+        {
+          "sha": "6182c2ff095f8aaedc0cf19640a8415b9a58a56d",
+          "date": "2026-09-11T00:50:16-04:00",
+          "subject": "docs: loop126 -- the entry file as the persistence reads 21,684,816, the best round; the fsync moves outside the lock"
+        },
+        {
+          "sha": "8607a121ffdd3c90ebc85859a088a877ce6c554f",
+          "date": "2026-09-10T23:24:05-04:00",
+          "subject": "docs: plan v3 phase D status"
+        },
+        {
+          "sha": "3dc5ecf3ddc3ca773c6c6486f4db6e72d6e88079",
+          "date": "2026-09-10T23:24:04-04:00",
+          "subject": "docs: deferred execution -- the phase D proposal to the gov5 side"
+        },
+        {
+          "sha": "a2616faea5704695af9a99f956506416f5b066bb",
+          "date": "2026-09-10T23:22:42-04:00",
+          "subject": "perf(qmdb): a twig dead for longer than the retention window keeps only its root (entry log, step 5)"
+        },
+        {
+          "sha": "cc1891b98bb2342fdb8ab21bc66837ee6c3f8a89",
+          "date": "2026-09-10T22:02:05-04:00",
+          "subject": "docs: loop125 -- delta v2 gives 296,936 on window 1 and two rounds at 21.11M; the file arm's cost was write syscalls"
+        },
+        {
+          "sha": "aff1d91f0c4a071829e876e2d7069a0ce37d112c",
+          "date": "2026-09-10T21:46:57-04:00",
+          "subject": "perf(qmdb): the entry file's appends are buffered and written in one call, not one syscall a record"
+        },
+        {
+          "sha": "8796313762444a0deedb8d3fa0127e4c871bcf50",
+          "date": "2026-09-10T21:29:26-04:00",
+          "subject": "docs: entry log status after step 3b"
+        },
+        {
+          "sha": "8b7539bea212f97a42f373592836ae5c1cc13c60",
+          "date": "2026-09-10T21:29:26-04:00",
+          "subject": "perf(qmdb): the entry file is the persistence -- a checkpoint of bits, fsync before the delta, restart from the file (entry log, step 3b)"
+        },
+        {
+          "sha": "00a0235d067bc8d7cd3db5b79aff009780c47fe7",
+          "date": "2026-09-10T21:14:47-04:00",
+          "subject": "docs: loop124 -- populating the entry file's mapping changes nothing; the reads are TLB walks, and windows 2-3 are the best yet"
+        },
+        {
+          "sha": "526fd65cc4917fa9844fe0f455d7dcd827317e56",
+          "date": "2026-09-10T19:45:10-04:00",
+          "subject": "docs: entry log status after loop123 and step 3a"
+        },
+        {
+          "sha": "ef280b1c1d4648f7ae214b5d2cb342c63a5a21c3",
+          "date": "2026-09-10T19:44:59-04:00",
+          "subject": "perf(qmdb): delta v2 carries a retired slot's flag, not its entry; a file-backed tree's undo record carries slots only"
+        },
+        {
+          "sha": "230363f8f131716552fccda2c4de93ffa4504787",
+          "date": "2026-09-10T19:39:18-04:00",
+          "subject": "perf(qmdb): the entry file is read through sealed 256 MB chunks mapped once with populated page tables"
+        },
+        {
+          "sha": "f6471936295ed198b6af1f5c8ae8ed5cdad7e194",
+          "date": "2026-09-10T19:34:36-04:00",
+          "subject": "docs: loop123 -- the entry file gives 15-20 GB back and costs ~70 ms a block in page faults on both chains"
+        },
+        {
+          "sha": "6f871fe453fb0d67cafd80008c8315088042c3c2",
+          "date": "2026-09-10T19:04:12-04:00",
+          "subject": "docs: loop122 -- record retention 16 gives window 2 four or five blocks on the chain's clock and 3.7 GB a node"
+        },
+        {
+          "sha": "72032c727b58fd4cd88298f667b6649798840cc0",
+          "date": "2026-09-10T18:20:01-04:00",
+          "subject": "perf(qmdb): the tree's entries can live in an append-only file instead of the heap (entry log, step 1)"
+        },
+        {
+          "sha": "339898de6b22f09f37552bd85a3838371023e99b",
+          "date": "2026-09-10T18:10:05-04:00",
+          "subject": "docs: the QMDB entry log on disk -- design for plan v3 phase M (the 1M form of the state)"
+        },
+        {
+          "sha": "524e3570540d66d06badeb39fb38d6ef12b9e904",
+          "date": "2026-09-10T18:06:32-04:00",
+          "subject": "docs: plan v3 section 5 -- the path to 1M TPS, and what each phase buys toward it"
+        },
+        {
+          "sha": "86d37ad27e631f28479b571fa620a38ce4a67ce1",
+          "date": "2026-09-10T18:03:45-04:00",
+          "subject": "perf(qmdb): N42_QMDB_RETAIN_DEPTH bounds the forest's block records; docs: loop121 heap profile (plan v3 M1)"
+        },
+        {
+          "sha": "7886618741148e4f498330acb1203ca3cee7182d",
+          "date": "2026-09-10T17:39:15-04:00",
+          "subject": "docs: loop120 -- leader tenure 64 removes the last of window 1's tail (282,517); the compaction ratio is a tie"
+        },
+        {
+          "sha": "e266485a43ae330be406170460a948f0d5e70710",
+          "date": "2026-09-10T17:03:28-04:00",
+          "subject": "bench(flood): fund the senders through every node's RPC, so a long leader tenure can be measured"
+        },
+        {
+          "sha": "14ecdf33b5df3091d5955e23628d9a0767fb0ffb",
+          "date": "2026-09-10T16:59:21-04:00",
+          "subject": "docs: loop119 -- the Ed25519 sender cache at 16M cuts the senders phase 37 -> 17 ms and loses a block to memory"
+        },
+        {
+          "sha": "ae2eddc4e08dda62187b22fa8c92c84ddcdfd949",
+          "date": "2026-09-10T16:34:30-04:00",
+          "subject": "perf(qmdb): compact the checkpoint from the files on a background thread, never under the forest lock"
+        },
+        {
+          "sha": "60f89195b29e96e07791d49501d313505a96164d",
+          "date": "2026-09-10T07:33:42-04:00",
+          "subject": "docs: loop117 -- build-on-seal adopted; the best round is 20,371,170 and the cycle is the followers' chain"
+        },
+        {
+          "sha": "18a8f4f4082ce7cb467a15aba121a643b4dcf5b4",
+          "date": "2026-09-10T07:09:15-04:00",
+          "subject": "fix(leader): a build-ahead request for a parent older than the build already prepared is ignored"
+        },
+        {
+          "sha": "ae30608e61eb599ef341591224e0aa5be8ca8a4b",
+          "date": "2026-09-10T07:04:45-04:00",
+          "subject": "docs: loop115-116 -- the forest without moves, build-on-seal at parity and the best rounds, and the stale build-ahead request that forks the chain"
+        },
+        {
+          "sha": "b4ff313bf3c2ffd5be11b49cc0b9be636e0d50b1",
+          "date": "2026-09-10T06:38:35-04:00",
+          "subject": "perf(qmdb): persist a block from the delta captured when it was computed, so persistence never moves the tree"
+        },
+        {
+          "sha": "42597e7f4cc8f4cf790777a626878f48d862a922",
+          "date": "2026-09-10T01:34:48-04:00",
+          "subject": "docs: plan v3 -- two chains and one box; loop110-114 (build-on-seal measured, the hang's stacks, 275,839)"
+        },
+        {
+          "sha": "3858f92cc809c0e342b54cea511848bb4fdb40fd",
+          "date": "2026-09-10T01:34:48-04:00",
+          "subject": "bench: fleet7-windows.py reads both chains and the box per window; fleet7-leader.py counts critical-path builds"
+        },
+        {
+          "sha": "38e0bc85d183aa0d201845f4dda9cc94ef285da4",
+          "date": "2026-09-10T01:34:48-04:00",
+          "subject": "fix(leader): build-on-seal -- taken builds stay findable, a refusal is replaced, on-seal for own blocks only, and the QMDB root job off the rayon pool"
+        },
+        {
+          "sha": "0923b23e1df9bf3cf1fbd9a0c159d7b17f48d5b5",
+          "date": "2026-09-09T18:06:53-04:00",
+          "subject": "chore: lock file for the h2-execution RLP dependency"
+        },
+        {
+          "sha": "48372fef869e36ff8f9070ccc076815548a82be1",
+          "date": "2026-09-09T18:06:39-04:00",
+          "subject": "feat(leader): build the next block the moment a block is sealed, on the builder's own post-state"
+        },
+        {
+          "sha": "2fa0a6b27f55bcdc2335308ef74675f373a11198",
+          "date": "2026-09-09T17:40:46-04:00",
+          "subject": "docs: plan v2 -- the leader's chain is the cycle; fleet7-leader.py measures it; the loop107/108 thread claim corrected"
+        },
+        {
+          "sha": "ed4df1e02ff9cbdc0e533e4ed4530f8be5da63b4",
+          "date": "2026-09-09T07:22:13-04:00",
+          "subject": "docs: loop108 -- sixteen rayon threads a node is worth 3%, and gives the best window of the campaign"
+        },
+        {
+          "sha": "217d9e175c2a90db3fc84ed01a53e5bc5c151454",
+          "date": "2026-09-09T06:50:54-04:00",
+          "subject": "docs: loop107 -- the import is contended, the builder is not the thief, and seven nodes share 256 cores"
+        },
+        {
+          "sha": "e9bf240244f3bd2ba80d2890063a333416dd236b",
+          "date": "2026-09-09T06:23:51-04:00",
+          "subject": "docs: loop106 -- the hashed post-state is load-bearing, and the code review said it was not"
+        },
+        {
+          "sha": "56feadae33ce9d2ac6c474c131a50eef65edab50",
+          "date": "2026-09-09T05:57:10-04:00",
+          "subject": "perf(follower): the Merkle-Patricia hashed post-state can be skipped"
+        },
+        {
+          "sha": "8f87dc8523e6d13f407da2b2b6b26adf2cab351b",
+          "date": "2026-09-09T04:56:37-04:00",
+          "subject": "docs: the next steps follow from the cost model, not from the last round"
+        },
+        {
+          "sha": "5d551f3f73597bfe26238eb23bc898592e78190c",
+          "date": "2026-09-09T04:46:58-04:00",
+          "subject": "docs: the status note leads with what the chain costs per transaction"
+        },
+        {
+          "sha": "c007245e6a07060ed0b566e314b4512023eb50d2",
+          "date": "2026-09-09T04:46:39-04:00",
+          "subject": "docs: loop105 -- the block is not a lever, and the chain costs 4 us of cycle per transaction"
+        },
+        {
+          "sha": "3834d6936dbc8909825b527194546ac4a1176255",
+          "date": "2026-09-09T04:26:03-04:00",
+          "subject": "docs: loop104 -- 53 ms off the import, still invisible, and a new best round"
+        },
+        {
+          "sha": "dea88cc08f9f40852785f0499279d77be1c2be55",
+          "date": "2026-09-09T04:02:47-04:00",
+          "subject": "docs: loop103 -- the campaign's best round, and two legs lost to my own compiles"
+        },
+        {
+          "sha": "fef4c27ef79f724e2b337259702bad5f66ead77a",
+          "date": "2026-09-09T03:45:36-04:00",
+          "subject": "perf(follower): the carry cache can be filled after the answer, not before it"
+        },
+        {
+          "sha": "17bcae7a3213608901aa53f41c0b8fb13460e4b7",
+          "date": "2026-09-09T03:05:04-04:00",
+          "subject": "docs: loop102 -- the two plumbing cuts are 17 ms, which the fleet cannot see"
+        },
+        {
+          "sha": "e9af3b24cee8673575bad56e33cbe72bb5001978",
+          "date": "2026-09-09T02:22:16-04:00",
+          "subject": "docs: loop101 -- pacing 350/400/450 is null, and window 1 resolves in whole blocks"
+        },
+        {
+          "sha": "2dced74e5b51f713a33ab30d022f33162973b771",
+          "date": "2026-09-09T02:13:30-04:00",
+          "subject": "bench: report what the quorum actually waits for, not the median validator"
+        },
+        {
+          "sha": "9823d040260028a007bfe52ea2f62bc6a426033d",
+          "date": "2026-09-09T04:48:22Z",
+          "subject": "docs: loop100 -- the fast answer's first attempt loses, and the import's last unaccounted time is the carry cache"
+        },
+        {
+          "sha": "b14304a735a546f8fd89144ea7cf3af0a4e0e70a",
+          "date": "2026-09-09T04:37:43Z",
+          "subject": "perf(follower): the fast answer keeps the remembered block, and the carry copy is timed"
+        },
+        {
+          "sha": "1b9e7ec0c046d8f3cdfeb33513492db6fc9c96ec",
+          "date": "2026-09-08T23:46:41Z",
+          "subject": "perf(follower): the queue's and the pool's bookkeeping can leave the vote path"
+        },
+        {
+          "sha": "380f7e63c8d5a42a61e44805b29acdf0d5f4827d",
+          "date": "2026-09-08T23:42:28Z",
+          "subject": "chore(follower): the root/hashed join is opt-in until it is measured"
+        },
+        {
+          "sha": "f0c0e4ac87385faf155a9f5832de2e39c0788ef2",
+          "date": "2026-09-08T23:41:28Z",
+          "subject": "perf(follower): the QMDB root and the hashed post-state run together, not one after the other"
+        },
+        {
+          "sha": "75de7a00eb63a85699f72c2e8ba0f68c045380c9",
+          "date": "2026-09-08T23:05:41Z",
+          "subject": "docs: how to get the graft's 42 ms back -- overlap the merge with the root, or shard the bundle"
+        },
+        {
+          "sha": "fac24a8337c65afc82a9abaabdbc6c2f29573a88",
+          "date": "2026-09-08T23:01:45Z",
+          "subject": "perf(follower): time the parent-state lookup, the mined bookkeeping and the engine's insert acknowledgement"
+        },
+        {
+          "sha": "71e99d8efd669b2fc63b29dd61fe99b1443bdeae",
+          "date": "2026-09-08T22:32:32Z",
+          "subject": "docs: the status note's cycle and memory-preparation paragraphs follow loop99"
+        },
+        {
+          "sha": "fe65daf4302a6cd1ede4776d9d5b393957a9c9a1",
+          "date": "2026-09-08T22:32:10Z",
+          "subject": "docs: the status note follows loop99 -- pacing is the ceiling, RAYON_NUM_THREADS=32 adopted"
+        },
+        {
+          "sha": "ea6849e8001fff6e51e1e6e8478da9b1849b56c1",
+          "date": "2026-09-08T22:31:43Z",
+          "subject": "docs: loop99 -- the import cuts hold on the fleet, and the pacing becomes the ceiling"
+        },
+        {
+          "sha": "744974429fe629beba8bdd60ad4b292b0e6c6a8e",
+          "date": "2026-09-08T21:57:28Z",
+          "subject": "perf(follower): answer a payload this node executed before the engine's own pass"
+        },
+        {
+          "sha": "9f40807374dbc5fda05395f8a0fbb912aaf9c7c7",
+          "date": "2026-09-08T21:25:58Z",
+          "subject": "fix(bench): hugeprep must write every page, and the pool is a target it iterates to"
+        },
+        {
+          "sha": "fa3ba9a6c4316345b97461eb4f1c045e5b4452d5",
+          "date": "2026-09-08T21:13:42Z",
+          "subject": "fix(bench): F7_HUGEPREP is unbound under set -u"
+        },
+        {
+          "sha": "5e12da7b423890aad2c1d878edc785311874fa19",
+          "date": "2026-09-08T21:06:18Z",
+          "subject": "docs: the fleet7 status note rewritten -- goal, method, cut table, what is in flight"
+        },
+        {
+          "sha": "ea948fa388d79196951c0bb4f61512fb3cb27732",
+          "date": "2026-09-08T14:24:37Z",
+          "subject": "chore: lockfile for engine-types' tracing-subscriber dev-dependency"
+        },
+        {
+          "sha": "22d7b4c1c844cfce36d28dff64dc761102faf99b",
+          "date": "2026-09-08T14:24:14Z",
+          "subject": "perf(import): sharded twig index with parallel retirements, in-place parallel collects, one fold for the hashed state"
+        },
+        {
+          "sha": "14958a79ad438b0c4e26fea317b41de22ef50b61",
+          "date": "2026-09-08T14:05:56Z",
+          "subject": "perf(follower): TxEnvs on the worker pool, the graft's base swap, parallel revert sort; bench runs dropcache + hugeprep before every leg"
+        },
+        {
+          "sha": "7276b5070e6213caad72da6054640c939846c56f",
+          "date": "2026-09-08T12:57:37Z",
+          "subject": "bench+docs: window 1 is bimodal by the huge-page pool at the flood's start; dropcache and hugeprep"
+        },
+        {
+          "sha": "a87d004591c4cf7ae785077e81f971df058befb1",
+          "date": "2026-09-08T11:52:36Z",
+          "subject": "docs: loop94 -- a follower's CPU is 61% ingest verification, 14% import"
+        },
+        {
+          "sha": "244d51401f4f5da399b2f65c30c7e85cdedc589e",
+          "date": "2026-09-08T10:40:08Z",
+          "subject": "docs: loop93 -- no stall to exercise the held ledger; grace legs six for six clean"
+        },
+        {
+          "sha": "2c6f5f27f94162160a8f7be5d5622a00bf8cc9cd",
+          "date": "2026-09-08T10:17:04Z",
+          "subject": "bench+docs: the stragglers' grace is the bench default; loop92 recorded"
+        },
+        {
+          "sha": "cfe7a64c2f0b603184d49f4d371a7d67a7772009",
+          "date": "2026-09-08T10:04:40Z",
+          "subject": "fix(queue): hold an own block's transactions until the chain settles its height"
+        },
+        {
+          "sha": "219060a3aa5297c71ae5d05aa83691f456cdc370",
+          "date": "2026-09-08T09:08:43Z",
+          "subject": "docs: loop91 -- the follower grouped by sender is null; stays off"
+        },
+        {
+          "sha": "6fca3dff75db8bba956410601abfe4e32304a942",
+          "date": "2026-09-08T08:48:50Z",
+          "subject": "fix(h2): the voters ledger counts the leader's own vote and sees late votes past the stale filter"
+        },
+        {
+          "sha": "6f7a6c33e7966d9d223572c32eccfde6ee6242d7",
+          "date": "2026-09-08T08:23:45Z",
+          "subject": "docs: fleet7 status note -- what is true, what is in flight, what is decided"
+        },
+        {
+          "sha": "f6a45559a1ae12645cb4b366af702ae5c561a730",
+          "date": "2026-09-08T08:13:55Z",
+          "subject": "feat(h2): progress votes -- a follower that imports after the view passed still tells the leader"
+        },
+        {
+          "sha": "8e12ddc8dacb1b58c09a6900c7b70a48bd9854ab",
+          "date": "2026-09-08T07:28:41Z",
+          "subject": "refactor(follower): use the provider's chunked hashed post-state"
+        },
+        {
+          "sha": "c02d01134902d03a78d1867e658d8eb0f38c33e7",
+          "date": "2026-09-08T06:07:55Z",
+          "subject": "perf(follower): group a block's transfers by sender (N42_FOLLOWER_SENDER_GROUPS)"
+        },
+        {
+          "sha": "6646d8944a5a2b6174e68500feb37c5f98099ffa",
+          "date": "2026-09-08T05:29:01Z",
+          "subject": "docs(roadmap): re-plan after round 43"
+        },
+        {
+          "sha": "5e59ae4e87812f15f20b9aae9da4f4c7eb4468ac",
+          "date": "2026-09-08T05:28:23Z",
+          "subject": "feat(h2): a stragglers' grace -- the leader waits for the votes outside the quorum"
+        },
+        {
+          "sha": "7846af5f02bdd7b5d0ffcf419c16d9999f34269c",
+          "date": "2026-09-08T05:23:14Z",
+          "subject": "bench(fleet7): record the block's shape every round; 450 ms default pacing"
+        },
+        {
+          "sha": "e4fd363550d1cec0089e246000f9f972ab07e694",
+          "date": "2026-09-08T05:21:55Z",
+          "subject": "docs: loop83-87 -- the stall's trigger is the leader outrunning the followers; 450 ms pacing"
+        },
+        {
+          "sha": "04115182eea1885e5f34cd8e529c8574e4bb5a5a",
+          "date": "2026-09-08T03:46:56Z",
+          "subject": "fix(provider): the chunked hashed post-state takes the bundle; builder graft cache knob"
+        },
+        {
+          "sha": "a8a437cc29a731a106ff897e5ccb4f5240ed129a",
+          "date": "2026-09-08T03:45:00Z",
+          "subject": "perf(provider): hash a large bundle's post-state over rayon chunks"
+        },
+        {
+          "sha": "bb7fb4a6e9e2b9a89dff0d99170e59e067925620",
+          "date": "2026-09-08T03:15:00Z",
+          "subject": "perf(state): key-prefix hasher and reserve for the twig index; the follower's graft skips the cache"
+        },
+        {
+          "sha": "4cf1d660a1241f334a3d6032cf636ec8ec8faa90",
+          "date": "2026-09-08T03:09:24Z",
+          "subject": "perf(state): the parallel state commit is the default; loop82 recorded"
+        },
+        {
+          "sha": "8500fed040257df5e30eb235a9cd76fb0d4e887c",
+          "date": "2026-09-08T01:30:07Z",
+          "subject": "perf(state): build the QMDB leaves and the hashed post-state on the worker pool (N42_PARALLEL_STATE_COMMIT)"
+        },
+        {
+          "sha": "64ddeaff1ea268fac152c029209e15621ef97783",
+          "date": "2026-09-07T23:09:35Z",
+          "subject": "docs: loop81 -- MDBX readahead loses, jemalloc background purge +3% but no cure"
+        },
+        {
+          "sha": "e1d80a8282a3adf781db28bab6fa150adc8aee47",
+          "date": "2026-09-07T22:24:20Z",
+          "subject": "feat(db): N42_MDBX_READAHEAD=1 turns MDBX readahead back on"
+        },
+        {
+          "sha": "eb154051f7d4a4f9bb12fdf4f41fb7904c1def1d",
+          "date": "2026-09-07T21:37:57Z",
+          "subject": "docs: TPS against the accounts a block touches (loop80 sweep)"
+        },
+        {
+          "sha": "8b2704a76ef85e105e3cbc4b4de985919fa6f8cf",
+          "date": "2026-09-07T20:57:27Z",
+          "subject": "feat(tx_flood): keep the pre-round-43 recipient shape as --legacy-recipients"
+        },
+        {
+          "sha": "3ae4127e4b847528ffddb8259ba806efebe1b5de",
+          "date": "2026-09-07T20:55:07Z",
+          "subject": "docs: block shape survey -- accounts touched by 163k consecutive transactions on four chains"
+        },
+        {
+          "sha": "d2f4ec42559f3dfc5fe72a7ba15d6a8d88372abe",
+          "date": "2026-09-07T20:46:33Z",
+          "subject": "test(queue): the reorg give-back in its own module, with tests"
+        },
+        {
+          "sha": "b874108021f85539d2c6e4e30eb865ae53ef4ab4",
+          "date": "2026-09-07T20:44:09Z",
+          "subject": "docs: the block shape against Ethereum, BNB, Polygon and Tron (scripts/chainmix.py)"
+        },
+        {
+          "sha": "167e79dfd157ad3344a7b2d9be68f8c53f51c2ea",
+          "date": "2026-09-07T20:11:26Z",
+          "subject": "fix(queue): offer a reverted block's transactions again on a reorg"
+        },
+        {
+          "sha": "c156463fa7a1944a2e1a3498bf14aacc5e21d60a",
+          "date": "2026-09-07T16:31:26Z",
+          "subject": "docs: the block-200 stall is memory -- kswapd reclaiming the page cache for huge pages"
+        },
+        {
+          "sha": "595574d9505cdf25e82b197c5d38338c9409b212",
+          "date": "2026-09-07T15:37:26Z",
+          "subject": "feat(node): the watchdog covers the build, and can dump every thread's stack"
+        },
+        {
+          "sha": "8b58600d8aebe4212e2e04157160c47eb493cef5",
+          "date": "2026-09-07T15:32:42Z",
+          "subject": "docs: round 43 -- the parallel builder, the flood that paid 13,000 recipients, and the grafted follower"
+        },
+        {
+          "sha": "7b99e17aee7a99d4536baeeadf109b3f6a70920d",
+          "date": "2026-09-07T14:44:54Z",
+          "subject": "perf(follower): graft the groups' bundles onto the block's state (N42_FOLLOWER_GRAFT)"
+        },
+        {
+          "sha": "9a40a002ab9484c12846e9d7c337712cd3920b2b",
+          "date": "2026-09-07T14:32:45Z",
+          "subject": "fix(tx_flood): the ingest path's recipients are indexed by the sender's global index"
+        },
+        {
+          "sha": "04a3eb31c7ceeb55197244505755ec6a349ddf08",
+          "date": "2026-09-07T13:33:01Z",
+          "subject": "perf(builder): lay the parallel-built block out in candidate order"
+        },
+        {
+          "sha": "db56969838c2cc7438f02285682fb8a8ab003d59",
+          "date": "2026-09-07T13:16:28Z",
+          "subject": "fix(builder): one revert per grafted account, and refused candidates go back to the queue"
+        },
+        {
+          "sha": "0a084077577b7c35a0a15c1d178b5c9bce3ec78d",
+          "date": "2026-09-07T11:37:01Z",
+          "subject": "perf(builder): convert candidates on the batch threads and run the batches on their own pool"
+        },
+        {
+          "sha": "292f282b8c6e6ed1dee0704417ab495a549039ca",
+          "date": "2026-09-07T10:14:14Z",
+          "subject": "perf(builder): group the parallel build by sender and graft the batches' bundles onto the block's state"
+        },
+        {
+          "sha": "98061d2d1f8f3b1ab8252e383e9c4455ec9796c9",
+          "date": "2026-09-07T09:34:15Z",
+          "subject": "feat(builder): execute a block's transfers in conflict-free groups (N42_PARALLEL_BUILD)"
+        },
+        {
+          "sha": "7deb21c4fc1f72d30f5db067ab5a0129c1c50a99",
+          "date": "2026-09-07T09:20:00Z",
+          "subject": "docs: round 42 -- pacing 250 null, bigger blocks lose the round, the leader's serial build is the long pole"
+        },
+        {
+          "sha": "8d020fe3b34def62dd49e12f16f2daa78bcc0bed",
+          "date": "2026-09-07T08:55:22Z",
+          "subject": "docs(roadmap): phase-1 status after rounds 40-41"
+        },
+        {
+          "sha": "27a98e6bc21d3d1e80b7097636c2953348eb4979",
+          "date": "2026-09-07T08:54:43Z",
+          "subject": "docs: round 41 -- the 2^22 sender cache, 396,601 and 385,742 with every block full"
+        },
+        {
+          "sha": "d9f4bfb0f5579a1e7887700560cb6af09a388a0c",
+          "date": "2026-09-07T08:54:11Z",
+          "subject": "debug: stage markers for the direct import and the builder, and a watchdog that names both when an import stalls"
+        },
+        {
+          "sha": "c7b69dee0370dd94d75d2e3c0947ddeb6c00c60b",
+          "date": "2026-09-07T07:56:50Z",
+          "subject": "docs: round 40, the 0x50 transaction on the fleet -- supply cost halved, the follower binds"
+        },
+        {
+          "sha": "1701dfc1735449e762f1d56d005f98682a32af87",
+          "date": "2026-09-07T05:38:47Z",
+          "subject": "test(n42-testing): a 0x50 transfer is admitted, mined and receipted as type 0x50 in one process"
+        }
+      ]
+    },
+    "n42-gov5": {
+      "path": "/home/n42/src/n42/N42-gov5",
+      "ref": "origin/main",
+      "head": "a8e353cac7a00c7f6ca2816cc8e4634c45a4f337",
+      "tree": "b0efc19296c222a417d23eee963ec114f92d6076",
+      "commits": [
+        {
+          "sha": "a8e353cac7a00c7f6ca2816cc8e4634c45a4f337",
+          "date": "2026-09-14T04:37:30-04:00",
+          "subject": "docs(qs): pause for the day -- 35zzp partial, state of the box, how to resume"
+        },
+        {
+          "sha": "14f29f6e4b3a1b4bb5cc25d0d4dd104e03d84120",
+          "date": "2026-09-14T02:28:32-04:00",
+          "subject": "docs(qs): the levers for the second-window slide, and a harness flag that never reached the nodes"
+        },
+        {
+          "sha": "15710ab9db954c0717263757ece6bb74fc810259",
+          "date": "2026-09-14T02:28:03-04:00",
+          "subject": "perf(txindex): bound the kept tail by transactions and drain the seal backlog"
+        },
+        {
+          "sha": "f0603e82ef9c35f6798f39626c372c1b066013e4",
+          "date": "2026-09-14T02:25:12-04:00",
+          "subject": "perf(history): the deferred fold prepares its rows outside the write transaction"
+        },
+        {
+          "sha": "afce47c11e34256810ea23356ea44740e597644a",
+          "date": "2026-09-14T02:17:48-04:00",
+          "subject": "docs(qs): 35zzo re-run -- B mean 90.6k, and a second-window slide"
+        },
+        {
+          "sha": "fc1dfe26363b0ab03cc496c17d6021d972e59a2a",
+          "date": "2026-09-14T00:20:12-04:00",
+          "subject": "docs(qs): 35zzo attempt 1 aborted under an unclaimed disk-heavy job"
+        },
+        {
+          "sha": "a8ab0c6120985b1e554f39f740cba03464267065",
+          "date": "2026-09-14T00:20:12-04:00",
+          "subject": "fix(mdbx): the write probe counts each row once"
+        },
+        {
+          "sha": "f7ec2836e31cc9f43f365b30843d75068c8bc95c",
+          "date": "2026-09-13T17:43:54-04:00",
+          "subject": "perf(deferred): the leader's own write takes the execution result its build computed"
+        },
+        {
+          "sha": "1ee7ec30a10d15a2b30c7210f58eba423c45ea86",
+          "date": "2026-09-13T17:40:29-04:00",
+          "subject": "docs(qs): the second audit, n42-r74, predictions 70-72 (rounds 35zzo-35zzq replace 35zzm/35zzn)"
+        },
+        {
+          "sha": "6445f1bfbfff52a6f19665ca81dd0a99bf69c8e0",
+          "date": "2026-09-13T17:39:08-04:00",
+          "subject": "perf: remove duplicate work found by a full audit of the seven-node paths; fix the deferred check"
+        },
+        {
+          "sha": "46a4c152ae5318241109441ade3d3360f676f151",
+          "date": "2026-09-13T11:30:40-04:00",
+          "subject": "datc: keep dense-hook entries only for flushed trie levels"
+        },
+        {
+          "sha": "82b234d13ae685a054e4340005d58e3f165b35de",
+          "date": "2026-09-12T21:18:29-04:00",
+          "subject": "docs(ethel): the USDT native asset experiment -- exact over a year, 1.3% CPU"
+        },
+        {
+          "sha": "ed1b1b47c8fe4ccec4907393c09769ec4da4a04e",
+          "date": "2026-09-12T21:18:29-04:00",
+          "subject": "feat(witness-replay): --native-asset off|shadow|on"
+        },
+        {
+          "sha": "f6ea2b8e1a8bbce90facd4679e516b67f8a45239",
+          "date": "2026-09-12T21:18:29-04:00",
+          "subject": "feat(vm): native asset module for USDT transfer, behind NativeAssetTime"
+        },
+        {
+          "sha": "5c4daee8684dd1929f35cd7e36d2fbf04b9da8a6",
+          "date": "2026-09-12T19:16:44-04:00",
+          "subject": "datc: run the upper-range build with --writemap"
+        },
+        {
+          "sha": "70597414992e11b2a475c102d5d91f46db5b7a00",
+          "date": "2026-09-12T19:16:44-04:00",
+          "subject": "datc: shard the root-hook collections by nibble"
+        },
+        {
+          "sha": "b73f222b9a25893387ad6e03854cd0a2725d0b00",
+          "date": "2026-09-12T19:16:44-04:00",
+          "subject": "kv, commitment: replace DupSort values in one positioned write"
+        },
+        {
+          "sha": "c70f5a33a181dbf5336c7b36eeed0325a6769516",
+          "date": "2026-09-12T18:36:46-04:00",
+          "subject": "feat(stablecoin-stats): measure USDT/USDC share and a native transfer path"
+        },
+        {
+          "sha": "a726eb8d852a2c88b140322049cb73b7cb9ad3fb",
+          "date": "2026-09-12T09:01:43-04:00",
+          "subject": "docs(qs): handover of the seven-node campaign at 2026-09-12 09:00 EDT; the log-analysis helpers"
+        },
+        {
+          "sha": "b8a8ae86248f3f923b006d2b18799e1192126fcf",
+          "date": "2026-09-12T05:54:16-04:00",
+          "subject": "docs(qs): 35zzm's first attempt never reached its gate (chain time vs wall clock); the audit before 35zzn"
+        },
+        {
+          "sha": "b15cd2b78ec12895cfa70f0e8df47c99adba2dec",
+          "date": "2026-09-12T05:53:31-04:00",
+          "subject": "fix: the deferred-execution and tx-root audit -- four reviews, twenty findings"
+        },
+        {
+          "sha": "ba434d725040b8ec9f9ca5b502e8892c8e6dd58e",
+          "date": "2026-09-12T05:15:48-04:00",
+          "subject": "test(consensus): the n42-rs cross-client deferred-execution vectors run against gov5's header check"
+        },
+        {
+          "sha": "f2bb919e4e4ea95edd128f5d30d499fd76e0cf05",
+          "date": "2026-09-12T03:38:32-04:00",
+          "subject": "fix(sync): the gossip block path runs the deferred check too, not only the direct push"
+        },
+        {
+          "sha": "a5df5eec4601d195f5f3efb6af72f932935c29ac",
+          "date": "2026-09-12T03:23:37-04:00",
+          "subject": "docs(qs): prediction 69 -- deferred execution (round 35zzn)"
+        },
+        {
+          "sha": "93e31b89480e515141b45471014b35df9cef7553",
+          "date": "2026-09-12T03:23:05-04:00",
+          "subject": "feat(consensus): deferred execution behind deferredExecutionTime"
+        },
+        {
+          "sha": "9ae0bb53888012e57e9a804f61beed4740e2dae9",
+          "date": "2026-09-12T03:01:05-04:00",
+          "subject": "docs(qs): prediction 68 -- the BLAKE3 binary transactions root (round 35zzm)"
+        },
+        {
+          "sha": "9564ffe613d2314747f57d6cf96eb5f9e7987f54",
+          "date": "2026-09-12T03:00:56-04:00",
+          "subject": "feat(block): the BLAKE3 binary transactions root, behind txRootBlake3Time"
+        },
+        {
+          "sha": "909d07f0ec09497f2d08ae34b9972de41131b715",
+          "date": "2026-09-12T01:29:27-04:00",
+          "subject": "docs(qs): 35zzl result -- prediction 67 holds; B mean 83.7k, best window 90.3k; standing after r67-r70"
+        },
+        {
+          "sha": "37b60f2590effc114b437e6781f6e27f052b21c1",
+          "date": "2026-09-12T00:20:24-04:00",
+          "subject": "docs(qs): 35zzk result -- prediction 66 holds on throughput (B mean 73.1k), the phase moved -25 not -50"
+        },
+        {
+          "sha": "71a4ffd3fbf7242d1a091e2993ef02565b0486b8",
+          "date": "2026-09-11T18:52:05-04:00",
+          "subject": "docs(qs): 35zzj result -- prediction 65 holds (executorMs 58 -> 0); B mean 70.7k"
+        },
+        {
+          "sha": "3bc32b0fde5931ad8043693f4ded62ad1592452e",
+          "date": "2026-09-11T17:40:45-04:00",
+          "subject": "docs(qs): 35zzi result -- prediction 64 holds on the phase, falls on throughput; the B legs decay on the write lock"
+        },
+        {
+          "sha": "ca9b538923afb9218e3517ab86519976b7c90773",
+          "date": "2026-09-11T17:34:53-04:00",
+          "subject": "docs(qs): 35zzi's B legs decay on the MDBX writer lock -- the history fold; prediction 67 (fold every 20 s)"
+        },
+        {
+          "sha": "55d9212b41f9c1475c6aac1d1974a4825754fd77",
+          "date": "2026-09-11T17:34:35-04:00",
+          "subject": "perf(node): the history backfill interval comes from the environment; the write probe times every write transaction"
+        },
+        {
+          "sha": "35dbe9a8ee6ea20e9447b7b280ff0596cb82fcd1",
+          "date": "2026-09-11T16:29:10-04:00",
+          "subject": "docs(qs): offline replay of r66 vs r69 -- executorMs 37 -> 13, finalizeMs 170 -> 96, no root errors"
+        },
+        {
+          "sha": "158e1c95e1fe51e594733619bad730110b258958",
+          "date": "2026-09-11T16:26:36-04:00",
+          "subject": "docs(qs): 35zzh result -- prediction 63 falsified on both mechanism claims; B1 73.4k"
+        },
+        {
+          "sha": "fac370a44bc665375236862055be6e0b9b89cd68",
+          "date": "2026-09-11T16:07:31-04:00",
+          "subject": "docs(qs): prediction 66 -- the delta-credited recipients are read across the workers before the fold"
+        },
+        {
+          "sha": "1c365ed9ffc049ecc915c379da706e18851a9682",
+          "date": "2026-09-11T16:05:08-04:00",
+          "subject": "perf(state): read a block's delta-credited recipients across the workers before the fold"
+        },
+        {
+          "sha": "d4b571b22c39e9784166e077f007cd38be8a1b4f",
+          "date": "2026-09-11T15:58:06-04:00",
+          "subject": "docs(qs): 35zzh's B1 profile splits the finalize; predictions 64 (batched root) and 65 (arena free list)"
+        },
+        {
+          "sha": "be70215c150c65f541cc8fdee1c591eb26303be1",
+          "date": "2026-09-11T15:57:33-04:00",
+          "subject": "fix(parallel): the arena free list keeps the largest arenas, not the first two"
+        },
+        {
+          "sha": "9ecfa3bead89b2eb409ca8208431136dd0c8911c",
+          "date": "2026-09-11T15:52:13-04:00",
+          "subject": "perf(qmdb): the root computer applies a block under the tree's leaf batch"
+        },
+        {
+          "sha": "28003fd1b5c03851f9be94b61444c5f49e66daa0",
+          "date": "2026-09-11T15:16:07-04:00",
+          "subject": "fix(hotstuff): Seal refuses a header whose extra-data does not decode"
+        },
+        {
+          "sha": "ec51933b12744fd45510439089c5a6a1167d395f",
+          "date": "2026-09-11T15:05:52-04:00",
+          "subject": "docs(qs): 35zzg on fresh dirs -- best windows recorded; prediction 62 on the median, not the p90"
+        },
+        {
+          "sha": "3b1922371835161c5aeba11e29257da2ffb9c508",
+          "date": "2026-09-11T14:22:14-04:00",
+          "subject": "docs(qs): 35zzf holds prediction 61 -- ten branch switches, no bad root; best window 75.6k"
+        },
+        {
+          "sha": "e4d40e7577a1149d8e4f4dcae1d20ebadf3aafbf",
+          "date": "2026-09-11T13:46:04-04:00",
+          "subject": "docs(qs): the full-block profile -- recovery is half the node, FinalizeTx twice per block; prediction 63"
+        },
+        {
+          "sha": "85e11933c334cecac2e0a95ed9fdb251ee942f20",
+          "date": "2026-09-11T13:45:37-04:00",
+          "subject": "perf(state): FinalizeTx with the no-op writer sets the deleted flags and nothing else"
+        },
+        {
+          "sha": "cd7fd4078c9c8818fee1a87471a5060f9f47dd94",
+          "date": "2026-09-11T13:15:30-04:00",
+          "subject": "docs(qs): the datadirs grew 16 -> 172 GiB in 18 h; prediction 62 (same configuration on a fresh reseed)"
+        },
+        {
+          "sha": "c34ef5b3acd5b2386a82780ce2fa62fdee56abca",
+          "date": "2026-09-11T12:55:28-04:00",
+          "subject": "docs(qs): 35zze -- the branch-switch rewind and the chained build; prediction 61"
+        },
+        {
+          "sha": "58274b84fbea21354b96093cbc99210fa43fa232",
+          "date": "2026-09-11T12:55:22-04:00",
+          "subject": "fix(miner): a build whose parent is not on the miner tree is refused, not sealed"
+        },
+        {
+          "sha": "416c433d6c03e0ee5e9a059d668a2ba2e82ab276",
+          "date": "2026-09-11T11:54:49-04:00",
+          "subject": "docs(qs): the cohort is mandatory with MobileAnchorTime; prediction 60 revised to the packet window"
+        },
+        {
+          "sha": "8d90f162c2aad487dfe2265cab8578e0d4681744",
+          "date": "2026-09-11T11:36:29-04:00",
+          "subject": "docs(qs): 35zza -- 64 workers pay on A blocks, not B; the B legs lost to a harness edit"
+        },
+        {
+          "sha": "3d29ee703e9c4f671ce2039c231bfa0f3dd4a1bf",
+          "date": "2026-09-11T11:22:05-04:00",
+          "subject": "docs(qs): 35zza warmup -- 64 workers buy a third of prediction 59; heap profile; prediction 60 (mobileverify off)"
+        },
+        {
+          "sha": "4d5af20c442887e2df1e3fb7718d9d09aff66b41",
+          "date": "2026-09-11T11:21:39-04:00",
+          "subject": "perf(parallel): keep the per-block transaction result slice across blocks"
+        },
+        {
+          "sha": "ff291086d7bf252031bb1a0f60ca02ebc74b7ad4",
+          "date": "2026-09-11T11:03:26-04:00",
+          "subject": "docs(qs): 35zzc crawled after a restart -- the future-block drain gated on the canonical head; 35zza runs on n42-r62"
+        },
+        {
+          "sha": "6358e0e895e3e300979c7349c0f719c6542f0c00",
+          "date": "2026-09-11T11:03:24-04:00",
+          "subject": "fix(chain): the future-block queue drains against the applied head, with push authority"
+        },
+        {
+          "sha": "82e0c3685dc68dfc20e10e6cc6ef73becb0ebfc2",
+          "date": "2026-09-11T10:32:15-04:00",
+          "subject": "docs(qs): 35zzc -- the pool is empty, not stale: per-node ingress is the other ceiling; prediction 59 (64 workers, durable arena)"
+        },
+        {
+          "sha": "c630d24648fce5b2ba9a909801eeddbb1562d93a",
+          "date": "2026-09-11T10:32:04-04:00",
+          "subject": "perf(parallel): keep the executor arenas across blocks instead of in a sync.Pool"
+        },
+        {
+          "sha": "2c60c491a243225f39e36d7b2d5f500f67a630ac",
+          "date": "2026-09-11T10:11:04-04:00",
+          "subject": "docs(qs): 35zzb -- prediction 57 falsified on the import median; the write gain moved into the tails"
+        },
+        {
+          "sha": "3b03e3c3d5dc07f798bc6c30719af8d87910af2d",
+          "date": "2026-09-11T09:13:02-04:00",
+          "subject": "docs(qs): 35zzc runs on n42-r60 (executor arena added, its own metric)"
+        },
+        {
+          "sha": "135b3cd79ea7569aad3fdb408e8848a0e1a75e4f",
+          "date": "2026-09-11T09:13:02-04:00",
+          "subject": "perf(parallel): reuse the executor's per-transaction arrays across blocks"
+        },
+        {
+          "sha": "492f3ad7512d54be24966c3ea78d05f5eb717cf7",
+          "date": "2026-09-11T08:51:30-04:00",
+          "subject": "docs(qs): 35zz full round -- B 66.9k at 16% occupancy"
+        },
+        {
+          "sha": "16bbd9afc55c152bba83945cbece878383088110",
+          "date": "2026-09-11T07:50:23-04:00",
+          "subject": "docs(qs): 35zz -- tenure 16 outruns the pool's reorg; prediction 58 (no reheap on an unchanged base fee)"
+        },
+        {
+          "sha": "629c70481bbf420a881052ac27f53ac8f00e88d9",
+          "date": "2026-09-11T07:50:23-04:00",
+          "subject": "perf(txspool): skip the priced-list reheap when the base fee is unchanged"
+        },
+        {
+          "sha": "6601e222051ad1bf1907fa57b586a1c373795bde",
+          "date": "2026-09-11T07:20:09-04:00",
+          "subject": "docs(qs): 35zy holds prediction 56; the follower import breakdown; prediction 57 (import allocations and encode)"
+        },
+        {
+          "sha": "7a2e3c3cce97d3f331eb29db43f729845a34079b",
+          "date": "2026-09-11T07:20:09-04:00",
+          "subject": "perf(rawdb): WriteTransactions encodes the block across the cores before the append loop"
+        },
+        {
+          "sha": "6141f690740eae18ec9c578d6cadaf1fd2fdfc56",
+          "date": "2026-09-11T07:16:50-04:00",
+          "subject": "perf(parallel): reuse each transaction's read/write set across executions"
+        },
+        {
+          "sha": "749f0c62fcd63eff02a485488a3da0d42e45a10a",
+          "date": "2026-09-11T06:27:50-04:00",
+          "subject": "docs(qs): tenure 16 runs as 35zz after 35zy"
+        },
+        {
+          "sha": "ec4a7e03a6f0413a5525a9541b3d375283ba9eeb",
+          "date": "2026-09-11T06:12:39-04:00",
+          "subject": "docs(qs): 35zx -- the recorder wrapper hid the layers from the parallel fill; 35zy on n42-r57"
+        },
+        {
+          "sha": "3c0b917d0e1064bc53b87786a6bddcb62e128c3f",
+          "date": "2026-09-11T06:12:39-04:00",
+          "subject": "fix(miner): carry the post-state layers on the IntraBlockState for the parallel fill"
+        },
+        {
+          "sha": "decb375f2a0b78f649e5e952df282deb193391e8",
+          "date": "2026-09-11T05:53:51-04:00",
+          "subject": "docs(qs): 35zw re-proposed the stale sibling again; the own-unverified mark closes the hole"
+        },
+        {
+          "sha": "659c189bb2967a7ad46b29849ad5e1d48d945673",
+          "date": "2026-09-11T05:53:38-04:00",
+          "subject": "fix(chain): an own build stays out of sibling convergence until the fleet commits it"
+        },
+        {
+          "sha": "0511f1b3832bdbb69a14e47b3c6d8fd4bae7a6f9",
+          "date": "2026-09-11T05:47:00-04:00",
+          "subject": "docs(qs): 35zu B1 -- the parallel fill read the store without the parent; prediction 56"
+        },
+        {
+          "sha": "521dd53f112ddfa9e51e173446b5979c62de6db2",
+          "date": "2026-09-11T05:47:00-04:00",
+          "subject": "fix(miner): the Block-STM fill reads unwritten parents through the build's post-state layers"
+        },
+        {
+          "sha": "65874376754226272f2313776b483f85a3b9539e",
+          "date": "2026-09-11T05:20:59-04:00",
+          "subject": "docs(qs): 35zu chains every in-tenure block; the handover block is the next lever -- prediction 55 (tenure 16)"
+        },
+        {
+          "sha": "4c971d5ce14c03e9338ee231cfbd9b74c88b086e",
+          "date": "2026-09-11T05:01:34-04:00",
+          "subject": "docs(qs): 35zt names the missing leaf -- the system address, created empty every block"
+        },
+        {
+          "sha": "d36f626966f46d3220e06328039e3e2404779a67",
+          "date": "2026-09-11T05:01:34-04:00",
+          "subject": "fix(state): the post-state snapshot records an empty account as absent"
+        },
+        {
+          "sha": "260543daa2d1d53f24ed0385193653f99823c5ef",
+          "date": "2026-09-11T04:55:09-04:00",
+          "subject": "diag(hotstuff): the finalize trace lists the leaves behind a small block's root"
+        },
+        {
+          "sha": "c6f3e6fb470477ed95e8ac35f204a7e0e4552b33",
+          "date": "2026-09-11T04:50:18-04:00",
+          "subject": "docs(qs): round 35zr -- the chained build read a store without its parent; prediction 54"
+        },
+        {
+          "sha": "2d826e5a23115850ea5dda0481d84854839816c4",
+          "date": "2026-09-11T04:50:18-04:00",
+          "subject": "fix(miner): a chained speculative build reads its unwritten parents through post-state snapshots"
+        },
+        {
+          "sha": "192d645b1ec1de4d47c926cce8c827e514d33de3",
+          "date": "2026-09-11T04:21:02-04:00",
+          "subject": "Merge remote-tracking branch 'origin/main'"
+        },
+        {
+          "sha": "9caac67932c71f0ce8b16cccb67c2477ce7d3476",
+          "date": "2026-09-11T04:20:40-04:00",
+          "subject": "Merge origin/main: the DATC line yields to the remote format v2"
+        },
+        {
+          "sha": "7ecc5c485707e3d76e9b1ac377bb4a1e0fb7a3f7",
+          "date": "2026-09-11T04:08:12-04:00",
+          "subject": "docs: the agent tier is a delegation, and today it verifies nothing"
+        },
+        {
+          "sha": "84f2c85087006a2545178757611722eb4409b589",
+          "date": "2026-09-11T03:59:45-04:00",
+          "subject": "datc: one kill stops the supervised build, and the scripts name the binary that exists"
+        },
+        {
+          "sha": "3ef3f9ccc43897515cd1ee1394d3744a91e56a85",
+          "date": "2026-09-11T03:54:25-04:00",
+          "subject": "docs(qs): round 35zq re-proposed 35zp's stale sibling; 35zr on n42-r51"
+        },
+        {
+          "sha": "5df597768575ffcd065df60c0ffcfe4bb1aca9a8",
+          "date": "2026-09-11T03:54:25-04:00",
+          "subject": "fix(hotstuff): Prepare refuses a parent it cannot resolve when committee evidence is wired"
+        },
+        {
+          "sha": "af658e5761439beb5800c382bb15476ad267da6c",
+          "date": "2026-09-11T03:49:36-04:00",
+          "subject": "docs(ethel): the Linux cross-check is min and full only"
+        },
+        {
+          "sha": "c0bded0a6960fe032dc330f5f6d4610544091e1d",
+          "date": "2026-09-11T03:45:43-04:00",
+          "subject": "fix(chain): GetHeaderByHash consults the header cache before the store's number row"
+        },
+        {
+          "sha": "a43451dde02a31a5c2d1b27a14a161dce56a225c",
+          "date": "2026-09-11T03:03:16-04:00",
+          "subject": "fix(miner): a sealed header enters the header cache at seal time so a chained speculative build finds its parent"
+        },
+        {
+          "sha": "bd6cd222c28140e072f99c5f7cb65cd28903bc69",
+          "date": "2026-09-11T02:48:52-04:00",
+          "subject": "docs(ethel): record the 2026-09-10 weekly cycle and its four traps"
+        },
+        {
+          "sha": "130ed0e6e7f83ac04eabf98663f2b9c21066ad4d",
+          "date": "2026-09-11T02:48:17-04:00",
+          "subject": "docs(ethel): witness-block-trace is not regressed, it was miswired"
+        },
+        {
+          "sha": "79df2e34eec122e98b97080fb01046ca3eb2fdde",
+          "date": "2026-09-11T02:42:40-04:00",
+          "subject": "docs(qs): round 35zn (diagnostic) -- the view placed in milliseconds; throughput as 35zm"
+        },
+        {
+          "sha": "a0f71388546ca6222611cb59e4f6b48b51b97ce0",
+          "date": "2026-09-11T01:48:47-04:00",
+          "subject": "perf(miner): two-deep speculation -- build v+1 on the miner tree the moment v is sealed, not after v's write"
+        },
+        {
+          "sha": "f8a4ee8a9314be706bb14a6ea29790f770b0f761",
+          "date": "2026-09-11T01:43:10-04:00",
+          "subject": "docs(qs): the view in milliseconds -- the speculative build waits for the previous write and lands 0.2-0.5 s after the QC; track 3c (two-deep speculation) removes it"
+        },
+        {
+          "sha": "2523df0d8d8a8457663e707aaf847784833c5572",
+          "date": "2026-09-11T00:24:14-04:00",
+          "subject": "docs(qs): round 35zm -- recover 51-122 ms and import 0.9-1.2 s as predicted, B unchanged at 62.5k mean: the varying part of the view is outside every measured phase"
+        },
+        {
+          "sha": "bdc2403dc4f0ff59b09d3ccd5986d6a3af142958",
+          "date": "2026-09-10T23:29:53-04:00",
+          "subject": "diag(consensus): millisecond stamps on the five per-view events"
+        },
+        {
+          "sha": "acc54a093bdbac029fd480a5c3a45f06e3c5cd14",
+          "date": "2026-09-10T23:11:00-04:00",
+          "subject": "docs(qs): round 35zl -- the baseline for 35zm reproduces at 69.1k (B four-window mean)"
+        },
+        {
+          "sha": "0cc8d5ebdb0098a2bbe35a48656dda073d1551b9",
+          "date": "2026-09-10T22:16:35-04:00",
+          "subject": "perf(import): the sender-hint pass asks the sender cache first and runs across the recovery fan-out"
+        },
+        {
+          "sha": "fbe28e257631d2627399577478695a779479971b",
+          "date": "2026-09-10T21:41:05-04:00",
+          "subject": "fix(ingest): the hint feed recovers under the import's fork signer; sender-cache counters and a one-shot import probe"
+        },
+        {
+          "sha": "91f5c0eee9e0ae45636f905b3c4dfd24859f2fa7",
+          "date": "2026-09-10T21:40:35-04:00",
+          "subject": "fix(ingest): the hint feed recovers under the import's fork signer; sender-cache counters and a one-shot import probe"
+        },
+        {
+          "sha": "b468abdf536135d804d6d92b6c2c4deb53436ccb",
+          "date": "2026-09-10T20:49:40-04:00",
+          "subject": "docs(qs): round 35zj -- the hint feed works, recover 460 -> 350, B four-window mean 68.4k (+24% over 35za); reseed confound noted"
+        },
+        {
+          "sha": "468aba0afda93c45b6f3fb9b461f175f77e40a1d",
+          "date": "2026-09-10T19:54:22-04:00",
+          "subject": "perf(import): sender verification asks the sender cache before the pool"
+        },
+        {
+          "sha": "21bea58a36bcfe6b99c892c75fc68041a5dff226",
+          "date": "2026-09-10T18:42:06-04:00",
+          "subject": "fix(ingest): the hint feed decodes Ethereum RLP -- what the generators submit -- before trying the native codec; hint-feed and txflood hint statistics"
+        },
+        {
+          "sha": "f0bc7ef033e3fe112a0b1e3ce216187bf5646065",
+          "date": "2026-09-10T15:57:01-04:00",
+          "subject": "feat(ingest): hint-only mode recovers senders into the cache ahead of the block; txflood -hint-peers streams every batch to it"
+        },
+        {
+          "sha": "c621308a089f2f9aebfd67ca2f6a91cd234c6140",
+          "date": "2026-09-10T06:07:56-04:00",
+          "subject": "docs(qs): round 35zh confirms prediction 49 -- canon 200 -> 18 ms; B four-window mean 63.7k (+16% over 35za), A 40.0k"
+        },
+        {
+          "sha": "f00ca575acd08b08bb260022f5088ac1003795ed",
+          "date": "2026-09-10T04:33:22-04:00",
+          "subject": "docs(qs): the night's eight rounds in one table, and track 2 made concrete (ingest hint-only sender pre-recovery)"
+        },
+        {
+          "sha": "1f98289edac229e884f8d82f1b2dbf6a20437128",
+          "date": "2026-09-10T04:06:59-04:00",
+          "subject": "fix(miner): never build on a consensus parent that is not the applied head"
+        },
+        {
+          "sha": "fbf0f8a16a3e65bc6cfb6f664dcd745fe4dff74d",
+          "date": "2026-09-10T03:32:15-04:00",
+          "subject": "perf(chain): CommitToCanonical takes the committed block from the block cache and hashes its transactions across the cores"
+        },
+        {
+          "sha": "3485e40b802c1f66ee7f88bc67a5d89666fd4a3b",
+          "date": "2026-09-10T03:04:00-04:00",
+          "subject": "docs(qs): round 35zf confirms predictions 46 and 47 -- reload 4 ms, no handoff timeouts, A 39.2k; B unchanged because the follower is now the pole"
+        },
+        {
+          "sha": "ada9a5fc43c70e03dc7740870ddbaef01656cb48",
+          "date": "2026-09-10T02:19:40-04:00",
+          "subject": "docs(qs): register prediction 48 -- round 35zg measures the per-commit fsync (commit-to-canonical's 89-143 ms MDBX commit inline in the HotStuff loop)"
+        },
+        {
+          "sha": "e735628b0c5d8267e09fed9fb1144cd9f4a64fdb",
+          "date": "2026-09-10T00:38:04-04:00",
+          "subject": "docs(qs): round 35ze confirms prediction 45 -- assemble 544-608 -> 266-279 ms and the view follows the leader down, B four-window mean 62.2k (+13% over 35za)"
+        },
+        {
+          "sha": "1262e538497f189e797a48462c45c4595017c442",
+          "date": "2026-09-09T23:56:49-04:00",
+          "subject": "fix(hotstuff): a leader view blocked on an unexecuted committed parent now resumes when the parent applies"
+        },
+        {
+          "sha": "a4d584c55823f8a52c766ddeacffccfb401376cb",
+          "date": "2026-09-09T21:50:02-04:00",
+          "subject": "perf(miner): the speculative tree keeps its own appends when the block it built is the next build's parent (N42_MINER_ADOPT_APPENDS)"
+        },
+        {
+          "sha": "2c03b27f660b565aba724c3f23d5cbe9dcab8d87",
+          "date": "2026-09-09T21:42:00-04:00",
+          "subject": "docs(qs): track 3 in mechanism -- the miner tree re-reads from disk what it computed one build earlier; 3a keeps its own appends"
+        },
+        {
+          "sha": "36c6f5c2b1bbfdc31ca2d4fa13bc2b73b5b070c4",
+          "date": "2026-09-09T21:39:36-04:00",
+          "subject": "perf(miner): MachineVerify no longer subscribes to MinedEntireEvent without verifiers -- 252 ms a block off the leader's assemble"
+        },
+        {
+          "sha": "1f725d2999dbff8f6cc84cf7107a52036314326d",
+          "date": "2026-09-09T19:54:19-04:00",
+          "subject": "docs: the four signature tiers, and what the repo actually has of them"
+        },
+        {
+          "sha": "21d6747e528de435b8598addd71df263fbd666be",
+          "date": "2026-09-09T19:44:29-04:00",
+          "subject": "docs(qs): round 35zc falsifies prediction 43 -- 6 GiB heaps bought page cache and cost the leader its view deadlines; prediction 44 registers 16 workers a node"
+        },
+        {
+          "sha": "0a7a6511d5249ded08bd364507b3dab0b138a53c",
+          "date": "2026-09-09T18:44:34-04:00",
+          "subject": "feat(txflood): -fund-timeout (default 300 s) -- the eighth generator's funding batch takes longer than 80 s behind seven flooding ones"
+        },
+        {
+          "sha": "8af7988f8a7c8cb4c45fe87e4652c814c5d9427b",
+          "date": "2026-09-09T18:22:56-04:00",
+          "subject": "fix(txflood): read the faucet nonce fleet-wide, and restart a batch that starts nonce-too-low"
+        },
+        {
+          "sha": "62ba86f3f08a710bfc0a04345cb2709a203f7d1e",
+          "date": "2026-09-09T17:54:55-04:00",
+          "subject": "docs(qs): register prediction 43 -- round 35zb tests the per-node memory budget"
+        },
+        {
+          "sha": "0d0642af4f932e1ba76d5f41300f29e10c06b32f",
+          "date": "2026-09-09T17:53:36-04:00",
+          "subject": "docs(qs): offline replay first results -- the uncontended follower imports a 163k block in 731 ms, the fleet's 1.4-1.9 s is the box"
+        },
+        {
+          "sha": "b0e8514f0ecd10948787ce837858b77990aa1c69",
+          "date": "2026-09-09T17:48:09-04:00",
+          "subject": "feat(qs): offline follower-path replay -- n42 qs-replay rewinds N blocks through the QMDB undo window and re-imports them"
+        },
+        {
+          "sha": "822376cfa9cc9f2494432ddfc5e836502e591577",
+          "date": "2026-09-09T17:27:05-04:00",
+          "subject": "docs(qs): review of rounds 35r-35za and the plan that replaces them"
+        },
+        {
+          "sha": "3e2875e7384578a3d2a39ebde32e98151f0dc050",
+          "date": "2026-09-09T04:57:47-04:00",
+          "subject": "docs(qs): the overnight rounds -- GOGC sets the heap, 1 gwei funds a leg, and the bad root is not the startup revert"
+        },
+        {
+          "sha": "215a302029da5459f1c11ad45b5d85cf424dab4c",
+          "date": "2026-09-09T03:51:26-04:00",
+          "subject": "test(qmdb): the startup revert is not the bad root's cause, and say so"
+        },
+        {
+          "sha": "dc47f71575ef0538b52a3779a246fb0b5ca3fd37",
+          "date": "2026-09-09T03:33:13-04:00",
+          "subject": "perf(miner): skip the branch align when the state is already at the parent"
+        },
+        {
+          "sha": "adb6f34e6d7714fc00d7c6f685af510e04ac6892",
+          "date": "2026-09-09T02:27:00-04:00",
+          "subject": "perf(miner): split the build's align timer into the persist wait and the unwind"
+        },
+        {
+          "sha": "21fca5a8c67b1a111d00293f4b19d5d2fb7cac72",
+          "date": "2026-09-09T01:53:37-04:00",
+          "subject": "docs(qs): 35z9 -- GOGC 200 stops the win2 collapse; a 17% faster view is only a 5% faster window, and the leader's align wait is why"
+        },
+        {
+          "sha": "5d0a82ae0a5f7d7d66531317393dd3114762a9b1",
+          "date": "2026-09-09T04:28:38Z",
+          "subject": "docs(qs): 35z8 -- the heap is set by GOGC, not by the limit; 35z9 tries GOGC 200 under a 10 GiB cap"
+        },
+        {
+          "sha": "38f85d6445368bc848e63d8898eb6a94df31b737",
+          "date": "2026-09-08T23:18:49Z",
+          "subject": "docs(qs): 35z7 -- lazy signing fills every block; sender hints cannot hit because gossip is off; the heap limit is now the ceiling"
+        },
+        {
+          "sha": "172c1691e3540fe3624893e27e05aaa7cbd22c65",
+          "date": "2026-09-08T22:53:32Z",
+          "subject": "docs(qs): 35z6's preflight held but the box ran out of memory; lazy signing and a generator reaper"
+        },
+        {
+          "sha": "eb25c986c840178a0f7ad9837da2d4a05a67313e",
+          "date": "2026-09-08T22:53:00Z",
+          "subject": "perf(txflood): -lazy-sign trades 29 GB of resident memory for half a core"
+        },
+        {
+          "sha": "8b3710a130f3177099ebf0263eae20c0ec409b17",
+          "date": "2026-09-08T21:11:13Z",
+          "subject": "feat(chain): print a state fingerprint after every startup repair"
+        },
+        {
+          "sha": "5f2eedac9b706383e6eab16877526c171192285b",
+          "date": "2026-09-08T21:08:18Z",
+          "subject": "docs(qs): a standing status page, and the 35z5 evidence narrows the root divergence"
+        },
+        {
+          "sha": "2b937f9b0a2cb53cb8bda9318dc4e446de58fff5",
+          "date": "2026-09-08T15:29:52Z",
+          "subject": "docs(qs): 35z4 -- tenure with the pool fixes reaches 60-64k; the follower import is the critical path; 35z5 registered"
+        },
+        {
+          "sha": "9f6773e3317c89654e6de47cb9dbf23d88135248",
+          "date": "2026-09-08T15:13:49Z",
+          "subject": "perf(parallel): apply the pool's sender hints before recovering a block's senders"
+        },
+        {
+          "sha": "92ea87f625f1b96a23a3defd934ed902db0acc5d",
+          "date": "2026-09-08T11:43:05Z",
+          "subject": "docs(qs): 35z3 -- clean start under tenure, the pool's insert path is the ceiling at 45-48k; 35z4 registered"
+        },
+        {
+          "sha": "5936dcc5ea33b64cdf338313331a7b6c91136d72",
+          "date": "2026-09-08T11:24:25Z",
+          "subject": "Merge remote-tracking branch 'origin/main' into qs/round26-account-write"
+        },
+        {
+          "sha": "bc2c9ae7cbda250dfbdb11c6fd1aa102b8ca3640",
+          "date": "2026-09-08T11:24:02Z",
+          "subject": "perf(txpool): keep the sorted cache across in-order appends; N42_TXPOOL_NOLOCALS"
+        },
+        {
+          "sha": "5d1d8e8c10b8431239dc3c4c9c167aa0f4a19c54",
+          "date": "2026-09-08T10:06:53Z",
+          "subject": "datc: dispatch set-start, and name every subcommand in the usage line"
+        },
+        {
+          "sha": "77b4d83d6afe8e5fce9f56102d40b40816b8475f",
+          "date": "2026-09-08T10:05:17Z",
+          "subject": "datc: record a build's origin on its first commit, not at its end"
+        },
+        {
+          "sha": "c994b3a91cb4928037a1129987deb05dc7cc2ada",
+          "date": "2026-09-08T09:53:33Z",
+          "subject": "docs(qs): 35z2 -- tenure A legs +31%; B1 aborted with three roots; the startup pre-warm is the trigger"
+        },
+        {
+          "sha": "aa4f36d14aadeca7c9f0a9e57e145f107e4bfb7b",
+          "date": "2026-09-08T09:53:04Z",
+          "subject": "fix(qmdb): pre-warm the miner's speculative tree before consensus starts"
+        },
+        {
+          "sha": "622c35b0b8976bc28220f70c21a792b1def98900",
+          "date": "2026-09-08T09:26:44Z",
+          "subject": "docs: 35z2 lost a leg to the transient startup twig mismatch; retries raised"
+        },
+        {
+          "sha": "8b96e9be28cb98f66def94370b10e92d345c5857",
+          "date": "2026-09-08T09:26:44Z",
+          "subject": "fix(node): six startup QMDB load attempts five seconds apart"
+        },
+        {
+          "sha": "d7ca3e085eb1820e59ea49e85745ffa4d9f6b504",
+          "date": "2026-09-08T08:42:19Z",
+          "subject": "Merge remote-tracking branch 'origin/main' into qs/round26-account-write"
+        },
+        {
+          "sha": "5b1842eaadf8c890ce0060bc1a7fe82223cb300d",
+          "date": "2026-09-08T08:41:53Z",
+          "subject": "docs(qs): round 35z aborted on the branch-switch bad root; fix 26c61201; 35z2 re-runs tenure 4"
+        },
+        {
+          "sha": "26c612015784904ee3dbd9647dbbc0c30678e277",
+          "date": "2026-09-08T08:41:32Z",
+          "subject": "fix(qmdb): the miner's speculative tree follows a branch switch"
+        },
+        {
+          "sha": "9771943be4a6ebebb761f8874a00ad6559eac49d",
+          "date": "2026-09-08T08:24:38Z",
+          "subject": "docs(datc): where the archive stands, what it costs, and what is left"
+        },
+        {
+          "sha": "dc3d34a84999f5d5959389bd2422f533c7b7d4b6",
+          "date": "2026-09-08T08:03:02Z",
+          "subject": "docs(qs): sweep result; round 35z (leader tenure 4 on the honest harness) registered"
+        },
+        {
+          "sha": "d9c30af8621c8bc04bd6b3cf6c6d6d81bea3cf7f",
+          "date": "2026-09-08T02:40:52Z",
+          "subject": "docs(qs): round 35y -- every A block full at 0.92 s; the cycle is 0.75 s + 15.7 us per transaction"
+        },
+        {
+          "sha": "f9162a11da07dbe56dad7b5cd05f4cd89c10ce9c",
+          "date": "2026-09-08T02:40:39Z",
+          "subject": "fix(txflood): -sweep returns the derived senders' balances to the faucet"
+        },
+        {
+          "sha": "4188c449cf1899243bdc18b7c2f220f26fd7b547",
+          "date": "2026-09-08T01:25:26Z",
+          "subject": "docs(qs): rounds 35w/35x -- the A legs' 53% was EIP-1559 crossing the generators' fixed price; 35y registered"
+        },
+        {
+          "sha": "fe577609403024cd0ea8a59b45e8f2995ce2e042",
+          "date": "2026-09-08T01:24:59Z",
+          "subject": "perf(miner): N42_MINER_FILL_GAS caps the builder's fill below the header gas limit"
+        },
+        {
+          "sha": "acf8df90c33977215b9adc52166104023841f451",
+          "date": "2026-09-08T01:03:01Z",
+          "subject": "perf(parallel): the nonce-too-high sample lists the sender's whole candidate chain"
+        },
+        {
+          "sha": "8136b06cccd1f34068d7ab9d2ef884f8cf7f1706",
+          "date": "2026-09-08T00:40:18Z",
+          "subject": "docs(qs): rounds 35u/35v -- honest supply, full 163k blocks at 3.2-3.5 s; the A legs alternate full/empty on nonce-too-high"
+        },
+        {
+          "sha": "84dbfae3ca13ab88f4d39f1f91341cf162b131de",
+          "date": "2026-09-07T23:53:34Z",
+          "subject": "perf(parallel): log a nonce-too-high sample from the builder's run beside the build reader's view"
+        },
+        {
+          "sha": "98d3efe36d4ded875660d788f92cae34806204d6",
+          "date": "2026-09-07T22:22:30Z",
+          "subject": "fix(txflood): fund senders at twice the flood price (-fund-gasprice)"
+        },
+        {
+          "sha": "48757f568271d3f336d790c04ee1c71b7973ffbd",
+          "date": "2026-09-07T21:41:06Z",
+          "subject": "docs(qs): rounds 35s/35t -- the generators' depth loop was a fixed point; 35u registered"
+        },
+        {
+          "sha": "fcc7b3596810f60d374d954f57c65bc2be83c0b3",
+          "date": "2026-09-07T20:30:07Z",
+          "subject": "fix(txflood): -depth-by-nonce measures a generator's own in-flight from chain nonces"
+        },
+        {
+          "sha": "42be80a669b529b548e3f80181fb8c129f02c8e4",
+          "date": "2026-09-07T12:56:12Z",
+          "subject": "docs(qs): round 35r results -- the heap was never the full-block ceiling"
+        },
+        {
+          "sha": "08868fcb909dbcb2fbd47d7300a05f8ab8f7f2a7",
+          "date": "2026-09-07T12:56:12Z",
+          "subject": "perf(parallel): log why a lenient fill dropped its candidates"
+        },
+        {
+          "sha": "edc2e4edd4123725c8179b231d9289a92b3c2511",
+          "date": "2026-09-07T12:56:12Z",
+          "subject": "fix(txflood): -depth-share N credits a symmetric generator with 1/N of each block"
+        },
+        {
+          "sha": "d371168f20a9239189bc48decda75aa5468396bd",
+          "date": "2026-09-07T12:29:20Z",
+          "subject": "fix(miner): a panic on one sealed block no longer stops the worker for good"
+        },
+        {
+          "sha": "7bbad4a77a0ada2d59cb8479451152e8db8f137c",
+          "date": "2026-09-07T11:23:05Z",
+          "subject": "docs(qs): round 35q results; round 35r (9 GiB heaps) registered"
+        },
+        {
+          "sha": "3116948ad361b1cbba6eb48c260b71fa8be8f34d",
+          "date": "2026-09-07T10:48:39Z",
+          "subject": "docs(qs): 35q — full 163k blocks at 3.5 s, the cycle is the heap; 35r raises the limit to 9 GiB"
+        },
+        {
+          "sha": "411c75a675b00b7e74444c7c891df362d89d94ea",
+          "date": "2026-09-07T09:52:21Z",
+          "subject": "docs(qs): round 35q registered — eight generators at 30k depth each after two funding failures"
+        },
+        {
+          "sha": "8ededbb1fff7623cd4a15f72a077626854eb4115",
+          "date": "2026-09-07T09:37:55Z",
+          "subject": "fix(txflood): retry the faucet balance preflight"
+        },
+        {
+          "sha": "147a3244f1abfd612554e26814d80426509714ed",
+          "date": "2026-09-07T08:29:26Z",
+          "subject": "docs: the applied-wait ran before the align and stalled tenure leaders; reverted; the post-switch bad root narrowed to the live tree's in-memory state"
+        },
+        {
+          "sha": "402cff724c284331804a2ff476ef8d9f04c2117f",
+          "date": "2026-09-07T08:28:48Z",
+          "subject": "fix(miner): wait for the persisted parent again; the applied-wait ran before the align that makes it applied"
+        },
+        {
+          "sha": "92d0a024d4e372e69cc7eedef8b06d50c2d22500",
+          "date": "2026-09-07T08:14:37Z",
+          "subject": "docs(qs): 35p registered and its warm-up — tenure holds with the applied-wait fix; supply-bound at 16% occupancy; 35q planned"
+        },
+        {
+          "sha": "5128e5654fa3a80ec88ce86c7015968b52ebbc26",
+          "date": "2026-09-07T07:32:05Z",
+          "subject": "docs(qs): 35o — B legs 45.7k/48.8k under rotation; A2 stalled on a split head after a mid-flight stop"
+        },
+        {
+          "sha": "a5306d4db18069c883c700608a321afd037cdadd",
+          "date": "2026-09-07T06:42:43Z",
+          "subject": "docs(qs): 35o A1 crawled on the void's rebuild; void removed for the later legs"
+        },
+        {
+          "sha": "1a83639fb6c7214ab5ea21b6ae93426d9b75dd0e",
+          "date": "2026-09-07T06:42:29Z",
+          "subject": "fix(chain): do not void the builder's speculative tree on a branch switch"
+        },
+        {
+          "sha": "53c0619e90923d15c17450dd8543c13f56ecb6d9",
+          "date": "2026-09-07T06:20:31Z",
+          "subject": "docs(qs): 35o warm-up — blocks refilled, rotation cycle 2.6-2.9 s at the heap limit; 35p planned"
+        },
+        {
+          "sha": "a0fc23561bd328e587b65fb0e18eff5f7a6f72b1",
+          "date": "2026-09-07T06:09:38Z",
+          "subject": "docs: the leader's bad root after a sibling switch was the speculative build reading a persisted-but-unapplied parent; fixed"
+        },
+        {
+          "sha": "20bed7d376a51506e12d0e0bc195022a52380650",
+          "date": "2026-09-07T06:09:07Z",
+          "subject": "fix(miner): a speculative build waits for its parent to be applied, not merely persisted"
+        },
+        {
+          "sha": "fb0ebe245605dafd6685d7f01f3b85276a7beb00",
+          "date": "2026-09-07T06:06:34Z",
+          "subject": "docs: 35n B1 — the unwind after a sibling switch leaves the leader's state forked; tenure back to 1 for 35o; 35o registered"
+        },
+        {
+          "sha": "edfb38d06978d7e42bba0e8c4ec9102f722df8c2",
+          "date": "2026-09-07T05:50:00Z",
+          "subject": "docs(qs): 35n — a silent seven-node exit, a doubled warm-up, fills back to 86-117k, generators single-core bound"
+        },
+        {
+          "sha": "f70175e1855b88db5ae06b0fb671826fa8e02be2",
+          "date": "2026-09-07T05:23:31Z",
+          "subject": "docs(qs): 35m warm-up 56.9k at 40% occupancy, the remote per-account caps bind under tenure; round 35n registered"
+        },
+        {
+          "sha": "c12790ec94ce5c75980fc0eb49de449446570bef",
+          "date": "2026-09-07T05:08:46Z",
+          "subject": "docs(qs): 35m second launch — the void on every failed-block revert made each build a 10-23 s reload; restricted"
+        },
+        {
+          "sha": "ea8415fb88a0d1b977dafec42e769980a76f2f29",
+          "date": "2026-09-07T05:08:23Z",
+          "subject": "fix(chain): void the builder's speculative tree trust only on a mutating unwind"
+        },
+        {
+          "sha": "199e1e478ceb6a5a1de27d04243d31de0d2cd36c",
+          "date": "2026-09-07T04:42:02Z",
+          "subject": "docs: 35m's first launch found the leader divergence class — the speculative tree's index trust survives an unwind; fixed"
+        },
+        {
+          "sha": "5500bb4a1f74466cbcca687e0ee19597ac7419a9",
+          "date": "2026-09-07T04:41:16Z",
+          "subject": "fix(chain): an unwind or failed-block revert voids the builder's speculative tree trust"
+        },
+        {
+          "sha": "c449fc1fc801e8230b83e4b54c75d8bba092c1db",
+          "date": "2026-09-07T04:32:05Z",
+          "subject": "docs(qs): 35l A2 — the A leg moves with tenure (37.3k)"
+        },
+        {
+          "sha": "e502274d02d811ac2634b59e2183b648b82527ff",
+          "date": "2026-09-07T04:19:54Z",
+          "subject": "docs(qs): 35l B2 — 0.7 s cycle at 22% occupancy; the pool's promotion is the ceiling"
+        },
+        {
+          "sha": "f2e1a97a96ccaad6bc71b49c236d0fd9e564c137",
+          "date": "2026-09-07T04:08:33Z",
+          "subject": "docs(qs): 35l B1 — tenure halves the cycle and empties the blocks; round 35m registered"
+        },
+        {
+          "sha": "3a51b7aad2094b18d10a37240ad3764eebbd109f",
+          "date": "2026-09-07T04:07:58Z",
+          "subject": "perf(txpool): inserters serialise on a gate ahead of the pool lock, so a reorg waits behind one batch"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,128 @@
+[
+  {
+    "version": "before",
+    "keys": 200000,
+    "generation": 2,
+    "requests": 147138,
+    "requested_bytes": 60903144
+  },
+  {
+    "version": "before",
+    "keys": 200000,
+    "generation": 3,
+    "requests": 147129,
+    "requested_bytes": 60800128
+  },
+  {
+    "version": "before",
+    "keys": 200000,
+    "generation": 4,
+    "requests": 147132,
+    "requested_bytes": 60873856
+  },
+  {
+    "version": "batch",
+    "keys": 200000,
+    "generation": 2,
+    "requests": 147138,
+    "requested_bytes": 60903144
+  },
+  {
+    "version": "batch",
+    "keys": 200000,
+    "generation": 3,
+    "requests": 147130,
+    "requested_bytes": 60801288
+  },
+  {
+    "version": "batch",
+    "keys": 200000,
+    "generation": 4,
+    "requests": 147132,
+    "requested_bytes": 60873856
+  },
+  {
+    "version": "after",
+    "keys": 200000,
+    "generation": 2,
+    "requests": 147111,
+    "requested_bytes": 60901896
+  },
+  {
+    "version": "after",
+    "keys": 200000,
+    "generation": 3,
+    "requests": 147106,
+    "requested_bytes": 60797448
+  },
+  {
+    "version": "after",
+    "keys": 200000,
+    "generation": 4,
+    "requests": 147110,
+    "requested_bytes": 60871240
+  },
+  {
+    "version": "before",
+    "keys": 2000000,
+    "generation": 2,
+    "requests": 147284,
+    "requested_bytes": 61604480
+  },
+  {
+    "version": "before",
+    "keys": 2000000,
+    "generation": 3,
+    "requests": 147129,
+    "requested_bytes": 60800128
+  },
+  {
+    "version": "before",
+    "keys": 2000000,
+    "generation": 4,
+    "requests": 147128,
+    "requested_bytes": 60669056
+  },
+  {
+    "version": "batch",
+    "keys": 2000000,
+    "generation": 2,
+    "requests": 147284,
+    "requested_bytes": 61604480
+  },
+  {
+    "version": "batch",
+    "keys": 2000000,
+    "generation": 3,
+    "requests": 147130,
+    "requested_bytes": 60801288
+  },
+  {
+    "version": "batch",
+    "keys": 2000000,
+    "generation": 4,
+    "requests": 147129,
+    "requested_bytes": 60670208
+  },
+  {
+    "version": "after",
+    "keys": 2000000,
+    "generation": 2,
+    "requests": 147111,
+    "requested_bytes": 61600520
+  },
+  {
+    "version": "after",
+    "keys": 2000000,
+    "generation": 3,
+    "requests": 147106,
+    "requested_bytes": 60797448
+  },
+  {
+    "version": "after",
+    "keys": 2000000,
+    "generation": 4,
+    "requests": 147105,
+    "requested_bytes": 60666376
+  }
+]

@@ -1,0 +1,22 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling serde_core v1.0.229
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling syn v3.0.5
+   Compiling cc v1.4.6
+   Compiling serde v1.0.229
+   Compiling serde_derive v1.0.229
+   Compiling blake3 v1.8.7
+   Compiling thiserror v2.0.20
+   Compiling thiserror-impl v2.0.20
+   Compiling constant_time_eq v0.4.2
+   Compiling cpufeatures v0.3.1
+   Compiling arrayvec v0.7.8
+   Compiling cfg-if v1.0.4
+   Compiling bincode v1.3.3
+   Compiling n42-twig-core-before v0.5.1 (/home/n42/src/n42/n42-26/docs/benchmarks/20260914-qmdb-value-transfer/before)
+   Compiling n42-twig-core v0.5.1 (/home/n42/src/n42/n42-26/docs/benchmarks/20260914-qmdb-value-transfer/after)
+   Compiling n42-value-transfer-bench v0.1.0 (/home/n42/src/n42/n42-26/docs/benchmarks/20260914-qmdb-value-transfer)
+    Finished `release` profile [optimized] target(s) in 9.02s

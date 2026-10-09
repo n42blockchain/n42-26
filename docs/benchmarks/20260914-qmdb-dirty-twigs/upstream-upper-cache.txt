@@ -1,0 +1,21 @@
+commit 255a2ec527113cc891baeabf0d9e63515881c5d1
+Author: MiraWells <1020080523@qq.com>
+Date:   Sun Sep 13 16:05:56 2026 -0400
+
+    perf(qmdb): cache the upper tree and refresh only the paths of changed twig roots
+    
+    root() rebuilt the whole upper tree on every call and prove() rebuilt it again
+    for each proof. The levels are now kept behind a mutex (root() stays &self):
+    a root read compares the leaf level with the twig roots and rehashes only the
+    ancestors of the ones that changed, and a change of power-of-two capacity
+    rebuilds. prove() reads its siblings from the cached levels. The full fold is
+    kept as root_full() and asserted equal in debug builds, and a test crosses
+    capacities 1-8 forward and back through undo.
+    
+    Roots unchanged: gov5 cross-client vectors, the real node state, harness S and
+    L workloads. Block latency at 50M keys is unchanged (the fold was a few ms);
+    proofs no longer pay a rebuild each.
+
+ crates/n42/twig-core/src/qmdb_compat.rs | 137 +++++++++++++++++++++++++++++---
+ docs/QMDB_UPGRADE_PLAN.md               |   3 +-
+ 2 files changed, 127 insertions(+), 13 deletions(-)

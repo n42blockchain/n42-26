@@ -1,0 +1,34 @@
+[
+  {
+    "keys": 200000,
+    "version": "before",
+    "count": 18,
+    "median_ms": 81.231,
+    "min_ms": 75.453,
+    "max_ms": 92.868
+  },
+  {
+    "keys": 200000,
+    "version": "after",
+    "count": 18,
+    "median_ms": 73.95349999999999,
+    "min_ms": 69.988,
+    "max_ms": 86.115
+  },
+  {
+    "keys": 2000000,
+    "version": "before",
+    "count": 18,
+    "median_ms": 93.1525,
+    "min_ms": 86.009,
+    "max_ms": 110.48
+  },
+  {
+    "keys": 2000000,
+    "version": "after",
+    "count": 18,
+    "median_ms": 84.315,
+    "min_ms": 78.322,
+    "max_ms": 94.434
+  }
+]

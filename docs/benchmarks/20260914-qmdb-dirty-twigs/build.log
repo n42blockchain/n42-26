@@ -1,0 +1,5 @@
+   Compiling n42-twig-core-batch v0.5.1 (/home/n42/src/n42/n42-26/docs/benchmarks/20260914-qmdb-dirty-twigs/batch)
+   Compiling n42-twig-core-after v0.5.1 (/home/n42/src/n42/n42-26/docs/benchmarks/20260914-qmdb-dirty-twigs/after)
+   Compiling n42-twig-core-before v0.5.1 (/home/n42/src/n42/n42-26/docs/benchmarks/20260914-qmdb-dirty-twigs/before)
+   Compiling n42-dirty-twigs-bench v0.1.0 (/home/n42/src/n42/n42-26/docs/benchmarks/20260914-qmdb-dirty-twigs)
+    Finished `release` profile [optimized] target(s) in 5.54s

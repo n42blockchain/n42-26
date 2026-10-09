@@ -1,0 +1,14 @@
+{
+  "binary_sha256": "c5fbf854bb9e3637752087d6f4dae07630d3a45260e61170b984793b303284a5",
+  "keys": [
+    200000,
+    2000000
+  ],
+  "pairs": 6,
+  "variants": [
+    "qmdb",
+    "hash4096"
+  ],
+  "kind": "storage",
+  "sorted_operations": true
+}

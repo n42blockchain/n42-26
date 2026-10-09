@@ -1,0 +1,78 @@
+[
+  {
+    "keys": 2000000,
+    "pair": 0,
+    "version": "qmdb",
+    "initialize_ms": 332.348,
+    "derive_ms": 116.703,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 492.059,
+        "per_second": 2032276
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 38.554,
+        "per_second": 25937376
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 0,
+    "version": "fold",
+    "initialize_ms": 349.952,
+    "derive_ms": 110.406,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 471.889,
+        "per_second": 2119140
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 38.144,
+        "per_second": 26216182
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 0,
+    "version": "ordered",
+    "initialize_ms": 163.718,
+    "derive_ms": 63.894,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 691.944,
+        "per_second": 1445204
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 51.928,
+        "per_second": 19257394
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "pair": 0,
+    "version": "ordered256",
+    "initialize_ms": 153.888,
+    "derive_ms": 58.999,
+    "reads": {
+      "1": {
+        "count": 1000000,
+        "elapsed_ms": 684.928,
+        "per_second": 1460008
+      },
+      "16": {
+        "count": 1000000,
+        "elapsed_ms": 52.805,
+        "per_second": 18937671
+      }
+    }
+  }
+]

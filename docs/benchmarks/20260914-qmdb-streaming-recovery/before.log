@@ -1,0 +1,21 @@
+   Compiling n42-node v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-node)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.61s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/deps/n42_node-f6af4eaa96fd0678)
+
+running 1 test
+
+thread 'qmdb_state_root::tests::persistent_recovery_replays_large_history_without_full_undo_stack' (301) panicked at crates/n42-node/src/qmdb_state_root.rs:3447:10:
+called `Result::unwrap()` on an `Err` value: Undo(Ahead { prev: 1, next: 147001 })
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test qmdb_state_root::tests::persistent_recovery_replays_large_history_without_full_undo_stack ... FAILED
+
+failures:
+
+failures:
+    qmdb_state_root::tests::persistent_recovery_replays_large_history_without_full_undo_stack
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 226 filtered out; finished in 5.62s
+
+error: test failed, to rerun pass `-p n42-node --lib`

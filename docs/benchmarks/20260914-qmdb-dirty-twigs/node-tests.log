@@ -1,0 +1,99 @@
+   Compiling n42-twig-core v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-twig-core)
+   Compiling n42-jmt v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-jmt)
+   Compiling n42-mobile v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-mobile)
+   Compiling n42-consensus v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-consensus)
+   Compiling n42-network v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-network)
+   Compiling n42-consensus-service v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-consensus-service)
+   Compiling n42-node v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-node)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.31s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/deps/n42_node-f6af4eaa96fd0678)
+
+running 58 tests
+test qmdb_read_status::tests::bench_read_counter_overhead ... ignored, measurement, not a correctness gate
+test qmdb_read_view::tests::bench_immutable_read_views ... ignored
+test qmdb_read_view::tests::account_codec_covers_nonce_and_balance_boundaries ... ok
+test qmdb_state::tests::a_prague_block_writes_the_system_caller_as_an_empty_live_leaf ... ok
+test qmdb_read_view::tests::corrupt_accounts_are_errors_not_absence ... ok
+test qmdb_state::tests::destroyed_account_emits_account_and_complete_storage_deletes ... ok
+test qmdb_state::tests::ignores_loaded_unchanged_state ... ok
+test qmdb_state::tests::emits_dirty_account_even_when_final_info_is_unchanged ... ok
+test qmdb_state::tests::converts_changed_account_and_storage_to_gov5_leaf_format ... ok
+test qmdb_state::tests::restored_slots_are_rewritten_unless_the_bundle_already_writes_them ... ok
+test qmdb_state_root::tests::bench_persistent_commit_path ... ignored, measurement, not a correctness gate
+test qmdb_state_root::tests::bench_persistent_operation_capacity ... ignored, persistent operation-cache capacity measurement, not timing or RSS
+test qmdb_state_root::tests::bench_undo_capacity_budget ... ignored, allocated-capacity measurement, not a timing or RSS benchmark
+test qmdb_state::tests::runtime_02_genesis_alloc_matches_gov5_qmdb_root ... ok
+test qmdb_state_root::tests::borrowed_wal_record_encodes_identically_to_the_owned_record ... ok
+test qmdb_state_root::tests::base_identity_cannot_be_admitted_as_a_new_block ... ok
+test qmdb_state_root::tests::qmdb_commit_lock_hold_vs_wal_append ... ignored, measurement, not a correctness gate
+test qmdb_state_root::tests::qmdb_replay_scaling_by_depth ... ignored, measurement, not a correctness gate
+test qmdb_state_root::tests::production_default_exceeds_legacy_65536_boundary ... ok
+test qmdb_state_root::tests::candidate_is_published_only_after_root_match ... ok
+test qmdb_state_root::tests::cached_tip_does_not_leak_across_branches ... ok
+test qmdb_state_root::tests::read_cache_byte_budget_keeps_pinned_and_oversized_versions_correct ... ok
+test qmdb_state_root::tests::tip_cache_metric_counts_resumed_and_cold_reconstructions ... ok
+test qmdb_state_root::tests::duplicate_commit_checks_complete_identity_without_rewriting_the_wal ... ok
+test qmdb_state_root::tests::a_base_file_round_trips_the_tree_at_the_committed_tip ... ok
+test qmdb_state_root::tests::read_cache_keeps_the_frequently_used_old_database_frontier ... ok
+test qmdb_state_root::tests::read_view_preparation_error_restores_the_applied_tree ... ok
+test qmdb_read_status::tests::counts_survive_thread_churn_and_shard_collisions ... ok
+test qmdb_state_root::tests::sibling_candidates_reconstruct_from_their_exact_parent_branch ... ok
+test qmdb_state_root::tests::cold_operations_refuse_changed_bytes_missing_files_and_wrong_locators ... ok
+test qmdb_state_root::tests::missing_parent_and_depth_limit_fail_closed ... ok
+test qmdb_state_root::tests::read_view_publication_requires_root_match_and_durable_wal ... ok
+test qmdb_state_root::tests::historical_snapshot_and_proof_are_bound_to_exact_block ... ok
+test qmdb_state_root::tests::immutable_read_views_pin_siblings_across_cache_eviction ... ok
+test qmdb_state_root::tests::persistent_store_replays_and_rejects_wrong_base ... ok
+test qmdb_state_root::tests::the_tree_walks_the_graph_in_place_and_returns_to_the_base ... ok
+test qmdb_state_root::tests::wal_rollback_failure_poisons_the_handle_until_reopen ... ok
+test qmdb_state_root::tests::wal_append_failure_rolls_back_the_insert ... ok
+test qmdb_state_root::tests::corrupt_replay_anchor_does_not_discard_the_current_branch ... ok
+test qmdb_state_root::tests::checkpoint_only_operations_gain_durable_locators_without_repeated_migration ... ok
+test qmdb_state_root::tests::streamed_legacy_checkpoint_preserves_branches_and_rejects_bad_roots ... ok
+test qmdb_state_root::tests::cold_operation_budget_preserves_versions_and_failed_append_retry ... ok
+test qmdb_state_root::tests::cached_tip_rejects_at_the_same_depth_as_a_cold_store ... ok
+test qmdb_state_root::tests::streaming_wal_recovers_every_torn_frame_boundary_and_refuses_corruption ... ok
+test qmdb_state_root::tests::undo_byte_eviction_preserves_historical_reads_siblings_and_rollback ... ok
+test qmdb_state_root::tests::root_job_still_returns_a_fresh_mismatch_for_engine_validation ... ok
+test qmdb_state_root::tests::root_job_rejects_conflicting_execution_for_an_already_stored_hash ... ok
+test qmdb_read_view::tests::account_decode_agrees_with_canonical_encoder_on_generated_inputs ... ok
+test qmdb_state_root::tests::persistent_empty_chain_uses_linear_wal_and_recovers_torn_tail ... ok
+test qmdb_state_root::tests::cached_tip_reproduces_cold_reconstruction ... ok
+test qmdb_state_root::tests::rejected_large_candidate_reverts_before_retry_and_view_publication ... ok
+test qmdb_read_view::tests::sharded_versions_match_tree_and_sequential_updates ... ok
+test qmdb_state_root::tests::wal_append_does_not_hold_the_state_lock ... ok
+test qmdb_state_reader::tests::only_mode_runs_evm_using_qmdb_accounts_and_slots ... ok
+test qmdb_state_reader::tests::verify_compares_reads_and_rejects_divergent_state ... ok
+test qmdb_state_reader::tests::malformed_qmdb_slot_never_becomes_zero_or_falls_back ... ok
+test qmdb_state_root::tests::failed_wal_recovers_when_speculation_evicted_its_leaf_heaps ... ok
+test qmdb_state_root::tests::persistent_recovery_replays_large_history_without_full_undo_stack ... ok
+
+test result: ok. 51 passed; 0 failed; 7 ignored; 0 measured; 176 filtered out; finished in 7.68s
+
+     Running tests/comm_stress_bench.rs (target/debug/deps/comm_stress_bench-4c83c2a3a286d812)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/qmdb_provider_hook.rs (target/debug/deps/qmdb_provider_hook-cfab29b88bd2def2)
+
+running 1 test
+test blockchain_provider_reads_the_exact_qmdb_version ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+
+     Running tests/restored_slots.rs (target/debug/deps/restored_slots-d086d6b638ff56f4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/stream_v2_pipeline.rs (target/debug/deps/stream_v2_pipeline-7cf2de30942a961a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s
+

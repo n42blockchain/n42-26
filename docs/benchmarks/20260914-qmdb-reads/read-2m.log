@@ -1,0 +1,41 @@
+   Compiling n42-qmdb-readbench v0.1.0 (/tmp/n42-qmdb-readbench)
+warning: variant `InvalidStorage` is never constructed
+  --> /home/n42/src/n42/n42-26/crates/n42-node/src/qmdb_read_view.rs:21:5
+   |
+17 | pub enum QmdbReadError {
+   |          ------------- variant in this enum
+...
+21 |     InvalidStorage(usize),
+   |     ^^^^^^^^^^^^^^
+   |
+   = note: `QmdbReadError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `block_hash`, `root`, and `storage` are never used
+  --> /home/n42/src/n42/n42-26/crates/n42-node/src/qmdb_read_view.rs:76:18
+   |
+43 | impl QmdbReadView {
+   | ----------------- methods in this implementation
+...
+76 |     pub const fn block_hash(&self) -> B256 {
+   |                  ^^^^^^^^^^
+...
+79 |     pub const fn root(&self) -> B256 {
+   |                  ^^^^
+...
+96 |     pub fn storage(&self, address: &Address, slot: &B256) -> Result<Option<U256>, QmdbReadError> {
+   |            ^^^^^^^
+
+warning: `n42-qmdb-readbench` (lib test) generated 2 warnings
+    Finished `release` profile [optimized] target(s) in 3.99s
+     Running unittests lib.rs (/tmp/n42-qmdb-readbench/target/release/deps/n42_qmdb_readbench-f8d08eb33b262e71)
+
+running 1 test
+read_view keys=2000000 initialize_ms=910.407
+read_view updates=147000 derive_ms=170.939
+read_view threads=1 reads=1000000 elapsed_ms=647.430 reads_per_second=1544569
+read_view threads=16 reads=1000000 elapsed_ms=52.635 reads_per_second=18998595
+test qmdb_read_view::tests::bench_immutable_read_views ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 4.15s
+

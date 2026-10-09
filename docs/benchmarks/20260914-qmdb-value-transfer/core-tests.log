@@ -1,0 +1,74 @@
+   Compiling n42-twig-core v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-twig-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.86s
+     Running unittests src/lib.rs (target/debug/deps/n42_twig_core-de8e46cf43f41f19)
+
+running 66 tests
+test flat::tests::insert_get_update_remove ... ok
+test flat::tests::tombstone_reuse_and_reinsert ... ok
+test qmdb_compat::tests::decodes_and_verifies_gov5_v2_proof_layout ... ok
+test qmdb_compat::tests::gov5_state_leaf_codec_matches_marshal_v2_layout ... ok
+test qmdb_compat::tests::oversized_next_slot_header_does_not_preallocate ... ok
+test qmdb_compat::tests::gov5_keys_and_sorted_block_mutations_are_deterministic ... ok
+test qmdb_compat::tests::split_commitment_freezes_deleted_leaf ... ok
+test qmdb_compat::tests::snapshot_preserves_dead_slots_and_root ... ok
+test qmdb_compat::tests::slot_snapshot_preserves_positions_and_rejects_sparse_history ... ok
+test qmdb_leaf_tree::tests::a_real_leaf_form_export_rebuilds_its_root ... ignored
+test qmdb_leaf_tree::tests::bench_batched_leaf_paths ... ignored
+test qmdb_compat::undo_tests::a_record_from_another_history_is_refused_without_mutating ... ok
+test qmdb_compat::undo_tests::a_key_appended_and_deleted_in_one_block_is_simply_gone ... ok
+test qmdb_compat::undo_tests::a_revert_while_recording_is_refused ... ok
+test qmdb_compat::undo_tests::a_reverted_block_leaves_no_trace ... ok
+test qmdb_compat::undo_tests::a_sibling_applied_after_a_revert_matches_a_node_that_never_saw_the_loser ... ok
+test simd::tests::all_zero_inputs_match ... ok
+test tests::empty_root_is_null ... ok
+test qmdb_compat::undo_tests::reverting_deeper_applies_records_newest_first ... ok
+test tests::single_insert_proof_roundtrip ... ok
+test tests::snapshot_restore_rejects_wrong_shard_count ... ok
+test tests::get_readback ... ok
+test tests::snapshot_restore_rejects_inconsistent_next_slot ... ok
+test simd::tests::singleblock_kernels_match_blake3_crate ... ok
+test tests::snapshot_restore_rejects_entry_in_wrong_shard ... ok
+test simd::tests::leaf_kernels_match_blake3_crate ... ok
+test tests::update_and_delete_change_root_and_verify ... ok
+test tests::check_consistency_passes_clean_and_detects_corruption ... ok
+test qmdb_leaf_tree::tests::missing_partial_twig_heap_rejects_undo_before_mutation ... ok
+test qmdb_compat::tests::generated_proof_roundtrips_exact_codec_and_root ... ok
+test tests::sharded_check_consistency_passes_clean ... ok
+test qmdb_compat::undo_tests::a_revert_across_a_twig_boundary_restores_the_twig_count ... ok
+test tests::append_order_determinism ... ok
+test qmdb_compat::tests::matches_gov5_cross_client_v1_vectors ... ok
+test qmdb_compat::tests::verify_portable_stream_matches_in_memory_root ... ok
+test tests::apply_batch_is_input_order_independent ... ok
+test qmdb_compat::leaf_form_tests::a_live_entry_that_does_not_hash_to_its_leaf_is_refused ... ok
+test qmdb_compat::tests::portable_snapshot_roundtrip_checks_identity_root_and_digest ... ok
+test tests::cross_check_root_vs_gov5_go ... ok
+test qmdb_leaf_tree::tests::duplicate_batch_leaves_tree_and_subsequent_appends_unchanged ... ok
+test tests::multi_twig_proofs ... ok
+test qmdb_compat::leaf_form_tests::undo_works_across_a_leaf_form_restore ... ok
+test tests::compaction_changes_root ... ok
+test tests::cross_check_sorted_batch_vs_gov5_go ... ok
+test qmdb_compat::leaf_form_tests::a_rebuilt_tree_keeps_evolving_like_the_original ... ok
+test qmdb_compat::leaf_form_tests::a_hollow_twig_carries_its_frozen_root ... ok
+test qmdb_compat::leaf_form_tests::the_portable_v2_layout_round_trips_and_is_authenticated ... ok
+test qmdb_leaf_tree::tests::an_empty_tree_has_the_null_root_and_grows_like_the_full_one ... ok
+test qmdb_compat::tests::verify_portable_stream_non_power_of_two_twig_count ... ok
+test qmdb_compat::leaf_form_tests::leaf_form_rebuilds_the_same_root_without_dead_entries ... ok
+test tests::cross_check_sharded16_root_vs_gov5_go ... ok
+test tests::sharded_prove_verify_and_key_binding ... ok
+test qmdb_leaf_tree::tests::a_leaf_form_from_the_full_tree_restores_to_the_same_root ... ok
+test qmdb_leaf_tree::tests::proofs_from_the_open_twig_verify_and_match_the_full_tree ... ok
+test tests::compaction_correctness_and_determinism ... ok
+test qmdb_leaf_tree::tests::the_hollow_leaf_form_round_trips_through_the_v2_stream ... ok
+test qmdb_leaf_tree::tests::undo_records_stack_newest_first_and_match_the_full_tree ... ok
+test qmdb_leaf_tree::tests::roots_match_the_full_tree_through_a_churned_history ... ok
+test qmdb_leaf_tree::tests::the_full_v2_stream_from_the_compat_tree_is_verified_and_read ... ok
+test qmdb_leaf_tree::tests::a_foreign_undo_record_is_refused_without_mutating ... ok
+test qmdb_leaf_tree::tests::undo_restores_the_root_and_the_layout_across_twig_boundaries ... ok
+test flat::tests::fuzz_against_std_hashmap ... ok
+test tests::snapshot_roundtrip_preserves_root_and_state ... ok
+test simd::tests::kernels_match_blake3_crate ... ok
+test qmdb_leaf_tree::tests::batched_leaf_paths_match_scalar_at_boundaries_and_after_undo ... ok
+test qmdb_leaf_tree::tests::recorded_block_keeps_heaps_beyond_the_normal_retention_window ... ok
+
+test result: ok. 64 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.54s
+

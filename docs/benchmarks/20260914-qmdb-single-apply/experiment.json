@@ -1,0 +1,38 @@
+{
+  "scope": "Actual QMDB store definitions in a standalone release harness; excludes reth/EVM/network/H2",
+  "cpu": "AMD EPYC 9B45 128-Core Processor",
+  "cpu_pinning": false,
+  "pairs_per_configuration": 6,
+  "blocks_per_process": 3,
+  "updates_per_block": 147000,
+  "filesystem": {
+    "tmpfs-200k": "tmpfs",
+    "ext4-200k": "ext4",
+    "ext4-2m": "ext4"
+  },
+  "rebase_blocks": 20000,
+  "source_sha256": {
+    "release-tests.log": "d4499aff3162676c90ed6df4a89a77feda41e72aca3d6218b0847b42fd5a6616",
+    "baseline.rs": "f9076f03a789e4b39ba421bb7e6fff66ab61ba74a8b6c18a86cefde63b025929",
+    "baseline-full.rs": "f982b1916061f488de7ac29879d9ded7a455b77a7c0f7dd5f5a484dc9e9726bc",
+    "node-tests.log": "3658e05877472e8141ec204417785b67145cae58da1f91a3d7ecf5278ffb7cad",
+    "workspace-clippy.log": "81a8649c954df67dc17239e6c76d25de3e35dbe77bdfeba296bf257ec328556c",
+    "Cargo.toml": "ca7675858755dbefdd0f29b5896f4ae1842c23467c3b0695f37254220c8dc57c",
+    "optimized.rs": "8e04b2c7c055d67ed87c123cb3ed1230880ebb6c9fc78ec8d4cd63d57816a235",
+    "lib.rs": "3f0595740b4360a9c8734f1657018969b18810349920ebff3e1983def14efb80",
+    "directory-sync.rs": "77ded88f0624fbf4cc77ec07dbcfd20135180887e2bf8be0fae2d2dcd765c546",
+    "qmdb-read-view.rs": "047b805ff9160cc0e2b2e62568f47b9a64bceb75d14444894e5d4803150592ff",
+    "Cargo.lock": "27f3ac6ff36f380720e4f3a1d76e70e92da79565c86c541fbe0678e2e66d08bd",
+    "optimized-full.rs": "88a7a0f1613f18c31b8abca506f50ad17a3857c5286803706a5be01a6f80dfe7",
+    "run.py": "1ebfc7a60b9327afb75bd7e974d6c9dc0dfb0ac8a57684fe4f71f402d4b908db",
+    "README.md": "efb5dd1a5794c625c72a663c081b2335725c22c7db325d7cc7fc933b9b01bbde",
+    "core.patch": "97552d20191157b67163f6ebbde0cf575b05c8a3d6f32545364bf7ca031b806f"
+  },
+  "upstream_refs_rechecked": {
+    "n42-rs": "466c1839791afadba7f1dd4d48c5518440dcafba",
+    "gov5_origin_main": "a8e353cac7a00c7f6ca2816cc8e4634c45a4f337"
+  },
+  "workspace_base_commit": "dbbcb540f2228d1c3133f14bd8b0cf2cb980ab4c",
+  "twig_source_sha256": "3bb34b8f066e4b6203f2ec29f60b2b6e89006418368e071c369c642c72602e76",
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+}

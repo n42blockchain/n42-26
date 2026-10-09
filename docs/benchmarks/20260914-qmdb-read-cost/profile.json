@@ -1,0 +1,92 @@
+{
+  "binary_sha256": "69a440627907e5ccedd1575e04069fabe1c750f5d04dffa2917ad11fc1fe7969",
+  "keys": 2000000,
+  "blocks": 3,
+  "preparation": "retain",
+  "read_views": true,
+  "filesystem": "ext4",
+  "restart_verified": true,
+  "metrics": {
+    "n42_qmdb_lock_wait_ms": {
+      "samples": [
+        0.00011,
+        3e-05,
+        0.0001
+      ],
+      "median": 0.0001,
+      "maximum": 0.00011
+    },
+    "n42_qmdb_operations_per_block": {
+      "samples": [
+        147000.0,
+        147000.0,
+        147000.0
+      ],
+      "median": 147000.0,
+      "maximum": 147000.0
+    },
+    "n42_qmdb_candidate_compute_ms": {
+      "samples": [
+        5.535302,
+        5.772772,
+        5.659642
+      ],
+      "median": 5.659642,
+      "maximum": 5.772772
+    },
+    "n42_qmdb_read_view_build_ms": {
+      "samples": [
+        116.70015,
+        113.496409,
+        103.413337
+      ],
+      "median": 113.496409,
+      "maximum": 116.70015
+    },
+    "n42_qmdb_read_view_updates": {
+      "samples": [
+        147000.0,
+        147000.0,
+        147000.0
+      ],
+      "median": 147000.0,
+      "maximum": 147000.0
+    },
+    "profile_wal_encoding_ms": {
+      "samples": [
+        8.276932,
+        9.371593,
+        10.153273
+      ],
+      "median": 9.371593,
+      "maximum": 10.153273
+    },
+    "n42_qmdb_wal_fsync_ms": {
+      "samples": [
+        128.740804,
+        8.537942,
+        9.900443
+      ],
+      "median": 9.900443,
+      "maximum": 128.740804
+    },
+    "n42_qmdb_wal_append_ms": {
+      "samples": [
+        184.968898,
+        11.528383,
+        26.871567
+      ],
+      "median": 26.871567,
+      "maximum": 184.968898
+    },
+    "n42_qmdb_lock_hold_ms": {
+      "samples": [
+        131.123405,
+        129.207314,
+        119.794762
+      ],
+      "median": 129.207314,
+      "maximum": 131.123405
+    }
+  }
+}

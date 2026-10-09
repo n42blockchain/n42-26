@@ -1,0 +1,10 @@
+
+running 1 test
+test fold_read_view::tests::bench_immutable_read_views ... read_view keys=2000000 initialize_ms=349.952
+read_view updates=147000 derive_ms=110.406
+read_view threads=1 reads=1000000 elapsed_ms=471.889 reads_per_second=2119140
+read_view threads=16 reads=1000000 elapsed_ms=38.144 reads_per_second=26216182
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 26 filtered out; finished in 3.03s
+

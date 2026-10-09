@@ -1,0 +1,74 @@
+[
+  {
+    "keys": 200000,
+    "ordered": 0,
+    "version": "before",
+    "count": 18,
+    "median_ms": 73.51050000000001,
+    "min_ms": 68.998,
+    "max_ms": 83.731
+  },
+  {
+    "keys": 200000,
+    "ordered": 0,
+    "version": "after",
+    "count": 18,
+    "median_ms": 70.7895,
+    "min_ms": 66.367,
+    "max_ms": 77.698
+  },
+  {
+    "keys": 200000,
+    "ordered": 1,
+    "version": "before",
+    "count": 18,
+    "median_ms": 62.367000000000004,
+    "min_ms": 58.269,
+    "max_ms": 70.791
+  },
+  {
+    "keys": 200000,
+    "ordered": 1,
+    "version": "after",
+    "count": 18,
+    "median_ms": 63.489999999999995,
+    "min_ms": 57.913,
+    "max_ms": 70.407
+  },
+  {
+    "keys": 2000000,
+    "ordered": 0,
+    "version": "before",
+    "count": 18,
+    "median_ms": 87.2015,
+    "min_ms": 79.257,
+    "max_ms": 99.5
+  },
+  {
+    "keys": 2000000,
+    "ordered": 0,
+    "version": "after",
+    "count": 18,
+    "median_ms": 82.5775,
+    "min_ms": 78.203,
+    "max_ms": 99.131
+  },
+  {
+    "keys": 2000000,
+    "ordered": 1,
+    "version": "before",
+    "count": 18,
+    "median_ms": 73.763,
+    "min_ms": 68.877,
+    "max_ms": 82.344
+  },
+  {
+    "keys": 2000000,
+    "ordered": 1,
+    "version": "after",
+    "count": 18,
+    "median_ms": 72.34299999999999,
+    "min_ms": 68.568,
+    "max_ms": 79.813
+  }
+]

@@ -1,0 +1,42 @@
+[
+  {
+    "keys": 2000000,
+    "mode": "0",
+    "samples": 3,
+    "elapsed_ms": {
+      "median": 240.532,
+      "minimum": 222.119,
+      "maximum": 250.214
+    },
+    "candidate_ms": {
+      "median": 0.0,
+      "minimum": 0.0,
+      "maximum": 0.0
+    },
+    "commit_ms": {
+      "median": 240.531,
+      "minimum": 222.118,
+      "maximum": 250.213
+    }
+  },
+  {
+    "keys": 2000000,
+    "mode": "1",
+    "samples": 3,
+    "elapsed_ms": {
+      "median": 137.525,
+      "minimum": 135.143,
+      "maximum": 154.1
+    },
+    "candidate_ms": {
+      "median": 0.0,
+      "minimum": 0.0,
+      "maximum": 0.0
+    },
+    "commit_ms": {
+      "median": 137.524,
+      "minimum": 135.142,
+      "maximum": 154.099
+    }
+  }
+]

@@ -1,0 +1,139 @@
+{
+  "scope": "Incremental counters around actual QMDB read-view account lookups; excludes provider metrics, reth, EVM, persistence, networking and H2",
+  "cpu": "AMD EPYC 9B45 128-Core Processor",
+  "account_keys": 200000,
+  "reads_per_sample": 1000000,
+  "pairs_per_threads": 6,
+  "binary_sha256": "cdbbebd6514875903c557fc80639216d73c1eb7b12ffa3de89826e97814fd5ab",
+  "rustc": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "source_sha256": {
+    "lib.rs": "8d6d8dc74bfd58531a6075aa16299a296774ea4815d9187536dd2b851f493a06",
+    "qmdb_read_view.rs": "047b805ff9160cc0e2b2e62568f47b9a64bceb75d14444894e5d4803150592ff",
+    "qmdb_read_status.rs": "ef79aed155e6b453510a83b604a05e81df4d15762626d67406a63bd780dfa7e9",
+    "Cargo.toml": "935fd029eadb87de3e478488ea996186350f13d87757e0050d5ed54305ab16c0",
+    "Cargo.lock": "38171770c33192c2569219707bd796e2b5e5c0f3b3010a26e20fd593208583dc"
+  },
+  "twig_source_sha256": "3bb34b8f066e4b6203f2ec29f60b2b6e89006418368e071c369c642c72602e76",
+  "results": {
+    "unrestricted.log": {
+      "1": {
+        "false": {
+          "samples_ms": [
+            270.193,
+            219.329,
+            269.045,
+            258.483,
+            248.971,
+            254.651
+          ],
+          "median_ms": 256.567,
+          "min_ms": 219.329,
+          "max_ms": 270.193
+        },
+        "true": {
+          "samples_ms": [
+            249.726,
+            262.07,
+            253.454,
+            286.834,
+            248.171,
+            222.168
+          ],
+          "median_ms": 251.59,
+          "min_ms": 222.168,
+          "max_ms": 286.834
+        },
+        "median_change_percent": -1.9398441732568883
+      },
+      "16": {
+        "false": {
+          "samples_ms": [
+            29.407,
+            21.247,
+            16.642,
+            15.336,
+            26.797,
+            27.542
+          ],
+          "median_ms": 24.022,
+          "min_ms": 15.336,
+          "max_ms": 29.407
+        },
+        "true": {
+          "samples_ms": [
+            27.902,
+            20.387,
+            15.614,
+            16.361,
+            17.937,
+            18.288
+          ],
+          "median_ms": 18.1125,
+          "min_ms": 15.614,
+          "max_ms": 27.902
+        },
+        "median_change_percent": -24.600366330863366
+      }
+    },
+    "affinity-0-15.log": {
+      "1": {
+        "false": {
+          "samples_ms": [
+            252.639,
+            235.269,
+            234.886,
+            231.911,
+            225.651,
+            231.161
+          ],
+          "median_ms": 233.3985,
+          "min_ms": 225.651,
+          "max_ms": 252.639
+        },
+        "true": {
+          "samples_ms": [
+            245.54,
+            238.019,
+            240.137,
+            251.059,
+            228.584,
+            227.917
+          ],
+          "median_ms": 239.078,
+          "min_ms": 227.917,
+          "max_ms": 251.059
+        },
+        "median_change_percent": 2.433391816999686
+      },
+      "16": {
+        "false": {
+          "samples_ms": [
+            19.139,
+            14.01,
+            14.655,
+            13.771,
+            13.837,
+            14.226
+          ],
+          "median_ms": 14.118,
+          "min_ms": 13.771,
+          "max_ms": 19.139
+        },
+        "true": {
+          "samples_ms": [
+            14.4,
+            14.517,
+            14.128,
+            14.095,
+            14.063,
+            14.01
+          ],
+          "median_ms": 14.1115,
+          "min_ms": 14.01,
+          "max_ms": 14.517
+        },
+        "median_change_percent": -0.04604051565377798
+      }
+    }
+  }
+}

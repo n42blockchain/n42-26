@@ -1,0 +1,11 @@
+
+running 1 test
+test baseline::tests::bench_immutable_read_views ... read_view keys=200000 initialize_ms=43.396
+read_view updates=147000 derive_ms=52.239
+read_view threads=1 reads=1000000 elapsed_ms=260.954 reads_per_second=3832095
+read_view threads=16 reads=1000000 elapsed_ms=30.985 reads_per_second=32274186
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.66s
+
+process_max_rss_kib=129720

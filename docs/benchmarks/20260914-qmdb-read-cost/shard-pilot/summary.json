@@ -1,0 +1,110 @@
+[
+  {
+    "keys": 2000000,
+    "version": "qmdb",
+    "count": 1,
+    "metrics": {
+      "initialize_ms": {
+        "median": 331.493,
+        "minimum": 331.493,
+        "maximum": 331.493
+      },
+      "derive_ms": {
+        "median": 104.748,
+        "minimum": 104.748,
+        "maximum": 104.748
+      },
+      "read_1_ms": {
+        "median": 473.042,
+        "minimum": 473.042,
+        "maximum": 473.042
+      },
+      "read_16_ms": {
+        "median": 37.772,
+        "minimum": 37.772,
+        "maximum": 37.772
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "version": "hash256",
+    "count": 1,
+    "metrics": {
+      "initialize_ms": {
+        "median": 219.167,
+        "minimum": 219.167,
+        "maximum": 219.167
+      },
+      "derive_ms": {
+        "median": 77.175,
+        "minimum": 77.175,
+        "maximum": 77.175
+      },
+      "read_1_ms": {
+        "median": 509.587,
+        "minimum": 509.587,
+        "maximum": 509.587
+      },
+      "read_16_ms": {
+        "median": 38.462,
+        "minimum": 38.462,
+        "maximum": 38.462
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "version": "hash1024",
+    "count": 1,
+    "metrics": {
+      "initialize_ms": {
+        "median": 530.13,
+        "minimum": 530.13,
+        "maximum": 530.13
+      },
+      "derive_ms": {
+        "median": 111.789,
+        "minimum": 111.789,
+        "maximum": 111.789
+      },
+      "read_1_ms": {
+        "median": 565.273,
+        "minimum": 565.273,
+        "maximum": 565.273
+      },
+      "read_16_ms": {
+        "median": 42.413,
+        "minimum": 42.413,
+        "maximum": 42.413
+      }
+    }
+  },
+  {
+    "keys": 2000000,
+    "version": "hash4096",
+    "count": 1,
+    "metrics": {
+      "initialize_ms": {
+        "median": 173.569,
+        "minimum": 173.569,
+        "maximum": 173.569
+      },
+      "derive_ms": {
+        "median": 79.559,
+        "minimum": 79.559,
+        "maximum": 79.559
+      },
+      "read_1_ms": {
+        "median": 413.786,
+        "minimum": 413.786,
+        "maximum": 413.786
+      },
+      "read_16_ms": {
+        "median": 35.705,
+        "minimum": 35.705,
+        "maximum": 35.705
+      }
+    }
+  }
+]

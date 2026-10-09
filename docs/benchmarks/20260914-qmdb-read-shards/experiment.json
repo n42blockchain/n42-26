@@ -1,0 +1,26 @@
+{
+  "cpu": "AMD EPYC 9B45 128-Core Processor",
+  "cpu_pinning": false,
+  "build_workers_max": 8,
+  "samples_per_version_per_shape": 6,
+  "keys": [
+    200000,
+    2000000
+  ],
+  "kinds": [
+    "account",
+    "storage"
+  ],
+  "scope": "Warm in-memory read index, not node/fleet TPS; RSS includes test tree and inputs",
+  "source_sha256": {
+    "baseline.rs": "73b3d3aeabc22c3281d4255d809e17f78b379677db9e2486f7c011d3d4101358",
+    "optimized.rs": "047b805ff9160cc0e2b2e62568f47b9a64bceb75d14444894e5d4803150592ff",
+    "intermediate-inline15.rs": "9462e12acb25f0e79a51d83452abc33272d2ca71efe34d7c7a2ba1d15529ad6d",
+    "Cargo.toml": "fb0faafb3130d565e994a80716f8d7ca407bb24cd83d00e0f08ac2f92fbd5b4a",
+    "Cargo.lock": "6631e2bb7dfc6a2803f451c0a470f100e3f261c42d1529d880702499482e0c2d",
+    "harness-lib.rs": "23eb2d478ea3bb80f6baed1ba4b6f426be2e988677475b6831611d010b018e03",
+    "run.py": "07a68d25650d25a3f082a1c5049aec50c877a9b43433d40f97d054fe4de37783",
+    "intermediate-arc.rs": "0361c0ce1f3312652921ee9cf1c62208859e810af3786a1a3499eea55606bc38"
+  },
+  "twig_source_sha256": "3bb34b8f066e4b6203f2ec29f60b2b6e89006418368e071c369c642c72602e76"
+}
