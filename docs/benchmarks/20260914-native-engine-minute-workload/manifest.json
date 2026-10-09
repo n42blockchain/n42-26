@@ -1,0 +1,89 @@
+{
+  "scope": "native first-child execution integration, corrected large-file publication order and pool configuration, full minute workload preparation; no connected four-node benchmark",
+  "sourceSha256": {
+    "bin/n42-stress/src/main.rs": "7a32dd488e5a928c57d8180f0b5bfa1bdba26d407a251ab560918ff286caf200",
+    "crates/n42-node/tests/parallel_qmdb_builder.rs": "7734c4eb8d01cc509352e8e9829c9ac6b86da9c2f0bf67e4b3398419b8dd69bc",
+    "crates/n42-node/tests/native_parallel_qmdb_builder.rs": "e9615e807190b9ff823b6c3f1dad306380ec079fe408af74a440a0ecd0d6323f",
+    "crates/n42-node/tests/common/parallel_qmdb_builder.rs": "49c7778790b4a7f2e32ad682fb137213e8eb9030cab4d768ffb2847cb7816df8",
+    "scripts/chain94-fleet.py": "a0a8a34bf9d1a8c20b3d2afce2a2aa28db2298ecf4cb6a04c96ecb2d905e1811",
+    "scripts/test_chain94_fleet.py": "047c9a9d52916a76b5b89ac7c30e92600c5ef98ca5a8819fbacda50ec313499b",
+    "docs/devlog-173-native-engine-and-minute-workload-20260914.md": "3295487aa6309b99333dec174b32ac4ce2f24a4486ce23d4b94492911f47a4e4",
+    "README.md": "ea0150c898d74f77666e4bec8c4c6c8ca77dc0d5d757111ec83f3c8cf14cbb5c"
+  },
+  "sourceArchiveSha256": "d0e0f2ee2083295b56be79bf03536cf65faf3b6a0350f2e2d0b363cf37c28130",
+  "upstreamLocalRefs": {
+    "n42-rs": "466c1839791afadba7f1dd4d48c5518440dcafba",
+    "n42-gov5": "074f9c8f22a7755de3bbe3e4455dec6a32b2a4d2",
+    "newGov5CommitsReviewed": 1,
+    "remoteRefreshAttempted": false
+  },
+  "productionBinaries": {
+    "n42-node": {
+      "path": "/home/n42/src/n42/n42-26/target/release/n42-node",
+      "sha256": "f1a1c09dc3b43feada38330da36e6ae28fcfadf0bea3e9a6f3f2c1b632bdd65d"
+    },
+    "n42-native-fleet": {
+      "path": "/home/n42/src/n42/n42-26/target/release/n42-native-fleet",
+      "sha256": "e2072edc146983350c3c03994116a66a27d3743536b7ff4e89e27759ddc1f422"
+    },
+    "n42-stress": {
+      "path": "/home/n42/src/n42/n42-26/target/release/n42-stress",
+      "sha256": "a9bbb2c72d3329dc516862bdd2cda3f8c18ea2b2cb5e3d26c10402ff4f497775"
+    },
+    "n42-verify-commit": {
+      "path": "/home/n42/src/n42/n42-26/target/release/n42-verify-commit",
+      "sha256": "46c301bb63125fae2b769e5b060ddc930db06c119a0c57d24f00aad9f2410b8e"
+    },
+    "n42-keccak": {
+      "path": "/home/n42/src/n42/n42-26/target/release/n42-keccak",
+      "sha256": "851640c292252c75e93bc60f02dd56299cc9956c4653814a3a4e68a29155a208"
+    }
+  },
+  "checks": {
+    "nativeEngine": "Debug and Release passed, 4096 transactions, wire round trip + N42 native payload conversion + real Engine batch import + QMDB root",
+    "ethereumControl": "Debug and Release passed",
+    "stressRegression": "9 passed, 2 external-file tests ignored in ordinary suite",
+    "nativeEngineAndStressClippy": "passed -D warnings",
+    "fleetLauncher": "8 tests passed; fresh four disables 5K low-memory pool; explicit transaction-forwarding flag reaches nodes",
+    "qualificationInput": "72000000 records, chain941004, SHA256 frozen; 60000000 minimum passed",
+    "minuteFileAudit": "all 72000000 records parsed; first 55000 per RPC decoded and signature recovered; sample covers 5000 senders and 147000 recipients with 44 contiguous nonces each",
+    "remainingSignatures": "71780000 signatures not individually audited offline; normal node validation remains required",
+    "oldOrderRegression": "expected test failure: first220000 records contained only16 senders; rejected file retained under explicit rejected name",
+    "actualFleetStart": "EPERM at TCP socket constructor, before spawning nodes",
+    "actualQualification": "file preflight passed; H2 RPC preflight failed EPERM; timed window never opened"
+  },
+  "minuteWorkload": {
+    "schema": 1,
+    "path": "/home/n42/src/n42/n42-26/.artifacts/native-four-20260914/presigned-minute-72m-interleaved.bin",
+    "sha256": "ffea0e0f6ab912313d37211ae6bfd7a89ea46c0356d45d2443019a0a8213cf85",
+    "bytes": 10149233021,
+    "version": 2,
+    "chainId": 941004,
+    "rpcGroups": 4,
+    "transactions": 72000000,
+    "minimumTransactions": 60000000,
+    "scope": "file identity and header capacity; signatures, full framing, running-chain nonces and execution not verified"
+  },
+  "buildReproduction": {
+    "previousPath": "/tmp/n42-ci-repro-j5wu4xcf",
+    "newPhysicalPath": "/home/n42/src/n42/n42-26/.artifacts/ci-repro-j5wu4xcf",
+    "oldPathRetainedAsSymlink": true,
+    "selectedSourceSha256": {
+      "n42-26/Cargo.lock": "6b05f1626d4c76636c228131c89cab3214c0f6266cf7ed6d2af427bed03a8a2f",
+      "n42-26/bin/n42-stress/src/main.rs": "7a32dd488e5a928c57d8180f0b5bfa1bdba26d407a251ab560918ff286caf200",
+      "n42-26/crates/n42-node/tests/common/parallel_qmdb_builder.rs": "49c7778790b4a7f2e32ad682fb137213e8eb9030cab4d768ffb2847cb7816df8",
+      "reth/crates/engine/tree/src/tree/payload_validator.rs": "12868e1123101106287a5f401732938cfd965e5c7c0984499f0720b5331e0446"
+    },
+    "tmpUsedBeforeBytes": 37566316544,
+    "tmpUsedAfterBytes": 32493965312,
+    "netTmpUsageDecreaseBytes": 5072351232,
+    "elapsedSeconds": 6.156,
+    "scope": "relocated only this goal\u2019s clean build reproduction directory; no other session data changed"
+  },
+  "privateKeysArchived": false,
+  "connectedNodes": 0,
+  "committedBlocks": 0,
+  "successfulCommittedTPS": null,
+  "goalAchieved": false,
+  "remaining": "four connected H2 validators, full successful-transaction windows with native commitments and durable QMDB-only reads, restart/catch-up validation; requires TCP/UDP-capable execution environment"
+}

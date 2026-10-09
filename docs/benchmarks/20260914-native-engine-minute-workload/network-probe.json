@@ -1,0 +1,10 @@
+{
+  "TCP": {
+    "errno": 1,
+    "error": "[Errno 1] Operation not permitted"
+  },
+  "UDP": {
+    "errno": 1,
+    "error": "[Errno 1] Operation not permitted"
+  }
+}

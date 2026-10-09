@@ -1,0 +1,58 @@
+   Compiling ark-ff v0.6.0
+   Compiling alloy-rpc-types-engine v2.3.0
+   Compiling n42-twig-core v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-twig-core)
+   Compiling ark-poly v0.6.0
+   Compiling ark-ec v0.6.0
+   Compiling ark-bn254 v0.6.0
+   Compiling ark-bls12-381 v0.6.0
+   Compiling revm-precompile v42.0.1
+   Compiling revm-handler v42.0.1
+   Compiling revm-inspector v42.0.1
+   Compiling revm v42.0.1
+   Compiling reth-trie-common v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/trie/common)
+   Compiling alloy-evm v0.38.0
+   Compiling reth-chainspec v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/chainspec)
+   Compiling reth-stages-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/stages/types)
+   Compiling reth-static-file-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/static-file/types)
+   Compiling reth-execution-types v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/evm/execution-types)
+   Compiling reth-storage-errors v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/errors)
+   Compiling n42-chainspec v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-chainspec)
+   Compiling reth-execution-errors v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/evm/execution-errors)
+   Compiling reth-storage-api v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/storage/storage-api)
+   Compiling reth-trie-sparse v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/trie/sparse)
+   Compiling reth-evm v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/evm/evm)
+   Compiling reth-trie v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/trie/trie)
+   Compiling reth-evm-ethereum v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/evm)
+   Compiling n42-parallel-evm v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-parallel-evm)
+   Compiling reth-revm v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/revm)
+   Compiling n42-execution v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-execution)
+   Compiling reth-consensus v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/consensus/consensus)
+   Compiling reth-consensus-common v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/consensus/common)
+   Compiling reth-ethereum-consensus v2.4.1 (/tmp/n42-ci-repro-j5wu4xcf/reth/crates/ethereum/consensus)
+   Compiling n42-jmt v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-jmt)
+   Compiling n42-mobile v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-mobile)
+   Compiling n42-consensus v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-consensus)
+   Compiling n42-network v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/crates/n42-network)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 24.10s
+     Running unittests src/lib.rs (target/debug/deps/n42_network-4ebe3f03612d79b8)
+
+running 1 test
+test gov5_block::tests::cancun_genesis_bootstraps_the_native_first_child ... FAILED
+
+failures:
+
+---- gov5_block::tests::cancun_genesis_bootstraps_the_native_first_child stdout ----
+
+thread 'gov5_block::tests::cancun_genesis_bootstraps_the_native_first_child' (2834) panicked at crates/n42-network/src/gov5_block.rs:705:9:
+assertion `left == right` failed
+  left: None
+ right: Some(0)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    gov5_block::tests::cancun_genesis_bootstraps_the_native_first_child
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 209 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p n42-network --lib`

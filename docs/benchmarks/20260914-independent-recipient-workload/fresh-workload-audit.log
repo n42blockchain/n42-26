@@ -1,0 +1,16 @@
+   Compiling n42-stress v0.5.1 (/tmp/n42-ci-repro-j5wu4xcf/n42-26/bin/n42-stress)
+    Finished `release` profile [optimized] target(s) in 22.25s
+     Running unittests src/bin/n42-keccak.rs (target/release/deps/n42_keccak-d21d334169e675c7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/release/deps/n42_stress-542128305dfab267)
+
+running 1 test
+verified 220000 secp256k1 signatures, chain 941004, 5000 senders, 147000 recipients, four groups of 55000, contiguous nonces 0..43; no chain execution measured
+test tests::audit_generated_fresh_four_workload ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 32.53s
+

@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "path": "/home/n42/src/n42/n42-26/.artifacts/native-four-20260914/presigned-startup-220k.bin",
+  "sha256": "4d59d91aafd4f064bb96dcb47653cdec647bad70b8c1df0e6465dc67dd18d48d",
+  "bytes": 30577467,
+  "version": 2,
+  "chainId": 941004,
+  "rpcGroups": 4,
+  "transactions": 220000,
+  "minimumTransactions": 220000,
+  "scope": "file identity and header capacity; signatures, full framing, running-chain nonces and execution not verified"
+}

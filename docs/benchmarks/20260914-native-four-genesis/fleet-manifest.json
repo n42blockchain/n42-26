@@ -1,0 +1,47 @@
+{
+  "artifacts_sha256": {
+    "genesis-range.n42frng": "e5564b1125614ffe1a71358b9e2d49f6689b82bf5b86093773a4dd91ce10448b",
+    "genesis.header.rlp": "bbdc911f51e4d8dc8eef3b56e7ff0ffd22b47e78dd0c57ab57988dda016e61d2",
+    "genesis.json": "5a9951f960cba413d27694e9d6203c2fbf4a3a2ba6c5d1d169abbb51a630c1d4",
+    "snapshot.qmdb": "9e25270f78a47b9b466438c858b6a2139ed3c05d3e87d2426be0a5061e1e839d"
+  },
+  "build_budget_ms": 200,
+  "chain_id": 941004,
+  "gas_limit": 5000000000,
+  "genesis_hash": "0x9e94c7fa149c40589c37184ce38a28bd7c8e4d3816fc2d7dedb1d370cca9b8d5",
+  "max_txs_per_block": 220000,
+  "node_count": 4,
+  "peers": [
+    "12D3KooWDYQiYGpdiHqg6iHyvWKfpe28SbuiMJypoSWJvYmuhCbo",
+    "12D3KooWHZUwvRrZe7uyTNoRgeXA1sBJS8jfSNuFHkhKiMx1CxdP",
+    "12D3KooWMnv6utywUAyCUDAReAxqnEgtMzUPJ7KL5deu9rpJtmkT",
+    "12D3KooWK5ZAJutwWngVb25TnM7h2RSBCSHyao12D6r8Lzzq9ogL"
+  ],
+  "ports": {
+    "auth": 23500,
+    "consensus": 33400,
+    "http": 23400,
+    "ingest": 34400,
+    "metrics": 23600,
+    "mobile": 9840,
+    "p2p": 31400
+  },
+  "prague_time": null,
+  "profile": "fresh-native-h2-qmdb-cancun",
+  "recipient_rule": "last20(keccak256(UTF8(n42-recipient-{decimal index})))",
+  "recipients": 147000,
+  "runtime_sha256": {
+    "consensus.json": "36a67e48008144e106710638563ccacd28faa78204f1f38b1b47d4a1757017dc",
+    "recipients.json": "4a099234152986c1e0773191c31460203f890a4568662b83423ca471d4775512",
+    "test-accounts.json": "cfb63e27a5a9afeada6e9136475134f61e3aac3368a00982f0f7b0c22f839932",
+    "trusted-config.json": "0445af2fab96f6ad831b79cb10be80598cc2dbe925e86ee2779f83d9a35e1ddb"
+  },
+  "sender_rule": "secp256k1(keccak256(UTF8(n42-test-key-{decimal index})))",
+  "senders": 5000,
+  "snapshot": {
+    "block_hash": "0x9e94c7fa149c40589c37184ce38a28bd7c8e4d3816fc2d7dedb1d370cca9b8d5",
+    "block_number": 0,
+    "state_root": "0x1310a80b8aaa0663766cc8737b2f5ba3c555f84f79c27dd3e648a21634564d26"
+  },
+  "source": "new genesis; no existing chain snapshot or signed roster was altered"
+}

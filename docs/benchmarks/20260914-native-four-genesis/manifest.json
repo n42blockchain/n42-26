@@ -1,0 +1,54 @@
+{
+  "scope": "four-node bootstrap artifacts and actual one-node CLI initialization; no connected fleet or TPS measurement",
+  "sourceSha256": {
+    "Cargo.lock": "4dd6ea1a298aa5cea93c6345ef3cf44d0a603f8ebf6fd13531eee3af1d6b6006",
+    "bin/n42-node/Cargo.toml": "ac68875c4eb3b5fa76241f3eb554926dcd16cc64710b447d1b3313b26810c914",
+    "bin/n42-node/src/native_fleet_main.rs": "c37dc9f13020a9a0422efbbe5d71ced96cfdf224c75f20bd89fda06ca27af679",
+    "crates/n42-network/src/gov5_block.rs": "e0bdb522e637ff90bf76441cf29b7d82a755666dd0b7d02526fe1a8d964e3569",
+    "scripts/chain94-fleet.py": "78a5266f6e7f32a740f8e12cdb8c95b8b77d4d9701b127eff389098830e1cb98",
+    "scripts/test_chain94_fleet.py": "354ed4133f17b69ca38b9659f068b0a06fa32406d29ac58ddc02a12b867cd9d3",
+    "scripts/qualify-1m-tps.sh": "9dc2ac4121f1e97df3bb204a65eee6fe8da874c62afad55a303ff31727772d8e",
+    "docs/devlog-171-native-four-node-genesis-20260914.md": "ee24ab996cbe4f64ddf5bdef811e5663bb1d45fe3ca6d98648044643ba723b59",
+    "README.md": "eaa5271dbb7d0ffc4cd8466877e0fe9877eb8bfc4fd659f87cf156ace9063780"
+  },
+  "rethBaseline": "23316e3ff8adca8c3bd5085ff0565fcae019202a",
+  "rethProof": "../20260914-parallel-import/reth-source-verification.json",
+  "genesisHash": "0x9e94c7fa149c40589c37184ce38a28bd7c8e4d3816fc2d7dedb1d370cca9b8d5",
+  "qmdbRoot": "0x1310a80b8aaa0663766cc8737b2f5ba3c555f84f79c27dd3e648a21634564d26",
+  "runtime": "/home/n42/src/n42/n42-26/.artifacts/native-four-20260914",
+  "validators": 4,
+  "faultTolerance": 1,
+  "quorum": 3,
+  "accounts": 152004,
+  "privateKeysArchived": false,
+  "checks": {
+    "generatorRoundTrip": "native finalized range and QMDB leaf snapshot decoded and verified",
+    "firstChildRegression": "reproduced failure, then 20 gov5_block tests passed",
+    "fleetLauncher": "8 tests passed",
+    "workspaceAllTargetsClippy": "passed -D warnings",
+    "changedRustFormat": "passed",
+    "shellSyntax": "passed",
+    "artifactSHA256": "all generated artifacts and runtime configuration hashes match",
+    "qualificationTrustParser": "accepted generated static H2-v4 roster",
+    "actualCLI": "QMDB native base rebuilt, verified and persisted; validator 0 of 4 resolved; Only reads enabled",
+    "actualCLIExit": "1, EPERM at NetworkManager creation",
+    "fleetStart": "EPERM at TCP socket creation; no children, PID files or run.json created"
+  },
+  "productionBinaryBuild": {
+    "status": "completed successfully",
+    "session": 39368,
+    "log": "/tmp/n42-four-native-binary.log",
+    "binaries": [
+      "n42-node",
+      "n42-native-fleet"
+    ],
+    "sha256": {
+      "n42-node": "f1a1c09dc3b43feada38330da36e6ae28fcfadf0bea3e9a6f3f2c1b632bdd65d",
+      "n42-native-fleet": "e2072edc146983350c3c03994116a66a27d3743536b7ff4e89e27759ddc1f422"
+    }
+  },
+  "connectedNodes": 0,
+  "h2CommittedBlocks": 0,
+  "fleetTPS": null,
+  "next": "independent-recipient stress workload completed in devlog172; full fleet execution still requires an environment permitting TCP/UDP sockets"
+}
