@@ -1,0 +1,14 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.34s
+     Running unittests src/lib.rs (target/debug/deps/n42_consensus-8d9079dbfd76096b)
+
+running 7 tests
+test gov5_native_header::tests::placeholder_and_mobile_root_headers_round_trip ... ok
+test gov5_native_header::tests::trailing_placeholders_are_never_written ... ok
+test gov5_native_header::tests::rejects_extra_fields_and_trailing_bytes ... ok
+test gov5_native_header::tests::zero_base_fee_written_by_alloy_round_trips ... ok
+test gov5_native_header::tests::alloy_exact_headers_decode_identically ... ok
+test gov5_native_header::tests::registry_returns_only_matching_headers ... ok
+test gov5_native_header::tests::chain94_live_header_round_trips_to_its_hash ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 237 filtered out; finished in 0.00s
+

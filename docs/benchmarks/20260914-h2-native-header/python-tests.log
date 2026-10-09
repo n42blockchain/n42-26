@@ -1,0 +1,9 @@
+...H2 TPS audit failed: node0: QMDB readErrors advanced by 1
+.H2 successful committed TPS 0.142857 < 1000000.000000
+........................H2 TPS audit failed: receipt count differs from committed transaction count
+....H2 successful committed TPS 0.095238 < 0.100000
+...
+----------------------------------------------------------------------
+Ran 35 tests in 1.553s
+
+OK

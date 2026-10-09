@@ -1,0 +1,1633 @@
+use crate::consensus_state::{AttestationRecord, EquivocationEvidence, SharedConsensusState};
+use crate::qmdb_state_root::Gov5QmdbStateRootStore;
+use crate::staking::{
+    MIN_STAKE_WEI, STAKING_ADDRESS, StakeStatus, StakingManager, UNSTAKE_COOLDOWN_BLOCKS,
+};
+// VerificationTask is used by the #[subscription(item = ...)] macro attribute.
+#[allow(unused_imports)]
+use crate::consensus_state::VerificationTask;
+use alloy_primitives::{Address, B256, U256};
+use jsonrpsee::core::RpcResult;
+use jsonrpsee::core::SubscriptionResult;
+use jsonrpsee::proc_macros::rpc;
+use jsonrpsee::types::ErrorObjectOwned;
+use jsonrpsee::{PendingSubscriptionSink, SubscriptionMessage};
+use n42_jmt::{PersistentSbmt, PersistentTwig};
+use n42_primitives::{BlsPublicKey, BlsSignature};
+use n42_zkproof::ProofScheduler;
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
+use tracing::{info, warn};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsensusStatusResponse {
+    pub latest_committed_view: Option<u64>,
+    pub latest_committed_block_hash: Option<String>,
+    pub validator_count: u32,
+    pub has_committed_qc: bool,
+    /// Same atomic QC snapshot as the view/hash above; no second state read.
+    pub commit_qc: Option<CommitQcResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitQcResponse {
+    pub view: u64,
+    pub block_hash: B256,
+    pub signature: String,
+    /// One explicit boolean per active validator index; avoids bit-order or
+    /// padding ambiguity at the audit boundary.
+    pub signers: Vec<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StateReadStatusResponse {
+    #[serde(flatten)]
+    pub reads: crate::qmdb_read_status::QmdbReadStatus,
+    pub validator_public_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidatorInfoResponse {
+    pub index: u32,
+    pub public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidatorSetResponse {
+    /// Current active validator set.
+    pub active: Vec<ValidatorInfoResponse>,
+    /// Number of pending changes (queued via proposeAdd/Remove, not yet committed).
+    pub pending_changes: usize,
+    /// Whether a next-epoch validator set has been staged (committed, awaiting epoch boundary).
+    pub staged_next_epoch: bool,
+    /// Current epoch number.
+    pub current_epoch: u64,
+    /// Number of validators in the staged next set (0 if none staged).
+    pub next_epoch_validator_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttestationResponse {
+    pub accepted: bool,
+    pub attestation_count: u32,
+    pub threshold_reached: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HealthResponse {
+    pub status: String,
+    pub has_committed_qc: bool,
+    pub validator_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttestationStatsResponse {
+    pub total_attestations: usize,
+    pub earliest_block: Option<u64>,
+    pub latest_block: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EquivocationsResponse {
+    pub total: usize,
+    pub evidence: Vec<EquivocationEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StakingStatusResponse {
+    pub staked: bool,
+    pub registered: bool,
+    pub amount: String,
+    pub bls_pubkey: String,
+    pub status: String,
+    pub cooldown_remaining_blocks: u64,
+    pub staked_at_block: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StakingInfoResponse {
+    pub total_staked: String,
+    pub staker_count: u64,
+    pub registered_count: u64,
+    pub min_stake: String,
+    pub cooldown_blocks: u64,
+    pub staking_address: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JmtRootResponse {
+    pub version: u64,
+    pub root: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TwigRootResponse {
+    pub version: u64,
+    pub root: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JmtProofResponse {
+    pub shard_index: u8,
+    pub key_hash: String,
+    pub value: Option<String>,
+    pub proof_hex: String,
+    pub shard_roots: Vec<String>,
+    pub root: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TwigProofResponse {
+    pub shard_index: u8,
+    pub key_hash: String,
+    pub value: String,
+    pub proof_hex: String,
+    pub shard_roots: Vec<String>,
+    pub root: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ZkProofResponse {
+    pub block_number: u64,
+    pub block_hash: String,
+    pub proof_type: String,
+    pub prover_backend: String,
+    pub proof_size: usize,
+    pub generation_ms: u64,
+    pub verified: bool,
+    pub proof_hex: String,
+    pub public_values_hex: String,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ZkStatusResponse {
+    pub enabled: bool,
+    pub backend: String,
+    pub proof_interval: u64,
+    pub proofs_stored: usize,
+    pub latest_proof_block: Option<u64>,
+    pub total_generated: u64,
+    pub total_failed: u64,
+    pub in_progress: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QmdbArchiveStateResponse {
+    pub block_hash: String,
+    pub root: String,
+    pub next_slot: u64,
+    pub live_entries: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QmdbArchiveInfoResponse {
+    pub archive_floor: u64,
+    pub archive_floor_hash: String,
+    pub archive_floor_root: String,
+    pub retained_blocks: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QmdbArchiveProofResponse {
+    pub block_hash: String,
+    pub root: String,
+    pub key: String,
+    pub value: String,
+    pub slot: u64,
+    pub proof_hex: String,
+}
+
+/// N42-specific RPC API.
+#[rpc(server, namespace = "n42")]
+pub trait N42Api {
+    /// Returns "ok" when consensus has committed at least one block, "syncing" otherwise.
+    #[method(name = "health")]
+    async fn health(&self) -> RpcResult<HealthResponse>;
+
+    #[method(name = "consensusStatus")]
+    async fn consensus_status(&self) -> RpcResult<ConsensusStatusResponse>;
+
+    /// Exact recent Gov5 header bytes, including nil slots/mobile root.
+    /// None means it is outside the native-header registry, not an empty header.
+    #[method(name = "nativeHeader")]
+    async fn native_header(&self, block_hash: B256) -> RpcResult<Option<String>>;
+
+    /// Actual QMDB adapter mode/counts and optional WAL-durable block root.
+    #[method(name = "stateReadStatus")]
+    async fn state_read_status(
+        &self,
+        block_hash: Option<B256>,
+    ) -> RpcResult<StateReadStatusResponse>;
+
+    /// Returns the active validator set with epoch transition status.
+    ///
+    /// The response includes `pending_changes` (queued, not yet committed) and
+    /// `staged_next_epoch` (committed, waiting for epoch boundary) so callers
+    /// can understand why a recently proposed validator is not yet visible.
+    #[method(name = "validatorSet")]
+    async fn validator_set(&self) -> RpcResult<ValidatorSetResponse>;
+
+    /// Pushes a notification each time a new block is committed by consensus.
+    #[subscription(name = "subscribeVerification", unsubscribe = "unsubscribeVerification", item = VerificationTask)]
+    async fn subscribe_verification(&self) -> SubscriptionResult;
+
+    /// Mobile submits a BLS attestation for a committed block.
+    #[method(name = "submitAttestation")]
+    async fn submit_attestation(
+        &self,
+        pubkey: String,
+        signature: String,
+        block_hash: B256,
+        slot: u64,
+    ) -> RpcResult<AttestationResponse>;
+
+    #[method(name = "blockAttestation")]
+    async fn block_attestation(&self, block_hash: B256) -> RpcResult<Option<AttestationRecord>>;
+
+    #[method(name = "attestationStats")]
+    async fn attestation_stats(&self) -> RpcResult<AttestationStatsResponse>;
+
+    #[method(name = "equivocations")]
+    async fn equivocations(&self) -> RpcResult<EquivocationsResponse>;
+
+    /// Returns staking status for a given address.
+    #[method(name = "stakingStatus")]
+    async fn staking_status(&self, address: Address) -> RpcResult<StakingStatusResponse>;
+
+    /// Returns global staking information.
+    #[method(name = "stakingInfo")]
+    async fn staking_info(&self) -> RpcResult<StakingInfoResponse>;
+
+    /// Returns the latest JMT root hash and version.
+    #[method(name = "jmtRoot")]
+    async fn jmt_root(&self) -> RpcResult<JmtRootResponse>;
+
+    /// Generates a JMT proof for an account, or a storage slot if `storage_slot` is provided.
+    #[method(name = "jmtProof")]
+    async fn jmt_proof(
+        &self,
+        address: Address,
+        storage_slot: Option<U256>,
+    ) -> RpcResult<JmtProofResponse>;
+
+    /// Returns the latest twig root hash and version.
+    #[method(name = "twigRoot")]
+    async fn twig_root(&self) -> RpcResult<TwigRootResponse>;
+
+    /// Generates a twig proof for an account, or a storage slot if `storage_slot` is provided.
+    #[method(name = "twigProof")]
+    async fn twig_proof(
+        &self,
+        address: Address,
+        storage_slot: Option<U256>,
+    ) -> RpcResult<TwigProofResponse>;
+
+    /// Returns the current JMT version (block count since genesis).
+    #[method(name = "jmtVersion")]
+    async fn jmt_version(&self) -> RpcResult<u64>;
+
+    /// Returns the immutable replay-v2 QMDB archive floor and retained range size.
+    #[method(name = "qmdbArchiveInfo")]
+    async fn qmdb_archive_info(&self) -> RpcResult<QmdbArchiveInfoResponse>;
+
+    /// Returns an immutable replay-v2 QMDB snapshot summary at an exact retained block.
+    #[method(name = "qmdbArchiveState")]
+    async fn qmdb_archive_state(&self, block_hash: B256) -> RpcResult<QmdbArchiveStateResponse>;
+
+    /// Returns a gov5-compatible replay-v2 QMDB membership proof at an exact retained block.
+    #[method(name = "qmdbArchiveProof")]
+    async fn qmdb_archive_proof(
+        &self,
+        block_hash: B256,
+        key: B256,
+    ) -> RpcResult<QmdbArchiveProofResponse>;
+
+    /// Returns the ZK proof for a given block number.
+    #[method(name = "zkProof")]
+    async fn zk_proof(&self, block_number: u64) -> RpcResult<ZkProofResponse>;
+
+    /// Returns the ZK proof for a given block hash.
+    #[method(name = "zkProofByHash")]
+    async fn zk_proof_by_hash(&self, block_hash: B256) -> RpcResult<ZkProofResponse>;
+
+    /// Returns the latest generated ZK proof.
+    #[method(name = "zkLatest")]
+    async fn zk_latest(&self) -> RpcResult<ZkProofResponse>;
+
+    /// Verifies the ZK proof for a given block number.
+    #[method(name = "zkVerify")]
+    async fn zk_verify(&self, block_number: u64) -> RpcResult<bool>;
+
+    /// Returns ZK proof subsystem status and statistics.
+    #[method(name = "zkStatus")]
+    async fn zk_status(&self) -> RpcResult<ZkStatusResponse>;
+
+    /// Proposes adding a new validator. Activates at next CommitQC (commit-then-activate).
+    /// Requires a valid admin token as the first parameter.
+    #[method(name = "proposeAddValidator")]
+    async fn propose_add_validator(
+        &self,
+        admin_token: String,
+        address: Address,
+        bls_pubkey: String,
+    ) -> RpcResult<String>;
+
+    /// Proposes removing a validator. Cannot drop below MIN_VALIDATOR_COUNT (4).
+    /// Requires a valid admin token as the first parameter.
+    #[method(name = "proposeRemoveValidator")]
+    async fn propose_remove_validator(
+        &self,
+        admin_token: String,
+        address: Address,
+    ) -> RpcResult<String>;
+}
+
+pub struct N42RpcServer {
+    validator_public_key: Option<BlsPublicKey>,
+    consensus_state: Arc<SharedConsensusState>,
+    staking_manager: Option<Arc<Mutex<StakingManager>>>,
+    jmt: Option<Arc<Mutex<PersistentSbmt>>>,
+    twig: Option<Arc<Mutex<PersistentTwig>>>,
+    zk_scheduler: Option<Arc<ProofScheduler>>,
+    qmdb_archive: Option<(u64, Arc<Gov5QmdbStateRootStore>)>,
+    admin_token: Option<String>,
+}
+
+impl N42RpcServer {
+    pub fn new(consensus_state: Arc<SharedConsensusState>) -> Self {
+        Self {
+            validator_public_key: None,
+            consensus_state,
+            staking_manager: None,
+            jmt: None,
+            twig: None,
+            zk_scheduler: None,
+            qmdb_archive: None,
+            admin_token: None,
+        }
+    }
+
+    pub fn with_validator_public_key(mut self, public_key: BlsPublicKey) -> Self {
+        self.validator_public_key = Some(public_key);
+        self
+    }
+
+    pub fn with_staking_manager(mut self, mgr: Arc<Mutex<StakingManager>>) -> Self {
+        self.staking_manager = Some(mgr);
+        self
+    }
+
+    pub fn with_jmt(mut self, jmt: Arc<Mutex<PersistentSbmt>>) -> Self {
+        self.jmt = Some(jmt);
+        self
+    }
+
+    pub fn with_twig(mut self, twig: Arc<Mutex<PersistentTwig>>) -> Self {
+        self.twig = Some(twig);
+        self
+    }
+
+    pub fn with_zk_scheduler(mut self, scheduler: Arc<ProofScheduler>) -> Self {
+        self.zk_scheduler = Some(scheduler);
+        self
+    }
+
+    pub fn with_qmdb_archive(
+        mut self,
+        archive_floor: u64,
+        store: Arc<Gov5QmdbStateRootStore>,
+    ) -> Self {
+        self.qmdb_archive = Some((archive_floor, store));
+        self
+    }
+
+    pub fn with_admin_token(mut self, token: String) -> Self {
+        self.admin_token = Some(token);
+        self
+    }
+
+    /// Compares two secrets without short-circuiting on the first differing
+    /// byte, so the time taken does not leak how long a common prefix is.
+    fn secret_eq(expected: &str, provided: &str) -> bool {
+        let (a, b) = (expected.as_bytes(), provided.as_bytes());
+        // The length itself is not secret, but bail out in constant time for
+        // the compared bytes rather than returning early mid-scan.
+        let mut diff = (a.len() ^ b.len()) as u8;
+        for i in 0..a.len().max(b.len()) {
+            let x = a.get(i).copied().unwrap_or(0);
+            let y = b.get(i).copied().unwrap_or(0);
+            diff |= x ^ y;
+        }
+        diff == 0 && a.len() == b.len()
+    }
+
+    fn verify_admin_token(&self, provided: &str) -> RpcResult<()> {
+        match &self.admin_token {
+            Some(expected) if Self::secret_eq(expected, provided) => Ok(()),
+            Some(_) => Err(ErrorObjectOwned::owned(
+                -32001,
+                "invalid admin token",
+                None::<()>,
+            )),
+            None => Err(ErrorObjectOwned::owned(
+                -32001,
+                "admin RPC not enabled (set N42_ADMIN_TOKEN)",
+                None::<()>,
+            )),
+        }
+    }
+
+    fn parse_bls_pubkey(hex_str: &str) -> RpcResult<BlsPublicKey> {
+        let bytes = hex::decode(hex_str.strip_prefix("0x").unwrap_or(hex_str)).map_err(|e| {
+            ErrorObjectOwned::owned(-32602, format!("invalid pubkey hex: {e}"), None::<()>)
+        })?;
+        let arr: [u8; 48] = bytes.try_into().map_err(|v: Vec<u8>| {
+            ErrorObjectOwned::owned(
+                -32602,
+                format!("pubkey must be exactly 48 bytes, got {}", v.len()),
+                None::<()>,
+            )
+        })?;
+        BlsPublicKey::from_bytes(&arr).map_err(|e| {
+            ErrorObjectOwned::owned(-32602, format!("invalid BLS public key: {e}"), None::<()>)
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl N42ApiServer for N42RpcServer {
+    async fn native_header(&self, block_hash: B256) -> RpcResult<Option<String>> {
+        let Some(raw) = n42_consensus::gov5_native_header_rlp(&block_hash) else {
+            return Ok(None);
+        };
+        let decoded = n42_consensus::Gov5NativeHeader::decode(&raw).map_err(|error| {
+            ErrorObjectOwned::owned(
+                -32603,
+                format!("invalid native header: {error}"),
+                None::<()>,
+            )
+        })?;
+        if decoded.encode().as_slice() != raw.as_ref() || decoded.hash() != block_hash {
+            return Err(ErrorObjectOwned::owned(
+                -32603,
+                "native header encoding/hash mismatch",
+                None::<()>,
+            ));
+        }
+        Ok(Some(format!("0x{}", hex::encode(raw.as_ref()))))
+    }
+
+    async fn state_read_status(
+        &self,
+        block_hash: Option<B256>,
+    ) -> RpcResult<StateReadStatusResponse> {
+        let reads = crate::qmdb_state_reader::status(block_hash).map_err(|error| {
+            ErrorObjectOwned::owned(
+                -32603,
+                format!("QMDB read status unavailable: {error}"),
+                None::<()>,
+            )
+        })?;
+        Ok(StateReadStatusResponse {
+            reads,
+            validator_public_key: self
+                .validator_public_key
+                .as_ref()
+                .map(|key| hex::encode(key.to_bytes())),
+        })
+    }
+
+    async fn health(&self) -> RpcResult<HealthResponse> {
+        let has_qc = self.consensus_state.load_committed_qc().is_some();
+        Ok(HealthResponse {
+            status: if has_qc { "ok" } else { "syncing" }.to_string(),
+            has_committed_qc: has_qc,
+            validator_count: self.consensus_state.validator_count(),
+        })
+    }
+
+    async fn consensus_status(&self) -> RpcResult<ConsensusStatusResponse> {
+        let committed_qc = self.consensus_state.load_committed_qc();
+        let (view, block_hash, has_qc) = match committed_qc.as_ref() {
+            Some(qc) => (Some(qc.view), Some(format!("{:?}", qc.block_hash)), true),
+            None => (None, None, false),
+        };
+
+        Ok(ConsensusStatusResponse {
+            latest_committed_view: view,
+            latest_committed_block_hash: block_hash,
+            validator_count: self.consensus_state.validator_count(),
+            has_committed_qc: has_qc,
+            commit_qc: committed_qc.as_ref().as_ref().map(|qc| CommitQcResponse {
+                view: qc.view,
+                block_hash: qc.block_hash,
+                signature: format!("0x{}", hex::encode(qc.aggregate_signature.to_bytes())),
+                signers: qc.signers.iter().by_vals().collect(),
+            }),
+        })
+    }
+
+    async fn validator_set(&self) -> RpcResult<ValidatorSetResponse> {
+        let Some(vs) = self.consensus_state.try_load_validator_set() else {
+            return Err(ErrorObjectOwned::owned(
+                -32603,
+                "validator set unavailable",
+                None::<()>,
+            ));
+        };
+        let mut active = Vec::with_capacity(vs.len() as usize);
+        for i in 0..vs.len() {
+            let pk = vs.get_public_key(i).map_err(|e| {
+                ErrorObjectOwned::owned(
+                    -32603,
+                    format!("failed to read validator public key at index {i}: {e}"),
+                    None::<()>,
+                )
+            })?;
+            active.push(ValidatorInfoResponse {
+                index: i,
+                public_key: hex::encode(pk.to_bytes()),
+            });
+        }
+
+        let epoch = self.consensus_state.load_epoch_status();
+        Ok(ValidatorSetResponse {
+            active,
+            pending_changes: epoch.pending_changes,
+            staged_next_epoch: epoch.staged_next_epoch,
+            current_epoch: epoch.current_epoch,
+            next_epoch_validator_count: epoch.next_epoch_validator_count,
+        })
+    }
+
+    async fn subscribe_verification(&self, pending: PendingSubscriptionSink) -> SubscriptionResult {
+        let sink = pending.accept().await?;
+        let mut rx = self.consensus_state.subscribe_block_committed();
+
+        info!("mobile verification subscriber connected");
+
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(task) => {
+                        let msg = match SubscriptionMessage::new(
+                            sink.method_name(),
+                            sink.subscription_id(),
+                            &task,
+                        ) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::error!(error = %e, "failed to serialize VerificationTask");
+                                continue;
+                            }
+                        };
+                        if sink.send(msg).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(skipped = n, "verification subscription lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn submit_attestation(
+        &self,
+        pubkey: String,
+        signature: String,
+        block_hash: B256,
+        slot: u64,
+    ) -> RpcResult<AttestationResponse> {
+        let bls_pubkey = Self::parse_bls_pubkey(&pubkey)?;
+        let pubkey_array = bls_pubkey.to_bytes();
+
+        let sig_bytes =
+            hex::decode(signature.strip_prefix("0x").unwrap_or(&signature)).map_err(|e| {
+                ErrorObjectOwned::owned(-32602, format!("invalid signature hex: {e}"), None::<()>)
+            })?;
+
+        let sig_array: [u8; 96] = sig_bytes.try_into().map_err(|v: Vec<u8>| {
+            ErrorObjectOwned::owned(
+                -32602,
+                format!("signature must be exactly 96 bytes, got {}", v.len()),
+                None::<()>,
+            )
+        })?;
+
+        let bls_sig = BlsSignature::from_bytes(&sig_array).map_err(|e| {
+            ErrorObjectOwned::owned(-32602, format!("invalid BLS signature: {e}"), None::<()>)
+        })?;
+
+        bls_pubkey
+            .verify(block_hash.as_slice(), &bls_sig)
+            .map_err(|e| {
+                ErrorObjectOwned::owned(
+                    -32003,
+                    format!("BLS signature verification failed: {e}"),
+                    None::<()>,
+                )
+            })?;
+
+        // Security: only accept attestations from verifiers that completed a QUIC
+        // handshake with StarHub. Self-signed BLS proofs alone are not sufficient;
+        // the pubkey must also be in the authorized set populated by the bridge.
+        if !self.consensus_state.is_authorized_verifier(&pubkey_array) {
+            return Err(ErrorObjectOwned::owned(
+                -32004,
+                "verifier not authorized: pubkey not registered via QUIC handshake",
+                None::<()>,
+            ));
+        }
+
+        let canonical_pubkey_hex = hex::encode(pubkey_array);
+        let mut att_state = self.consensus_state.attestation_state.lock().map_err(|_| {
+            ErrorObjectOwned::owned(
+                -32603,
+                "internal error: attestation state lock poisoned",
+                None::<()>,
+            )
+        })?;
+
+        match att_state.record_attestation(block_hash, canonical_pubkey_hex) {
+            Some((count, threshold_reached)) => {
+                if threshold_reached {
+                    info!(%block_hash, slot, count, "mobile attestation threshold reached");
+                }
+                Ok(AttestationResponse {
+                    accepted: true,
+                    attestation_count: count,
+                    threshold_reached,
+                })
+            }
+            None => Err(ErrorObjectOwned::owned(
+                -32001,
+                format!("unknown block hash: {block_hash}"),
+                None::<()>,
+            )),
+        }
+    }
+
+    async fn block_attestation(&self, block_hash: B256) -> RpcResult<Option<AttestationRecord>> {
+        Ok(self.consensus_state.get_block_attestation(&block_hash))
+    }
+
+    async fn attestation_stats(&self) -> RpcResult<AttestationStatsResponse> {
+        let (total, earliest, latest) = self.consensus_state.attestation_stats();
+        Ok(AttestationStatsResponse {
+            total_attestations: total,
+            earliest_block: earliest,
+            latest_block: latest,
+        })
+    }
+
+    async fn equivocations(&self) -> RpcResult<EquivocationsResponse> {
+        let evidence = self.consensus_state.get_equivocations();
+        Ok(EquivocationsResponse {
+            total: evidence.len(),
+            evidence,
+        })
+    }
+
+    async fn staking_status(&self, address: Address) -> RpcResult<StakingStatusResponse> {
+        let staking_mgr = match &self.staking_manager {
+            Some(mgr) => mgr,
+            None => {
+                return Ok(StakingStatusResponse {
+                    staked: false,
+                    registered: false,
+                    amount: "0".to_string(),
+                    bls_pubkey: String::new(),
+                    status: "no_staking_manager".to_string(),
+                    cooldown_remaining_blocks: 0,
+                    staked_at_block: 0,
+                });
+            }
+        };
+
+        let mgr = staking_mgr.lock().map_err(|_| {
+            ErrorObjectOwned::owned(-32603, "staking manager lock poisoned", None::<()>)
+        })?;
+
+        if let Some(entry) = mgr.get_stake(&address) {
+            let (status_str, cooldown_remaining) = match entry.status {
+                StakeStatus::Active => ("active".to_string(), 0u64),
+                StakeStatus::Unstaking { initiated_block } => {
+                    let end = initiated_block + UNSTAKE_COOLDOWN_BLOCKS;
+                    let current = mgr.last_scanned_block();
+                    let remaining = end.saturating_sub(current);
+                    ("unstaking".to_string(), remaining)
+                }
+            };
+            let is_staked =
+                matches!(entry.status, StakeStatus::Active) && entry.amount >= MIN_STAKE_WEI;
+            Ok(StakingStatusResponse {
+                staked: is_staked,
+                registered: true, // staked implies registered
+                amount: format!("{}", entry.amount),
+                bls_pubkey: hex::encode(entry.bls_pubkey),
+                status: status_str,
+                cooldown_remaining_blocks: cooldown_remaining,
+                staked_at_block: entry.staked_at_block,
+            })
+        } else if let Some(reg) = mgr.get_registration(&address) {
+            Ok(StakingStatusResponse {
+                staked: false,
+                registered: true,
+                amount: "0".to_string(),
+                bls_pubkey: hex::encode(reg.bls_pubkey),
+                status: "registered".to_string(),
+                cooldown_remaining_blocks: 0,
+                staked_at_block: 0,
+            })
+        } else {
+            Ok(StakingStatusResponse {
+                staked: false,
+                registered: false,
+                amount: "0".to_string(),
+                bls_pubkey: String::new(),
+                status: "not_registered".to_string(),
+                cooldown_remaining_blocks: 0,
+                staked_at_block: 0,
+            })
+        }
+    }
+
+    async fn staking_info(&self) -> RpcResult<StakingInfoResponse> {
+        let staking_mgr = match &self.staking_manager {
+            Some(mgr) => mgr,
+            None => {
+                return Ok(StakingInfoResponse {
+                    total_staked: "0".to_string(),
+                    staker_count: 0,
+                    registered_count: 0,
+                    min_stake: format!("{MIN_STAKE_WEI}"),
+                    cooldown_blocks: UNSTAKE_COOLDOWN_BLOCKS,
+                    staking_address: format!("{STAKING_ADDRESS}"),
+                });
+            }
+        };
+
+        let mgr = staking_mgr.lock().map_err(|_| {
+            ErrorObjectOwned::owned(-32603, "staking manager lock poisoned", None::<()>)
+        })?;
+
+        let (total, count) = mgr.total_staked();
+        Ok(StakingInfoResponse {
+            total_staked: format!("{total}"),
+            staker_count: count,
+            registered_count: mgr.registration_count() as u64,
+            min_stake: format!("{MIN_STAKE_WEI}"),
+            cooldown_blocks: UNSTAKE_COOLDOWN_BLOCKS,
+            staking_address: format!("{STAKING_ADDRESS}"),
+        })
+    }
+
+    async fn jmt_root(&self) -> RpcResult<JmtRootResponse> {
+        let jmt_root = self.consensus_state.load_jmt_root();
+        match jmt_root.as_ref() {
+            Some((version, root)) => Ok(JmtRootResponse {
+                version: *version,
+                root: format!("{root:?}"),
+            }),
+            None => Err(ErrorObjectOwned::owned(
+                -32001,
+                "JMT not initialized or no blocks committed yet",
+                None::<()>,
+            )),
+        }
+    }
+
+    async fn jmt_proof(
+        &self,
+        address: Address,
+        storage_slot: Option<U256>,
+    ) -> RpcResult<JmtProofResponse> {
+        let jmt = self.jmt.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32001, "JMT not enabled on this node", None::<()>)
+        })?;
+
+        let key_hash = match storage_slot {
+            Some(slot) => n42_jmt::storage_key(&address, &slot).0,
+            None => n42_jmt::account_key(&address).0,
+        };
+
+        let tree = jmt
+            .lock()
+            .map_err(|_| ErrorObjectOwned::owned(-32603, "SBMT lock poisoned", None::<()>))?;
+
+        // SBMT root_hash and prove are infallible; prove always returns a proof
+        // (inclusion or exclusion). The full ShardedBmtProof is bincode-encoded
+        // into `proof_hex` for the mobile client to deserialize and verify.
+        //
+        // IMPORTANT for verifiers: the `root` field below is the **SBMT combined
+        // root** (its own depth-4 shard merkle), NOT the block header's
+        // `state_root` (which is reth's MPT root, and is `B256::ZERO` in
+        // deferred-state-root mode). `verify_state_proof` must be given THIS root
+        // (also available via `n42_jmtRoot`). The `shard_roots` field carries the
+        // proof's 4 shard-tree siblings (`shard_path`), not the 16 shard roots it
+        // held under JMT — it is informational only; verification uses `proof_hex`.
+        let root = tree.root_hash();
+        let proof = tree.inner().prove(key_hash);
+        let proof_bytes = bincode::serialize(&proof).map_err(|e| {
+            ErrorObjectOwned::owned(-32603, format!("SBMT proof encode error: {e}"), None::<()>)
+        })?;
+
+        Ok(JmtProofResponse {
+            shard_index: proof.shard_index,
+            key_hash: hex::encode(proof.inner.key),
+            value: proof.value.as_ref().map(hex::encode),
+            proof_hex: hex::encode(&proof_bytes),
+            shard_roots: proof.shard_path.iter().map(hex::encode).collect(),
+            root: format!("{root:?}"),
+        })
+    }
+
+    async fn jmt_version(&self) -> RpcResult<u64> {
+        let jmt = self.jmt.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32001, "JMT not enabled on this node", None::<()>)
+        })?;
+        let tree = jmt
+            .lock()
+            .map_err(|_| ErrorObjectOwned::owned(-32603, "JMT lock poisoned", None::<()>))?;
+        Ok(tree.version())
+    }
+
+    async fn qmdb_archive_info(&self) -> RpcResult<QmdbArchiveInfoResponse> {
+        let (archive_floor, store) = self.qmdb_archive.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(
+                -32001,
+                "replay-v2 QMDB archive is not enabled on this node",
+                None::<()>,
+            )
+        })?;
+        let retained_blocks = store.retained_block_count().map_err(|error| {
+            ErrorObjectOwned::owned(
+                -32603,
+                format!("QMDB archive inventory failed: {error}"),
+                None::<()>,
+            )
+        })?;
+        Ok(QmdbArchiveInfoResponse {
+            archive_floor: *archive_floor,
+            archive_floor_hash: format!("{}", store.base_block_hash()),
+            archive_floor_root: format!("{}", store.base_root()),
+            retained_blocks,
+        })
+    }
+
+    async fn qmdb_archive_state(&self, block_hash: B256) -> RpcResult<QmdbArchiveStateResponse> {
+        let (_, store) = self.qmdb_archive.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(
+                -32001,
+                "replay-v2 QMDB archive is not enabled on this node",
+                None::<()>,
+            )
+        })?;
+        let snapshot = store
+            .snapshot_for(block_hash)
+            .map_err(|error| {
+                ErrorObjectOwned::owned(
+                    -32603,
+                    format!("QMDB archive reconstruction failed: {error}"),
+                    None::<()>,
+                )
+            })?
+            .ok_or_else(|| {
+                ErrorObjectOwned::owned(
+                    -32001,
+                    format!("QMDB archive block is below the floor or not retained: {block_hash}"),
+                    None::<()>,
+                )
+            })?;
+        let root = store
+            .root_for(block_hash)
+            .map_err(|error| {
+                ErrorObjectOwned::owned(
+                    -32603,
+                    format!("QMDB archive root lookup failed: {error}"),
+                    None::<()>,
+                )
+            })?
+            .expect("a reconstructed retained block has a root");
+        Ok(QmdbArchiveStateResponse {
+            block_hash: format!("{block_hash}"),
+            root: format!("{root}"),
+            next_slot: snapshot.next_slot,
+            live_entries: snapshot.entries.iter().filter(|entry| entry.active).count(),
+        })
+    }
+
+    async fn qmdb_archive_proof(
+        &self,
+        block_hash: B256,
+        key: B256,
+    ) -> RpcResult<QmdbArchiveProofResponse> {
+        let (_, store) = self.qmdb_archive.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(
+                -32001,
+                "replay-v2 QMDB archive is not enabled on this node",
+                None::<()>,
+            )
+        })?;
+        let proof = store
+            .proof_for(block_hash, key.0)
+            .map_err(|error| {
+                ErrorObjectOwned::owned(
+                    -32603,
+                    format!("QMDB archive proof reconstruction failed: {error}"),
+                    None::<()>,
+                )
+            })?
+            .ok_or_else(|| {
+                ErrorObjectOwned::owned(
+                    -32001,
+                    "QMDB archive block is unavailable or key is absent",
+                    None::<()>,
+                )
+            })?;
+        let root = store
+            .root_for(block_hash)
+            .map_err(|error| {
+                ErrorObjectOwned::owned(
+                    -32603,
+                    format!("QMDB archive root lookup failed: {error}"),
+                    None::<()>,
+                )
+            })?
+            .expect("a proven retained block has a root");
+        let proof_hex = hex::encode(proof.encode().map_err(|error| {
+            ErrorObjectOwned::owned(
+                -32603,
+                format!("QMDB archive proof encoding failed: {error}"),
+                None::<()>,
+            )
+        })?);
+        Ok(QmdbArchiveProofResponse {
+            block_hash: format!("{block_hash}"),
+            root: format!("{root}"),
+            key: format!("{key}"),
+            value: hex::encode(&proof.value),
+            slot: proof.slot,
+            proof_hex,
+        })
+    }
+
+    async fn twig_root(&self) -> RpcResult<TwigRootResponse> {
+        let twig_root = self.consensus_state.load_twig_root();
+        match twig_root.as_ref() {
+            Some((version, root)) => Ok(TwigRootResponse {
+                version: *version,
+                root: format!("{root:?}"),
+            }),
+            None => Err(ErrorObjectOwned::owned(
+                -32001,
+                "Twig not initialized or no blocks committed yet",
+                None::<()>,
+            )),
+        }
+    }
+
+    async fn twig_proof(
+        &self,
+        address: Address,
+        storage_slot: Option<U256>,
+    ) -> RpcResult<TwigProofResponse> {
+        let twig = self.twig.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32001, "Twig not enabled on this node", None::<()>)
+        })?;
+
+        let key_hash = match storage_slot {
+            Some(slot) => n42_jmt::storage_key(&address, &slot).0,
+            None => n42_jmt::account_key(&address).0,
+        };
+
+        let mut tree = twig
+            .lock()
+            .map_err(|_| ErrorObjectOwned::owned(-32603, "Twig lock poisoned", None::<()>))?;
+
+        // Twig proofs are inclusion proofs for live leaves. The full
+        // ShardedTwigProof is bincode-encoded into `proof_hex` for mobile/FFI.
+        // `root` is the combined twig root, not the block header's MPT root.
+        let root = tree.root_hash();
+        let proof = tree.inner().prove(key_hash).ok_or_else(|| {
+            ErrorObjectOwned::owned(
+                -32001,
+                "Twig proof unavailable for key (key not present)",
+                None::<()>,
+            )
+        })?;
+        let proof_bytes = bincode::serialize(&proof).map_err(|e| {
+            ErrorObjectOwned::owned(-32603, format!("Twig proof encode error: {e}"), None::<()>)
+        })?;
+
+        Ok(TwigProofResponse {
+            shard_index: proof.shard_index,
+            key_hash: hex::encode(proof.inner.key),
+            value: hex::encode(&proof.inner.value),
+            proof_hex: hex::encode(&proof_bytes),
+            shard_roots: proof.shard_path.iter().map(hex::encode).collect(),
+            root: format!("{root:?}"),
+        })
+    }
+
+    async fn zk_proof(&self, block_number: u64) -> RpcResult<ZkProofResponse> {
+        let scheduler = self.zk_scheduler.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32001, "ZK proof not enabled on this node", None::<()>)
+        })?;
+        let result = scheduler
+            .proof_store()
+            .get_by_block(block_number)
+            .ok_or_else(|| {
+                ErrorObjectOwned::owned(
+                    -32001,
+                    format!("no ZK proof found for block {block_number}"),
+                    None::<()>,
+                )
+            })?;
+        Ok(proof_result_to_response(&result))
+    }
+
+    async fn zk_proof_by_hash(&self, block_hash: B256) -> RpcResult<ZkProofResponse> {
+        let scheduler = self.zk_scheduler.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32001, "ZK proof not enabled on this node", None::<()>)
+        })?;
+        let result = scheduler
+            .proof_store()
+            .get_by_hash(&block_hash)
+            .ok_or_else(|| {
+                ErrorObjectOwned::owned(
+                    -32001,
+                    format!("no ZK proof found for block hash {block_hash:?}"),
+                    None::<()>,
+                )
+            })?;
+        Ok(proof_result_to_response(&result))
+    }
+
+    async fn zk_latest(&self) -> RpcResult<ZkProofResponse> {
+        let scheduler = self.zk_scheduler.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32001, "ZK proof not enabled on this node", None::<()>)
+        })?;
+        let result = scheduler.proof_store().latest().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32001, "no ZK proofs generated yet", None::<()>)
+        })?;
+        Ok(proof_result_to_response(&result))
+    }
+
+    async fn zk_verify(&self, block_number: u64) -> RpcResult<bool> {
+        let scheduler = self.zk_scheduler.as_ref().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32001, "ZK proof not enabled on this node", None::<()>)
+        })?;
+        let result = scheduler
+            .proof_store()
+            .get_by_block(block_number)
+            .ok_or_else(|| {
+                ErrorObjectOwned::owned(
+                    -32001,
+                    format!("no ZK proof found for block {block_number}"),
+                    None::<()>,
+                )
+            })?;
+        // Re-verify using the prover instance. Use spawn_blocking to avoid
+        // blocking the tokio thread (SP1 verification involves crypto work).
+        let prover = scheduler.prover().clone();
+        let verify_result = tokio::task::spawn_blocking(move || prover.verify(&result))
+            .await
+            .map_err(|e| {
+                ErrorObjectOwned::owned(
+                    -32603,
+                    format!("verification task failed: {e}"),
+                    None::<()>,
+                )
+            })?;
+        match verify_result {
+            Ok(valid) => Ok(valid),
+            Err(e) => {
+                warn!(target: "n42::zk::rpc", block_number, error = %e, "ZK proof re-verification error");
+                Err(ErrorObjectOwned::owned(
+                    -32603,
+                    format!("verification error: {e}"),
+                    None::<()>,
+                ))
+            }
+        }
+    }
+
+    async fn zk_status(&self) -> RpcResult<ZkStatusResponse> {
+        match &self.zk_scheduler {
+            Some(scheduler) => {
+                let latest_block = scheduler.proof_store().latest().map(|p| p.block_number);
+                let stats = scheduler.proof_store().stats();
+                Ok(ZkStatusResponse {
+                    enabled: true,
+                    backend: scheduler.backend_name().to_string(),
+                    proof_interval: scheduler.proof_interval(),
+                    proofs_stored: scheduler.proof_store().len(),
+                    latest_proof_block: latest_block,
+                    total_generated: stats.generated,
+                    total_failed: stats.failed,
+                    in_progress: scheduler.in_progress_count(),
+                })
+            }
+            None => Ok(ZkStatusResponse {
+                enabled: false,
+                backend: String::new(),
+                proof_interval: 0,
+                proofs_stored: 0,
+                latest_proof_block: None,
+                total_generated: 0,
+                total_failed: 0,
+                in_progress: 0,
+            }),
+        }
+    }
+
+    async fn propose_add_validator(
+        &self,
+        admin_token: String,
+        address: Address,
+        bls_pubkey: String,
+    ) -> RpcResult<String> {
+        self.verify_admin_token(&admin_token)?;
+        let bls_pk = Self::parse_bls_pubkey(&bls_pubkey)?;
+
+        let info = n42_chainspec::ValidatorInfo {
+            address,
+            bls_public_key: bls_pk,
+            p2p_peer_id: None,
+        };
+
+        let admin_tx = self.consensus_state.admin_tx().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32603, "admin channel not available", None::<()>)
+        })?;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        admin_tx
+            .send(crate::consensus_state::AdminCommand::AddValidator {
+                info,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| {
+                ErrorObjectOwned::owned(-32603, "consensus loop unavailable", None::<()>)
+            })?;
+
+        reply_rx.await
+            .map_err(|_| ErrorObjectOwned::owned(-32603, "consensus loop dropped reply", None::<()>))?
+            .map(|()| "validator add queued; will be included in Proposal when this node is leader, stages at CommitQC, activates at epoch boundary".to_string())
+            .map_err(|e| ErrorObjectOwned::owned(-32003, e, None::<()>))
+    }
+
+    async fn propose_remove_validator(
+        &self,
+        admin_token: String,
+        address: Address,
+    ) -> RpcResult<String> {
+        self.verify_admin_token(&admin_token)?;
+        let admin_tx = self.consensus_state.admin_tx().ok_or_else(|| {
+            ErrorObjectOwned::owned(-32603, "admin channel not available", None::<()>)
+        })?;
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        admin_tx
+            .send(crate::consensus_state::AdminCommand::RemoveValidator {
+                address,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| {
+                ErrorObjectOwned::owned(-32603, "consensus loop unavailable", None::<()>)
+            })?;
+
+        reply_rx.await
+            .map_err(|_| ErrorObjectOwned::owned(-32603, "consensus loop dropped reply", None::<()>))?
+            .map(|()| "validator remove queued; will be included in Proposal when this node is leader, stages at CommitQC, activates at epoch boundary".to_string())
+            .map_err(|e| ErrorObjectOwned::owned(-32003, e, None::<()>))
+    }
+}
+
+fn proof_result_to_response(result: &n42_zkproof::ZkProofResult) -> ZkProofResponse {
+    ZkProofResponse {
+        block_number: result.block_number,
+        block_hash: format!("{:?}", result.block_hash),
+        proof_type: format!("{}", result.proof_type),
+        prover_backend: result.prover_backend.clone(),
+        proof_size: result.proof_bytes.len(),
+        generation_ms: result.generation_ms,
+        verified: result.verified,
+        proof_hex: hex::encode(&result.proof_bytes),
+        public_values_hex: hex::encode(&result.public_values),
+        created_at: result.created_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::Address;
+    use n42_chainspec::ValidatorInfo;
+    use n42_consensus::ValidatorSet;
+    use n42_primitives::{BlsSecretKey, QuorumCertificate};
+
+    fn test_bls_key(seed: u8) -> BlsSecretKey {
+        BlsSecretKey::key_gen(&[seed; 32]).expect("deterministic BLS key should be valid")
+    }
+
+    fn make_rpc() -> N42RpcServer {
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        N42RpcServer::new(state)
+    }
+
+    fn make_rpc_with_validators(count: usize) -> N42RpcServer {
+        let validators: Vec<_> = (0..count)
+            .map(|i| {
+                let sk = test_bls_key(i as u8);
+                ValidatorInfo {
+                    address: Address::ZERO,
+                    bls_public_key: sk.public_key(),
+                    p2p_peer_id: None,
+                }
+            })
+            .collect();
+        let vs = ValidatorSet::new(&validators, 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        N42RpcServer::new(state)
+    }
+
+    #[tokio::test]
+    async fn native_header_rpc_preserves_optional_slots_and_refuses_malformed_data() {
+        let rpc = make_rpc();
+        let native = n42_consensus::Gov5NativeHeader {
+            header: alloy_consensus::Header {
+                number: 876_543,
+                extra_data: vec![0x12, 0x34].into(),
+                ..Default::default()
+            },
+            mobile_registry_root: Some(B256::repeat_byte(0x75)),
+        };
+        let raw = native.encode();
+        assert!(!native.is_alloy_exact());
+        let hash = n42_consensus::remember_gov5_native_header(&raw);
+        assert_eq!(
+            rpc.native_header(hash).await.unwrap(),
+            Some(format!("0x{}", hex::encode(raw)))
+        );
+        assert!(
+            rpc.native_header(B256::repeat_byte(0xda))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let malformed = n42_consensus::remember_gov5_native_header(&[0xc0]);
+        assert!(rpc.native_header(malformed).await.is_err());
+    }
+
+    fn make_qc(view: u64, block_hash: B256) -> QuorumCertificate {
+        let mut qc = QuorumCertificate::genesis();
+        qc.view = view;
+        qc.block_hash = block_hash;
+        qc
+    }
+
+    #[tokio::test]
+    async fn test_consensus_status_empty() {
+        let rpc = make_rpc();
+        let status = rpc.consensus_status().await.unwrap();
+        assert!(!status.has_committed_qc);
+        assert!(status.latest_committed_view.is_none());
+        assert!(status.latest_committed_block_hash.is_none());
+        assert!(status.commit_qc.is_none());
+        assert_eq!(status.validator_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_consensus_status_with_qc() {
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        let mut qc = make_qc(42, B256::repeat_byte(0xAB));
+        qc.signers = [true, false, true, true].into_iter().collect();
+        let signature = format!("0x{}", hex::encode(qc.aggregate_signature.to_bytes()));
+        state.update_committed_qc(qc);
+
+        let rpc = N42RpcServer::new(state);
+        let status = rpc.consensus_status().await.unwrap();
+        assert!(status.has_committed_qc);
+        assert_eq!(status.latest_committed_view, Some(42));
+        assert!(status.latest_committed_block_hash.is_some());
+        let serialized = serde_json::to_value(&status).unwrap();
+        let proof = status.commit_qc.unwrap();
+        assert_eq!(proof.view, status.latest_committed_view.unwrap());
+        assert_eq!(
+            Some(format!("{:?}", proof.block_hash)),
+            status.latest_committed_block_hash
+        );
+        assert_eq!(proof.signature, signature);
+        assert_eq!(proof.signers, [true, false, true, true]);
+        assert_eq!(
+            serialized["commitQc"]["signers"],
+            serde_json::json!([true, false, true, true])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validator_set_response() {
+        let rpc = make_rpc_with_validators(3);
+        let result = rpc.validator_set().await.unwrap();
+        assert_eq!(result.active.len(), 3);
+        for (i, v) in result.active.iter().enumerate() {
+            assert_eq!(v.index, i as u32);
+            assert!(!v.public_key.is_empty());
+        }
+        // Fresh state: no pending or staged changes.
+        assert_eq!(result.pending_changes, 0);
+        assert!(!result.staged_next_epoch);
+        assert_eq!(result.current_epoch, 0);
+        assert_eq!(result.next_epoch_validator_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_health_syncing() {
+        let rpc = make_rpc();
+        let health = rpc.health().await.unwrap();
+        assert_eq!(health.status, "syncing");
+        assert!(!health.has_committed_qc);
+        assert_eq!(health.validator_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_health_ok() {
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        state.update_committed_qc(make_qc(1, B256::ZERO));
+
+        let rpc = N42RpcServer::new(state);
+        let health = rpc.health().await.unwrap();
+        assert_eq!(health.status, "ok");
+        assert!(health.has_committed_qc);
+        assert_eq!(health.validator_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_health_reports_validator_count() {
+        let rpc = make_rpc_with_validators(3);
+        let health = rpc.health().await.unwrap();
+        assert_eq!(health.status, "syncing");
+        assert_eq!(health.validator_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_twig_root_and_proof_roundtrip() {
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        let dir = tempfile::tempdir().unwrap();
+        let twig = Arc::new(Mutex::new(
+            PersistentTwig::open(dir.path().join("twig.snapshot"), 1000).unwrap(),
+        ));
+
+        let address = Address::repeat_byte(0xAB);
+        let slot = U256::from(7);
+        let root = {
+            let mut tree = twig.lock().unwrap();
+            tree.inner_mut().seed_genesis_account(
+                address,
+                U256::from(123u64),
+                2,
+                n42_jmt::EMPTY_CODE_HASH,
+                [(slot, U256::from(9u64))],
+            );
+            tree.flush().unwrap();
+            let root = tree.root_hash();
+            state.update_twig_root(tree.version(), root);
+            root
+        };
+
+        let rpc = N42RpcServer::new(state).with_twig(Arc::clone(&twig));
+        let root_resp = rpc.twig_root().await.unwrap();
+        assert_eq!(root_resp.version, 0);
+        assert_eq!(root_resp.root, format!("{root:?}"));
+
+        let proof_resp = rpc.twig_proof(address, None).await.unwrap();
+        assert_eq!(proof_resp.root, root_resp.root);
+        let proof_bytes = hex::decode(&proof_resp.proof_hex).unwrap();
+        let expected_key = n42_jmt::account_key(&address).0;
+        let expected_proof = {
+            let tree = twig.lock().unwrap();
+            tree.inner().prove(expected_key).unwrap()
+        };
+        expected_proof
+            .verify_for_key(&root.0, &expected_key)
+            .unwrap();
+        assert_eq!(proof_bytes, bincode::serialize(&expected_proof).unwrap());
+
+        let storage_resp = rpc.twig_proof(address, Some(slot)).await.unwrap();
+        assert_eq!(storage_resp.root, root_resp.root);
+
+        let missing = rpc.twig_proof(Address::repeat_byte(0xCD), None).await;
+        assert!(missing.is_err());
+        assert_eq!(missing.unwrap_err().code(), -32001);
+    }
+
+    #[tokio::test]
+    async fn test_attestation_stats_empty() {
+        let rpc = make_rpc();
+        let stats = rpc.attestation_stats().await.unwrap();
+        assert_eq!(stats.total_attestations, 0);
+        assert!(stats.earliest_block.is_none());
+        assert!(stats.latest_block.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_equivocations_empty() {
+        let rpc = make_rpc();
+        let result = rpc.equivocations().await.unwrap();
+        assert_eq!(result.total, 0);
+        assert!(result.evidence.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_invalid_hex() {
+        let rpc = make_rpc();
+        let result = rpc
+            .submit_attestation("not_hex".into(), "0000".into(), B256::ZERO, 0)
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), -32602);
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_wrong_pubkey_length() {
+        let rpc = make_rpc();
+        let result = rpc
+            .submit_attestation(
+                hex::encode([0u8; 32]),
+                hex::encode([0u8; 96]),
+                B256::ZERO,
+                0,
+            )
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), -32602);
+        assert!(err.message().contains("48 bytes"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_wrong_sig_length() {
+        let rpc = make_rpc();
+        let sk = test_bls_key(0x21);
+        let result = rpc
+            .submit_attestation(
+                hex::encode(sk.public_key().to_bytes()),
+                hex::encode([0u8; 48]),
+                B256::ZERO,
+                0,
+            )
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), -32602);
+        assert!(err.message().contains("96 bytes"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_unknown_block() {
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        let sk = test_bls_key(0x22);
+        // Authorize so we pass the identity check and reach the "unknown block" error.
+        state.authorize_verifier(sk.public_key().to_bytes());
+
+        let rpc = N42RpcServer::new(state);
+        let block_hash = B256::repeat_byte(0xCC);
+        let sig = sk.sign(block_hash.as_slice());
+
+        let result = rpc
+            .submit_attestation(
+                hex::encode(sk.public_key().to_bytes()),
+                hex::encode(sig.to_bytes()),
+                block_hash,
+                1,
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), -32001);
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_valid() {
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        let block_hash = B256::repeat_byte(0xDD);
+        state.notify_block_committed(block_hash, 10);
+
+        let sk = test_bls_key(0x23);
+        // Authorize the verifier to simulate a completed QUIC handshake.
+        state.authorize_verifier(sk.public_key().to_bytes());
+
+        let rpc = N42RpcServer::new(state);
+        let sig = sk.sign(block_hash.as_slice());
+
+        let result = rpc
+            .submit_attestation(
+                hex::encode(sk.public_key().to_bytes()),
+                hex::encode(sig.to_bytes()),
+                block_hash,
+                10,
+            )
+            .await;
+        assert!(result.is_ok());
+        let resp = result.unwrap();
+        assert!(resp.accepted);
+        assert_eq!(resp.attestation_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_unauthorized_pubkey() {
+        // A valid BLS signature from an unregistered pubkey must be rejected.
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        let block_hash = B256::repeat_byte(0xDE);
+        state.notify_block_committed(block_hash, 11);
+        // Deliberately NOT calling state.authorize_verifier(...).
+
+        let rpc = N42RpcServer::new(state);
+        let sk = test_bls_key(0x24);
+        let sig = sk.sign(block_hash.as_slice());
+
+        let result = rpc
+            .submit_attestation(
+                hex::encode(sk.public_key().to_bytes()),
+                hex::encode(sig.to_bytes()),
+                block_hash,
+                11,
+            )
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.code(),
+            -32004,
+            "unauthorized verifier must return -32004"
+        );
+        assert!(err.message().contains("not authorized"));
+    }
+
+    #[tokio::test]
+    async fn test_block_attestation_lookup() {
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        let hash = B256::repeat_byte(0xEE);
+        state.record_attestation(hash, 5, 3);
+
+        let rpc = N42RpcServer::new(state);
+        let record = rpc.block_attestation(hash).await.unwrap();
+        assert!(record.is_some());
+        let r = record.unwrap();
+        assert_eq!(r.block_number, 5);
+        assert_eq!(r.valid_count, 3);
+
+        assert!(rpc.block_attestation(B256::ZERO).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_equivocations_with_data() {
+        let vs = ValidatorSet::new(&[], 0);
+        let state = Arc::new(SharedConsensusState::new(vs));
+        state.record_equivocation(10, 0, B256::repeat_byte(0xAA), B256::repeat_byte(0xBB));
+        state.record_equivocation(11, 1, B256::repeat_byte(0xCC), B256::repeat_byte(0xDD));
+
+        let rpc = N42RpcServer::new(state);
+        let result = rpc.equivocations().await.unwrap();
+        assert_eq!(result.total, 2);
+        assert_eq!(result.evidence[0].view, 10);
+        assert_eq!(result.evidence[1].validator_index, 1);
+    }
+}

@@ -1,0 +1,41 @@
+{
+  "fixture_only": true,
+  "fleet_tps_measured": false,
+  "mandatory_tps_gate_integrated": true,
+  "python_tests_passed": 43,
+  "rust_tests_passed": 3,
+  "rust_tests_ignored": 2,
+  "workspace_all_targets_clippy": true,
+  "reth_revision": "23316e3ff8adca8c3bd5085ff0565fcae019202a",
+  "binaries": {
+    "n42-keccak": "1d1d6cc94133024b74cd3865576e70f11eef5433082deb363fb9e53c385b8b81",
+    "n42-verify-commit": "9b54ff256271f185308221dab5951e2dd73f00fce25cdd46aa896a109f8defca"
+  },
+  "limitations": [
+    "Operator must authenticate trust-file provenance.",
+    "Static four-validator H2-v4 with f=1 only.",
+    "Verifier shares production BLS and message code.",
+    "No real fleet TPS, independent EVM replay, transaction trie reconstruction or hardware durability proof."
+  ],
+  "files": {
+    "README.md": "f8a36980ae5075c62324d4f7644bb7d354fac3b5565bd141e08ccf538be59957",
+    "fixture-result/audit.json": "f86a094c6e8ef90de149f6018ae21f5a0aaf5d1dc322db1663355af51f33737d",
+    "fixture-result/end.json": "96d43c0e16221923458ac8873fd9a38bac5685866987fc66e390def2aae32b30",
+    "fixture-result/fixture-only.json": "0858c5ba272622cffbd53091a54f70476ee4eb22f19e8eb245cd73eae3e41ba4",
+    "fixture-result/start.json": "9635d009833027285edac1fb873dac3e5a1746ef61c2f0565e051d07b0d75fad",
+    "fixture-result/trusted-config.json": "73d7f5a45d68aa1c9fe17b1301aa7a248190b6ba2baba04279c11d62576b220c",
+    "h2-tps-audit.py": "6be4123464aba5b962745b1229a66a37afeac859556ff54165099d094d1c6df1",
+    "h2-tps-commit-qcs.json": "de7785a43ae845af7aa9782ced1b5762b951f87ab98798a577b5095dc9c6cf81",
+    "n42-tps-qc-build.log": "186cd6d94c967dfdda51705a5c5dfa8064745e33f9f984c3bfa20d35bf10b918",
+    "n42-tps-qc-clippy.log": "51b58debee7f2c8c96e2915469cbe5056aa90f30e808687a95b5511d25e61f96",
+    "n42-tps-qc-export.log": "42d5f164eaaccc5f063fb8f7a6d98c3a4b6696702df4371b1af0a46104633a6d",
+    "n42-tps-qc-fixture-audit.log": "b826ee8b9678885051ed5e4a963158be55b56a1140d0d835939960579eb9a74b",
+    "n42-tps-qc-rust-tests.log": "f5acfb307b47526ba6121125aed08a8487fdf5f494470f6373c5c5ce946f1a96",
+    "n42-tps-qc-tests.log": "33ec7c510a94a27359a2665d769646f66086770f445705e8e017bd0bf4401b3c",
+    "n42-verify-commit.rs": "d8c02c18212abd2604c8b8eb79fdc480a956bdf8322a59d0595452862b75cbec",
+    "qualify-1m-tps.sh": "8abcadc38d891b77ce75a52348942a189940230b71eba543b41f0332c07fc73e",
+    "run-fixture-audit.py": "93b287494c90d18a52df37caf7dc11f4625f2ceef3a9ae8d72d5f93664ce934f",
+    "signing-contexts.json": "66b3b60a0e569ce05f190ca339b005db9d650ed3460b5f5e0f8d09850b3a47bf",
+    "test-h2-tps-audit.py": "5532ddddd4fd44b4a0033267b6a4ae764fa77a1caf15f0b361028c03ee5111a2"
+  }
+}
