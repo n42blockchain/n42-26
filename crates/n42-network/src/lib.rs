@@ -32,7 +32,8 @@ pub use finalized_range::{
 };
 pub use gov5_block::{
     Gov5BlockError, Gov5GossipBlock, decode_gov5_block_rlp, encode_gov5_block_rlp,
-    gov5_header_view, normalize_execution_payload_for_gov5_h2,
+    gov5_header_view, gov5_normalization_preserves_execution_input,
+    normalize_execution_payload_for_gov5_h2,
 };
 pub use gov5_rpc::{
     GOV5_BODIES_BY_RANGE_PROTOCOL, Gov5BodiesByRangeRequest, Gov5CanonicalBlockReader,

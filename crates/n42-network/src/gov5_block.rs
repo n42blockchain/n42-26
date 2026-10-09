@@ -118,7 +118,7 @@ pub fn normalize_execution_payload_for_gov5_h2(
     // A native chain-94 parent selects the post-Cancun profile. Never erase
     // executed withdrawals or the committee link as the early devnet profile does.
     if let Some(parent) = n42_consensus::remembered_gov5_native_header(&execution.parent_hash())
-        && parent.mobile_registry_root.is_some()
+        && (parent.mobile_registry_root.is_some() || native_cancun_genesis(&parent))
     {
         return normalize_native_payload(execution, view, state_root, receipts_root, &parent);
     }
@@ -183,6 +183,58 @@ pub fn normalize_execution_payload_for_gov5_h2(
     Ok(ExecutionData::from_block_unchecked(block_hash, &block))
 }
 
+// Gov5 seeds a Cancun block-zero header without mobileRegistryRoot. Its
+// first live native block must still retain withdrawals and Cancun markers.
+fn native_cancun_genesis(parent: &Gov5NativeHeader) -> bool {
+    parent.header.number == 0
+        && parent.mobile_registry_root.is_none()
+        && parent.header.withdrawals_root.is_some()
+        && parent.header.blob_gas_used.is_some()
+        && parent.header.excess_blob_gas.is_some()
+        && parent.header.parent_beacon_block_root.is_some()
+}
+
+/// A conservative guard for reusing the builder's execution output after Gov5
+/// changes the header hash. Only the native Cancun profile is eligible: the
+/// pre-Shanghai normalization can also change the withdrawal body.
+pub fn gov5_normalization_preserves_execution_input(
+    original: &ExecutionData,
+    normalized: &ExecutionData,
+) -> bool {
+    let before = original.payload.as_v1();
+    let after = normalized.payload.as_v1();
+    let empty_requests = |data: &ExecutionData| {
+        data.sidecar
+            .requests_hash()
+            .is_none_or(|hash| hash == alloy_eips::eip7685::EMPTY_REQUESTS_HASH)
+    };
+    // Compare raw transaction bytes and EVM environment fields directly. A
+    // full block reconstruction would decode 100k transactions twice here.
+    original.payload.as_v4().is_none()
+        && normalized.payload.as_v4().is_none()
+        && original.payload.blob_gas_used().is_some()
+        && original.payload.excess_blob_gas().is_some()
+        && original.parent_beacon_block_root().is_some()
+        && empty_requests(original)
+        && empty_requests(normalized)
+        && before.parent_hash == after.parent_hash
+        && before.fee_recipient == after.fee_recipient
+        && before.logs_bloom == after.logs_bloom
+        && before.prev_randao == after.prev_randao
+        && before.block_number == after.block_number
+        && before.gas_limit == after.gas_limit
+        && before.gas_used == after.gas_used
+        && before.timestamp == after.timestamp
+        && before.base_fee_per_gas == after.base_fee_per_gas
+        && before.transactions == after.transactions
+        && original.withdrawals() == normalized.withdrawals()
+        && original.payload.blob_gas_used() == normalized.payload.blob_gas_used()
+        && original.payload.excess_blob_gas() == normalized.payload.excess_blob_gas()
+        && original.parent_beacon_block_root() == normalized.parent_beacon_block_root()
+        && original.sidecar.versioned_hashes() == normalized.sidecar.versioned_hashes()
+        && original.payload.block_access_list() == normalized.payload.block_access_list()
+}
+
 fn normalize_native_payload(
     execution: &ExecutionData,
     view: u64,
@@ -190,7 +242,7 @@ fn normalize_native_payload(
     receipts_root: B256,
     parent: &Gov5NativeHeader,
 ) -> Result<ExecutionData, Gov5BlockError> {
-    if parent.mobile_registry_root != Some(B256::ZERO) {
+    if parent.mobile_registry_root != Some(B256::ZERO) && !native_cancun_genesis(parent) {
         return Err(Gov5BlockError::PayloadReconstruction(
             "native mobile registry updates are not implemented".into(),
         ));
@@ -244,7 +296,7 @@ fn normalize_native_payload(
 /// form. Auxiliary verifier/reward lists are empty because execution validity
 /// and H2-v4 consensus authentication are carried independently.
 pub fn encode_gov5_block_rlp(execution: &ExecutionData) -> Result<Vec<u8>, Gov5BlockError> {
-    let block = reconstruct_gov5_block(execution)?;
+    let block = reconstruct_gov5_block_raw(execution)?;
     validate_gov5_interop_header(&block.header)
         .map_err(|error| Gov5BlockError::HeaderProfile(error.to_string()))?;
     let native = n42_consensus::remembered_gov5_native_header(&execution.block_hash());
@@ -255,8 +307,20 @@ pub fn encode_gov5_block_rlp(execution: &ExecutionData) -> Result<Vec<u8>, Gov5B
     {
         return Err(Gov5BlockError::PayloadHashMismatch);
     }
-    if calculate_transaction_root(&block.body.transactions) != block.header.transactions_root {
-        return Err(Gov5BlockError::TransactionRootMismatch);
+    // Reconstruction computes the trie root from these exact payload bytes and
+    // authenticates it through the header hash. Check that every transaction is
+    // canonical before reusing its bytes, so the same root also commits to the
+    // decoded transactions. A reusable buffer avoids one allocation per tx and
+    // a second full trie construction over re-encoded transactions.
+    let mut canonical = Vec::new();
+    for bytes in &block.body.transactions {
+        let transaction = TxEnvelope::decode_2718_exact(bytes.as_ref())
+            .map_err(|error| Gov5BlockError::PayloadReconstruction(error.to_string()))?;
+        canonical.clear();
+        transaction.encode_2718(&mut canonical);
+        if canonical.as_slice() != bytes.as_ref() {
+            return Err(Gov5BlockError::TransactionRootMismatch);
+        }
     }
 
     let mut header_rlp = Vec::new();
@@ -265,12 +329,7 @@ pub fn encode_gov5_block_rlp(execution: &ExecutionData) -> Result<Vec<u8>, Gov5B
     } else {
         block.header.encode(&mut header_rlp);
     }
-    let transaction_bytes = block
-        .body
-        .transactions
-        .iter()
-        .map(|transaction| Bytes::from(transaction.encoded_2718()))
-        .collect::<Vec<_>>();
+    let transaction_bytes = &block.body.transactions;
     let verifiers = Vec::<Bytes>::new();
     let rewards = n42_consensus::gov5_withdrawals_to_rewards(
         block
@@ -299,7 +358,8 @@ pub fn encode_gov5_block_rlp(execution: &ExecutionData) -> Result<Vec<u8>, Gov5B
     rewards_rlp.extend_from_slice(&reward_items);
     let payload_length =
         header_rlp.len() + transaction_bytes.length() + verifiers.length() + rewards_rlp.len();
-    let mut encoded = Vec::new();
+    let mut encoded =
+        Vec::with_capacity(alloy_rlp::length_of_length(payload_length) + payload_length);
     RlpHeader {
         list: true,
         payload_length,
@@ -320,22 +380,35 @@ pub fn encode_gov5_block_rlp(execution: &ExecutionData) -> Result<Vec<u8>, Gov5B
 fn reconstruct_gov5_block(
     execution: &ExecutionData,
 ) -> Result<alloy_consensus::Block<TxEnvelope>, Gov5BlockError> {
-    let expected_hash = execution.block_hash();
-    if let Ok(direct) = execution.clone().try_into_block::<TxEnvelope>()
-        && validate_gov5_interop_header(&direct.header).is_ok()
-        && direct.header.hash_slow() == expected_hash
-    {
-        return Ok(direct);
-    }
+    reconstruct_gov5_block_raw(execution)?.try_map_transactions(|bytes| {
+        TxEnvelope::decode_2718_exact(bytes.as_ref())
+            .map_err(|error| Gov5BlockError::PayloadReconstruction(error.to_string()))
+    })
+}
 
+/// Reconstruct the authenticated header and raw transaction body with one trie
+/// calculation, including when the standard Ethereum header needs Gov5 fields.
+fn reconstruct_gov5_block_raw(
+    execution: &ExecutionData,
+) -> Result<alloy_consensus::Block<Bytes>, Gov5BlockError> {
+    let expected_hash = execution.block_hash();
     let extra_data = execution.payload.as_v1().extra_data.clone();
     let mut standard_execution = execution.clone();
     standard_execution.payload.set_extra_data(Bytes::new());
     let mut block = standard_execution
-        .try_into_block::<TxEnvelope>()
+        .into_block_raw()
         .map_err(|error| Gov5BlockError::PayloadReconstruction(error.to_string()))?;
-    block.header.ommers_hash = B256::ZERO;
     block.header.extra_data = extra_data;
+    // Match the old direct conversion before trying native header variants.
+    // Ethereum's converter rejects extraData longer than 32 bytes; only Gov5's
+    // reconstruction path permits its longer consensus metadata.
+    if block.header.extra_data.len() <= 32
+        && validate_gov5_interop_header(&block.header).is_ok()
+        && block.header.hash_slow() == expected_hash
+    {
+        return Ok(block);
+    }
+    block.header.ommers_hash = B256::ZERO;
 
     if let Some(native) = n42_consensus::remembered_gov5_native_header(&expected_hash) {
         let rewards = n42_consensus::gov5_withdrawals_to_rewards(
@@ -669,6 +742,62 @@ mod tests {
         assert_eq!(&recovered.header.extra_data[..4], b"N42H");
         assert_eq!(gov5_header_view(&recovered.header).unwrap(), 19);
         assert_eq!(recovered.header.extra_data.len(), 108);
+    }
+
+    #[test]
+    fn cancun_genesis_bootstraps_the_native_first_child() {
+        let parent = Gov5NativeHeader {
+            header: Header {
+                number: 0,
+                withdrawals_root: Some(alloy_consensus::constants::EMPTY_ROOT_HASH),
+                blob_gas_used: Some(0),
+                excess_blob_gas: Some(0),
+                parent_beacon_block_root: Some(B256::ZERO),
+                ..Default::default()
+            },
+            // Gov5's genesis builder does not stamp mobileRegistryRoot.
+            mobile_registry_root: None,
+        };
+        let parent_hash = remember_gov5_native_header(&parent.encode());
+        let block: Block<TxEnvelope> = Block {
+            header: Header {
+                parent_hash,
+                number: 1,
+                transactions_root: calculate_transaction_root::<TxEnvelope>(&[]),
+                withdrawals_root: Some(alloy_consensus::constants::EMPTY_ROOT_HASH),
+                blob_gas_used: Some(0),
+                excess_blob_gas: Some(0),
+                parent_beacon_block_root: Some(B256::ZERO),
+                ..Default::default()
+            },
+            body: BlockBody {
+                withdrawals: Some(Default::default()),
+                ..Default::default()
+            },
+        };
+        let execution = ExecutionData::from_block_unchecked(block.header.hash_slow(), &block);
+        let normalized = normalize_execution_payload_for_gov5_h2(
+            &execution,
+            1,
+            B256::repeat_byte(0x71),
+            keccak256([]),
+        )
+        .unwrap();
+        assert!(gov5_normalization_preserves_execution_input(
+            &execution,
+            &normalized
+        ));
+        let mut changed = normalized.clone();
+        changed.payload.as_v1_mut().timestamp += 1;
+        assert!(!gov5_normalization_preserves_execution_input(
+            &execution, &changed
+        ));
+        let decoded = decode_gov5_block_rlp(&encode_gov5_block_rlp(&normalized).unwrap()).unwrap();
+        assert_eq!(decoded.header.blob_gas_used, Some(0));
+        assert_eq!(decoded.header.excess_blob_gas, Some(0));
+        assert_eq!(decoded.header.parent_beacon_block_root, Some(B256::ZERO));
+        assert_eq!(decoded.header.withdrawals_root, Some(keccak256([])));
+        assert_eq!(decoded.mobile_registry_root, Some(B256::ZERO));
     }
 
     #[test]

@@ -49,4 +49,35 @@ mod tests {
                 .unwrap()
         );
     }
+
+    #[test]
+    fn matches_offline_audit_log_and_failure_fixture() {
+        use alloy_primitives::{Address, Bytes, Log};
+        // Also checked by scripts/test-h2-tps-audit.py against its independent
+        // RLP encoder (scripts/fixtures/gov5-receipt-audit.json).
+        let receipts: Vec<_> = [true, false, true]
+            .into_iter()
+            .enumerate()
+            .map(|(index, success)| EthereumReceipt {
+                tx_type: TxType::Eip1559,
+                success,
+                cumulative_gas_used: (index as u64 + 1) * 21_000,
+                logs: if index == 0 {
+                    vec![Log::new_unchecked(
+                        Address::repeat_byte(0x11),
+                        vec![B256::repeat_byte(0x22), B256::repeat_byte(0x33)],
+                        Bytes::from((0..80u8).collect::<Vec<_>>()),
+                    )]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect();
+        assert_eq!(
+            gov5_native_receipts_root(&receipts),
+            "0x91e7d4d76b7fe8687ce49e001e8438a779fbbc7b59b797b47f2dc7cd9ddadd9e"
+                .parse::<B256>()
+                .unwrap()
+        );
+    }
 }

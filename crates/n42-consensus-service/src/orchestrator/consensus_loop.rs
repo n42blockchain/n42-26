@@ -1549,6 +1549,7 @@ impl ConsensusService {
                                     timestamp: 0,
                                     execution_output: None,
                                     leader_ready_unix_ms: 0,
+                                    native_header_rlp: None,
                                 })
                                 .and_then(|broadcast| bincode::serialize(&broadcast).ok())
                                 .map(Into::into)

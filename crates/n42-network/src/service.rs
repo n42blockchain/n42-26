@@ -4438,6 +4438,55 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn reliable_send_reports_closed_channel_and_full_channel_timeout() {
+        let (closed_tx, closed_rx) = mpsc::channel(1);
+        drop(closed_rx);
+        assert!(matches!(
+            NetworkHandle::send_with_backpressure(
+                &closed_tx,
+                NetworkCommand::BroadcastTransaction(vec![1]),
+            )
+            .await,
+            Err(NetworkError::ChannelClosed)
+        ));
+
+        let (full_tx, _full_rx) = mpsc::channel(1);
+        full_tx
+            .try_send(NetworkCommand::BroadcastTransaction(vec![0]))
+            .unwrap();
+        assert!(matches!(
+            NetworkHandle::send_with_backpressure(
+                &full_tx,
+                NetworkCommand::BroadcastTransaction(vec![1]),
+            )
+            .await,
+            Err(NetworkError::ChannelFull)
+        ));
+    }
+
+    #[test]
+    fn register_peer_rejects_more_than_sixteen_addresses_without_enqueueing() {
+        let (handle, mut rx, _prx) = test_handle();
+        let addresses = (0..17)
+            .map(|port| {
+                format!("/ip4/127.0.0.1/udp/{}/quic-v1", 9400 + port)
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+
+        let error = handle
+            .register_peer(PeerId::random(), addresses, false)
+            .expect_err("an unbounded peer address list must be rejected");
+
+        assert!(matches!(error, NetworkError::Dial(message) if message.contains("max is 16")));
+        assert!(
+            rx.try_recv().is_err(),
+            "rejected peer must not reach the service"
+        );
+    }
+
     #[test]
     fn test_handle_validator_peer_map() {
         let (handle, _rx, _prx) = test_handle();
@@ -4608,6 +4657,21 @@ mod tests {
     }
 
     #[test]
+    fn recent_block_announcement_dedup_forgets_oldest_after_capacity() {
+        let mut dedup = RecentBlockAnnouncementDedup::default();
+        for index in 0_u32..RECENT_BLOCK_ANNOUNCEMENT_IDS_LIMIT as u32 {
+            assert!(!dedup.observe(&index.to_be_bytes()));
+        }
+        let oldest = 0_u32.to_be_bytes();
+        let newest = (RECENT_BLOCK_ANNOUNCEMENT_IDS_LIMIT as u32).to_be_bytes();
+
+        assert!(!dedup.observe(&newest));
+        assert!(!dedup.observe(&oldest), "evicted ids may be accepted again");
+        assert_eq!(dedup.order.len(), RECENT_BLOCK_ANNOUNCEMENT_IDS_LIMIT);
+        assert_eq!(dedup.ids.len(), RECENT_BLOCK_ANNOUNCEMENT_IDS_LIMIT);
+    }
+
+    #[test]
     fn gov5_block_fetch_uses_one_preferred_peer_per_attempt() {
         let preferred = PeerId::random();
         let advertised = PeerId::random();
@@ -4636,6 +4700,17 @@ mod tests {
     }
 
     #[test]
+    fn gov5_block_fetch_fanout_uses_last_connected_peer_as_final_fallback() {
+        let preferred = PeerId::random();
+        let last = PeerId::random();
+        let connected = vec![last];
+
+        let peers = gov5_block_fetch_fanout(preferred, Some(last), &[], &connected);
+
+        assert_eq!(peers, vec![last]);
+    }
+
+    #[test]
     fn stale_gov5_block_fetch_is_rearmed_after_transport_deadline() {
         let now = Instant::now();
         let stale_hash = B256::repeat_byte(0x41);
@@ -4658,6 +4733,46 @@ mod tests {
             vec![stale_hash],
             "only a hash at or beyond the transport deadline may bypass pending de-duplication"
         );
+    }
+
+    #[test]
+    fn stale_gov5_block_fetch_ignores_hashes_no_longer_pending() {
+        let now = Instant::now();
+        let pending_hash = B256::repeat_byte(0x51);
+        let completed_hash = B256::repeat_byte(0x52);
+        let peer = PeerId::random();
+        let pending = HashSet::from([pending_hash]);
+        let recent = HashMap::from([
+            (pending_hash, (now - GOV5_BLOCK_REQUEST_STALE_AFTER, peer)),
+            (completed_hash, (now - GOV5_BLOCK_REQUEST_STALE_AFTER, peer)),
+        ]);
+
+        assert_eq!(
+            stale_gov5_block_fetches(&pending, &recent, now),
+            vec![pending_hash]
+        );
+    }
+
+    #[test]
+    fn fulfilled_gov5_block_cache_prunes_expired_entries_when_full() {
+        let now = Instant::now();
+        let expired = B256::repeat_byte(0x61);
+        let retained = B256::repeat_byte(0x62);
+        let mut fulfilled = HashMap::with_capacity(MAX_RECENT_GOV5_BLOCK_REQUESTS);
+        fulfilled.insert(expired, now - GOV5_BLOCK_FULFILLED_RETENTION);
+        for index in 1_u64..MAX_RECENT_GOV5_BLOCK_REQUESTS as u64 {
+            let mut bytes = [0; 32];
+            bytes[24..].copy_from_slice(&index.to_be_bytes());
+            fulfilled.insert(B256::from(bytes), now - Duration::from_secs(1));
+        }
+        fulfilled.insert(retained, now);
+
+        remember_gov5_block_fulfilled(&mut fulfilled, B256::repeat_byte(0x63), now);
+
+        assert_eq!(fulfilled.len(), MAX_RECENT_GOV5_BLOCK_REQUESTS);
+        assert!(!fulfilled.contains_key(&expired));
+        assert!(fulfilled.contains_key(&retained));
+        assert!(fulfilled.contains_key(&B256::repeat_byte(0x63)));
     }
 
     #[test]

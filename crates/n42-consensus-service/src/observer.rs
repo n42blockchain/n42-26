@@ -1504,6 +1504,7 @@ impl ObserverOrchestrator {
                 timestamp: 0,
                 execution_output: None,
                 leader_ready_unix_ms: 0,
+                native_header_rlp: None,
             };
 
             // Import directly — no serialize/deserialize round-trip
@@ -2184,6 +2185,236 @@ mod tests {
         )
     }
 
+    #[test]
+    fn finalized_lineage_rejects_cycles_without_growing_the_path() {
+        let hash = numbered_hash(2);
+        let mut catchup = Gov5FinalizedCatchup::new(hash, 2, PeerId::random());
+        let entry = Gov5LineageEntry {
+            hash,
+            parent_hash: hash,
+            number: 2,
+        };
+        catchup.record_block(entry, B256::ZERO).unwrap();
+        assert!(catchup.record_block(entry, B256::ZERO).is_err());
+        assert_eq!(catchup.reverse_path.len(), 1);
+        assert!(catchup.pending.is_empty());
+        assert!(!catchup.discovery_complete);
+    }
+
+    #[test]
+    fn finalized_lineage_rejects_wrapping_block_numbers() {
+        let mut catchup = Gov5FinalizedCatchup::new(numbered_hash(1), 3, PeerId::random());
+        catchup
+            .record_block(
+                Gov5LineageEntry {
+                    hash: numbered_hash(1),
+                    parent_hash: numbered_hash(2),
+                    number: 0,
+                },
+                B256::ZERO,
+            )
+            .unwrap();
+        assert!(
+            catchup
+                .record_block(
+                    Gov5LineageEntry {
+                        hash: numbered_hash(2),
+                        parent_hash: B256::ZERO,
+                        number: u64::MAX,
+                    },
+                    B256::ZERO
+                )
+                .is_err()
+        );
+        assert_eq!(catchup.reverse_path.len(), 1);
+        assert!(!catchup.discovery_complete);
+    }
+
+    #[test]
+    fn finalized_lineage_stops_accepting_entries_after_reaching_the_head() {
+        let mut catchup = Gov5FinalizedCatchup::new(numbered_hash(1), 1, PeerId::random());
+        catchup
+            .record_block(
+                Gov5LineageEntry {
+                    hash: numbered_hash(1),
+                    parent_hash: B256::ZERO,
+                    number: 1,
+                },
+                B256::ZERO,
+            )
+            .unwrap();
+        catchup
+            .record_block(
+                Gov5LineageEntry {
+                    hash: numbered_hash(99),
+                    parent_hash: numbered_hash(98),
+                    number: 99,
+                },
+                B256::ZERO,
+            )
+            .unwrap();
+        assert!(catchup.discovery_complete);
+        assert_eq!(catchup.reverse_path.len(), 1);
+        assert_eq!(catchup.pending.len(), 1);
+        assert_eq!(catchup.pending.front().unwrap().hash, numbered_hash(1));
+        assert_eq!(catchup.pending_hashes, HashSet::from([numbered_hash(1)]));
+    }
+
+    #[test]
+    fn finalized_lineage_enforces_its_memory_bound() {
+        let count = MAX_GOV5_FINALIZED_LINEAGE as u64 + 1;
+        let mut catchup = Gov5FinalizedCatchup::new(numbered_hash(count), count, PeerId::random());
+        for number in (2..=count).rev() {
+            catchup
+                .record_block(
+                    Gov5LineageEntry {
+                        hash: numbered_hash(number),
+                        parent_hash: numbered_hash(number - 1),
+                        number,
+                    },
+                    B256::ZERO,
+                )
+                .unwrap();
+        }
+        assert!(
+            catchup
+                .record_block(
+                    Gov5LineageEntry {
+                        hash: numbered_hash(1),
+                        parent_hash: B256::ZERO,
+                        number: 1,
+                    },
+                    B256::ZERO
+                )
+                .is_err()
+        );
+        assert_eq!(catchup.reverse_path.len(), MAX_GOV5_FINALIZED_LINEAGE);
+        assert_eq!(catchup.seen.len(), MAX_GOV5_FINALIZED_LINEAGE);
+        assert!(!catchup.discovery_complete);
+    }
+
+    fn cache_live_block(observer: &mut ObserverOrchestrator, number: u64, executed: bool) {
+        let hash = numbered_hash(number);
+        let parent_hash = numbered_hash(number - 1);
+        observer.gov5_live_order.push_back(hash);
+        observer.gov5_live_blocks.insert(
+            hash,
+            PendingGov5LiveBlock {
+                execution_data: test_execution_data(parent_hash, hash, number),
+                parent_hash,
+                number,
+                executed,
+            },
+        );
+    }
+
+    #[test]
+    fn finalized_path_requires_complete_executed_contiguous_ancestry() {
+        let (mut observer, _commands, _priority) = test_observer();
+        cache_live_block(&mut observer, 2, true);
+        assert!(
+            observer
+                .gov5_finalized_path_to_head(numbered_hash(2))
+                .is_none()
+        );
+        cache_live_block(&mut observer, 1, false);
+        assert!(
+            observer
+                .gov5_finalized_path_to_head(numbered_hash(2))
+                .is_none()
+        );
+        observer
+            .gov5_live_blocks
+            .get_mut(&numbered_hash(1))
+            .unwrap()
+            .executed = true;
+        assert_eq!(
+            observer.gov5_finalized_path_to_head(numbered_hash(2)),
+            Some(vec![(1, numbered_hash(1)), (2, numbered_hash(2))])
+        );
+        observer
+            .gov5_live_blocks
+            .get_mut(&numbered_hash(1))
+            .unwrap()
+            .number = 7;
+        assert!(
+            observer
+                .gov5_finalized_path_to_head(numbered_hash(2))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn finalized_catchup_executes_and_promotes_the_authenticated_chain() {
+        let (mut observer, _commands, _priority) = test_observer();
+        let execution = Arc::new(CatchupExecutionLayer::default());
+        observer.el = execution.clone();
+        cache_live_block(&mut observer, 1, false);
+        cache_live_block(&mut observer, 2, false);
+        observer.record_gov5_finality(numbered_hash(2), 9, PeerId::random());
+        observer.advance_gov5_catchup_from_cache();
+        observer.drive_gov5_finalized_catchup().await;
+
+        assert_eq!(observer.head_block_hash, numbered_hash(2));
+        assert_eq!(observer.local_view, 9);
+        assert_eq!(observer.blocks_imported, 2);
+        assert_eq!(
+            *execution.fcu_heads.lock().unwrap(),
+            vec![numbered_hash(1), numbered_hash(2)]
+        );
+        assert!(observer.gov5_finalized_catchup.is_none());
+        assert!(observer.gov5_live_blocks.is_empty());
+        assert!(observer.gov5_finality.is_empty());
+    }
+
+    #[test]
+    fn block_fetch_deduplicates_requests_and_retries_after_the_deadline() {
+        let (mut observer, _commands, mut priority) = test_observer();
+        let peer = PeerId::random();
+        let hash = numbered_hash(7);
+        observer.request_gov5_block(peer, hash);
+        assert!(priority.try_recv().is_ok());
+        observer.request_gov5_block(peer, hash);
+        assert!(priority.try_recv().is_err());
+        observer
+            .gov5_fetch_requested_at
+            .insert(hash, Instant::now() - GOV5_FETCH_RETRY_INTERVAL);
+        observer.request_gov5_block(peer, hash);
+        assert!(priority.try_recv().is_ok());
+        assert_eq!(observer.gov5_fetch_requested_at.len(), 1);
+    }
+
+    #[test]
+    fn failed_enqueue_does_not_suppress_a_future_block_fetch() {
+        let (mut observer, commands, priority) = test_observer();
+        drop(commands);
+        drop(priority);
+        let hash = numbered_hash(7);
+        observer.request_gov5_block(PeerId::random(), hash);
+        assert!(!observer.gov5_fetch_requested_at.contains_key(&hash));
+    }
+
+    #[test]
+    fn block_fetch_window_rejects_new_hashes_without_evicting_inflight_requests() {
+        let (mut observer, _commands, mut priority) = test_observer();
+        for number in 1..=MAX_GOV5_LIVE_PENDING as u64 {
+            observer
+                .gov5_fetch_requested_at
+                .insert(numbered_hash(number), Instant::now());
+        }
+        observer.request_gov5_block(PeerId::random(), numbered_hash(999));
+        assert!(
+            !observer
+                .gov5_fetch_requested_at
+                .contains_key(&numbered_hash(999))
+        );
+        assert_eq!(
+            observer.gov5_fetch_requested_at.len(),
+            MAX_GOV5_LIVE_PENDING
+        );
+        assert!(priority.try_recv().is_err());
+    }
+
     /// A content-level rejection must retire the hash rather than rotate the
     /// fan-out. Against a live four-node gov5 chain the old behaviour re-derived
     /// the same verdict ~1,465 times per second and wrote 66 MB of identical
@@ -2272,5 +2503,63 @@ mod tests {
             candidates.is_empty(),
             "no candidate should remain when every peer refused"
         );
+    }
+
+    #[tokio::test]
+    async fn peer_disconnect_clears_sync_capability_verdict_and_connection_state() {
+        let (mut observer, _commands, _priority) = test_observer();
+        let peer = PeerId::random();
+
+        observer
+            .handle_network_event(NetworkEvent::PeerConnected(peer))
+            .await;
+        observer.sync_unsupported_peers.insert(peer);
+        observer
+            .handle_network_event(NetworkEvent::PeerDisconnected(peer))
+            .await;
+
+        assert!(!observer.connected_peers.contains(&peer));
+        assert!(
+            !observer.sync_unsupported_peers.contains(&peer),
+            "capability is connection-specific and must be re-probed after reconnect"
+        );
+
+        observer
+            .handle_network_event(NetworkEvent::PeerConnected(peer))
+            .await;
+        assert!(observer.connected_peers.contains(&peer));
+        assert!(!observer.sync_unsupported_peers.contains(&peer));
+    }
+
+    #[tokio::test]
+    async fn transient_sync_failure_releases_inflight_state_and_allows_retry() {
+        let (mut observer, mut commands, _priority) = test_observer();
+        let peer = PeerId::random();
+        observer.connected_peers.insert(peer);
+        observer.sync_in_flight = true;
+        observer.sync_started_at = Some(Instant::now());
+
+        observer
+            .handle_network_event(NetworkEvent::SyncRequestFailed {
+                peer,
+                error: "temporary transport error".to_owned(),
+                unsupported_protocol: false,
+            })
+            .await;
+
+        assert!(!observer.sync_in_flight);
+        assert!(observer.sync_started_at.is_none());
+        assert!(!observer.sync_unsupported_peers.contains(&peer));
+        assert_eq!(observer.initiate_sync(10, 40).await, Some(40));
+        assert!(observer.sync_in_flight);
+        assert!(observer.sync_started_at.is_some());
+        assert!(matches!(
+            commands.recv().await,
+            Some(NetworkCommand::RequestSync { peer: requested_peer, request })
+                if requested_peer == peer
+                    && request.from_view == 11
+                    && request.to_view == 40
+                    && request.local_committed_view == 10
+        ));
     }
 }
