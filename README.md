@@ -1,5 +1,7 @@
 # N42
 
+**Project roadmap:** [总体结构、三条路线与性能基线](docs/04-Product-Lines-and-Performance.md) — 自定义 H2/QMDB 链与互通、极限 TPS、ETH EL+CL 的目标和验证边界。
+
 A high-performance blockchain system combining **HotStuff-2** BFT consensus with **reth** EVM execution, featuring parallel mobile device verification for enhanced security.
 
 ## Architecture Overview

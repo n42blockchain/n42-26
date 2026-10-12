@@ -1,5 +1,7 @@
 # Crate Reference
 
+组件对应的产品路线见 [总体结构、三条路线与性能基线](04-Product-Lines-and-Performance.md)。
+
 ## Crate matrix
 
 | Crate | Role | Key exports / entrypoints | Depends on | Production status |

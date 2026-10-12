@@ -1,5 +1,7 @@
 # Workspace Map
 
+全仓路线入口：[总体结构、三条路线与性能基线](04-Product-Lines-and-Performance.md)。
+
 ## Top-level layout
 
 ```text

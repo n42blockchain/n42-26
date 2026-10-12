@@ -1,5 +1,7 @@
 # System Architecture
 
+产品路线与协议边界见 [总体结构、三条路线与性能基线](04-Product-Lines-and-Performance.md)；下文记录现有组件架构。
+
 ## Executive summary
 
 N42 is a high-performance blockchain node that combines:

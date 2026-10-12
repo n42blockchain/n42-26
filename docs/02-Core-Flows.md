@@ -1,5 +1,7 @@
 # Core Flows
 
+各运行流程的产品归属及验收边界见 [总体结构、三条路线与性能基线](04-Product-Lines-and-Performance.md)。
+
 ## 1. Node startup and recovery
 
 ```mermaid

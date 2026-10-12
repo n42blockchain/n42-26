@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+## 全仓路线入口
+
+开发前参阅 [总体结构、三条路线与性能基线](docs/04-Product-Lines-and-Performance.md)。区分自定义 H2/QMDB 兼容主线、极限 TPS 路线和 ETH EL+CL 路线；保留各自协议配置与验收口径。最高 TPS 引用须附原始报告及测量范围。
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Git 提交规则

@@ -1,5 +1,7 @@
 # N42-26 Development Log
 
+项目路线与当前性能口径见 [总体结构、三条路线与性能基线](docs/04-Product-Lines-and-Performance.md)。
+
 > Project: HotStuff-2 Consensus + reth Execution Layer Custom Blockchain
 > Repository: n42-26
 > Start Date: 2026-02-15
