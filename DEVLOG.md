@@ -2,6 +2,8 @@
 
 项目路线与当前性能口径见 [总体结构、三条路线与性能基线](docs/04-Product-Lines-and-Performance.md)。
 
+2026-10-12：新增 [两个硕士课题研究建议（HTML）](docs/research/two-master-theses-20261012.html)，聚焦故障域感知共享执行及 QMDB 跨实现持久化一致性。
+
 > Project: HotStuff-2 Consensus + reth Execution Layer Custom Blockchain
 > Repository: n42-26
 > Start Date: 2026-02-15

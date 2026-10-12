@@ -2,6 +2,8 @@
 
 **Project roadmap:** [总体结构、三条路线与性能基线](docs/04-Product-Lines-and-Performance.md) — ETH ECDSA 兼容的 H2/QMDB 自定义链与互通、Ed25519 极限 TPS、ETH EL+CL 的目标和验证边界。
 
+**Research agenda:** [两个硕士课题（HTML）](docs/research/two-master-theses-20261012.html) — 共享执行与原生调度、QMDB 跨实现一致性与崩溃恢复，含研究动向和实验计划。
+
 A high-performance blockchain system combining **HotStuff-2** BFT consensus with **reth** EVM execution, featuring parallel mobile device verification for enhanced security.
 
 ## Architecture Overview
