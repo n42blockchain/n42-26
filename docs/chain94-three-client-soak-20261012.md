@@ -133,3 +133,15 @@ Gov5 短测两笔失败已定位为块 13,652,396 中对同一 ERC20 合约的 `
 交易、回执和 trace 已保存于 `gov5/failed-smoke-transactions.json`，不包含私钥。
 
 一小时运行、节点退出/恢复、整队重启及混合委员会互通仍待完成。
+
+### Gov5 短测失败归因闭环
+
+在后续持续运行期间，对块 13,652,396 两笔失败调用补充真实交易执行前的
+`prestateTracer`。测试 ERC20 的余额 slot 为发送者地址，
+两发送者余额均为零，转出数量分别为 811 和 307；调用 trace 均为 `execution reverted`。
+与该合约的余额不足分支一致。负载生成器把 seed 提交完成标记为已 seeded，
+普通账号可能在自己的 token seed 实际执行前发送 token 转账。
+这是有效交易的合约回退；不属于执行根或节点一致性错误。
+公开 prestate／交易／receipt／call trace 已配对保存。
+
+正在进行的 Reth 稳定适配见 [两工程补全记录](reth-stable-completion-20261012.md)。
