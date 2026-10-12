@@ -230,6 +230,7 @@ mod tests {
 
     #[test]
     fn selfdestruct_wipe_shadows_older_slots_but_not_recreated_writes() {
+        let _test_guard = crate::test_execution_guard();
         let mv = MvMemory::new();
         let account = addr(1);
         let old_slot = U256::from(7);
@@ -273,6 +274,7 @@ mod tests {
 
     #[test]
     fn recreated_account_hides_unmaterialized_base_storage() {
+        let _test_guard = crate::test_execution_guard();
         let mv = MvMemory::new();
         let account = addr(2);
         let unread_base_slot = U256::from(99);

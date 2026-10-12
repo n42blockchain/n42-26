@@ -261,6 +261,15 @@ where
     })
 }
 
+// Execution tests mutate process-wide environment and share a global metrics
+// recorder with direct scheduler tests. Serialize their setup/run/snapshot so
+// unrelated manual aborts cannot enter another test's accounting window.
+#[cfg(test)]
+fn test_execution_guard() -> parking_lot::MutexGuard<'static, ()> {
+    static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    LOCK.lock()
+}
+
 #[cfg(test)]
 mod deferred_coinbase_tests {
     use super::*;
@@ -312,6 +321,7 @@ mod deferred_coinbase_tests {
 
     #[test]
     fn deferred_parallel_matches_sequential_state() {
+        let _test_guard = crate::test_execution_guard();
         let bene = addr(0xC01D_B175);
         let (db, txs) = workload(200);
         let cfg = CfgEnv::default();
@@ -344,6 +354,7 @@ mod deferred_coinbase_tests {
 
     #[test]
     fn hot_recipient_matches_sequential() {
+        let _test_guard = crate::test_execution_guard();
         // Every tx sends value to the SAME recipient (a hot account written by all
         // txs via NORMAL tx writes, not the coinbase reward). This probes whether
         // Block-STM handles a generic hot account correctly (vs the coinbase, which
@@ -399,6 +410,7 @@ mod deferred_coinbase_tests {
 
     #[test]
     fn contract_beneficiary_disables_deferral() {
+        let _test_guard = crate::test_execution_guard();
         // A contract beneficiary (non-empty code) must NOT be deferred: a tx could
         // CALL it and reduce its balance with nonce/code unchanged, which the
         // post-hoc `new - base` delta would saturate to 0. The plan returns
@@ -434,6 +446,7 @@ mod deferred_coinbase_tests {
 
     #[test]
     fn beneficiary_as_sender_disables_deferral() {
+        let _test_guard = crate::test_execution_guard();
         // Beneficiary is also tx 0's sender (nonce-changing ⇒ non-commutative): the
         // plan returns `Sequential` so the whole block falls back to sequential, and
         // every account (incl. the beneficiary) matches exactly.
@@ -457,6 +470,7 @@ mod deferred_coinbase_tests {
 
     #[test]
     fn constructor_selfdestruct_of_deferred_beneficiary_falls_back() {
+        let _test_guard = crate::test_execution_guard();
         let sender = addr(0x5151);
         let beneficiary = sender.create(0);
         let mut db = CacheDB::<EmptyDB>::default();
@@ -530,6 +544,7 @@ mod deferred_coinbase_tests {
 
     #[test]
     fn selfdestruct_classification_respects_eip6780() {
+        let _test_guard = crate::test_execution_guard();
         let sender = addr(0x6161);
         let contract = addr(0xC0DE);
         let recipient = addr(0xDEAD);
@@ -818,6 +833,7 @@ mod differential_tests {
     /// re-execute at least once per block, and the counters must say so.
     #[test]
     fn forced_conflict_increments_the_reexecution_counter() {
+        let _test_guard = crate::test_execution_guard();
         if rayon::current_num_threads() < 2 {
             eprintln!("skipping: Block-STM needs at least two lanes to conflict");
             return;
@@ -882,8 +898,8 @@ mod differential_tests {
             reexecutions >= 1,
             "a forced conflict must abort at least once"
         );
-        // Other tests may run concurrently and share the process-wide recorder,
-        // so the window can only be compared as a whole.
+        // The shared test guard keeps both the execution workers and direct
+        // scheduler tests quiescent outside this exact accounting window.
         assert_eq!(
             failures, reexecutions,
             "every validation failure is exactly one abort_and_reschedule"
@@ -919,6 +935,7 @@ mod differential_tests {
 
     #[test]
     fn differential_mixed_workloads_match_sequential() {
+        let _test_guard = crate::test_execution_guard();
         // Varied conflict densities: many seeds, varying tx counts and contract
         // counts (fewer contracts ⇒ hotter storage ⇒ more aborts).
         for seed in 0..8u64 {
@@ -928,6 +945,7 @@ mod differential_tests {
 
     #[test]
     fn differential_high_storage_contention() {
+        let _test_guard = crate::test_execution_guard();
         // A single shared counter ⇒ every contract call serializes on slot 0.
         // The final counter must equal the number of successful calls, identical
         // in parallel and sequential.
@@ -937,6 +955,7 @@ mod differential_tests {
 
     #[test]
     fn differential_storage_conflict_counter_is_exact() {
+        let _test_guard = crate::test_execution_guard();
         // Pin down the counter semantics: K=1, all-CALL block (no transfers) must
         // leave slot 0 == number of txs, matching sequential exactly.
         let n = 100u64;

@@ -121,6 +121,7 @@ mod tests {
 
     #[test]
     fn destroy_then_recreate_clears_old_slots_and_restores_live_account() {
+        let _test_guard = crate::test_execution_guard();
         let address = addr(1);
         let mut state = HashMap::new();
 

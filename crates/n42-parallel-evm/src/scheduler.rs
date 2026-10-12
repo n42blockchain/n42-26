@@ -255,6 +255,7 @@ mod tests {
 
     #[test]
     fn abort_and_reschedule_counts_one_reexecution_per_abort() {
+        let _test_guard = crate::test_execution_guard();
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let _guard = metrics::set_default_local_recorder(&recorder);
@@ -279,6 +280,7 @@ mod tests {
 
     #[test]
     fn abort_and_reschedule_only_decrements_currently_validated_txs_once() {
+        let _test_guard = crate::test_execution_guard();
         let scheduler = Scheduler::new(4);
 
         scheduler.status[0].store(STATUS_VALIDATED, Ordering::SeqCst);
@@ -297,6 +299,7 @@ mod tests {
 
     #[test]
     fn finish_validation_does_not_revive_a_tx_invalidated_by_lower_abort() {
+        let _test_guard = crate::test_execution_guard();
         let scheduler = Scheduler::new(4);
 
         scheduler.status[0].store(STATUS_VALIDATED, Ordering::SeqCst);
@@ -314,6 +317,7 @@ mod tests {
 
     #[test]
     fn validation_waits_for_predecessor_completion_not_just_claim() {
+        let _test_guard = crate::test_execution_guard();
         let scheduler = Scheduler::new(2);
         scheduler.exec_cursor.store(2, Ordering::SeqCst);
         scheduler.status[0].store(STATUS_EXECUTED, Ordering::SeqCst);
