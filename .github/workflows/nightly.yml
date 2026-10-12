@@ -24,8 +24,8 @@ jobs:
 
       - uses: actions/checkout@v7
         with:
-          repository: n42blockchain/reth
-          ref: 23316e3ff8adca8c3bd5085ff0565fcae019202a # chore/reth-upstream-20260804
+          repository: paradigmxyz/reth
+          ref: 3d592ece6de8c4559987416a544fc215fd6d6921 # v2.7.0
           path: reth
 
       - name: Apply N42 reth patches
