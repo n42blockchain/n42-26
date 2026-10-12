@@ -47,4 +47,13 @@ class SoakAuditTests(unittest.TestCase):
         with self.assertRaises(audit.h2.AuditError):audit.header_qc(block,7)
 
 
+    def test_rust_checkpoint_uses_most_significant_bit_first(self):
+        qc=dict(view=9,block_hash=self.block()['hash'],aggregate_signature=[17]*96,signers=[7,[0xaa]])
+        converted=audit.checkpoint_qc(dict(last_committed_qc=qc),7)
+        self.assertEqual(converted['signers'],[True,False,True,False,True,False,True])
+        for bits in [[6,[0xaa]],[7,[0xab]],[7,[]]]:
+            qc['signers']=bits
+            with self.assertRaises(audit.h2.AuditError):audit.checkpoint_qc(dict(last_committed_qc=qc),7)
+
+
 if __name__ == '__main__':unittest.main()

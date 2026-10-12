@@ -86,3 +86,30 @@ v1 无投票水位时关闭已恢复的 current view，避免假设该 view 未�
 Gov5 第二轮 smoke 的 IDC CommitQC 验证已通过，随后按 hash 查询回执报不存在。
 定位为 `jsonrpc.BlockNumberOrHash` 解码把 Hash 数组按值传给 helper，结果只写入副本、目标仍为零 hash。
 已改为指针写入并补字符串、对象参数一致性及非法输入回归；该修复的 Go 测试与第三轮 smoke 待完成。
+
+### 按既有兼容分支复用（用户补充后）
+
+历史 n42-rs `perf/erigon-borrow-20260828` @ `e7d5c0cf7` 记录了真正的七人混合委员会：
+Go 0–4、n42-26 为 5、n42-rs 为 6；151 个样本块中 25 个由 n42-rs 生产，多个 Go-led QC 包含 Rust 投票。
+原工作树 `/home/n42/src/n42/n42-rs-wt-erigon` 保留完整 chain94 header 扩展、Prague/EOF 规则、
+状态 bootstrap 与跨实现签名配置。当前 n42-rs 性能主线缺少其中部分兼容扩展；本次自定义链验收优先复用该现存兼容分支，
+不把性能路线的 Ed25519/帧改动引入 ECDSA 兼容链，不重写已有协议。原兼容源码保持只读，使用独立 target 构建。
+
+Gov5 第三轮 smoke：60.000651 秒，共同 QC 认证高度 13,652,387 → 13,652,422（+35），
+七个 leader 全覆盖，98 成功 / 2 失败交易回执及累计 gas/回执根跨七节点一致，QC 聚合签名验证通过。
+失败交易原因仍须单独核对；本轮 PASS 不代替一小时持续运行、故障与重启验收。
+
+优雅停止后的七节点均持久化到 13,652,426，head/root/QC 一致：
+`0x26fd2d7692b4d91a54f2e6982420c04b20241ff1f530ae2e08b2a41740615257`，
+root `0x23c4e35e5cb2c898a86a6ddaee660b213ebbf7f96b744c1d6ad71f5d25fc20bc`，
+view 73，locked/committed/R1/R2 水位均为 72。该公开 CommitQC 已用离线 verifier 核验。
+后续 Rust 和混合运行可从此 replay 派生、已认证的短程继续点开始，保持共同数据和委员会；不伪造历史 QC。
+
+旧 n42-rs 兼容分支 release 节点、init-snapshot、验证者构建通过；H2 共识/网络/执行与 QMDB 相关回归共 328 项通过。
+已从 Gov5 停止后的 13,652,426 导出新的配对工件；n42-26 和旧 n42-rs 均初始化成功，
+导入 6,191,631 accounts / 12,969 slots，QMDB leaf-form 重建根通过。
+本工程沿用 `scripts/chain94-fleet.py` 和原 `consensus.json`（slot 3000 ms、epoch 200、f=2）准备七节点，
+bootstrap 使用真实 v2 状态和验证过的 CommitQC；各节点可写数据目录独立。
+
+持续审计新增读取 n42-rs 原有公开 checkpoint 的适配，不改该工程协议或检查点布局；
+正确区分 Rust checkpoint 的 Msb0 bitmap 与 Gov5 wire 的 Lsb0 bitmap。工具离线回归现为 6 项通过。

@@ -52,6 +52,19 @@ def header_qc(block, count):
                 signers=[bool(packed[i//8] & (1 << (i % 8))) for i in range(count)])
 
 
+def checkpoint_qc(snapshot, count):
+    """Read the public commit certificate from the existing Rust checkpoint format."""
+    qc = snapshot['last_committed_qc']
+    bits = qc['signers']
+    if not isinstance(bits, list) or len(bits) != 2 or bits[0] != count:
+        raise h2.AuditError('checkpoint signer count differs')
+    packed = bytes(bits[1]); signature = bytes(qc['aggregate_signature'])
+    if len(packed) != (count+7)//8 or (count % 8 and packed[-1] & ((1 << (8-count % 8))-1)) or len(signature) != 96:
+        raise h2.AuditError('invalid checkpoint signature/bitmap')
+    return dict(view=qc['view'],blockHash=qc['block_hash'],signature='0x'+signature.hex(),
+                signers=[bool(packed[i//8] & (0x80 >> (i % 8))) for i in range(count)])
+
+
 def verify_qc(qc, trusted, binary):
     request = dict(trusted, expectedView=qc['view'], expectedBlockHash=qc['blockHash'], qc=qc)
     result = subprocess.run([str(binary)], input=json.dumps(request), text=True,
@@ -92,8 +105,8 @@ def main():
     if args.seconds <= 0 or args.interval <= 0 or args.min_blocks <= 0:
         parser.error('duration, interval and minimum blocks must be positive')
     cfg = json.loads(args.config.read_text()); nodes = cfg['nodes']; trusted = cfg['trusted']
-    if cfg.get('mode') not in ('gov5', 'n42-26'):
-        parser.error('supported RPC adapters: gov5, n42-26')
+    if cfg.get('mode') not in ('gov5', 'n42-26', 'n42-rs'):
+        parser.error('supported adapters: gov5, n42-26, n42-rs with validator checkpoints')
     if len(nodes) != 7 or len(trusted['validators']) != 7 or trusted['faultTolerance'] != 2:
         parser.error('this contract requires seven validators and f=2')
     args.output.mkdir(parents=True, exist_ok=False)
@@ -128,6 +141,19 @@ def main():
                             raise h2.AuditError('committed status/QC mismatch')
                         proofs.append(verify_qc(qc, trusted, verifier)); commits.append(h2.quantity(block['number']))
                     current = min([current]+commits)
+                elif cfg['mode'] == 'n42-rs':
+                    commits = []
+                    for node in nodes:
+                        snapshot = json.loads(Path(node['checkpoint']).read_text())
+                        qc = checkpoint_qc(snapshot, 7)
+                        proofs.append(verify_qc(qc, trusted, verifier))
+                        block = h2.read_committed_block(node['url'], qc['blockHash'])
+                        number = h2.quantity(block['number'])
+                        canonical = h2.rpc(node['url'], 'eth_getBlockByNumber', [hex(number), False])
+                        if canonical['hash'] != qc['blockHash']:
+                            raise h2.AuditError('validator checkpoint commit is not canonical')
+                        commits.append(number)
+                    current = min([current]+commits)
                 else:
                     latest = list(pool.map(lambda pair: h2.rpc(pair[0]['url'], 'eth_getBlockByNumber', [hex(pair[1]), False]), zip(nodes, heads)))
                     commits = []
@@ -154,9 +180,10 @@ def main():
                     if any(s != summaries[0] for s in summaries[1:]):
                         raise h2.AuditError('cross-node receipt mismatch')
                     for key in totals: totals[key] += summaries[0][key]
+                    failed = [{key:r.get(key) for key in ('transactionHash','gasUsed','from','to','contractAddress')} for r in receipts[0] if h2.quantity(r['status']) == 0]
                     producers.add(block['miner'].lower()); parent = block['hash']; last = number
                     last_progress = time.monotonic()
-                    log.write(json.dumps(dict(event='block',number=number,hash=parent,receipts=summaries[0],boundary_qc=proofs))+'\n')
+                    log.write(json.dumps(dict(event='block',number=number,hash=parent,receipts=summaries[0],failed_receipts=failed,boundary_qc=proofs))+'\n')
                 if time.monotonic()-last_progress > args.stall_seconds:
                     raise h2.AuditError('committed progress stalled')
                 sample=dict(event='sample',time=time.time(),heads=heads,common=last,resources=resources(cfg.get('pids',[])))
