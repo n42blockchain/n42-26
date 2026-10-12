@@ -23,35 +23,22 @@ GIT_COMMITTER_NAME="Nyxen" GIT_COMMITTER_EMAIL="40690755+MiraWells@users.noreply
 - 规模：100-500 IDC 节点，每节点约 10,000 手机；性能目标：8 秒 slot
 - Rust edition 2024，最低 Rust 1.97；开发与 CI 由 `rust-toolchain.toml` 固定为 Rust 1.97.1
 
-### ⚠️ reth fork 基线（务必对齐，否则会触发依赖降级）
+### Reth 稳定版基线
 
-**当前唯一正确基线：`../reth` @ `chore/reth-upstream-20260804`（reth 2.4.1，包含
-paradigmxyz/main `92855d264`，merge commit `82debcaff`）**，对应 workspace pin
-**revm 42.0.1 / alloy-evm 0.38.0 / reth-primitives-traits 0.6.0 / Alloy 2.3.0**。动手前先
-`git -C ../reth log -1 --oneline` 确认 reth 在 `82debcaff`（或其后代）。jit/revmc 默认关闭
-（Windows 无 LLVM 22；Linux 要 JIT 用 `--features jit`）。**CI 已对齐**：所有 workflow
-固定 reth 为该分支的 `23316e3ff8adca8c3bd5085ff0565fcae019202a`，构建前通过
-`bash scripts/apply-reth-patches.sh ../reth` 应用仓库内的交易根缓存 API 补丁；
-Docker 构建也应用同一补丁（见 `.github/workflows/*.yml` 和 `README.md`）。
-适配要点：reth 2.4.1 删除 changed-path 跟踪并重构 sparse-trie proof target；N42 的
-payload-cache/state-root 定制必须保留 `HashedPostState` 路径。20260804 合并起
-`BlobStore::insert` 收 `PooledBlobSidecar`（`BlobTransactionSidecarVariant` 加
-`.into()` 即以 full availability 包装）。
+当前基线为官方 **v2.7.0**，上游 commit
+`3d592ece6de8c4559987416a544fc215fd6d6921`，加六个 N42 补丁后为
+`3452d7d0217095446b0f2632a283e314951da273`。版本、补丁序列与直接依赖以
+[`reth-source.lock`](reth-source.lock) 为准；CI 检出官方源并应用 `patches/reth-*.patch`。
 
-**🔴 红线：切勿为了让旧 reth 编过而降级 `Cargo.toml` 的 revm/alloy/reth-* 版本。** 那会推翻
-deps upgrade 工作（参见 devlog-60 维护者说明），也正是历史上 CI 误用旧 ref（`n42-v2-upgrade`）
-把 reth 2.3→2.2 降级、导致 Lint+E2E 全红的根因。
+本机原 `../reth` 是包含未提交改动的旧 checkout，不可直接作为当前构建源或覆盖修改。
+已适配源位于 `.artifacts/reth-upgrade/reth-worktree`；使用独立 workspace，
+将其中 Cargo.toml 的 Reth path 依赖指向该源，再运行
+`bash scripts/check-reth-source.sh <reth-source>` 验证。
 
-历史基线（**已弃用，不要再用**，仅留作参考）：
-
-| reth 分支（弃用） | base | 旧 pin |
-|-----------|------|-------------|
-| `n42-v2-upgrade`（最旧） | reth v2.2.0 | revm 38 / alloy-evm 0.34 / reth-primitives-traits 0.3.1 |
-| `chore/merge-upstream-main` | upstream main @04c7f29f | revm 40.0.3 / alloy-evm 0.36.0 / reth-primitives-traits 0.4.0 |
-| `chore/merge-upstream-fc2cc1e` | reth 2.3 @449ecfdce | revm 40.0.3 / alloy-evm 0.36.0 / reth-primitives-traits 0.4.1 |
-| `chore/merge-upstream-paradigmxyz-latest` | reth 2.3 @0655e7a9a | revm 41.0.0 / alloy-evm 0.37.0 / reth-primitives-traits 0.5.0 |
-| `chore/reth-upstream-20260714` | reth 2.3/2.4.0 @ccce351451 | revm 41.0.0 / alloy-evm 0.37.1 / reth-primitives-traits 0.5.2 |
-| `chore/reth-upstream-20260719` | reth 2.4.1 @8e84768246 | revm 41.0.0 / alloy-evm 0.37.1 / reth-primitives-traits 0.5.2 |
+直接依赖为 revm 43.0.3、alloy-evm 0.39.0、reth-primitives-traits 0.8.2、
+Alloy 2.5.0 与 alloy-primitives 1.7.3。不要为旧源码降低这些依赖。
+QMDB bin 状态读取、交易根缓存、导入批处理及 Engine 状态 provider 补丁均须保留；
+迁移记录见 [Reth 2.7.0 适配](docs/devlog-177-reth-27-upgrade-20261003.md)。
 
 ## 常用命令
 
