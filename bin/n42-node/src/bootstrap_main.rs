@@ -36,8 +36,7 @@ struct Args {
     #[arg(long, conflicts_with = "gov5_hotstuff_state_hex")]
     consensus_state: Option<PathBuf>,
     /// Hex value stored at Gov5 HotStuffState["state"]:
-    /// view(8 LE) + consecutiveTimeouts(4 LE) + lockedQC_len(4 LE) +
-    /// lockedQC(SSZ) + committedQC(SSZ).
+    /// v1 view/timeouts/QCs or N42HSSv2 with durable R1/R2 vote watermarks.
     #[arg(long, conflicts_with = "consensus_state")]
     gov5_hotstuff_state_hex: Option<String>,
     #[arg(long, required_unless_present = "consensus_state_out")]
@@ -94,22 +93,50 @@ fn snapshot_from_gov5_state(
     let encoded_hex = encoded_hex.strip_prefix("0x").unwrap_or(encoded_hex);
     let bytes =
         hex::decode(encoded_hex).map_err(|error| eyre::eyre!("invalid Gov5 state hex: {error}"))?;
-    if bytes.len() < 16 {
-        return Err(eyre::eyre!("Gov5 HotStuff state is shorter than 16 bytes"));
-    }
-    let current_view = read_u64_le(&bytes, 0, "view")?;
-    let consecutive_timeouts = read_u32_le(&bytes, 8, "consecutive timeout count")?;
-    let locked_len = usize::try_from(read_u32_le(&bytes, 12, "locked QC length")?)?;
-    let locked_end = 16usize
+    let is_v2 = bytes.starts_with(b"N42HSSv2");
+    let header = if is_v2 { 100 } else { 12 };
+    let view_offset = if is_v2 { 8 } else { 0 };
+    let current_view = read_u64_le(&bytes, view_offset, "view")?;
+    let consecutive_timeouts = read_u32_le(&bytes, view_offset + 8, "consecutive timeout count")?;
+    let locked_len = usize::try_from(read_u32_le(&bytes, header, "locked QC length")?)?;
+    let locked_start = header + 4;
+    let locked_end = locked_start
         .checked_add(locked_len)
         .ok_or_else(|| eyre::eyre!("Gov5 locked QC length overflows"))?;
     let locked_bytes = bytes
-        .get(16..locked_end)
+        .get(locked_start..locked_end)
         .ok_or_else(|| eyre::eyre!("Gov5 HotStuff state has a truncated locked QC"))?;
-    let committed_bytes = bytes
-        .get(locked_end..)
-        .filter(|bytes| !bytes.is_empty())
-        .ok_or_else(|| eyre::eyre!("Gov5 HotStuff state has no committed QC"))?;
+    let committed_bytes = if is_v2 {
+        let committed_len =
+            usize::try_from(read_u32_le(&bytes, locked_end, "committed QC length")?)?;
+        let start = locked_end
+            .checked_add(4)
+            .ok_or_else(|| eyre::eyre!("Gov5 QC offset overflows"))?;
+        let end = start
+            .checked_add(committed_len)
+            .ok_or_else(|| eyre::eyre!("Gov5 committed QC length overflows"))?;
+        if end != bytes.len() {
+            return Err(eyre::eyre!(
+                "Gov5 v2 state is truncated or has trailing bytes"
+            ));
+        }
+        bytes.get(start..end).filter(|data| !data.is_empty())
+    } else {
+        bytes.get(locked_end..).filter(|data| !data.is_empty())
+    }
+    .ok_or_else(|| eyre::eyre!("Gov5 HotStuff state has no committed QC"))?;
+    // v1 has no durable vote clocks; close its recovered current view rather
+    // than assuming the validator never voted after the last commit.
+    let last_voted_view = if is_v2 {
+        read_u64_le(&bytes, 20, "last voted view")?
+    } else {
+        current_view
+    };
+    let last_commit_voted_view = if is_v2 {
+        read_u64_le(&bytes, 60, "last commit voted view")?
+    } else {
+        current_view
+    };
     let locked_qc = quorum_certificate_from_h2(
         decode_h2_qc(locked_bytes)
             .map_err(|error| eyre::eyre!("invalid Gov5 locked QC: {error}"))?,
@@ -135,11 +162,9 @@ fn snapshot_from_gov5_state(
         scheduled_epoch_transition: None,
         authorized_verifiers: Vec::new(),
         committed_block_count,
-        // This validator was absent while Gov5 formed the checkpoint. Setting
-        // both clocks to the last committed view prevents any historical vote
-        // after bootstrap without claiming it signed one.
-        last_voted_view: last_committed_qc.view,
-        last_commit_voted_view: last_committed_qc.view,
+        // Preserve both durable vote watermarks across cross-client recovery.
+        last_voted_view: last_voted_view.max(last_committed_qc.view),
+        last_commit_voted_view: last_commit_voted_view.max(last_committed_qc.view),
         current_epoch_validators: Some((0, validators.to_vec(), fault_tolerance)),
         execution_validated_head_view: last_committed_qc.view,
         execution_validated_head_hash: last_committed_qc.block_hash,
@@ -380,4 +405,68 @@ fn main() -> eyre::Result<()> {
         bundle.payload.checkpoint_block_hash
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod gov5_recovery_tests {
+    use super::*;
+    fn qc() -> Vec<u8> {
+        let key = n42_primitives::BlsSecretKey::from_bytes(&[1; 32]).unwrap();
+        let signature = key.sign_h2_v4(b"fixture").to_bytes();
+        let mut data = 3u64.to_le_bytes().to_vec();
+        for field in [&[7u8; 32][..], &signature[..], &[1u8, 0, 1][..]] {
+            data.extend_from_slice(&(field.len() as u32).to_le_bytes());
+            data.extend_from_slice(field);
+        }
+        data
+    }
+    fn state(v2: bool) -> Vec<u8> {
+        let qc = qc();
+        let mut data = Vec::new();
+        if v2 {
+            data.extend_from_slice(b"N42HSSv2");
+        }
+        data.extend_from_slice(&9u64.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        if v2 {
+            data.extend_from_slice(&8u64.to_le_bytes());
+            data.extend_from_slice(&[7; 32]);
+            data.extend_from_slice(&7u64.to_le_bytes());
+            data.extend_from_slice(&[7; 32]);
+        }
+        data.extend_from_slice(&(qc.len() as u32).to_le_bytes());
+        data.extend_from_slice(&qc);
+        if v2 {
+            data.extend_from_slice(&(qc.len() as u32).to_le_bytes());
+        }
+        data.extend_from_slice(&qc);
+        data
+    }
+    #[test]
+    fn preserves_v2_vote_clocks_above_committed_qc() {
+        let snapshot = snapshot_from_gov5_state(&hex::encode(state(true)), 42, &[], 0).unwrap();
+        assert_eq!(snapshot.current_view, 9);
+        assert_eq!(snapshot.last_committed_qc.view, 3);
+        assert_eq!(snapshot.last_voted_view, 8);
+        assert_eq!(snapshot.last_commit_voted_view, 7);
+    }
+    #[test]
+    fn v1_closes_the_unknown_outstanding_vote_view() {
+        let snapshot = snapshot_from_gov5_state(&hex::encode(state(false)), 42, &[], 0).unwrap();
+        assert_eq!(snapshot.last_voted_view, 9);
+        assert_eq!(snapshot.last_commit_voted_view, 9);
+    }
+    #[test]
+    fn v2_truncation_and_trailing_data_fail_closed() {
+        let data = state(true);
+        for len in 0..data.len() {
+            assert!(
+                snapshot_from_gov5_state(&hex::encode(&data[..len]), 42, &[], 0).is_err(),
+                "len={len}"
+            );
+        }
+        let mut trailing = data;
+        trailing.push(0);
+        assert!(snapshot_from_gov5_state(&hex::encode(trailing), 42, &[], 0).is_err());
+    }
 }

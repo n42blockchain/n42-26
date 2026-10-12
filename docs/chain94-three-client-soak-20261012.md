@@ -73,3 +73,16 @@
 再核对 QC 目标为本地 canonical ancestor。共同比较上限取所有节点 QC 已认证高度的最小值，
 逐块检查连续 parent 链与根/回执；QC 作为窗口边界的祖先链认证证据记录，不把移动委员会字段伪装为 IDC QC。
 新增 canonical QC 解码、位序、长度、bitmap padding、尾随字节回归；离线 5 项通过。
+
+### 快照恢复与 RPC 后续修复
+
+本工程初始化成功：replay 输出头 13,652,362，6,191,590 accounts / 12,744 slots；
+n42-rs 共识回归 286 项通过，验证者 release 构建通过，legacy 配置修复 `429e2cb1a` 已推送。
+
+本工程 bootstrap 原只支持 Gov5 v1 快照；已增加 `N42HSSv2` 解析并保留 R1/R2 持久化投票水位。
+v1 无投票水位时关闭已恢复的 current view，避免假设该 view 未投票。长度和尾随数据严格校验。
+对应 release 回归 3 项通过，bootstrap release 重建通过。
+
+Gov5 第二轮 smoke 的 IDC CommitQC 验证已通过，随后按 hash 查询回执报不存在。
+定位为 `jsonrpc.BlockNumberOrHash` 解码把 Hash 数组按值传给 helper，结果只写入副本、目标仍为零 hash。
+已改为指针写入并补字符串、对象参数一致性及非法输入回归；该修复的 Go 测试与第三轮 smoke 待完成。
