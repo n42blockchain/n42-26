@@ -80,6 +80,33 @@ def verify_qc(qc, trusted, binary):
     return value
 
 
+def node_commit(node, mode, head, trusted, verifier):
+    """Authenticate this adapter's certificate and bind it to a canonical block."""
+    if mode == 'n42-26':
+        status = h2.rpc(node['url'], 'n42_consensusStatus', [])
+        if not status.get('hasCommittedQc') or status.get('validatorCount') != 7:
+            raise h2.AuditError('missing committed QC or incorrect validator count')
+        qc = status['commitQc']
+        if qc['blockHash'] != status['latestCommittedBlockHash'] or qc['view'] != status['latestCommittedView']:
+            raise h2.AuditError('committed status/QC mismatch')
+    elif mode == 'n42-rs':
+        qc = checkpoint_qc(json.loads(Path(node['checkpoint']).read_text()), 7)
+    elif mode == 'gov5':
+        header = h2.rpc(node['url'], 'eth_getBlockByNumber', [hex(head), False])
+        qc = header_qc(header, 7)
+    else:
+        raise h2.AuditError('unknown node commit adapter')
+    proof = verify_qc(qc, trusted, verifier)
+    target = h2.read_committed_block(node['url'], qc['blockHash'])
+    number = h2.quantity(target['number'])
+    canonical = h2.rpc(node['url'], 'eth_getBlockByNumber', [hex(number), False])
+    # RPC/checkpoint commits can advance after the sampled head; only an
+    # embedded certificate is constrained by the exact header carrying it.
+    if target['hash'] != qc['blockHash'] or canonical['hash'] != qc['blockHash'] or (mode == 'gov5' and number > head):
+        raise h2.AuditError('commit QC target is not an available canonical ancestor')
+    return number, proof
+
+
 def resources(pids):
     rows = []
     for pid in pids:
@@ -105,8 +132,10 @@ def main():
     if args.seconds <= 0 or args.interval <= 0 or args.min_blocks <= 0:
         parser.error('duration, interval and minimum blocks must be positive')
     cfg = json.loads(args.config.read_text()); nodes = cfg['nodes']; trusted = cfg['trusted']
-    if cfg.get('mode') not in ('gov5', 'n42-26', 'n42-rs'):
-        parser.error('supported adapters: gov5, n42-26, n42-rs with validator checkpoints')
+    if cfg.get('mode') not in ('gov5', 'n42-26', 'n42-rs', 'mixed'):
+        parser.error('supported adapters: gov5, n42-26, n42-rs, mixed with per-node adapters')
+    if cfg['mode'] == 'mixed' and any(n.get('mode') not in ('gov5', 'n42-26', 'n42-rs') for n in nodes):
+        parser.error('mixed nodes must each specify a supported adapter')
     if len(nodes) != 7 or len(trusted['validators']) != 7 or trusted['faultTolerance'] != 2:
         parser.error('this contract requires seven validators and f=2')
     args.output.mkdir(parents=True, exist_ok=False)
@@ -128,45 +157,12 @@ def main():
             while time.monotonic() < deadline:
                 heads = [h2.quantity(h) for h in parallel('eth_blockNumber', [])]
                 current = min(heads)
-                proofs = []
-                if cfg['mode'] == 'n42-26':
-                    statuses = parallel('n42_consensusStatus', [])
-                    commits = []
-                    for node, status in zip(nodes, statuses):
-                        if not status.get('hasCommittedQc') or status.get('validatorCount') != 7:
-                            raise h2.AuditError('missing committed QC or incorrect validator count')
-                        block = h2.read_committed_block(node['url'], status['latestCommittedBlockHash'])
-                        qc = status['commitQc']
-                        if qc['blockHash'] != block['hash'] or qc['view'] != status['latestCommittedView']:
-                            raise h2.AuditError('committed status/QC mismatch')
-                        proofs.append(verify_qc(qc, trusted, verifier)); commits.append(h2.quantity(block['number']))
-                    current = min([current]+commits)
-                elif cfg['mode'] == 'n42-rs':
-                    commits = []
-                    for node in nodes:
-                        snapshot = json.loads(Path(node['checkpoint']).read_text())
-                        qc = checkpoint_qc(snapshot, 7)
-                        proofs.append(verify_qc(qc, trusted, verifier))
-                        block = h2.read_committed_block(node['url'], qc['blockHash'])
-                        number = h2.quantity(block['number'])
-                        canonical = h2.rpc(node['url'], 'eth_getBlockByNumber', [hex(number), False])
-                        if canonical['hash'] != qc['blockHash']:
-                            raise h2.AuditError('validator checkpoint commit is not canonical')
-                        commits.append(number)
-                    current = min([current]+commits)
-                else:
-                    latest = list(pool.map(lambda pair: h2.rpc(pair[0]['url'], 'eth_getBlockByNumber', [hex(pair[1]), False]), zip(nodes, heads)))
-                    commits = []
-                    for node, header in zip(nodes, latest):
-                        qc = header_qc(header, 7)
-                        proof = verify_qc(qc, trusted, verifier)
-                        target = h2.read_committed_block(node['url'], qc['blockHash'])
-                        number = h2.quantity(target['number'])
-                        canonical = h2.rpc(node['url'], 'eth_getBlockByNumber', [hex(number), False])
-                        if canonical['hash'] != qc['blockHash'] or number > h2.quantity(header['number']):
-                            raise h2.AuditError('embedded QC target is not an available canonical ancestor')
-                        proofs.append(proof);commits.append(number)
-                    current = min([current]+commits)
+                commits = list(pool.map(
+                    lambda pair: node_commit(pair[0], pair[0]['mode'] if cfg['mode'] == 'mixed' else cfg['mode'], pair[1], trusted, verifier),
+                    zip(nodes, heads),
+                ))
+                proofs = [proof for _, proof in commits]
+                current = min([current]+[number for number, _ in commits])
                 if first is None:
                     first = last = current
                     parent = matching_blocks(parallel('eth_getBlockByNumber', [hex(current), False]), current)['hash']

@@ -2,6 +2,7 @@ import copy
 import importlib.util
 from pathlib import Path
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('soak', Path(__file__).with_name('audit-chain94-soak.py'))
 audit = importlib.util.module_from_spec(spec)
@@ -27,6 +28,27 @@ class SoakAuditTests(unittest.TestCase):
         with self.assertRaises(audit.h2.AuditError):audit.matching_blocks([block],42)
         block=self.block();block['transactions']=['0x'+'44'*32]*2
         with self.assertRaises(audit.h2.AuditError):audit.matching_blocks([block],42)
+
+    def test_node_adapter_binds_n42_status_to_canonical_qc(self):
+        block=self.block();qc=dict(blockHash=block['hash'],view=9)
+        status=dict(hasCommittedQc=True,validatorCount=7,commitQc=qc,latestCommittedBlockHash=block['hash'],latestCommittedView=9)
+        with mock.patch.object(audit.h2,'rpc',side_effect=[status,block]), mock.patch.object(audit.h2,'read_committed_block',return_value=block), mock.patch.object(audit,'verify_qc',return_value={'verified':True}):
+            self.assertEqual(audit.node_commit({'url':'local'},'n42-26',42,{},Path('unused')),(42,{'verified':True}))
+        wrong=copy.deepcopy(block);wrong['hash']='0x'+'22'*32
+        with mock.patch.object(audit.h2,'rpc',side_effect=[status,wrong]), mock.patch.object(audit.h2,'read_committed_block',return_value=block), mock.patch.object(audit,'verify_qc',return_value={'verified':True}):
+            with self.assertRaises(audit.h2.AuditError):audit.node_commit({'url':'local'},'n42-26',42,{},Path('unused'))
+
+    def test_rpc_commit_may_advance_after_the_sampled_head(self):
+        block=self.block();qc=dict(blockHash=block['hash'],view=9)
+        status=dict(hasCommittedQc=True,validatorCount=7,commitQc=qc,latestCommittedBlockHash=block['hash'],latestCommittedView=9)
+        with mock.patch.object(audit.h2,'rpc',side_effect=[status,block]), mock.patch.object(audit.h2,'read_committed_block',return_value=block), mock.patch.object(audit,'verify_qc',return_value={'verified':True}):
+            self.assertEqual(audit.node_commit({'url':'local'},'n42-26',41,{},Path('unused'))[0],42)
+
+    def test_adapter_rejects_unknown_kind_and_qc_above_head(self):
+        with self.assertRaises(audit.h2.AuditError):audit.node_commit({'url':'local'},'unknown',42,{},Path('unused'))
+        header=self.qc_block();target=self.block()
+        with mock.patch.object(audit.h2,'rpc',side_effect=[header,target]), mock.patch.object(audit.h2,'read_committed_block',return_value=target), mock.patch.object(audit,'verify_qc',return_value={'verified':True}):
+            with self.assertRaises(audit.h2.AuditError):audit.node_commit({'url':'local'},'gov5',41,{},Path('unused'))
 
     def qc_block(self, packed=0x55):
         def field(data):return len(data).to_bytes(4,'little')+data
