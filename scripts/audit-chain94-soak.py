@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Read-only continuous chain94 audit; never starts, stops or resets nodes."""
+import argparse
+import concurrent.futures
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import time
+
+spec = importlib.util.spec_from_file_location('h2_audit', Path(__file__).with_name('h2-tps-audit.py'))
+h2 = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(h2)
+FIELDS = ('hash', 'parentHash', 'stateRoot', 'receiptsRoot', 'transactionsRoot', 'gasUsed', 'transactions')
+
+
+def matching_blocks(blocks, number, parent=None):
+    if not blocks or any(not isinstance(b, dict) or h2.quantity(b.get('number')) != number for b in blocks):
+        raise h2.AuditError('missing or wrongly numbered block')
+    for block in blocks:
+        h2.block_summary(block)
+    for field in FIELDS:
+        if any(b.get(field) != blocks[0].get(field) for b in blocks[1:]):
+            raise h2.AuditError(f'cross-node mismatch at {number}: {field}')
+    if parent is not None and blocks[0]['parentHash'] != parent:
+        raise h2.AuditError(f'noncontinuous parent at {number}')
+    return blocks[0]
+
+
+def evidence_qc(evidence, block, count):
+    if not isinstance(evidence, dict) or evidence.get('blockHash') != block['hash']:
+        raise h2.AuditError('consensus evidence missing or bound to another block')
+    if h2.quantity(evidence['signerCount']) != count:
+        raise h2.AuditError('consensus evidence roster size differs')
+    packed = h2.data_bytes(evidence['signers'])
+    if len(packed) != (count + 7)//8 or (count % 8 and packed[-1] >> (count % 8)):
+        raise h2.AuditError('noncanonical consensus signer bitmap')
+    return dict(view=h2.quantity(evidence['view']), blockHash=block['hash'],
+                signature=evidence['aggregateSignature'],
+                signers=[bool(packed[i//8] & (1 << (i % 8))) for i in range(count)])
+
+
+def verify_qc(qc, trusted, binary):
+    request = dict(trusted, expectedView=qc['view'], expectedBlockHash=qc['blockHash'], qc=qc)
+    result = subprocess.run([str(binary)], input=json.dumps(request), text=True,
+                            capture_output=True, timeout=15)
+    value = json.loads(result.stdout)
+    if (result.returncode or value.get('verified') is not True
+            or value.get('profile') != trusted['profile']
+            or value.get('view') != qc['view'] or value.get('blockHash') != qc['blockHash']
+            or value.get('validatorCount') != len(trusted['validators'])
+            or value.get('faultTolerance') != trusted['faultTolerance']
+            or value.get('signerCount', 0) < len(trusted['validators'])-trusted['faultTolerance']):
+        raise h2.AuditError('commit QC verification failed')
+    return value
+
+
+def resources(pids):
+    rows = []
+    for pid in pids:
+        base = Path('/proc')/str(pid)
+        status = (base/'status').read_text()
+        row = dict(pid=pid, fds=len(list((base/'fd').iterdir())))
+        for line in status.splitlines():
+            if line.startswith(('VmRSS:', 'Threads:')):
+                key, value = line.split(':', 1); row[key] = int(value.split()[0])
+        rows.append(row)
+    return rows
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config', type=Path, required=True)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--seconds', type=int, default=3600)
+    parser.add_argument('--min-blocks', type=int, default=1000)
+    parser.add_argument('--interval', type=float, default=5)
+    parser.add_argument('--stall-seconds', type=int, default=180)
+    args = parser.parse_args()
+    if args.seconds <= 0 or args.interval <= 0 or args.min_blocks <= 0:
+        parser.error('duration, interval and minimum blocks must be positive')
+    cfg = json.loads(args.config.read_text()); nodes = cfg['nodes']; trusted = cfg['trusted']
+    if cfg.get('mode') not in ('gov5', 'n42-26'):
+        parser.error('supported RPC adapters: gov5, n42-26')
+    if len(nodes) != 7 or len(trusted['validators']) != 7 or trusted['faultTolerance'] != 2:
+        parser.error('this contract requires seven validators and f=2')
+    args.output.mkdir(parents=True, exist_ok=False)
+    os.environ['N42_KECCAK_BIN'] = str(Path(cfg['keccak']).resolve())
+    verifier = Path(cfg['verifier']).resolve()
+    start = time.monotonic(); deadline = start+args.seconds; last_progress = start
+    first = last = parent = None; producers = set(); totals = dict(successful_transactions=0, failed_transactions=0)
+    report = dict(status='RUNNING', scope='committed chain/receipt/QC consistency; durability requires restart verification')
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=7) as pool, (args.output/'samples.jsonl').open('x') as log:
+            def parallel(method, params):
+                return list(pool.map(lambda node: h2.rpc(node['url'], method, params), nodes))
+            identities = parallel('eth_chainId', [])
+            if any(h2.quantity(i) != trusted['chainId'] for i in identities):
+                raise h2.AuditError('chain ID mismatch')
+            genesis = parallel('eth_getBlockByNumber', ['0x0', False])
+            if any(b['hash'] != trusted['genesisHash'] for b in genesis):
+                raise h2.AuditError('genesis identity mismatch')
+            while time.monotonic() < deadline:
+                heads = [h2.quantity(h) for h in parallel('eth_blockNumber', [])]
+                current = min(heads)
+                proofs = []
+                if cfg['mode'] == 'n42-26':
+                    statuses = parallel('n42_consensusStatus', [])
+                    commits = []
+                    for node, status in zip(nodes, statuses):
+                        if not status.get('hasCommittedQc') or status.get('validatorCount') != 7:
+                            raise h2.AuditError('missing committed QC or incorrect validator count')
+                        block = h2.read_committed_block(node['url'], status['latestCommittedBlockHash'])
+                        qc = status['commitQc']
+                        if qc['blockHash'] != block['hash'] or qc['view'] != status['latestCommittedView']:
+                            raise h2.AuditError('committed status/QC mismatch')
+                        proofs.append(verify_qc(qc, trusted, verifier)); commits.append(h2.quantity(block['number']))
+                    current = min([current]+commits)
+                if first is None:
+                    first = last = current
+                    parent = matching_blocks(parallel('eth_getBlockByNumber', [hex(current), False]), current)['hash']
+                if current < last:
+                    raise h2.AuditError('common committed height regressed')
+                for number in range(last+1, current+1):
+                    blocks = parallel('eth_getBlockByNumber', [hex(number), False])
+                    block = matching_blocks(blocks, number, parent)
+                    if cfg['mode'] == 'gov5':
+                        evidences = parallel('n42_getConsensusEvidence', [hex(number)])
+                        proofs = [verify_qc(evidence_qc(e, block, 7), trusted, verifier) for e in evidences]
+                    receipts = parallel('eth_getBlockReceipts', [block['hash']])
+                    summaries = [h2.receipt_summary(r, b) for r, b in zip(receipts, blocks)]
+                    if any(s != summaries[0] for s in summaries[1:]):
+                        raise h2.AuditError('cross-node receipt mismatch')
+                    for key in totals: totals[key] += summaries[0][key]
+                    producers.add(block['miner'].lower()); parent = block['hash']; last = number
+                    last_progress = time.monotonic()
+                    log.write(json.dumps(dict(event='block',number=number,hash=parent,receipts=summaries[0],qc=proofs))+'\n')
+                if time.monotonic()-last_progress > args.stall_seconds:
+                    raise h2.AuditError('committed progress stalled')
+                sample=dict(event='sample',time=time.time(),heads=heads,common=last,resources=resources(cfg.get('pids',[])))
+                log.write(json.dumps(sample)+'\n');log.flush();print(json.dumps(sample),flush=True)
+                time.sleep(min(args.interval,max(0,deadline-time.monotonic())))
+        expected=set(a.lower() for a in cfg['validator_addresses'])
+        if last-first < args.min_blocks or producers != expected or totals['successful_transactions'] == 0:
+            raise h2.AuditError('insufficient committed blocks, leader coverage or successful transaction workload')
+        report['status']='PASS'
+    except Exception as error:
+        report.update(status='FAIL',error=str(error));raise
+    finally:
+        report.update(first=first,last=last,elapsed_seconds=time.monotonic()-start,producers=sorted(producers),**totals)
+        (args.output/'summary.json').write_text(json.dumps(report,indent=2)+'\n')
+
+if __name__ == '__main__':
+    main()

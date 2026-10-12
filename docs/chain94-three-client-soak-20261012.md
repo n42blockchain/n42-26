@@ -42,3 +42,22 @@
 - 每项结果附源码、二进制、配置、起止高度、实际时长、日志和审计输出。
 
 本页将随实测更新。已有历史互通或空块短测记录不替代上述持续运行验收。
+
+## 进展与已发现问题
+
+- QMDB leaf-form 导出通过：输出高度 13,652,362，root
+  `0x24fc459b2bdc8da63c9d98c825f047061688e3db8aaeddbb8db3af4d72c00cda`，
+  63,541,729 slots / 6,204,334 live entries，2,353,106,566 bytes；重建根与 header 一致。
+- 首次账户导出失败：旧 replay v2 数据缺少 QMDBApplied 标记，工具只接受带标记的数据。
+  Gov5 修复 `92feb67e` 增加 canonical head fallback，并在同一只读事务重建 QMDB 根后才发布工件。
+  新增缺 head、非 canonical head、正常 fallback/marker 和根不一致回归；该包测试通过。
+  当前工作分支推送遇远端 non-fast-forward，修复已推送至 `fix/replay-v2-state-export-20261012`。
+- 修复后完整账户导出成功：6,191,590 accounts / 12,744 storage slots，与 live entries 总数一致；
+  JSONL SHA256 `d0892d4639f6b7f9128a6aa03f50a58933a76c4cae1a0c87ebf0a620cda51d53`。
+- 本工程冻结源码 + 适配 Reth 2.7 的 release 节点、bootstrap、init-snapshot 构建通过；Gov5 release 节点构建通过。
+- n42-rs 验证者原先无条件启用 H2-v4，而 chain94 配置未启用 interopV4。
+  已准备按链配置选择 Gov5Legacy/PoP 签名域的候选，并保持 v4 配置原行为；测试及实机验收待完成。
+- 七节点管理脚本离线回归 13 项通过；持续审计工具离线回归 5 项通过。
+  `scripts/audit-chain94-soak.py` 当前支持 Gov5/n42-26 RPC，核验新增块、回执根、QC 签名及资源样本；
+  n42-rs RPC/验证者证据适配待完成。工具的 PASS 仅覆盖其记录的链/回执/QC 窗口，持久化仍须重启验证。
+- Gov5 独立七节点 smoke 已按机器独占协议排队；后续一小时持续运行及故障恢复尚未完成。
