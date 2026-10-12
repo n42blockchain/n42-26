@@ -18,6 +18,8 @@ Reth/revm、网络、数据库和工具可作为共用组件。每条路线应�
 
 ## 2. 自定义链：H2 + QMDB bin + 跨实现互通
 
+当前进行中的联合检查见 [Gov5 replay v2 三工程七节点持续运行验收](chain94-three-client-soak-20261012.md)。
+
 目标链路：ETH 兼容 ECDSA 交易 → 验签与 sender 恢复 → 有界交易池 → 构块 → 执行
 → QMDB bin 状态根 → H2 封头、投票与 QC → 提交和持久化。
 
