@@ -231,7 +231,7 @@ mod tests {
             frame_root(&[*signed(0).hash(), *signed(1).hash()])
         );
         assert_eq!(frame.chain_id(), 94);
-        assert_eq!(frame.encoded_bytes(), input.iter().map(|tx| tx.len()).sum());
+        assert_eq!(frame.encoded_bytes(), input.iter().map(|tx| tx.len()).sum::<usize>());
         for tx in frame.transactions() {
             assert_eq!(tx.sender(), tx.transaction().verify().unwrap());
         }
