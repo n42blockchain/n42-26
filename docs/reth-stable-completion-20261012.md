@@ -43,6 +43,7 @@
 
 ## 验证记录与待办
 
+- 本工程脚本完整回归：95 项通过（包括下列定向回归）。
 - `test_apply_reth_patches.py`：7 项通过。
 - `test_reth_ci_baseline.py`：1 项通过。
 - `test_reth_sync.py`：2 项通过。

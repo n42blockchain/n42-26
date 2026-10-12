@@ -145,3 +145,23 @@ Gov5 短测两笔失败已定位为块 13,652,396 中对同一 ERC20 合约的 `
 公开 prestate／交易／receipt／call trace 已配对保存。
 
 正在进行的 Reth 稳定适配见 [两工程补全记录](reth-stable-completion-20261012.md)。
+
+### Gov5 一小时持续运行结果
+
+3600.000613 秒长测 PASS：共同 QC 认证窗口 13,652,424 → 13,654,225（+1,801），
+4,481 笔成功 / 0 失败，七个 leader 全覆盖，块身份、parent、状态／交易／回执根、
+回执身份与累计 gas 跨七节点核对，嵌入 QC 的聚合签名通过。
+该窗口起点来自头中携带的祖先 QC，略早于恢复时数据库 head；
+这是认证窗口计数，不把它当作新负载独立吞吐成绩。
+证据：`gov5/soak-audit/summary.json`、`samples.jsonl`。
+
+七节点均优雅停止。只读导出的停止状态全部一致：
+
+- head：13,654,229；hash `0x6c410f224600189f6c9c6c71770f2812b7c4ee96fffaa50a092855b61d33a767`。
+- QMDB root：`0xe3a2548fc9eadd81a5f7ad2c30dacaaa41e99ff69feff530401b4136041ffc01`。
+- view：1,877；R1 / R2 持久化水位：1,876。
+- 各节点 CommitQC 与各自 head 匹配，7 份 QC 均经既定委员会和 legacy 签名域独立验证。
+
+停止状态保存在 `gov5/node*/soak-anchor.json` 与 `gov5/soak-stopped-state.json`；
+保留早先 13,652,426 的 `anchor.json` 和配对导出工件，未覆盖原继续点。
+这轮通过一小时健康运行与停止后状态检查，完整重启、掉线恢复和混合互通仍未验收。
