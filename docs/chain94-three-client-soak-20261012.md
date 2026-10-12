@@ -61,3 +61,15 @@
   `scripts/audit-chain94-soak.py` 当前支持 Gov5/n42-26 RPC，核验新增块、回执根、QC 签名及资源样本；
   n42-rs RPC/验证者证据适配待完成。工具的 PASS 仅覆盖其记录的链/回执/QC 窗口，持久化仍须重启验证。
 - Gov5 独立七节点 smoke 已按机器独占协议排队；后续一小时持续运行及故障恢复尚未完成。
+
+### 首轮 Gov5 smoke 现场与审计修正
+
+隔离七节点已从 replay 输出继续出块；正式审计起点为 13,652,378。
+审计首次 FAIL：`consensus evidence roster size differs`。所有本轮进程随后优雅退出，数据库与日志保留。
+源码核对确认 Gov5 `n42_getConsensusEvidence` 在本配置下返回确定性移动委员会证据，
+不能当作七个 IDC 验证者的 H2 CommitQC；`AssembleCE` 的 IDC/移动组合结构未在该实时写入入口使用。
+
+审计改为解析各节点头中嵌入的 `LastCommittedQC`，按链的 legacy 签名域验证聚合签名，
+再核对 QC 目标为本地 canonical ancestor。共同比较上限取所有节点 QC 已认证高度的最小值，
+逐块检查连续 parent 链与根/回执；QC 作为窗口边界的祖先链认证证据记录，不把移动委员会字段伪装为 IDC QC。
+新增 canonical QC 解码、位序、长度、bitmap padding、尾随字节回归；离线 5 项通过。

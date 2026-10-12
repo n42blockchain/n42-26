@@ -28,17 +28,23 @@ class SoakAuditTests(unittest.TestCase):
         block=self.block();block['transactions']=['0x'+'44'*32]*2
         with self.assertRaises(audit.h2.AuditError):audit.matching_blocks([block],42)
 
-    def evidence(self):
-        return dict(blockHash=self.block()['hash'],signerCount='0x7',view='0x9',signers='0x55',aggregateSignature='0x'+'11'*96)
+    def qc_block(self, packed=0x55):
+        def field(data):return len(data).to_bytes(4,'little')+data
+        qc=(9).to_bytes(8,'little')+field(bytes.fromhex('11'*32))+field(bytes.fromhex('22'*96))+field((7).to_bytes(2,'little')+bytes([packed]))
+        block=self.block();block['extraData']='0x'+(b'N42H'+(10).to_bytes(8,'little')+qc+bytes(96)).hex()
+        return block
 
-    def test_gov5_bitmap_is_little_endian(self):
-        qc=audit.evidence_qc(self.evidence(),self.block(),7)
+    def test_gov5_header_qc_bitmap_is_little_endian(self):
+        qc=audit.header_qc(self.qc_block(),7)
         self.assertEqual(qc['signers'],[True,False,True,False,True,False,True])
         self.assertEqual(qc['view'],9)
+        self.assertEqual(qc['blockHash'],self.block()['hash'])
 
-    def test_evidence_wrong_hash_roster_padding_or_size_rejected(self):
-        for field,value in [('blockHash','0x'+'22'*32),('signerCount','0x6'),('signers','0xd5'),('signers','0x')]:
-            evidence=self.evidence();evidence[field]=value
-            with self.assertRaises(audit.h2.AuditError):audit.evidence_qc(evidence,self.block(),7)
+    def test_qc_padding_size_roster_and_trailing_rejected(self):
+        for block,count in [(self.qc_block(0xd5),7),(self.qc_block(),6),(self.block(),7)]:
+            with self.assertRaises(audit.h2.AuditError):audit.header_qc(block,count)
+        block=self.qc_block();block['extraData'] += '00'
+        with self.assertRaises(audit.h2.AuditError):audit.header_qc(block,7)
+
 
 if __name__ == '__main__':unittest.main()

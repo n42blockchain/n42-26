@@ -28,16 +28,27 @@ def matching_blocks(blocks, number, parent=None):
     return blocks[0]
 
 
-def evidence_qc(evidence, block, count):
-    if not isinstance(evidence, dict) or evidence.get('blockHash') != block['hash']:
-        raise h2.AuditError('consensus evidence missing or bound to another block')
-    if h2.quantity(evidence['signerCount']) != count:
-        raise h2.AuditError('consensus evidence roster size differs')
-    packed = h2.data_bytes(evidence['signers'])
-    if len(packed) != (count + 7)//8 or (count % 8 and packed[-1] >> (count % 8)):
-        raise h2.AuditError('noncanonical consensus signer bitmap')
-    return dict(view=h2.quantity(evidence['view']), blockHash=block['hash'],
-                signature=evidence['aggregateSignature'],
+def header_qc(block, count):
+    """Gov5 embeds LastCommittedQC in header extra; mobile CE is separate."""
+    extra = h2.data_bytes(block.get('extraData'))
+    if len(extra) > 4096 or len(extra) <= 108 or extra[:4] != b'N42H':
+        raise h2.AuditError('header has no bounded embedded commit QC')
+    data = extra[12:-96]
+    if len(data) < 8:
+        raise h2.AuditError('truncated header QC')
+    view = int.from_bytes(data[:8], 'little'); offset = 8
+    def field(expected):
+        nonlocal offset
+        if offset+4 > len(data):raise h2.AuditError('truncated QC field')
+        size = int.from_bytes(data[offset:offset+4], 'little'); offset += 4
+        if size != expected or offset+size > len(data):raise h2.AuditError('invalid QC field length')
+        value = data[offset:offset+size]; offset += size
+        return value
+    block_hash = field(32); signature = field(96); bitmap = field(2+(count+7)//8)
+    packed = bitmap[2:]
+    if offset != len(data) or int.from_bytes(bitmap[:2], 'little') != count or (count % 8 and packed[-1] >> (count % 8)):
+        raise h2.AuditError('noncanonical QC bitmap or trailing data')
+    return dict(view=view,blockHash='0x'+block_hash.hex(),signature='0x'+signature.hex(),
                 signers=[bool(packed[i//8] & (1 << (i % 8))) for i in range(count)])
 
 
@@ -117,6 +128,19 @@ def main():
                             raise h2.AuditError('committed status/QC mismatch')
                         proofs.append(verify_qc(qc, trusted, verifier)); commits.append(h2.quantity(block['number']))
                     current = min([current]+commits)
+                else:
+                    latest = list(pool.map(lambda pair: h2.rpc(pair[0]['url'], 'eth_getBlockByNumber', [hex(pair[1]), False]), zip(nodes, heads)))
+                    commits = []
+                    for node, header in zip(nodes, latest):
+                        qc = header_qc(header, 7)
+                        proof = verify_qc(qc, trusted, verifier)
+                        target = h2.read_committed_block(node['url'], qc['blockHash'])
+                        number = h2.quantity(target['number'])
+                        canonical = h2.rpc(node['url'], 'eth_getBlockByNumber', [hex(number), False])
+                        if canonical['hash'] != qc['blockHash'] or number > h2.quantity(header['number']):
+                            raise h2.AuditError('embedded QC target is not an available canonical ancestor')
+                        proofs.append(proof);commits.append(number)
+                    current = min([current]+commits)
                 if first is None:
                     first = last = current
                     parent = matching_blocks(parallel('eth_getBlockByNumber', [hex(current), False]), current)['hash']
@@ -125,9 +149,6 @@ def main():
                 for number in range(last+1, current+1):
                     blocks = parallel('eth_getBlockByNumber', [hex(number), False])
                     block = matching_blocks(blocks, number, parent)
-                    if cfg['mode'] == 'gov5':
-                        evidences = parallel('n42_getConsensusEvidence', [hex(number)])
-                        proofs = [verify_qc(evidence_qc(e, block, 7), trusted, verifier) for e in evidences]
                     receipts = parallel('eth_getBlockReceipts', [block['hash']])
                     summaries = [h2.receipt_summary(r, b) for r, b in zip(receipts, blocks)]
                     if any(s != summaries[0] for s in summaries[1:]):
@@ -135,7 +156,7 @@ def main():
                     for key in totals: totals[key] += summaries[0][key]
                     producers.add(block['miner'].lower()); parent = block['hash']; last = number
                     last_progress = time.monotonic()
-                    log.write(json.dumps(dict(event='block',number=number,hash=parent,receipts=summaries[0],qc=proofs))+'\n')
+                    log.write(json.dumps(dict(event='block',number=number,hash=parent,receipts=summaries[0],boundary_qc=proofs))+'\n')
                 if time.monotonic()-last_progress > args.stall_seconds:
                     raise h2.AuditError('committed progress stalled')
                 sample=dict(event='sample',time=time.time(),heads=heads,common=last,resources=resources(cfg.get('pids',[])))
