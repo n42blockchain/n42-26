@@ -165,3 +165,9 @@ Gov5 短测两笔失败已定位为块 13,652,396 中对同一 ERC20 合约的 `
 停止状态保存在 `gov5/node*/soak-anchor.json` 与 `gov5/soak-stopped-state.json`；
 保留早先 13,652,426 的 `anchor.json` 和配对导出工件，未覆盖原继续点。
 这轮通过一小时健康运行与停止后状态检查，完整重启、掉线恢复和混合互通仍未验收。
+
+Gov5 一小时资源汇总已保存于 `gov5/soak-resource-summary.json`。
+各节点 FD 最大 22、线程最大 17–18；RSS 从约 3.29–3.32 GiB 升至 4.33–4.40 GiB，
+最后十分钟仍有约 0.06–0.12 GiB 范围变化，不能据此认定长期内存有界。
+七份日志的 panic/fatal/bad-block/state-root-mismatch/database-corrupt 模式计数均为零；
+该模式扫描与链/回执/QC 验证互为补充，不能代替故障恢复验收。
