@@ -227,3 +227,7 @@ strip = true
 inherits = "release"
 debug = true
 strip = false
+
+[patch.crates-io]
+# TestRng trait compatibility with proptest 1.11 / rand 0.10.
+proptest-arbitrary-interop = { path = "vendor/dependency-repairs/proptest-arbitrary-interop-0.1.0" }
