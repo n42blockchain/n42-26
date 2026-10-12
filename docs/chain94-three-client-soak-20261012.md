@@ -113,3 +113,23 @@ bootstrap 使用真实 v2 状态和验证过的 CommitQC；各节点可写数据
 
 持续审计新增读取 n42-rs 原有公开 checkpoint 的适配，不改该工程协议或检查点布局；
 正确区分 Rust checkpoint 的 Msb0 bitmap 与 Gov5 wire 的 Lsb0 bitmap。工具离线回归现为 6 项通过。
+
+### 三工程独立短测与长测启动
+
+- n42-26：90.000803 秒，共同认证高度 13,652,433 → 13,652,462（+29），
+  210 成功 / 0 失败，七个 leader 全覆盖，七份独立状态使用 QMDB `only` 读取，根/回执/QC 审计通过。
+  本轮发送器实际为短时突发，不能当作持续负载验收。证据：`n42-26-smoke-audit/summary.json`。
+- n42-rs 既有兼容分支：90.000671 秒，13,652,433 → 13,652,460（+27），
+  164 成功 / 0 失败，七个 leader 全覆盖；沿用七份独立执行实例，25/27 个新增块包含负载。
+  采用修正后的 2 TPS 持续发送，根/回执/QC 审计通过。证据：`rs-compat-fleet/smoke2-audit/summary.json`。
+- Gov5 `44592a05` 修复低速发送器每 10 ms 至少放行一笔导致低速设置实际变成 100 TPS 的问题；
+  保留分数 tick 和 batch credit，低速/高速及 batch 回归通过，已单独提交推送。
+- Gov5 已从保存的七份状态恢复，启动 3,600 秒、至少 1,000 个新增认证块的长测。
+  结果持续写入 `gov5/soak-audit/samples.jsonl`；运行中数据不作为最终 PASS。
+
+Gov5 短测两笔失败已定位为块 13,652,396 中对同一 ERC20 合约的 `transfer` 调用。
+`debug_traceTransaction` 均返回 `execution reverted`，使用 gas 分别为 23,744 和 23,756；
+不是用尽 gas。七节点失败状态和回执根一致。具体余额/合约条件仍需核对，尚不宣称原因完全闭环。
+交易、回执和 trace 已保存于 `gov5/failed-smoke-transactions.json`，不包含私钥。
+
+一小时运行、节点退出/恢复、整队重启及混合委员会互通仍待完成。
