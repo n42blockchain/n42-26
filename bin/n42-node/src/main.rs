@@ -83,6 +83,7 @@ where
         >,
 {
     let best_provider = provider.clone();
+    let hash_provider = provider.clone();
     n42_network::Gov5CanonicalBlockReader::new_ranged(
         move || {
             best_provider
@@ -115,7 +116,15 @@ where
             }
             Ok(rlps)
         },
-    )
+    ).with_hash_reader(move |hash| {
+        let view = hash_provider.consistent_provider().map_err(|e| e.to_string())?;
+        let Some(block) = view.block(hash.into()).map_err(|e| e.to_string())? else { return Ok(None) };
+        if view.block_hash(block.header.number).map_err(|e| e.to_string())? != Some(hash) {
+            return Ok(None);
+        }
+        let execution = ExecutionData::from_block_unchecked(hash, &block);
+        n42_network::encode_gov5_block_rlp(&execution).map(Some).map_err(|e| e.to_string())
+    })
 }
 
 fn env_bool(name: &str) -> bool {
