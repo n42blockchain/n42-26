@@ -237,3 +237,28 @@ flush，进程成功退出后再重开读取 1,024 条记录，测试持久化�
 后续 022–025 门槛拒绝启动；现场完整移至 `rs27-fleet/faults-attempt1-queue-shadow/`。
 临时排队脚本改名 `wait-for-validation-claim.py`，同目录标准库解析及两线程 smoke 已通过。
 第二轮恢复／混合队列从任务 026 开始；第一轮不能记录为恢复 PASS。
+
+
+## 恢复审计发现并修复两处 Rust 缺口
+
+第三轮 RS 恢复演练已证明单节点重新追齐：七节点同高 13,653,785，
+同根 `92890576c47a3b7a9838a8cbcb697902f83835730b71a03156150e50badc5462`。
+随后停掉节点 5、6 时，在连续两任 leader 缺席的 view 上无法推进，故该轮仍为 FAIL。
+工件保留于 `rs27-fleet/faults-attempt3-two-offline-leaders/`。
+
+修复分两组逐段推送：
+
+- RS 兼容升级分支启动时读实际 canonical execution head，首次握手通报实际高度；
+  若 checkpoint 指向本地尚缺的块，执行驱动从已有执行头继续，保留原 finalized 水位。
+  启动读取不制造提交证书或 finality。缺失／未知执行头拒绝启动。
+- 本工程、RS 兼容升级及 RS 主线复用 Gov5 现有 TC 推进逻辑：任意持有完整验证超时 quorum
+  的节点可本地推进 view；只有下一任 leader 可签名并广播 NewView。固定 n−f quorum、
+  超时签名、内嵌 QC、未知 epoch 拒绝及 NewView leader 校验保持原规则。
+  新回归在 native / gov5legacy / h2v4 三个域分别验证五签名可越过两任离线 leader、
+  四签名不能推进、非 leader 不能伪造 NewView。
+
+任务 038 的回归／构建门槛通过：RS 兼容共识 242 项，RS 主线共识 287 项；
+本工程共识单测 245 项，integration 67 项、committee evidence 12 项和其他明确 target 均通过。
+两个 Rust 运行二进制已重新冻结，摘要在 `recovery-binaries.sha256`。
+第四轮恢复与混合队列从任务 039 开始；前三套独立一小时窗口发生在此次 timeout 修复前，
+不能把旧窗口的二进制身份替换成新二进制。
