@@ -1637,6 +1637,10 @@ impl ConsensusService {
                     "authenticated Gov5 catch-up",
                 );
                 self.head_block_number = self.head_block_number.max(block_number);
+                // The FCU above already made this exact hash canonical. Close
+                // matching lifecycle entries so they cannot block the next
+                // live commit behind a redundant execution-ready notification.
+                self.mark_catchup_commits_finalized(block_hash);
                 self.prune_executed_h2_v4_catchup_history();
                 crate::qualification_abort_at("execution_validated");
                 // This synchronous catch-up path bypasses handle_valid_import,
@@ -7055,6 +7059,72 @@ mod tests {
             expected.push(hash);
         }
         assert_eq!(mock.fcu_heads(), expected);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn catchup_valid_fcu_closes_matching_commit_lifecycles_and_releases_live_commit() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid, PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+        orch.async_finalize_fcu = false;
+        orch.head_block_number = 100;
+        orch.head_block_hash = B256::repeat_byte(0x70);
+        orch.execution_validated_head_view = 200;
+        let (hash, rlp) = test_gov5_block_rlp(orch.head_block_hash, 101, 201);
+        let next = B256::repeat_byte(0x71);
+        for (view, block_hash, stage) in [
+            (201, hash, AsyncCommitStage::Committed),
+            (202, hash, AsyncCommitStage::Committed),
+            (203, next, AsyncCommitStage::ExecutionReady),
+        ] {
+            orch.async_commit_states.insert(view, AsyncCommitState {
+                view, block_hash, commit_qc: test_commit_qc(view, block_hash),
+                stage, finalize_in_flight: false, committed_at: Instant::now(),
+            });
+        }
+        assert!(orch.import_h2_v4_catchup_block(
+            n42_network::PeerId::random(),
+            n42_network::decode_gov5_block_rlp(&rlp).unwrap(), 201,
+        ).await);
+        for view in [201, 202] {
+            assert_eq!(orch.async_commit_states[&view].stage, AsyncCommitStage::Finalized);
+        }
+        assert_eq!(mock.fcu_heads(), vec![hash]);
+        orch.drive_async_commits().await;
+        assert_eq!(mock.fcu_heads(), vec![hash, next]);
+        assert_eq!(orch.async_commit_states[&203].stage, AsyncCommitStage::Finalized);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn catchup_nonvalid_fcu_preserves_commit_barrier() {
+        for status in [PayloadStatusEnum::Syncing, PayloadStatusEnum::Accepted] {
+            let (engine, output_rx) = make_test_engine();
+            let (network, _cmd_rx, _prx) = make_test_network();
+            let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+            let mock = Arc::new(MockExecutionLayer::new(PayloadStatusEnum::Valid, status));
+            let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+            orch.el = Some(mock);
+            orch.head_block_number = 100;
+            orch.head_block_hash = B256::repeat_byte(0x70);
+            orch.execution_validated_head_view = 200;
+            let (hash, rlp) = test_gov5_block_rlp(orch.head_block_hash, 101, 201);
+            orch.async_commit_states.insert(201, AsyncCommitState {
+                view: 201, block_hash: hash, commit_qc: test_commit_qc(201, hash),
+                stage: AsyncCommitStage::Committed, finalize_in_flight: false,
+                committed_at: Instant::now(),
+            });
+            assert!(!orch.import_h2_v4_catchup_block(
+                n42_network::PeerId::random(),
+                n42_network::decode_gov5_block_rlp(&rlp).unwrap(), 201,
+            ).await);
+            assert_eq!(orch.async_commit_states[&201].stage, AsyncCommitStage::Committed);
+            assert_eq!(orch.head_block_number, 100);
+        }
     }
 
     #[test]

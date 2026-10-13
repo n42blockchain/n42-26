@@ -938,6 +938,18 @@ impl ConsensusService {
         );
     }
 
+    /// A synchronous catch-up FCU can finalize a hash before the ordinary
+    /// lifecycle driver sees its execution-ready notification.
+    pub(super) fn mark_catchup_commits_finalized(&mut self, block_hash: B256) {
+        let views: Vec<_> = self.async_commit_states.iter()
+            .filter(|(_, state)| state.block_hash == block_hash)
+            .map(|(view, _)| *view)
+            .collect();
+        for view in views {
+            self.mark_async_commit_finalized(view, block_hash);
+        }
+    }
+
     fn mark_async_commit_retryable(&mut self, view: u64, block_hash: B256) {
         if let Some(state) = self.async_commit_states.get_mut(&view)
             && state.block_hash == block_hash
