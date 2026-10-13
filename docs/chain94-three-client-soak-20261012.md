@@ -299,3 +299,19 @@ canonical hash、QMDB 根及收据一致性检查通过，停止前后 R1/R2、v
 后一个耗时不包含七个 EL 串行初始化时间，不能当作端到端重启耗时。
 详细阶段事件、停止水位及 QC 在 `faults-drills/events.jsonl`。
 Gov5、本工程恢复演练及混合委员会运行门槛尚在后续队列，最终综合验收未签署。
+
+
+## Gov5 恢复验收 PASS；本工程恢复驱动继续修正
+
+Gov5 的第二轮恢复全套 PASS，工件 `gov5/faults-drills/summary.json`。
+第一次五在线 60 秒仅新增 5 块的失败现场保留于 `gov5/faults-attempt1-five-node-window/`。
+链原配置 period=3s、maxTimeout=30s，两个离线 leader 的轮换可能跨越一个 60 秒窗口；
+五在线改为 180 秒至少 7 个认证块，六/七在线的健康窗口保持原门槛，协议参数未更改。
+恢复第五个节点后首个新提交耗时约 20.172 秒；整队启动且追齐后约 10.155 秒恢复新提交。
+前后 R1/R2、view、锁定与提交 QC 对比通过，没有改变已验证的 Gov5 二进制。
+
+本工程第一轮恢复完成单/双节点停机出块、无 quorum 停顿、恢复追齐，但全队启动时
+驱动先等 node0 的 committed RPC 状态才启动 node1..6，因尚无 quorum 而超时。
+`n42-26-faults-attempt1-startup-barrier/` 保留原 FAIL。启动屏障改为先检查本地执行 RPC
+及已有 snapshot 高度，等七节点全部启动后，仍严格执行 QC/追齐、新提交及持久水位校验。
+这项修正只涉及隔离测试驱动，未更改本工程生产恢复逻辑；从任务 061 重试。
