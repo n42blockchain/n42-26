@@ -1453,7 +1453,7 @@ impl ConsensusService {
             debug!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, number = block.header.number, "holding gov5 block until H2-v4 authenticates its hash");
             return;
         };
-        let view = match n42_network::gov5_header_view(&block.header) {
+        let header_view = match n42_network::gov5_header_view(&block.header) {
             Ok(view) => view,
             Err(error) => {
                 counter!("n42_h2_v4_blocks_rejected_total", "reason" => "header_view").increment(1);
@@ -1467,12 +1467,17 @@ impl ConsensusService {
         // authenticated hash already binds the complete header/body; only a
         // header claiming a view newer than its certificate is impossible.
         // Zero remains the internal transitively-authenticated parent sentinel.
-        if bound_view != 0 && view > bound_view {
+        if bound_view != 0 && header_view > bound_view {
             counter!("n42_h2_v4_blocks_rejected_total", "reason" => "consensus_header_view")
                 .increment(1);
-            warn!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, bound_view, header_view = view, "rejected Gov5 block whose header view is newer than its H2 certificate");
+            warn!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, bound_view, header_view, "rejected Gov5 block whose header view is newer than its H2 certificate");
             return;
         }
+        // A producer can prepare several headers in one view and propose them
+        // in successive views. The verified H2 binding, when present, orders
+        // these executions; the immutable header view is only its lower bound.
+        // Transitively authenticated parents have no certificate binding yet.
+        let view = if bound_view == 0 { header_view } else { bound_view };
         self.remember_h2_v4_block_view(block.block_hash, view);
         if block.header.number <= self.head_block_number {
             self.prune_executed_h2_v4_catchup_history();
@@ -7019,6 +7024,37 @@ mod tests {
             expected,
             "a hash-keyed body cache must still release canonical ancestry by height"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successive_h2_certificates_preserve_execution_order_for_reused_header_view() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+        orch.head_block_number = 100;
+        orch.head_block_hash = B256::repeat_byte(0x70);
+        orch.execution_validated_head_view = 200;
+        let source = n42_network::PeerId::random();
+        let mut expected = Vec::new();
+
+        for (height, certificate_view) in [(101, 201), (102, 202)] {
+            let (hash, rlp) = test_gov5_block_rlp(orch.head_block_hash, height, 201);
+            orch.remember_h2_v4_block_view(hash, certificate_view);
+            orch.h2_v4_catchup_active = true;
+            orch.handle_h2_v4_gov5_block(source, rlp, Some(hash)).await;
+            assert_eq!(orch.head_block_hash, hash);
+            assert_eq!(orch.head_block_number, height);
+            assert_eq!(orch.execution_validated_head_view, certificate_view);
+            assert_eq!(orch.h2_v4_block_views[&hash], certificate_view);
+            expected.push(hash);
+        }
+        assert_eq!(mock.fcu_heads(), expected);
     }
 
     #[test]
