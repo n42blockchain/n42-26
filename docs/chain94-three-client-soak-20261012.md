@@ -372,3 +372,25 @@ Gov5 adapter 现在仅对合法 optional-QC 形状向前查看最多 8 个 canon
 并检查其目标在每个被验收节点的 canonical 链中。其他异常 header 直接拒绝。
 新增 bound/invalid-header 回归后，审计专项 12 通过，整个 Python 集合 101 通过。
 审计修正 `1d91435` 已推送，下一轮使用最终 Reth 适配的重建二进制。
+
+
+## 混合追块与异步提交衔接修复（2026-10-13）
+
+任务 104 未通过 300 秒收敛门槛，现场保留在
+`mixed27-fleet/smoke-attempt4-async-catchup-barrier/`。七个节点已开始互通并正常提交，
+但本工程执行停在 13654624，其他六个节点继续前进。
+日志显示 catch-up 已对 2346..2349 的块完成 new_payload/FCU Valid 并推进执行头，
+它们的 async commit state 却仍停在 Committed；旧队列项阻塞了本地 leader
+view=2350 的已执行新区块最终 FCU。这不是增加等待时间能解决的问题。
+
+修复 `5a876d5`：只有同步 catch-up FCU 为 Valid 后，按精确 hash 关闭已有的
+匹配异步提交项，包含同 hash 的合法后续视图。不从 header view 生成任何 QC；
+Accepted/Syncing 不能关闭队列。回归同时检查后继 live commit 被释放，原不匹配项
+不会关闭。任务 107 共识服务 239 通过 / 3 声明忽略。
+
+修复 `d5fab65`：成功的 eager new_payload 留存本地 leader 的已验证高度，
+与 Gov5 收块共用既有有界高度索引。自身 gossip 不回送，也不依赖 envelope
+反馈先到；在后续 Valid FCU 才同时推进 head hash 与 catch-up height floor。
+回归覆盖 eager 回调先到、尚未 FCU 时高度不动、确认后下一个 ancestry suffix 可释放。
+完整 workspace 已完成 1813 通过 / 0 失败 / 30 声明忽略；任务 108 已重建最终节点并退出 0。
+上述修复均分段推送。独立一小时结果仍绑定原先各自的二进制，混合最终窗口待重测。

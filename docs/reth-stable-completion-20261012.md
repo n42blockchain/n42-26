@@ -153,7 +153,7 @@ Geth 对照：[prestate OnTxStart](https://github.com/ethereum/go-ethereum/blob/
 | 最终回归 | 通过 | 失败 | 声明忽略 | 工件 |
 |---|---:|---:|---:|---|
 | n42-rs main 完整 workspace | 3352 | 0 | 87 | build-service/093.log，退出 0 |
-| n42-26 锁定 Reth 源完整 workspace | 1810 | 0 | 30 | build-service/094.log，退出 0 |
+| n42-26 锁定 Reth 源完整 workspace | 1813 | 0 | 30 | build-service/108.log，退出 0 |
 | RS 升级 chain94 完整 workspace | 1941 | 0 | 35 | build-service/095.log，workspace 命令退出 0 |
 | Python 审计/驱动回归 | 101 | 0 | 0 | python-final-tests.log |
 
@@ -164,5 +164,7 @@ RS main 专项原快照（含新增 diff 检查）与另外 17 个 RPC E2E 均�
 完整脚本和原失败记录均保留。声明忽略项未记成通过。
 
 本工程最终节点构建成功，SHA256
-`4f8a20a94be903a81a3712fef063d84282894ce584f619cdd4feca31d0a5848c`。
+`5b281a26b4979cbeceeb37cd5de6cef576f97207eacc1be6c203e86a103dd9de`。
 混合运行与恢复验收仍在后续队列，最终结论须结合三工程七节点验收文档。
+
+任务 108 在混合追块／异步提交衔接与 leader 高度回归加入后重新完成整个 workspace 和最终节点构建（退出 0），没有仅沿用早先 094 的二进制。
