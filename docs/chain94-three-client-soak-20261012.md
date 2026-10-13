@@ -315,3 +315,27 @@ Gov5 的第二轮恢复全套 PASS，工件 `gov5/faults-drills/summary.json`。
 `n42-26-faults-attempt1-startup-barrier/` 保留原 FAIL。启动屏障改为先检查本地执行 RPC
 及已有 snapshot 高度，等七节点全部启动后，仍严格执行 QC/追齐、新提交及持久水位校验。
 这项修正只涉及隔离测试驱动，未更改本工程生产恢复逻辑；从任务 061 重试。
+
+
+## 本工程恢复全套 PASS
+
+任务 080 返回 0，`n42-26-faults-drills/summary.json` 为 PASS。
+冷启动且历史 body/header 缓存为空时追块、单/双节点停机继续出块、四在线无 quorum 停顿、
+恢复 quorum 后追齐、整队优雅重启后持续出块及持久投票水位／QC 比较全部完成。
+恢复第五个节点后约 5.061 秒出现新认证提交，随后五在线 180 秒新增 28 块；
+整队启动且追齐后约 5.078 秒恢复新提交。
+
+此前错误现场依次保留在 `n42-26-faults-attempt{1..5}-*/`：启动 RPC 屏障、
+未初始化 QC、未完成启动追齐，以及真实的历史 body 缓存缺失／native header 缓存缺失。
+已修复的生产缺口为：
+
+1. block-by-hash cache miss 经持久 canonical reader 读取，并在阻塞线程池完成；
+   校验真实 native hash、32MiB 上限及现有 genesis fork digest，缺块／错误读取仍拒绝。
+2. 从持久 Alloy header 恢复本链既有 absent/zero registry 尾部，只有精确编码哈希匹配才
+   复原 native header；未知非零 registry 不猜测。这沿用 RS 兼容实现的恢复边界。
+   by-hash 和 by-range 均在转换 Engine payload 前复原，避免重启后丢失内存注册信息。
+
+任务 079：共识 247 通过，网络 220 通过 / 1 声明忽略，release 节点重建成功。
+生产修复按 callback/codec、节点接线、native hash 恢复和诊断分别提交并推送。
+至此，三工程各自的一小时窗口及完整恢复演练均有通过工件；旧小时窗口的二进制
+身份保持原样，后续混合窗口将使用修复后的 Rust 二进制，综合混合验收仍待完成。
