@@ -93,8 +93,20 @@ def node_commit(node, mode, head, trusted, verifier):
     elif mode == 'n42-rs':
         qc = checkpoint_qc(json.loads(Path(node['checkpoint']).read_text()), 7)
     elif mode == 'gov5':
-        header = h2.rpc(node['url'], 'eth_getBlockByNumber', [hex(head), False])
-        qc = header_qc(header, 7)
+        # Rust producers use the existing optional-QC header profile. Inspect
+        # at most one committee rotation for a Go-produced carrier; its QC
+        # still authenticates an available canonical ancestor on this node.
+        for height in range(head, max(-1, head-8), -1):
+            header = h2.rpc(node['url'], 'eth_getBlockByNumber', [hex(height), False])
+            if not isinstance(header, dict) or h2.quantity(header.get('number')) != height:
+                raise h2.AuditError('missing or wrongly numbered QC carrier')
+            extra = h2.data_bytes(header.get('extraData'))
+            if len(extra) == 108 and extra[:4] == b'N42H':
+                continue
+            qc = header_qc(header, 7)
+            break
+        else:
+            raise h2.AuditError('no embedded commit QC within bounded committee rotation')
     else:
         raise h2.AuditError('unknown node commit adapter')
     proof = verify_qc(qc, trusted, verifier)

@@ -67,6 +67,33 @@ class SoakAuditTests(unittest.TestCase):
             with self.assertRaises(audit.h2.AuditError):audit.verify_qc(qc, trusted, Path('unused'))
             audit.verify_qc(qc, dict(trusted, certificatePhase='prepare'), Path('unused'))
 
+    def test_gov5_optional_qc_header_uses_bounded_canonical_carrier(self):
+        header = self.block()
+        header['number'] = '0x2b'
+        header['extraData'] = '0x'+(b'N42H'+(11).to_bytes(8,'little')+bytes(96)).hex()
+        carrier = self.qc_block()
+        target = self.block()
+        with mock.patch.object(audit.h2,'rpc',side_effect=[header,carrier,target]) as rpc, mock.patch.object(audit.h2,'read_committed_block',return_value=target), mock.patch.object(audit,'verify_qc',return_value={'verified':True}) as verify:
+            self.assertEqual(audit.node_commit({'url':'local'},'gov5',43,{},Path('unused'))[0],42)
+            self.assertEqual(rpc.call_args_list[1].args[2],['0x2a',False])
+            self.assertEqual(verify.call_args.args[0]['view'],9)
+        # Malformed extra-data cannot hide behind the optional-QC path.
+        header['extraData'] = '0x'+bytes(108).hex()
+        with mock.patch.object(audit.h2,'rpc',return_value=header):
+            with self.assertRaises(audit.h2.AuditError):
+                audit.node_commit({'url':'local'},'gov5',43,{},Path('unused'))
+
+    def test_gov5_optional_qc_search_has_a_fixed_bound(self):
+        def rpc(_url, _method, params):
+            header = self.block()
+            header['number'] = params[0]
+            header['extraData'] = '0x'+(b'N42H'+bytes(104)).hex()
+            return header
+        with mock.patch.object(audit.h2,'rpc',side_effect=rpc) as calls:
+            with self.assertRaises(audit.h2.AuditError):
+                audit.node_commit({'url':'local'},'gov5',43,{},Path('unused'))
+            self.assertEqual(calls.call_count,8)
+
     def qc_block(self, packed=0x55):
         def field(data):return len(data).to_bytes(4,'little')+data
         qc=(9).to_bytes(8,'little')+field(bytes.fromhex('11'*32))+field(bytes.fromhex('22'*96))+field((7).to_bytes(2,'little')+bytes([packed]))
