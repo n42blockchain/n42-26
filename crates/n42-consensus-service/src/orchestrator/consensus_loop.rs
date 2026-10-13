@@ -1826,6 +1826,12 @@ impl ConsensusService {
         has_staking_target: bool,
         state_diff: Option<n42_execution::state_diff::StateDiff>,
     ) {
+        if self.h2_v4_identity.is_some() && block_number > self.head_block_number {
+            // Gossip does not echo a leader's own body. Retain the height from
+            // successful new_payload so its later Valid FCU advances both the
+            // hash and the catch-up height floor, even before envelope feedback.
+            self.remember_h2_v4_block_number(hash, block_number);
+        }
         if block_ts > 0 {
             self.last_committed_timestamp = self.last_committed_timestamp.max(block_ts);
         }

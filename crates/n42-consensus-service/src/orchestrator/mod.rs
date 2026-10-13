@@ -1270,6 +1270,15 @@ impl ConsensusService {
         }
     }
 
+    fn remember_h2_v4_block_number(&mut self, hash: B256, number: u64) {
+        self.h2_v4_block_numbers.insert(hash, number);
+        let limit = self.h2_v4_catchup_buffer_blocks
+            .saturating_add(DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS);
+        while self.h2_v4_block_numbers.len() > limit {
+            self.h2_v4_block_numbers.pop_first();
+        }
+    }
+
     fn stage_h2_v4_catchup_block(
         &mut self,
         source: PeerId,
@@ -1495,18 +1504,11 @@ impl ConsensusService {
         // binding and only while it is ahead of the durable execution floor.
         // Otherwise a stream of unbound or already-executed history could
         // evict the mapping for a live asynchronous Engine API completion.
-        self.h2_v4_block_numbers
-            .insert(block.block_hash, block.header.number);
         // Keep the complete bounded reverse suffix addressable by hash. Live
         // proposals can otherwise start overlapping ancestry walkers: when an
         // already-staged parent falls out of a small hash index, re-downloading
         // it recursively walks the same historical chain again.
-        let block_number_index_limit = self
-            .h2_v4_catchup_buffer_blocks
-            .saturating_add(DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS);
-        while self.h2_v4_block_numbers.len() > block_number_index_limit {
-            self.h2_v4_block_numbers.pop_first();
-        }
+        self.remember_h2_v4_block_number(block.block_hash, block.header.number);
         // A consensus-authenticated child header cryptographically binds its
         // exact parent hash. Walk that ancestry newest-to-oldest, but buffer
         // execution until the complete bounded segment can be released in
@@ -7125,6 +7127,30 @@ mod tests {
             assert_eq!(orch.async_commit_states[&201].stage, AsyncCommitStage::Committed);
             assert_eq!(orch.head_block_number, 100);
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn eager_leader_height_waits_for_fcu_and_reconnects_the_catchup_suffix() {
+        let mut orch = make_test_orchestrator_with_state(None)
+            .with_h2_v4_participant(test_h2_identity());
+        let parent = B256::repeat_byte(0x70);
+        orch.head_block_hash = parent;
+        orch.head_block_number = 100;
+        orch.execution_validated_head_view = 200;
+        let (leader, _) = test_gov5_block_rlp(parent, 101, 201);
+        // No leader envelope has reached the metadata cache yet.
+        orch.handle_eager_import_done(leader, 1, parent, 101, false, None).await;
+        assert_eq!(orch.head_block_hash, parent);
+        assert_eq!(orch.head_block_number, 100);
+        assert_eq!(orch.h2_v4_block_numbers[&leader], 101);
+        orch.advance_execution_validated_head(201, leader, "test Valid leader FCU");
+        assert_eq!(orch.head_block_number, 101);
+        assert!(!orch.h2_v4_block_numbers.contains_key(&leader));
+        let (_, child) = test_gov5_block_rlp(leader, 102, 202);
+        assert!(orch.stage_h2_v4_catchup_block(
+            n42_network::PeerId::random(), child, 102, 202, true,
+        ));
+        assert_eq!(orch.ready_h2_v4_catchup_heights(), Some(vec![102]));
     }
 
     #[test]
