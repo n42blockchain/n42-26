@@ -1253,7 +1253,10 @@ impl request_response::Codec for Gov5BlockByHashCodec {
                 } else {
                     lookup()
                 };
-                response.rlp = result.map_err(io::Error::other)?.unwrap_or_default();
+                response.rlp = result.map_err(|error| {
+                    tracing::warn!(?hash, %error, "persistent Gov5 block-by-hash lookup failed");
+                    io::Error::other(error)
+                })?.unwrap_or_default();
             }
         }
         if response.rlp.is_empty() {
