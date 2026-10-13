@@ -111,6 +111,15 @@ fn optional_u64(buf: &mut &[u8], name: &'static str) -> Result<Option<u64>, Gov5
 }
 
 impl Gov5NativeHeader {
+    /// Recover the native tail from a stored Alloy header only when its exact
+    /// encoded hash matches. Chain94's registry is empty, so the deployed tail
+    /// is absent or the zero root; other roots remain unavailable, never guessed.
+    pub fn recover(header: &Header, expected: B256) -> Option<Self> {
+        [None, Some(B256::ZERO)].into_iter().map(|mobile_registry_root| Self {
+            header: header.clone(), mobile_registry_root,
+        }).find(|native| native.hash() == expected)
+    }
+
     /// Decodes gov5's native header RLP. Accepts every header alloy accepts and
     /// additionally the placeholder-bearing and 23-field shapes.
     pub fn decode(raw: &[u8]) -> Result<Self, Gov5NativeHeaderError> {
@@ -395,6 +404,17 @@ mod tests {
     const CHAIN94_HEADER_RLP: &str = "f90368a059f7f5e67d917fb749f1b7f6255d476cca61e2c4fc7de6a21d7760928eea7e61a0000000000000000000000000000000000000000000000000000000000000000094580339c31c60b974ac9f70e2f8307b2b4490f70aa0a697c095ee299396deee1f7c63f0f6e50bd7143023e2461e84b09edab2e8495da0b7fbcd5eeea17f9e6eb08bc37bbbc09db6fe6350e0fe9497febc25c8d35e68d7a0e8c427cdf8308a6d37d006bc2b5d9df8618f052b19d2b10d813d4c5ecc277dacb90100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008083ceea378401c9c38083019a28846a8bb578b901034e343248152b000000000000142b00000000000020000000910d74febb5dac309b7389bb53ebea19bf91a664a4cfc4d74c127c15428be4ee60000000977324f952eb3d8f92cd1a9f790dc0c4fbf518c57fc70ced923e4c36d7829610d8532f5912de3e6066fc3b22eca090cc022980b768946ebea5a8b583a2c09d98def9724bdc047462dac65210ba4876921cf217b1e340c0adeb3fdf59862b71020300000007003b9517bc3a0e87fcdda01e00ac99ef1458cff9f7de7e9701c6ab5618cc9dded960654c9ae9a754fb779f6ef188a35399ee1395be42a6b86c6d4e56807ec9938ef0c6a753510cf3c7cde0218487b5b32acda479cacb530a2af80efaffbc302cfc90a0000000000000000000000000000000000000000000000000000000000000000088000000000000000007a0cff8fe1aae31883367719c195d4a0b551a24ea62c33f8447ff57cf587ea86b088080a0b6f70d3e799599e153f794f255a6dcf69d86e56cde3a83dc9ba17b92b618f2fb8080a00000000000000000000000000000000000000000000000000000000000000000";
     const CHAIN94_HEADER_HASH: &str =
         "0e37dae9d0cbf1c8e09c335654dc4cae3e18760dade40039e0e693368cc796d7";
+
+    #[test]
+    fn cold_header_recovery_is_bound_to_the_exact_hash() {
+        for root in [None, Some(B256::ZERO)] {
+            let native = Gov5NativeHeader { header: Header::default(), mobile_registry_root: root };
+            assert_eq!(Gov5NativeHeader::recover(&native.header, native.hash()), Some(native));
+        }
+        let unsupported = Gov5NativeHeader { header: Header::default(), mobile_registry_root: Some(B256::repeat_byte(0x77)) };
+        assert!(Gov5NativeHeader::recover(&unsupported.header, unsupported.hash()).is_none());
+        assert!(Gov5NativeHeader::recover(&Header::default(), B256::repeat_byte(0x33)).is_none());
+    }
 
     #[test]
     fn chain94_live_header_round_trips_to_its_hash() {
