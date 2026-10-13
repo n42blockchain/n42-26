@@ -72,6 +72,7 @@ def verify_qc(qc, trusted, binary):
     value = json.loads(result.stdout)
     if (result.returncode or value.get('verified') is not True
             or value.get('profile') != trusted['profile']
+            or value.get('certificatePhase', 'commit') != trusted.get('certificatePhase', 'commit')
             or value.get('view') != qc['view'] or value.get('blockHash') != qc['blockHash']
             or value.get('validatorCount') != len(trusted['validators'])
             or value.get('faultTolerance') != trusted['faultTolerance']

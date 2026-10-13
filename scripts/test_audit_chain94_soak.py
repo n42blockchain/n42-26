@@ -1,5 +1,6 @@
 import copy
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -49,6 +50,22 @@ class SoakAuditTests(unittest.TestCase):
         header=self.qc_block();target=self.block()
         with mock.patch.object(audit.h2,'rpc',side_effect=[header,target]), mock.patch.object(audit.h2,'read_committed_block',return_value=target), mock.patch.object(audit,'verify_qc',return_value={'verified':True}):
             with self.assertRaises(audit.h2.AuditError):audit.node_commit({'url':'local'},'gov5',41,{},Path('unused'))
+
+    def test_verifier_response_binds_exact_certificate_phase(self):
+        qc = dict(view=9, blockHash='0x'+'11'*32)
+        trusted = dict(profile='gov5legacy', validators=['key']*7, faultTolerance=2)
+        proof = dict(verified=True, profile='gov5legacy', view=9, blockHash=qc['blockHash'],
+                     validatorCount=7, faultTolerance=2, signerCount=5)
+        def result(value):
+            return mock.Mock(returncode=0, stdout=json.dumps(value))
+        with mock.patch.object(audit.subprocess, 'run', return_value=result(proof)):
+            audit.verify_qc(qc, trusted, Path('unused'))
+            with self.assertRaises(audit.h2.AuditError):
+                audit.verify_qc(qc, dict(trusted, certificatePhase='prepare'), Path('unused'))
+        proof['certificatePhase']='prepare'
+        with mock.patch.object(audit.subprocess, 'run', return_value=result(proof)):
+            with self.assertRaises(audit.h2.AuditError):audit.verify_qc(qc, trusted, Path('unused'))
+            audit.verify_qc(qc, dict(trusted, certificatePhase='prepare'), Path('unused'))
 
     def qc_block(self, packed=0x55):
         def field(data):return len(data).to_bytes(4,'little')+data

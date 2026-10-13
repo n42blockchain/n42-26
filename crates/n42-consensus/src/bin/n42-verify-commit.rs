@@ -1,9 +1,12 @@
-//! Offline commit-QC verifier. Caller must authenticate the expected profile,
+//! Offline QC verifier; defaults to commit, accepts an explicit prepare phase.
+//! Caller must authenticate the expected phase, profile,
 //! chain identity, validator roster, fault tolerance and validator-changes hash.
 use alloy_primitives::{Address, B256};
 use bitvec::prelude::*;
 use n42_consensus::{
-    protocol::quorum::{ConsensusSigningProfile, verify_commit_qc_with_profile},
+    protocol::quorum::{
+        ConsensusSigningProfile, verify_commit_qc_with_profile, verify_qc_with_profile,
+    },
     validator::ValidatorSet,
 };
 use n42_primitives::{
@@ -89,16 +92,29 @@ fn verify(input: &Value) -> Result<Value, String> {
         aggregate_signature: BlsSignature::from_bytes(&fixed_bytes::<96>(&qc["signature"])?)
             .map_err(|e| e.to_string())?,
     };
-    // Commit only. Never use the prepare-or-commit fallback verification API.
-    verify_commit_qc_with_profile(&certificate, &validator_set, &changes, profile)
-        .map_err(|e| e.to_string())?;
-    Ok(json!({"schema":1, "verified":true, "profile":profile_name,
+    // Select one explicit domain; never fall back to the other signature phase.
+    let phase = match input.get("certificatePhase") {
+        None => "commit",
+        Some(Value::String(value)) if value == "commit" || value == "prepare" => value,
+        _ => return Err("unsupported certificate phase".into()),
+    };
+    let message = if phase == "prepare" {
+        verify_qc_with_profile(&certificate, &validator_set, profile).map_err(|e| e.to_string())?;
+        profile.vote_message(view, hash)
+    } else {
+        verify_commit_qc_with_profile(&certificate, &validator_set, &changes, profile)
+            .map_err(|e| e.to_string())?;
+        profile.commit_message(view, hash, changes)
+    };
+    Ok(
+        json!({"schema":1, "verified":true, "certificatePhase":phase, "profile":profile_name,
         "chainBoundSignature": matches!(profile, ConsensusSigningProfile::H2V4(_)),
         "view":view, "blockHash":hash, "validatorCount":validators.len(),
         "faultTolerance":fault_tolerance, "signerCount":certificate.signer_count(),
         "validatorSetHash":format!("0x{}",roster_hash.finalize().to_hex()),
         "validatorChangesHash":changes,
-        "signingMessage":format!("0x{}", hex::encode(profile.commit_message(view,hash,changes)))}))
+        "signingMessage":format!("0x{}", hex::encode(message))}),
+    )
 }
 
 fn main() {
@@ -165,6 +181,24 @@ mod tests {
             "faultTolerance":1,"validatorChangesHash":B256::ZERO,"expectedView":7,"expectedBlockHash":hash,
             "validators":keys.iter().map(|sk|hex::encode(sk.public_key().to_bytes())).collect::<Vec<_>>(),
             "qc":{"view":7,"blockHash":hash,"signature":hex::encode(aggregate.to_bytes()),"signers":[true,true,true,false]}})
+    }
+
+    #[test]
+    fn explicit_phases_reject_cross_domain_certificates() {
+        for profile in ["native", "h2v4", "gov5legacy"] {
+            let mut prepare = fixture(profile, true);
+            assert!(verify(&prepare).is_err());
+            prepare["certificatePhase"] = json!("prepare");
+            assert_eq!(verify(&prepare).unwrap()["certificatePhase"], "prepare");
+            let mut commit = fixture(profile, false);
+            assert_eq!(verify(&commit).unwrap()["certificatePhase"], "commit");
+            commit["certificatePhase"] = json!("prepare");
+            assert!(verify(&commit).is_err());
+            commit["certificatePhase"] = json!("unknown");
+            assert!(verify(&commit).is_err());
+            commit["certificatePhase"] = Value::Null;
+            assert!(verify(&commit).is_err());
+        }
     }
 
     #[test]
