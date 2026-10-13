@@ -121,3 +121,18 @@ n42-26 使用重新冻结的 v2.7 二进制，严格 `N42_QMDB_READS=only` 的�
 注意：当前 RS CLI 自身版本字符串来自 N42 workspace，构建缓存的 commit 元信息也可能
 滞后于工作树；依赖版本按 Cargo.lock 的官方 v2.7 commit 核对，运行二进制按冻结 SHA256
 清单追溯，不用 CLI 字符串证明上游版本或当前源码 HEAD。
+
+
+## 再次审计补全
+
+- n42-26 一小时七节点正确性续跑 PASS：新增 1,198 块、7,154 笔成功交易、0 失败。
+  停止后七节点的 14 份 locked/committed QC 分别按 prepare/commit 域离线验证通过。
+- 离线验证器新增显式 `certificatePhase`，缺省仍为 commit；不存在跨域自动重试。
+  Rust 回归 5 通过 / 2 声明忽略，Python 审计回归 10 通过；prepare 响应不能冒充 commit。
+- n42-rs 主线完整 workspace 回归修复 sled 重开用例后，继续发现
+  `prestate::debug_trace_call_matches_geth_prestate_snapshot` 的 beneficiary 账户快照差异：
+  同一 E2E target 76 通过 / 1 失败，原完整 workspace 仍不能记为 PASS。
+  失败工件 `rs-main-workspace-tests-retry.log` 保留，尚未用修改预期工件绕过该差异。
+- 七节点自定义链验收使用升级兼容分支的冻结二进制；其持续运行与恢复门槛独立于
+  性能主线的上述 RPC 回归。升级兼容七节点一小时续跑已经启动，持续检查真实历史状态
+  派生的区块、QMDB 根、收据和固定七密钥 QC；结果仍以完成后的 summary 为准。
