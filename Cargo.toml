@@ -229,5 +229,7 @@ debug = true
 strip = false
 
 [patch.crates-io]
+# Fee-disabled traceCall must retain the Geth beneficiary prestate.
+revm-inspectors = { path = "vendor/dependency-repairs/revm-inspectors-0.44.1" }
 # TestRng trait compatibility with proptest 1.11 / rand 0.10.
 proptest-arbitrary-interop = { path = "vendor/dependency-repairs/proptest-arbitrary-interop-0.1.0" }
