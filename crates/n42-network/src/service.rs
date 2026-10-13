@@ -3107,18 +3107,23 @@ impl NetworkService {
                     .cloned()
                     .unwrap_or_default();
                 let found = !response.is_empty();
+                let has_storage = !found && self.gov5_canonical_blocks.is_some();
                 if self
                     .swarm
                     .behaviour_mut()
                     .gov5_block_by_hash
-                    .send_response(channel, Gov5BlockByHashResponse { rlp: response })
+                    .send_response(channel, Gov5BlockByHashResponse {
+                        rlp: response,
+                        fork_digest: self.gov5_status.map(|s| s.genesis_hash.as_slice()[..4].try_into().expect("four genesis bytes")).unwrap_or_default(),
+                        fallback: if found { None } else { self.gov5_canonical_blocks.clone().map(|r| (r, request.block_hash)) },
+                    })
                     .is_err()
                 {
                     tracing::warn!(%peer, block_hash = %request.block_hash, "failed to answer Gov5 block-by-hash request");
                 } else {
                     metrics::counter!(
                         "n42_gov5_block_fetch_responses_total",
-                        "result" => if found { "found" } else { "missing" }
+                        "result" => if found { "found" } else if has_storage { "storage" } else { "missing" }
                     )
                     .increment(1);
                     tracing::debug!(

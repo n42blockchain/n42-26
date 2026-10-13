@@ -38,6 +38,7 @@ pub const MAX_GOV5_RANGE_RESPONSE_BYTES: usize =
     crate::finalized_range::MAX_MATERIALIZED_FINALIZED_RANGE_BYTES;
 const GOV5_RANGE_REQUEST_SSZ_LEN: usize = 52;
 type Gov5BestBlockNumber = dyn Fn() -> Result<u64, String> + Send + Sync;
+type Gov5BlockRlpByHash = dyn Fn(B256) -> Result<Option<Vec<u8>>, String> + Send + Sync;
 type Gov5BlockRlpByNumber = dyn Fn(u64) -> Result<Option<Vec<u8>>, String> + Send + Sync;
 type Gov5BlockRlpsByRange =
     dyn Fn(std::ops::RangeInclusive<u64>) -> Result<Vec<Vec<u8>>, String> + Send + Sync;
@@ -55,6 +56,7 @@ const GOV5_RANGE_BATCH_BLOCKS: u64 = 32;
 #[derive(Clone)]
 pub struct Gov5CanonicalBlockReader {
     best_block_number: Arc<Gov5BestBlockNumber>,
+    block_rlp_by_hash: Option<Arc<Gov5BlockRlpByHash>>,
     block_rlp_by_number: Arc<Gov5BlockRlpByNumber>,
     /// Contiguous blocks from the start of the range up to the first missing
     /// one, all read from one consistent view.
@@ -79,6 +81,7 @@ impl Gov5CanonicalBlockReader {
         let per_block = Arc::clone(&block_rlp_by_number);
         Self {
             best_block_number: Arc::new(best_block_number),
+            block_rlp_by_hash: None,
             block_rlp_by_number,
             block_rlps_by_range: Arc::new(move |numbers| {
                 let mut rlps = Vec::new();
@@ -107,11 +110,29 @@ impl Gov5CanonicalBlockReader {
         let per_range = Arc::clone(&block_rlps_by_range);
         Self {
             best_block_number: Arc::new(best_block_number),
+            block_rlp_by_hash: None,
             block_rlp_by_number: Arc::new(move |number| {
                 Ok(per_range(number..=number)?.into_iter().next())
             }),
             block_rlps_by_range,
         }
+    }
+
+    pub fn with_hash_reader<R>(mut self, reader: R) -> Self
+    where
+        R: Fn(B256) -> Result<Option<Vec<u8>>, String> + Send + Sync + 'static,
+    {
+        self.block_rlp_by_hash = Some(Arc::new(reader));
+        self
+    }
+
+    pub fn block_rlp_by_hash(&self, hash: B256) -> Result<Option<Vec<u8>>, String> {
+        let Some(reader) = &self.block_rlp_by_hash else { return Ok(None) };
+        let Some(rlp) = reader(hash)? else { return Ok(None) };
+        if rlp.len() > MAX_GOV5_BLOCK_SIZE { return Err("stored block exceeds by-hash bound".into()) }
+        let block = crate::gov5_block::decode_gov5_block_rlp(&rlp).map_err(|e| e.to_string())?;
+        if block.block_hash != hash { return Err("stored block differs from requested hash".into()) }
+        Ok(Some(rlp))
     }
 
     pub fn best_block_number(&self) -> Result<u64, String> {
@@ -458,9 +479,12 @@ pub struct Gov5BlockByHashRequest {
     pub block_hash: B256,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Gov5BlockByHashResponse {
     pub rlp: Vec<u8>,
+    pub fork_digest: [u8; 4],
+    /// Local response source only; never serialized on the wire.
+    pub fallback: Option<(Gov5CanonicalBlockReader, B256)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1195,6 +1219,7 @@ impl request_response::Codec for Gov5BlockByHashCodec {
         let encoded = read_bounded(io, MAX_SNAPPY_FRAME_SIZE).await?;
         Ok(Gov5BlockByHashResponse {
             rlp: decode_chunked_block(&encoded)?,
+            ..Default::default()
         })
     }
 
@@ -1219,16 +1244,26 @@ impl request_response::Codec for Gov5BlockByHashCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
+        let mut response = response;
+        if response.rlp.is_empty() {
+            if let Some((reader, hash)) = response.fallback.take() {
+                let lookup = move || reader.block_rlp_by_hash(hash);
+                let result = if tokio::runtime::Handle::try_current().is_ok() {
+                    tokio::task::spawn_blocking(lookup).await.map_err(io::Error::other)?
+                } else {
+                    lookup()
+                };
+                response.rlp = result.map_err(io::Error::other)?.unwrap_or_default();
+            }
+        }
         if response.rlp.is_empty() {
             // Gov5's first response byte is its RPC status. A non-zero status
             // makes a cache miss fail closed instead of looking like a valid
             // zero-length block.
             io.write_all(&[1]).await
         } else {
-            // Rust readers validate the block hash after decoding, so a zero
-            // digest is sufficient for the Rust-to-Rust recovery path. Gov5
-            // does not currently request blocks from Rust over this protocol.
-            io.write_all(&encode_chunked_block(&response.rlp, [0; 4])?)
+            // Preserve the configured fork digest for Go and Rust requesters.
+            io.write_all(&encode_chunked_block(&response.rlp, response.fork_digest)?)
                 .await
         }
     }
@@ -1444,6 +1479,43 @@ mod tests {
         assert_eq!(decode_chunked_block(&encoded).unwrap(), b"block-rlp");
     }
 
+    #[tokio::test]
+    async fn block_by_hash_reads_persistent_storage_without_cache() {
+        let (hash, rlp) = range_block(42, B256::ZERO);
+        let stored = rlp.clone();
+        let caller = std::thread::current().id();
+        let reader = Gov5CanonicalBlockReader::new(|| Ok(42), |_| Ok(None))
+            .with_hash_reader(move |wanted| {
+                assert_ne!(std::thread::current().id(), caller, "storage must run off the swarm task");
+                Ok((wanted == hash).then(|| stored.clone()))
+            });
+        let mut wire = futures::io::Cursor::new(Vec::new());
+        Gov5BlockByHashCodec.write_response(
+            &StreamProtocol::new(GOV5_BLOCK_BY_HASH_PROTOCOL), &mut wire,
+            Gov5BlockByHashResponse { fallback: Some((reader, hash)), fork_digest: [1,2,3,4], ..Default::default() }
+        ).await.unwrap();
+        let wire = wire.into_inner();
+        assert_eq!(&wire[1..5], &[1,2,3,4]);
+        assert_eq!(decode_chunked_block(&wire).unwrap(), rlp);
+    }
+
+    #[test]
+    fn stored_block_reader_rejects_wrong_hash_oversize_and_read_errors() {
+        let (hash, rlp) = range_block(42, B256::ZERO);
+        let reader = Gov5CanonicalBlockReader::new(|| Ok(42), |_| Ok(None))
+            .with_hash_reader(move |_| Ok(Some(rlp.clone())));
+        assert!(reader.block_rlp_by_hash(hash).unwrap().is_some());
+        assert!(reader.block_rlp_by_hash(B256::repeat_byte(0x55)).is_err());
+        let oversized = Gov5CanonicalBlockReader::new(|| Ok(0), |_| Ok(None))
+            .with_hash_reader(|_| Ok(Some(vec![0; MAX_GOV5_BLOCK_SIZE+1])));
+        assert!(oversized.block_rlp_by_hash(hash).is_err());
+        let failed = Gov5CanonicalBlockReader::new(|| Ok(0), |_| Ok(None))
+            .with_hash_reader(|_| Err("storage read failed".into()));
+        assert!(failed.block_rlp_by_hash(hash).is_err());
+        let absent = Gov5CanonicalBlockReader::new(|| Ok(0), |_| Ok(None));
+        assert!(absent.block_rlp_by_hash(hash).unwrap().is_none());
+    }
+
     #[test]
     fn block_by_hash_response_roundtrips_and_cache_miss_fails_closed() {
         let protocol = StreamProtocol::new(GOV5_BLOCK_BY_HASH_PROTOCOL);
@@ -1453,6 +1525,7 @@ mod tests {
             &mut writer,
             Gov5BlockByHashResponse {
                 rlp: b"block-rlp".to_vec(),
+                ..Default::default()
             },
         ))
         .unwrap();
@@ -1465,7 +1538,7 @@ mod tests {
         futures::executor::block_on(Gov5BlockByHashCodec.write_response(
             &protocol,
             &mut miss,
-            Gov5BlockByHashResponse { rlp: Vec::new() },
+            Gov5BlockByHashResponse { rlp: Vec::new(), ..Default::default() },
         ))
         .unwrap();
         assert!(decode_chunked_block(&miss.into_inner()).is_err());
@@ -1486,7 +1559,7 @@ mod tests {
         futures::executor::block_on(Gov5BlockByHashCodec.write_response(
             &protocol,
             &mut wire,
-            Gov5BlockByHashResponse { rlp: large.clone() },
+            Gov5BlockByHashResponse { rlp: large.clone(), ..Default::default() },
         ))
         .unwrap();
         let decoded = futures::executor::block_on(
