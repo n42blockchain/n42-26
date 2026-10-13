@@ -136,3 +136,33 @@ n42-26 使用重新冻结的 v2.7 二进制，严格 `N42_QMDB_READS=only` 的�
 - 七节点自定义链验收使用升级兼容分支的冻结二进制；其持续运行与恢复门槛独立于
   性能主线的上述 RPC 回归。升级兼容七节点一小时续跑已经启动，持续检查真实历史状态
   派生的区块、QMDB 根、收据和固定七密钥 QC；结果仍以完成后的 summary 为准。
+
+
+## 2026-10-13 稳定版适配回归收尾
+
+RS prestate 快照差异已在实际使用的 `revm_inspectors::DebugInspector` 修复。
+旧 `crates/n42/reth-rpc` 不在 active RPC 依赖路径，不在那里留下无效改动。
+按 exact-version 0.44.1 引入本地 replacement，保留上游源与许可证、原 checksum、
+来源说明以及 `N42-PATCH.diff`；三份 replacement 的修复源 SHA256 均为
+`1405f152ecd9d722d77a96d7bd19c9395aad3863a87f01dda40cc628584fc5a8`。
+Default prestate 从预执行数据库补读缺少的 beneficiary；不修改执行结果，
+diff 模式、disableCode 和已经出现的账户/存储保持原语义。
+Geth 对照：[prestate OnTxStart](https://github.com/ethereum/go-ethereum/blob/master/eth/tracers/native/prestate.go)。
+保留原快照，并添加 unchanged-beneficiary 不应进入 diff 的检查。
+
+| 最终回归 | 通过 | 失败 | 声明忽略 | 工件 |
+|---|---:|---:|---:|---|
+| n42-rs main 完整 workspace | 3352 | 0 | 87 | build-service/093.log，退出 0 |
+| n42-26 锁定 Reth 源完整 workspace | 1810 | 0 | 30 | build-service/094.log，退出 0 |
+| RS 升级 chain94 完整 workspace | 1941 | 0 | 35 | build-service/095.log，workspace 命令退出 0 |
+| Python 审计/驱动回归 | 101 | 0 | 0 | python-final-tests.log |
+
+RS main 专项原快照（含新增 diff 检查）与另外 17 个 RPC E2E 均通过，工件 092.log。
+兼容分支 095.log 中还包含一次独立 prestate 专项，因此把所有 summary 直接相加会
+多算一次（1942）；表中只计完整 workspace 的 1941。095 整体任务在随后重建命令
+遗漏 package selector 时返回 101；未改写为成功，正确分 package 重建由任务 099 执行。
+完整脚本和原失败记录均保留。声明忽略项未记成通过。
+
+本工程最终节点构建成功，SHA256
+`4f8a20a94be903a81a3712fef063d84282894ce584f619cdd4feca31d0a5848c`。
+混合运行与恢复验收仍在后续队列，最终结论须结合三工程七节点验收文档。

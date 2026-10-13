@@ -339,3 +339,36 @@ Gov5 的第二轮恢复全套 PASS，工件 `gov5/faults-drills/summary.json`。
 生产修复按 callback/codec、节点接线、native hash 恢复和诊断分别提交并推送。
 至此，三工程各自的一小时窗口及完整恢复演练均有通过工件；旧小时窗口的二进制
 身份保持原样，后续混合窗口将使用修复后的 Rust 二进制，综合混合验收仍待完成。
+
+
+## 混合委员会连续追块修复（2026-10-13，验收进行中）
+
+混合拓扑为 Gov5 节点 0..4、本工程节点 5、升级后的 RS 节点 6，沿用同一固定七密钥、
+f=2、五签名 quorum。共同 replay v2 派生锚点为 13654526，hash
+`6e579033416d4ec6e6fdbe5cb91790aebaf1f7fe0eb53ced4b2ecfd4fa00c045`，QMDB bin 根
+`d7fb98d9e806c50cb61c15cf0e41a7c0d1e17837677e932d33582f764b945b68`。
+原 replay 数据及三个独立运行数据目录未替换。
+
+任务 082 的初始 RPC QC 屏障失败、任务 084 的 300 秒执行追齐失败均保留；
+分别位于 `mixed27-fleet/smoke-attempt1-startup-barrier/`、
+`mixed27-fleet/smoke-attempt2-execution-lag/`。任务 084 日志实际显示首个区块
+new_payload 和 FCU 为 Valid，随后一个不同 hash 的后继区块携带相同 header view=2233，
+其已验证的 H2 certificate view=2234。原处理用 header view 覆盖 certificate binding，
+后继因此被误判在 execution floor 以下，未推进 FCU，后续 ancestry 无法连接。
+
+修复保留已有经验证的 H2 certificate view；header view 仍必须不高于该绑定。
+仅 transitively authenticated、尚无 certificate 的父块使用 header view。
+不改变 wire、签名域、quorum、交易类型或状态树。
+新增回归连续输入两个 header view 相同但 certificate view 递增的区块，检查执行头、
+高度、绑定及两次 FCU。任务 086 共识服务 237 通过 / 3 声明忽略，release 节点重建成功。
+修复提交 `88f0f80` 已推送 main。混合持续运行和恢复验收仍待重测结果，不能据此签署 PASS。
+
+
+混合任务 087 已恢复执行追齐且七个执行头一致，随后 auditor 因 Rust 生产者使用
+协议允许的 108-byte 无内嵌 QC header 而失败。原现场在
+`mixed27-fleet/smoke-attempt3-optional-qc-auditor/`。没有使用 mobile CE 冒充 H2 commit QC。
+Gov5 adapter 现在仅对合法 optional-QC 形状向前查看最多 8 个 canonical header，
+寻找已有 Go carrier 的 commit QC；继续离线验证原固定七密钥／f=2／commit 签名域，
+并检查其目标在每个被验收节点的 canonical 链中。其他异常 header 直接拒绝。
+新增 bound/invalid-header 回归后，审计专项 12 通过，整个 Python 集合 101 通过。
+审计修正 `1d91435` 已推送，下一轮使用最终 Reth 适配的重建二进制。
