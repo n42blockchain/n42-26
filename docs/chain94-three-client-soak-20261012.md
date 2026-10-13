@@ -394,3 +394,26 @@ Accepted/Syncing 不能关闭队列。回归同时检查后继 live commit 被�
 回归覆盖 eager 回调先到、尚未 FCU 时高度不动、确认后下一个 ancestry suffix 可释放。
 完整 workspace 已完成 1813 通过 / 0 失败 / 30 声明忽略；任务 108 已重建最终节点并退出 0。
 上述修复均分段推送。独立一小时结果仍绑定原先各自的二进制，混合最终窗口待重测。
+
+
+## 混合节点生产覆盖检查与 RS 主线节奏借用
+
+任务 109：七执行头一致，90 秒新增 43 块、167 成功交易、0 失败，
+QC、hash、QMDB 根及收据检查没有报错，但只覆盖六个生产者，因此 summary 保持 FAIL。
+没有把“六节点继续出块”当成七生产者互通通过。原现场在
+`mixed27-fleet/smoke-attempt5-rs-wall-clock-pacing/`。
+缺少生产者为 RS index 6（`0x1ccde065f222f44709797be2908fc72b7801eda5`）。
+父块链时间在一次 Root build 时已比墙钟领先约 40 秒，RS 旧 attribute builder
+等待墙钟超过父时间而持续让过 leader view；不是签名或状态根错误。
+
+核对 `../n42-rs` main 现有 `block_attributes` 与 `head_stamp` 后，只借用两点：
+
+1. header 已在 EL、内存 timestamp cache 为空时，恢复真实父时间戳；
+2. pacing 仍按收到父块后的链 period 等待，timestamp 按父时间 + period 确定。
+   重启与 genesis fallback 分开，溢出时间戳拒绝，不把父时间当成墙钟 deadline。
+
+这沿用 Gov5 H2 Prepare 的确定性时间与 VerifyHeader 的父子单调性规则；
+没有借入性能路线的 Ed25519/帧协议，也没有修改五签名门槛。
+新增父时间恢复用例与四个时间节奏用例。变更通过 Rust 语法解析和差异检查后，
+按先推送、补验证的既有安排分成两次提交；112/113 编译回归及114短测、115一小时、
+116恢复测试仍等待共享机器占用释放，尚不能记为通过。
