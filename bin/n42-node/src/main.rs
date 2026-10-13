@@ -108,6 +108,9 @@ where
                     .ok_or_else(|| {
                         format!("canonical hash is missing for persisted block {number}")
                     })?;
+                let native = n42_consensus::Gov5NativeHeader::recover(&block.header, block_hash)
+                    .ok_or_else(|| format!("cannot recover persisted native header {block_hash}"))?;
+                n42_consensus::remember_gov5_native_header(&native.encode());
                 let execution = ExecutionData::from_block_unchecked(block_hash, &block);
                 rlps.push(
                     n42_network::encode_gov5_block_rlp(&execution)
@@ -122,6 +125,9 @@ where
         if view.block_hash(block.header.number).map_err(|e| e.to_string())? != Some(hash) {
             return Ok(None);
         }
+        let native = n42_consensus::Gov5NativeHeader::recover(&block.header, hash)
+            .ok_or_else(|| format!("cannot recover persisted native header {hash}"))?;
+        n42_consensus::remember_gov5_native_header(&native.encode());
         let execution = ExecutionData::from_block_unchecked(hash, &block);
         n42_network::encode_gov5_block_rlp(&execution).map(Some).map_err(|e| e.to_string())
     })
