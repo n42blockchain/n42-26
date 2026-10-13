@@ -230,3 +230,10 @@ flush，进程成功退出后再重开读取 1,024 条记录，测试持久化�
 七节点区块／QMDB 根／收据／固定七密钥 commit QC 的连续一致性检查通过。
 工件：`rs27-fleet/soak-audit/summary.json`，后台任务 `build-service/020.result.json` 返回 0。
 这补齐了 Gov5、本工程与升级兼容 RS 各自一小时窗口；尚未替代正在运行的恢复演练和混合互通。
+
+
+恢复驱动第一轮在停掉 RS 节点 6 后因临时目录的 `queue.py` 遮蔽 Python 标准库而阻塞，
+其余六个节点持续出块。优雅停止自有 supervisor 后，任务 021 以 130 结束，
+后续 022–025 门槛拒绝启动；现场完整移至 `rs27-fleet/faults-attempt1-queue-shadow/`。
+临时排队脚本改名 `wait-for-validation-claim.py`，同目录标准库解析及两线程 smoke 已通过。
+第二轮恢复／混合队列从任务 026 开始；第一轮不能记录为恢复 PASS。
