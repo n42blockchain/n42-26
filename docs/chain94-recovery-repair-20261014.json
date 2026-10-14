@@ -1,0 +1,831 @@
+{
+  "status": "PASS",
+  "scope": "chain94 fixed seven validators, f=2; owned graceful stop/recovery, not power-loss durability",
+  "source_commits": {
+    "n42-26": "51e2fee",
+    "n42-rs-chain94": "cf128a8b3"
+  },
+  "chain_id": 94,
+  "genesis_hash": "0xa2d2ff5d814552bb9a113b68ad7ed2b824fbb52caed42dbe573068845b57be99",
+  "binary_sha256": {
+    "n42-gov5": "c6a7366bdf2370116a40d07a480e7942cd8f80f220e1ef287d1f00c9863e2533",
+    "n42-node": "866efb3ab2ac1a48ed53a439da5f90ce479750f43f95616322e4fd6574bf3c95",
+    "rs27/n42": "e83ef4d41bb0661adf394a727d85d37ac1a0345fc7e39cb675e25816c0e22ffd",
+    "rs27/h2_validator": "69c568654320d36af6eb328166eddd96655e6894e399eb8ede437407620e60e6"
+  },
+  "regression": {
+    "117": {
+      "returncode": 0,
+      "result_groups": 3,
+      "passed": 19,
+      "failed": 0,
+      "declared_ignored": 0
+    },
+    "124": {
+      "returncode": 0,
+      "result_groups": 62,
+      "passed": 1815,
+      "failed": 0,
+      "declared_ignored": 30
+    },
+    "126": {
+      "returncode": 0,
+      "result_groups": 112,
+      "passed": 1943,
+      "failed": 0,
+      "declared_ignored": 35
+    }
+  },
+  "healthy": {
+    "status": "PASS",
+    "scope": "committed chain/receipt/QC consistency; durability requires restart verification",
+    "first": 13657071,
+    "last": 13657099,
+    "elapsed_seconds": 60.00079770999582,
+    "producers": [
+      "0x1ccde065f222f44709797be2908fc72b7801eda5",
+      "0x301631ce4b15f1a0d62a35d6c421dd5a845e555e",
+      "0x580339c31c60b974ac9f70e2f8307b2b4490f70a",
+      "0xa97ab21a7efbcb7995b67ed39287ba408850a9f1",
+      "0xd2a316a1cd3a777141cb7e5aace46fb01df90eac",
+      "0xe5eb05fc41cdad4433f52988f83f78f46bb27e61",
+      "0xf7dc5c92fa9e812eb0c3157492da65457ae5de46"
+    ],
+    "successful_transactions": 95,
+    "failed_transactions": 0
+  },
+  "recovery": {
+    "status": "PASS",
+    "scope": "owned process graceful stop/recovery; fixed seven-key quorum and canonical receipts"
+  },
+  "verified_recovery_blocks": 128,
+  "verified_recovery_successful_transactions": 1203,
+  "verified_recovery_failed_transactions": 0,
+  "stages": [
+    {
+      "event": "stopped",
+      "time": 1791949825.8892512,
+      "nodes": [
+        6
+      ]
+    },
+    {
+      "event": "progress",
+      "time": 1791949886.4854133,
+      "active": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "first": 13657100,
+      "last": 13657129,
+      "seconds": 60
+    },
+    {
+      "event": "restarted",
+      "time": 1791949910.488996,
+      "nodes": [
+        6
+      ]
+    },
+    {
+      "event": "caught_up",
+      "time": 1791949915.5571358,
+      "number": 13657143,
+      "hash": "0xd1984aa07c9eb6a5b064126de2015e8a5e307cdea71a782a89c279e886b197c9",
+      "state_root": "0x2992e6012707b0f2b53cfc6bf22a6ec9d23a9f7ed7b4e5e59e0711246c0a229c",
+      "heads": [
+        13657147,
+        13657147,
+        13657147,
+        13657147,
+        13657147,
+        13657147,
+        13657147
+      ]
+    },
+    {
+      "event": "progress",
+      "time": 1791949945.8939655,
+      "active": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "first": 13657143,
+      "last": 13657157,
+      "seconds": 30
+    },
+    {
+      "event": "stopped",
+      "time": 1791949946.2179523,
+      "nodes": [
+        5,
+        6
+      ]
+    },
+    {
+      "event": "progress",
+      "time": 1791950127.2456892,
+      "active": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "first": 13657162,
+      "last": 13657179,
+      "seconds": 180
+    },
+    {
+      "event": "stopped",
+      "time": 1791950127.4094703,
+      "nodes": [
+        4
+      ]
+    },
+    {
+      "event": "no_quorum_stable",
+      "time": 1791950247.697947,
+      "active": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "number": 13657184,
+      "hash": "0xafaa5e7de682c44f002ca76352bf8436eb80657e2169a7cec6b99a3ee808d404",
+      "seconds": 60,
+      "drain_seconds": 60
+    },
+    {
+      "event": "restarted",
+      "time": 1791950253.7004304,
+      "nodes": [
+        4
+      ]
+    },
+    {
+      "event": "resumed_committing",
+      "time": 1791950273.876742,
+      "active": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "first": 13657184,
+      "last": 13657189,
+      "recovery_seconds": 20.176185961994634,
+      "budget_seconds": 180
+    },
+    {
+      "event": "progress",
+      "time": 1791950454.9057772,
+      "active": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "first": 13657189,
+      "last": 13657209,
+      "seconds": 180
+    },
+    {
+      "event": "restarted",
+      "time": 1791950484.9117637,
+      "nodes": [
+        5,
+        6
+      ]
+    },
+    {
+      "event": "caught_up",
+      "time": 1791950489.9732296,
+      "number": 13657219,
+      "hash": "0xa7e4e2975026f928d5f70480a4a9e96ad0fb41378e92300f32d1e8c770a87db3",
+      "state_root": "0xb460e14a93bc440d0b3223d2433801fdd8c89773df890ee237a9ab9a4b5a04de",
+      "heads": [
+        13657221,
+        13657221,
+        13657221,
+        13657221,
+        13657221,
+        13657221,
+        13657221
+      ]
+    },
+    {
+      "event": "progress",
+      "time": 1791950520.289484,
+      "active": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "first": 13657219,
+      "last": 13657231,
+      "seconds": 30
+    },
+    {
+      "event": "stopped",
+      "time": 1791950520.8087502,
+      "nodes": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
+    },
+    {
+      "event": "restart_anchor",
+      "time": 1791950520.8088634,
+      "number": 13657233,
+      "hash": "0x614686457503db087bb3fded6ce96daaada5b5ed0a05c5e58fba6999f6004895",
+      "state_root": "0x122cf6af40484ed9b5e935672b9c5098da8361e81775e5c7c4e793645fce87d2"
+    },
+    {
+      "event": "restarted",
+      "time": 1791950581.063897,
+      "nodes": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
+    },
+    {
+      "event": "caught_up",
+      "time": 1791950628.3549597,
+      "number": 13657272,
+      "hash": "0x27328804d661b37f90db89a42c5524527b7a68ca15cd89363664741bd25c8998",
+      "state_root": "0x158d94a20fd3a738b2209a73024e53af5fbfc5780d5bba08762d4d71ae02ccc9",
+      "heads": [
+        13657274,
+        13657274,
+        13657274,
+        13657274,
+        13657274,
+        13657273,
+        13657273
+      ]
+    },
+    {
+      "event": "resumed_committing",
+      "time": 1791950633.4673371,
+      "active": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "first": 13657272,
+      "last": 13657275,
+      "recovery_seconds": 5.083279548998689,
+      "budget_seconds": 180
+    },
+    {
+      "event": "progress",
+      "time": 1791950694.1082249,
+      "active": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "first": 13657275,
+      "last": 13657303,
+      "seconds": 60
+    },
+    {
+      "event": "stopped",
+      "time": 1791950694.604038,
+      "nodes": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
+    }
+  ],
+  "durable_states": {
+    "durable_before_restart": [
+      {
+        "node": 0,
+        "view": 5088,
+        "r1": 5087,
+        "r2": 5087,
+        "locked": {
+          "blockHash": "0xeb1dd7383676ef12a9790439812cb2bbbab8e410481ca16a6589ce506c757229",
+          "signature": "0x89486728fcc7e0b30731010623019d17e5c86e75b28802c72ca5a366205303bc55e6aaa71be4692931f08b291247de8b0782b7e50a9ea5e9b060065b6539158f9311508df8ee66e69fafd1e1c7df709c51ef7390cfb2ee2bbce5a7606b47c0f9",
+          "signers": [
+            false,
+            true,
+            false,
+            true,
+            true,
+            true,
+            true
+          ],
+          "view": 5087
+        },
+        "committed": {
+          "blockHash": "0xeb1dd7383676ef12a9790439812cb2bbbab8e410481ca16a6589ce506c757229",
+          "signature": "0x953d621e8dcbc2208012702712a48631f26c8ad1dc9f1a9312b147f1ee2edc3a1cee8a65a94cc282a2729c717ca32e0107035c2c08409b2755a1caf18ef36c3cad0eb747678fc17605ab9f98d66fb451c93d8aab85328e4275809825a351f950",
+          "signers": [
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
+            true
+          ],
+          "view": 5087
+        }
+      },
+      {
+        "node": 1,
+        "view": 5088,
+        "r1": 5087,
+        "r2": 5087,
+        "locked": {
+          "blockHash": "0xeb1dd7383676ef12a9790439812cb2bbbab8e410481ca16a6589ce506c757229",
+          "signature": "0x89486728fcc7e0b30731010623019d17e5c86e75b28802c72ca5a366205303bc55e6aaa71be4692931f08b291247de8b0782b7e50a9ea5e9b060065b6539158f9311508df8ee66e69fafd1e1c7df709c51ef7390cfb2ee2bbce5a7606b47c0f9",
+          "signers": [
+            false,
+            true,
+            false,
+            true,
+            true,
+            true,
+            true
+          ],
+          "view": 5087
+        },
+        "committed": {
+          "blockHash": "0xeb1dd7383676ef12a9790439812cb2bbbab8e410481ca16a6589ce506c757229",
+          "signature": "0x953d621e8dcbc2208012702712a48631f26c8ad1dc9f1a9312b147f1ee2edc3a1cee8a65a94cc282a2729c717ca32e0107035c2c08409b2755a1caf18ef36c3cad0eb747678fc17605ab9f98d66fb451c93d8aab85328e4275809825a351f950",
+          "signers": [
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
+            true
+          ],
+          "view": 5087
+        }
+      },
+      {
+        "node": 2,
+        "view": 5088,
+        "r1": 5087,
+        "r2": 5087,
+        "locked": {
+          "blockHash": "0xeb1dd7383676ef12a9790439812cb2bbbab8e410481ca16a6589ce506c757229",
+          "signature": "0x89486728fcc7e0b30731010623019d17e5c86e75b28802c72ca5a366205303bc55e6aaa71be4692931f08b291247de8b0782b7e50a9ea5e9b060065b6539158f9311508df8ee66e69fafd1e1c7df709c51ef7390cfb2ee2bbce5a7606b47c0f9",
+          "signers": [
+            false,
+            true,
+            false,
+            true,
+            true,
+            true,
+            true
+          ],
+          "view": 5087
+        },
+        "committed": {
+          "blockHash": "0xeb1dd7383676ef12a9790439812cb2bbbab8e410481ca16a6589ce506c757229",
+          "signature": "0x953d621e8dcbc2208012702712a48631f26c8ad1dc9f1a9312b147f1ee2edc3a1cee8a65a94cc282a2729c717ca32e0107035c2c08409b2755a1caf18ef36c3cad0eb747678fc17605ab9f98d66fb451c93d8aab85328e4275809825a351f950",
+          "signers": [
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
+            true
+          ],
+          "view": 5087
+        }
+      },
+      {
+        "node": 3,
+        "view": 5088,
+        "r1": 5087,
+        "r2": 5087,
+        "locked": {
+          "blockHash": "0xeb1dd7383676ef12a9790439812cb2bbbab8e410481ca16a6589ce506c757229",
+          "signature": "0x89486728fcc7e0b30731010623019d17e5c86e75b28802c72ca5a366205303bc55e6aaa71be4692931f08b291247de8b0782b7e50a9ea5e9b060065b6539158f9311508df8ee66e69fafd1e1c7df709c51ef7390cfb2ee2bbce5a7606b47c0f9",
+          "signers": [
+            false,
+            true,
+            false,
+            true,
+            true,
+            true,
+            true
+          ],
+          "view": 5087
+        },
+        "committed": {
+          "blockHash": "0xeb1dd7383676ef12a9790439812cb2bbbab8e410481ca16a6589ce506c757229",
+          "signature": "0x953d621e8dcbc2208012702712a48631f26c8ad1dc9f1a9312b147f1ee2edc3a1cee8a65a94cc282a2729c717ca32e0107035c2c08409b2755a1caf18ef36c3cad0eb747678fc17605ab9f98d66fb451c93d8aab85328e4275809825a351f950",
+          "signers": [
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
+            true
+          ],
+          "view": 5087
+        }
+      },
+      {
+        "node": 4,
+        "view": 5088,
+        "r1": 5087,
+        "r2": 5087,
+        "locked": {
+          "blockHash": "0xeb1dd7383676ef12a9790439812cb2bbbab8e410481ca16a6589ce506c757229",
+          "signature": "0x89486728fcc7e0b30731010623019d17e5c86e75b28802c72ca5a366205303bc55e6aaa71be4692931f08b291247de8b0782b7e50a9ea5e9b060065b6539158f9311508df8ee66e69fafd1e1c7df709c51ef7390cfb2ee2bbce5a7606b47c0f9",
+          "signers": [
+            false,
+            true,
+            false,
+            true,
+            true,
+            true,
+            true
+          ],
+          "view": 5087
+        },
+        "committed": {
+          "blockHash": "0xeb1dd7383676ef12a9790439812cb2bbbab8e410481ca16a6589ce506c757229",
+          "signature": "0x953d621e8dcbc2208012702712a48631f26c8ad1dc9f1a9312b147f1ee2edc3a1cee8a65a94cc282a2729c717ca32e0107035c2c08409b2755a1caf18ef36c3cad0eb747678fc17605ab9f98d66fb451c93d8aab85328e4275809825a351f950",
+          "signers": [
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
+            true
+          ],
+          "view": 5087
+        }
+      },
+      {
+        "node": 5,
+        "view": 5088,
+        "r1": 5087,
+        "r2": 5087,
+        "locked": {
+          "view": 5087,
+          "blockHash": "0xeb1dd7383676ef12a9790439812cb2bbbab8e410481ca16a6589ce506c757229",
+          "signature": "0x89486728fcc7e0b30731010623019d17e5c86e75b28802c72ca5a366205303bc55e6aaa71be4692931f08b291247de8b0782b7e50a9ea5e9b060065b6539158f9311508df8ee66e69fafd1e1c7df709c51ef7390cfb2ee2bbce5a7606b47c0f9",
+          "signers": [
+            false,
+            true,
+            false,
+            true,
+            true,
+            true,
+            true
+          ]
+        },
+        "committed": {
+          "view": 5087,
+          "blockHash": "0xeb1dd7383676ef12a9790439812cb2bbbab8e410481ca16a6589ce506c757229",
+          "signature": "0x953d621e8dcbc2208012702712a48631f26c8ad1dc9f1a9312b147f1ee2edc3a1cee8a65a94cc282a2729c717ca32e0107035c2c08409b2755a1caf18ef36c3cad0eb747678fc17605ab9f98d66fb451c93d8aab85328e4275809825a351f950",
+          "signers": [
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
+            true
+          ]
+        }
+      },
+      {
+        "node": 6,
+        "view": 5088,
+        "r1": 5087,
+        "r2": 5087,
+        "locked": {
+          "view": 5087,
+          "blockHash": "0xeb1dd7383676ef12a9790439812cb2bbbab8e410481ca16a6589ce506c757229",
+          "signature": "0x89486728fcc7e0b30731010623019d17e5c86e75b28802c72ca5a366205303bc55e6aaa71be4692931f08b291247de8b0782b7e50a9ea5e9b060065b6539158f9311508df8ee66e69fafd1e1c7df709c51ef7390cfb2ee2bbce5a7606b47c0f9",
+          "signers": [
+            false,
+            true,
+            false,
+            true,
+            true,
+            true,
+            true
+          ]
+        },
+        "committed": {
+          "view": 5087,
+          "blockHash": "0xeb1dd7383676ef12a9790439812cb2bbbab8e410481ca16a6589ce506c757229",
+          "signature": "0x953d621e8dcbc2208012702712a48631f26c8ad1dc9f1a9312b147f1ee2edc3a1cee8a65a94cc282a2729c717ca32e0107035c2c08409b2755a1caf18ef36c3cad0eb747678fc17605ab9f98d66fb451c93d8aab85328e4275809825a351f950",
+          "signers": [
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
+            true
+          ]
+        }
+      }
+    ],
+    "durable_after_restart": [
+      {
+        "node": 0,
+        "view": 5168,
+        "r1": 5167,
+        "r2": 5167,
+        "locked": {
+          "blockHash": "0x2dde0675b0208b8850711e39ac16da31852f3920ef39fd07bc0440f840d2f787",
+          "signature": "0x81c4eebd504d1ccc37d28391fc7f9b7cbcbfdd5934a9a14da71ea11ce9a3dfc49ebd426928eb3b26a53b99740e113e9d169bccef7c08cc3fe31981c06609fd2f3702421211bc9cbdd1974ba8d7b909e13f5ff08ad6c55c04ba4eadca95d9e6e5",
+          "signers": [
+            true,
+            true,
+            false,
+            true,
+            true,
+            false,
+            true
+          ],
+          "view": 5167
+        },
+        "committed": {
+          "blockHash": "0x2dde0675b0208b8850711e39ac16da31852f3920ef39fd07bc0440f840d2f787",
+          "signature": "0x879cd0c780a8bffae1b51ab04b8a8c71f9a9a520dfa571cde54a027ad669639674a86c93a9d3e83fd1694f66d88ab3a40c397bed76f4d098f997b3b1eddc8f080e1760d922e68137bf55fb2b627b41d2636c9cb48553ff0c901b3e3e21fcb80d",
+          "signers": [
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
+            true
+          ],
+          "view": 5167
+        }
+      },
+      {
+        "node": 1,
+        "view": 5168,
+        "r1": 5167,
+        "r2": 5167,
+        "locked": {
+          "blockHash": "0x2dde0675b0208b8850711e39ac16da31852f3920ef39fd07bc0440f840d2f787",
+          "signature": "0x81c4eebd504d1ccc37d28391fc7f9b7cbcbfdd5934a9a14da71ea11ce9a3dfc49ebd426928eb3b26a53b99740e113e9d169bccef7c08cc3fe31981c06609fd2f3702421211bc9cbdd1974ba8d7b909e13f5ff08ad6c55c04ba4eadca95d9e6e5",
+          "signers": [
+            true,
+            true,
+            false,
+            true,
+            true,
+            false,
+            true
+          ],
+          "view": 5167
+        },
+        "committed": {
+          "blockHash": "0x2dde0675b0208b8850711e39ac16da31852f3920ef39fd07bc0440f840d2f787",
+          "signature": "0x879cd0c780a8bffae1b51ab04b8a8c71f9a9a520dfa571cde54a027ad669639674a86c93a9d3e83fd1694f66d88ab3a40c397bed76f4d098f997b3b1eddc8f080e1760d922e68137bf55fb2b627b41d2636c9cb48553ff0c901b3e3e21fcb80d",
+          "signers": [
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
+            true
+          ],
+          "view": 5167
+        }
+      },
+      {
+        "node": 2,
+        "view": 5168,
+        "r1": 5167,
+        "r2": 5167,
+        "locked": {
+          "blockHash": "0x2dde0675b0208b8850711e39ac16da31852f3920ef39fd07bc0440f840d2f787",
+          "signature": "0x81c4eebd504d1ccc37d28391fc7f9b7cbcbfdd5934a9a14da71ea11ce9a3dfc49ebd426928eb3b26a53b99740e113e9d169bccef7c08cc3fe31981c06609fd2f3702421211bc9cbdd1974ba8d7b909e13f5ff08ad6c55c04ba4eadca95d9e6e5",
+          "signers": [
+            true,
+            true,
+            false,
+            true,
+            true,
+            false,
+            true
+          ],
+          "view": 5167
+        },
+        "committed": {
+          "blockHash": "0x2dde0675b0208b8850711e39ac16da31852f3920ef39fd07bc0440f840d2f787",
+          "signature": "0x879cd0c780a8bffae1b51ab04b8a8c71f9a9a520dfa571cde54a027ad669639674a86c93a9d3e83fd1694f66d88ab3a40c397bed76f4d098f997b3b1eddc8f080e1760d922e68137bf55fb2b627b41d2636c9cb48553ff0c901b3e3e21fcb80d",
+          "signers": [
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
+            true
+          ],
+          "view": 5167
+        }
+      },
+      {
+        "node": 3,
+        "view": 5168,
+        "r1": 5167,
+        "r2": 5167,
+        "locked": {
+          "blockHash": "0x2dde0675b0208b8850711e39ac16da31852f3920ef39fd07bc0440f840d2f787",
+          "signature": "0x81c4eebd504d1ccc37d28391fc7f9b7cbcbfdd5934a9a14da71ea11ce9a3dfc49ebd426928eb3b26a53b99740e113e9d169bccef7c08cc3fe31981c06609fd2f3702421211bc9cbdd1974ba8d7b909e13f5ff08ad6c55c04ba4eadca95d9e6e5",
+          "signers": [
+            true,
+            true,
+            false,
+            true,
+            true,
+            false,
+            true
+          ],
+          "view": 5167
+        },
+        "committed": {
+          "blockHash": "0x2dde0675b0208b8850711e39ac16da31852f3920ef39fd07bc0440f840d2f787",
+          "signature": "0x879cd0c780a8bffae1b51ab04b8a8c71f9a9a520dfa571cde54a027ad669639674a86c93a9d3e83fd1694f66d88ab3a40c397bed76f4d098f997b3b1eddc8f080e1760d922e68137bf55fb2b627b41d2636c9cb48553ff0c901b3e3e21fcb80d",
+          "signers": [
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
+            true
+          ],
+          "view": 5167
+        }
+      },
+      {
+        "node": 4,
+        "view": 5168,
+        "r1": 5167,
+        "r2": 5167,
+        "locked": {
+          "blockHash": "0x2dde0675b0208b8850711e39ac16da31852f3920ef39fd07bc0440f840d2f787",
+          "signature": "0x81c4eebd504d1ccc37d28391fc7f9b7cbcbfdd5934a9a14da71ea11ce9a3dfc49ebd426928eb3b26a53b99740e113e9d169bccef7c08cc3fe31981c06609fd2f3702421211bc9cbdd1974ba8d7b909e13f5ff08ad6c55c04ba4eadca95d9e6e5",
+          "signers": [
+            true,
+            true,
+            false,
+            true,
+            true,
+            false,
+            true
+          ],
+          "view": 5167
+        },
+        "committed": {
+          "blockHash": "0x2dde0675b0208b8850711e39ac16da31852f3920ef39fd07bc0440f840d2f787",
+          "signature": "0x879cd0c780a8bffae1b51ab04b8a8c71f9a9a520dfa571cde54a027ad669639674a86c93a9d3e83fd1694f66d88ab3a40c397bed76f4d098f997b3b1eddc8f080e1760d922e68137bf55fb2b627b41d2636c9cb48553ff0c901b3e3e21fcb80d",
+          "signers": [
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
+            true
+          ],
+          "view": 5167
+        }
+      },
+      {
+        "node": 5,
+        "view": 5168,
+        "r1": 5167,
+        "r2": 5167,
+        "locked": {
+          "view": 5167,
+          "blockHash": "0x2dde0675b0208b8850711e39ac16da31852f3920ef39fd07bc0440f840d2f787",
+          "signature": "0x81c4eebd504d1ccc37d28391fc7f9b7cbcbfdd5934a9a14da71ea11ce9a3dfc49ebd426928eb3b26a53b99740e113e9d169bccef7c08cc3fe31981c06609fd2f3702421211bc9cbdd1974ba8d7b909e13f5ff08ad6c55c04ba4eadca95d9e6e5",
+          "signers": [
+            true,
+            true,
+            false,
+            true,
+            true,
+            false,
+            true
+          ]
+        },
+        "committed": {
+          "view": 5167,
+          "blockHash": "0x2dde0675b0208b8850711e39ac16da31852f3920ef39fd07bc0440f840d2f787",
+          "signature": "0x879cd0c780a8bffae1b51ab04b8a8c71f9a9a520dfa571cde54a027ad669639674a86c93a9d3e83fd1694f66d88ab3a40c397bed76f4d098f997b3b1eddc8f080e1760d922e68137bf55fb2b627b41d2636c9cb48553ff0c901b3e3e21fcb80d",
+          "signers": [
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
+            true
+          ]
+        }
+      },
+      {
+        "node": 6,
+        "view": 5168,
+        "r1": 5167,
+        "r2": 5167,
+        "locked": {
+          "view": 5167,
+          "blockHash": "0x2dde0675b0208b8850711e39ac16da31852f3920ef39fd07bc0440f840d2f787",
+          "signature": "0x81c4eebd504d1ccc37d28391fc7f9b7cbcbfdd5934a9a14da71ea11ce9a3dfc49ebd426928eb3b26a53b99740e113e9d169bccef7c08cc3fe31981c06609fd2f3702421211bc9cbdd1974ba8d7b909e13f5ff08ad6c55c04ba4eadca95d9e6e5",
+          "signers": [
+            true,
+            true,
+            false,
+            true,
+            true,
+            false,
+            true
+          ]
+        },
+        "committed": {
+          "view": 5167,
+          "blockHash": "0x2dde0675b0208b8850711e39ac16da31852f3920ef39fd07bc0440f840d2f787",
+          "signature": "0x879cd0c780a8bffae1b51ab04b8a8c71f9a9a520dfa571cde54a027ad669639674a86c93a9d3e83fd1694f66d88ab3a40c397bed76f4d098f997b3b1eddc8f080e1760d922e68137bf55fb2b627b41d2636c9cb48553ff0c901b3e3e21fcb80d",
+          "signers": [
+            true,
+            true,
+            false,
+            false,
+            true,
+            true,
+            true
+          ]
+        }
+      }
+    ]
+  },
+  "runtime_jobs": {
+    "118": {
+      "returncode": 0
+    },
+    "125": {
+      "returncode": 0
+    }
+  }
+}
