@@ -22,6 +22,22 @@ REPO = Path(__file__).resolve().parents[1]
 BASES = dict(http=22400, auth=22500, metrics=22600, consensus=32400, p2p=30400, mobile=9740)
 
 
+def qmdb_ready(log_path, since=0):
+    """Require forest readiness from this launch, not an older log entry.
+
+    RPC may listen while the forest is still loading. Capture the append-log
+    size before restarting and pass it as ``since`` before starting consensus.
+    """
+    if since < 0:
+        raise ValueError("log offset must be nonnegative")
+    try:
+        with open(log_path, "rb") as stream:
+            stream.seek(since)
+            return b"QMDB state ready" in stream.read()
+    except FileNotFoundError:
+        return False
+
+
 def digest(path):
     with open(path, "rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()

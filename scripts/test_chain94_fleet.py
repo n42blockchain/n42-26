@@ -14,6 +14,23 @@ spec.loader.exec_module(fleet)
 
 
 class FleetTests(unittest.TestCase):
+    def test_qmdb_restart_readiness_ignores_old_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "execution.log"
+            self.assertFalse(fleet.qmdb_ready(log))
+            log.write_bytes(b"QMDB state ready\n")
+            offset = log.stat().st_size
+            self.assertTrue(fleet.qmdb_ready(log))
+            self.assertFalse(fleet.qmdb_ready(log, offset))
+            with log.open("ab") as stream:
+                stream.write(b"RPC HTTP server started\n")
+            self.assertFalse(fleet.qmdb_ready(log, offset))
+            with log.open("ab") as stream:
+                stream.write(b"QMDB state ready\n")
+            self.assertTrue(fleet.qmdb_ready(log, offset))
+            with self.assertRaises(ValueError):
+                fleet.qmdb_ready(log, -1)
+
     def test_foreground_child_exit_fails_and_reaps_other_children(self):
         # Real, tiny Python subprocesses exercise lifecycle only: no node,
         # sockets, signing, compilation, or fleet workload is started.
