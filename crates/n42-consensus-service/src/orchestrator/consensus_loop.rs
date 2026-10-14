@@ -964,6 +964,7 @@ impl ConsensusService {
     fn mark_async_commit_retryable(&mut self, view: u64, block_hash: B256) {
         if let Some(state) = self.async_commit_states.get_mut(&view)
             && state.block_hash == block_hash
+            && state.stage != AsyncCommitStage::Finalized
         {
             state.stage = AsyncCommitStage::Committed;
             state.finalize_in_flight = false;
@@ -1227,7 +1228,11 @@ impl ConsensusService {
         // An older in-flight FCU may answer after synchronous catch-up has
         // already finalized this hash. Its result must not re-arm the queue
         // or apply side effects to an older canonical head.
-        if self.h2_v4_catchup_finalized.contains(&block_hash) {
+        if self.h2_v4_catchup_finalized.contains(&block_hash)
+            || self.async_commit_states.get(&view).is_some_and(|state| {
+                state.block_hash == block_hash && state.stage == AsyncCommitStage::Finalized
+            })
+        {
             return;
         }
         if finalized {

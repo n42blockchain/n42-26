@@ -6219,6 +6219,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_failed_fcu_cannot_reopen_a_normally_finalized_commit() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid, PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+        orch.async_finalize_fcu = false;
+        let hash = B256::repeat_byte(0xc2);
+        orch.handle_block_committed(1, hash, test_commit_qc(1, hash), None).await;
+        orch.handle_eager_import_done(hash, 1, B256::ZERO, 1, false, None).await;
+        assert!(orch.h2_v4_catchup_finalized.is_empty());
+        assert_eq!(orch.async_commit_states[&1].stage, AsyncCommitStage::Finalized);
+        orch.handle_finalize_done(1, hash, test_commit_qc(1, hash), false).await;
+        assert_eq!(orch.async_commit_states[&1].stage, AsyncCommitStage::Finalized);
+        assert_eq!(mock.fcu_heads(), vec![hash]);
+    }
+
+    #[tokio::test]
     async fn execution_ready_children_finalize_in_commit_order() {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
