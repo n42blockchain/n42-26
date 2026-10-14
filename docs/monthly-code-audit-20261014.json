@@ -1,0 +1,629 @@
+{
+  "date": "2026-10-14",
+  "interval_utc": {
+    "from": "2026-09-14T00:00:00Z",
+    "to_exclusive": "2026-10-15T00:00:00Z"
+  },
+  "scope": {
+    "n42-26": {
+      "head": "18fe108881416a72bfc42754f8a5d97505ed64d5",
+      "base": "e89eb5c614980cf15287802873a49320d57de28d",
+      "first_parent_commits": 61,
+      "net_changed_files": 1307,
+      "areas": {
+        "docs": 1091,
+        "scripts": 63,
+        "vendor": 42,
+        "crates/n42-node/src": 19,
+        "bin": 11,
+        "crates/n42-tx-types/src": 9,
+        "crates/n42-execution/src": 8,
+        "patches": 7,
+        "crates/n42-consensus-service/src": 6,
+        "crates/n42-consensus/src": 5,
+        "crates/n42-node/tests": 5,
+        "crates/n42-parallel-evm/src": 5,
+        "sdk": 5,
+        ".github": 4,
+        "crates/n42-network/src": 4,
+        "contracts": 3,
+        "examples": 3,
+        "CLAUDE.md": 1
+      }
+    },
+    "N42-gov5": {
+      "head": "44592a0536d849c06392437e019bfcc9077c8207",
+      "base": "4533358fc28db215a12b78577968037ee4fec33d",
+      "first_parent_commits": 4,
+      "net_changed_files": 10,
+      "areas": {
+        "cmd": 7,
+        "modules": 3
+      }
+    },
+    "n42-rs": {
+      "head": "abe8891c6e76b77729c5e9522cf25503ad0c88e9",
+      "base": "f9c6fcea47ac8acd9a9c55ffcb559e67933d7749",
+      "first_parent_commits": 730,
+      "net_changed_files": 2631,
+      "areas": {
+        "vendor": 1141,
+        "scripts": 1010,
+        "ddn": 39,
+        "crates/storage/provider": 35,
+        "crates/net/network": 29,
+        "crates/n42/engine-types": 27,
+        "docs": 27,
+        "bin": 25,
+        "crates/ethereum/node": 24,
+        "crates/n42/alloy-rpc-types-engine": 23,
+        "crates/n42/h2-node": 19,
+        "crates/n42/h2-consensus": 18,
+        "crates/n42/qmdb-reth": 17,
+        "crates/storage/storage-api": 15,
+        "crates/n42/h2-execution": 14,
+        "crates/n42/h2-net": 12,
+        "crates/n42/primitives": 12,
+        "crates/n42/tx-queue": 10
+      }
+    },
+    "n42-rs-wt-reth27-chain94": {
+      "head": "d64964d87b92d33770348bc32c5cd0424f657567",
+      "base": "e7d5c0cf7d78888f14e69c640e3f9e2bd6703293",
+      "first_parent_commits": 36,
+      "net_changed_files": 223,
+      "areas": {
+        "vendor": 42,
+        "crates/net/network": 29,
+        "crates/ethereum/node": 24,
+        "crates/n42/alloy-rpc-types-engine": 23,
+        "crates/storage/provider": 22,
+        "crates/storage/storage-api": 13,
+        "crates/n42/h2-consensus": 7,
+        "crates/node/core": 7,
+        "crates/storage/storage-overlay": 7,
+        "crates/n42/h2-node": 6,
+        "crates/node/builder": 5,
+        "crates/revm/src": 5,
+        "crates/storage/db-api": 5,
+        "crates/storage/db": 5,
+        "bin": 4,
+        "crates/n42/alloy-rpc-types-beacon": 3,
+        "crates/chainspec/src": 2,
+        "scripts": 2
+      }
+    }
+  },
+  "final_source_refs": {
+    "n42-26": {
+      "branch": "main",
+      "published_head_at_report": "7c5fcc631405e446b8acf8e4d518922f153e29f9",
+      "origin": "git@github.com:n42blockchain/n42-26.git",
+      "pending_tracked_files": []
+    },
+    "N42-gov5": {
+      "branch": "fix/monthly-audit-20261014",
+      "published_head_at_report": "11d82582cf46a28855a4a2781ac3b5624082e9a0",
+      "origin": "git@github.com:n42blockchain/N42-gov5.git",
+      "pending_tracked_files": []
+    },
+    "n42-rs": {
+      "branch": "main",
+      "published_head_at_report": "5fdb986e1d7f9ae151d129f7b8bfe7c57ada9b9e",
+      "origin": "git@github.com:n42blockchain/n42-rs.git",
+      "pending_tracked_files": []
+    },
+    "n42-rs-chain94": {
+      "branch": "upgrade/reth-v2.7.0-chain94-20261012",
+      "published_head_at_report": "fecb43bbd41ac2f09cfa069620f1a7085d1a6e91",
+      "origin": "git@github.com:n42blockchain/n42-rs.git",
+      "pending_tracked_files": []
+    }
+  },
+  "validation": {
+    "001": {
+      "returncode": 0,
+      "finished": 1791953048.006005,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/001.log",
+      "log_sha256": "3ccded0c280bd8d585e00523785a96855701b7a4f799098452cd89e43c471ec3",
+      "rust_test_totals": {
+        "passed": 471,
+        "failed": 0,
+        "ignored": 9
+      },
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/001-root-core.sh"
+        ]
+      }
+    },
+    "002": {
+      "returncode": 0,
+      "finished": 1791953168.5732536,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/002.log",
+      "log_sha256": "50f5f76dc66ef15d6315942fbb011c7a145a6ed98f055506f8e0c2f1dd83e6e2",
+      "rust_test_totals": {
+        "passed": 1030,
+        "failed": 0,
+        "ignored": 28
+      },
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/002-rs-core.sh"
+        ]
+      }
+    },
+    "003": {
+      "returncode": 0,
+      "finished": 1791953172.492851,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/003.log",
+      "log_sha256": "d1b811f87a33ba145ff5181217a485b4946133484f5f2579d9ae3b6778cc4d1e",
+      "rust_test_totals": null,
+      "go_package_results": [
+        {
+          "package": "github.com/n42blockchain/N42/cmd/n42-reth-state-dump",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/cmd/n42-consensus-anchor",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/cmd/txflood",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/modules/rpc/jsonrpc",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/internal/consensus/hotstuff",
+          "action": "pass"
+        }
+      ],
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/003-gov-tools.sh"
+        ]
+      }
+    },
+    "004": {
+      "returncode": 0,
+      "finished": 1791954052.9094546,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/004.log",
+      "log_sha256": "aeacdd69a28a0706ad3eacb46dd2cc5636e0d8379d28f72c0dd78b99d36a3d55",
+      "rust_test_totals": {
+        "passed": 1816,
+        "failed": 0,
+        "ignored": 30
+      },
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/004-root-full.sh"
+        ]
+      }
+    },
+    "005": {
+      "returncode": 101,
+      "finished": 1791954904.64438,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/005.log",
+      "log_sha256": "b7520463cc1e99336347059a4adbae5ac6d4d71e722643a2731574daa17d6b5f",
+      "rust_test_totals": {
+        "passed": 2483,
+        "failed": 1,
+        "ignored": 64
+      },
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/005-rs-full.sh"
+        ]
+      }
+    },
+    "006": {
+      "returncode": 0,
+      "finished": 1791955157.58754,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/006.log",
+      "log_sha256": "9587e663f731a6179b0bf4b734b83bac909bf254735f90f78acdbdec7af27147",
+      "rust_test_totals": null,
+      "go_package_results": [
+        {
+          "package": "github.com/n42blockchain/N42/cmd/n42-reth-state-dump",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/cmd/n42-consensus-anchor",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/cmd/txflood",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/modules/state/commitment",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/internal/consensus/hotstuff",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/lib/qmdb",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/internal/ingest",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/internal",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/modules/state",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/internal/consensus/hotstuff",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/modules/state/commitment",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/lib/qmdb",
+          "action": "pass"
+        }
+      ],
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/006-gov-live-core.sh"
+        ]
+      }
+    },
+    "007": {
+      "returncode": 101,
+      "finished": 1791955203.7878265,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/007.log",
+      "log_sha256": "d2d0cf5bbfd7572ce8e41192343cbfc4cfa979803fa1e2e583aaa631df1f1148",
+      "rust_test_totals": null,
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/007-root-restored-context.sh"
+        ]
+      }
+    },
+    "008": {
+      "returncode": 0,
+      "finished": 1791955249.3815258,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/008.log",
+      "log_sha256": "222e2054ed3418ed5ddc154443f696c92ed5f65da90144df8be525b4f4a45f98",
+      "rust_test_totals": {
+        "passed": 388,
+        "failed": 0,
+        "ignored": 8
+      },
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/007-root-restored-context.sh"
+        ]
+      }
+    },
+    "009": {
+      "returncode": 0,
+      "finished": 1791955409.1064074,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/009.log",
+      "log_sha256": "9171086e67f28e3298cda187d40c866dcd0f43f16c969b4c1de2235b203a1089",
+      "rust_test_totals": {
+        "passed": 3355,
+        "failed": 0,
+        "ignored": 87
+      },
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/009-rs-full.sh"
+        ]
+      }
+    },
+    "010": {
+      "returncode": 0,
+      "finished": 1791955450.638262,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/010.log",
+      "log_sha256": "641569f47f49fa84311f146065a501c1a13d90ca906afc76a6817327a29ddfec",
+      "rust_test_totals": {
+        "passed": 49,
+        "failed": 0,
+        "ignored": 0
+      },
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/010-compat-context.sh"
+        ]
+      }
+    },
+    "011": {
+      "returncode": 101,
+      "finished": 1791955525.4591916,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/011.log",
+      "log_sha256": "b05a76379596d435754bc9e3c7900a8dbc7961ba0ab3498cb2135850492cf88c",
+      "rust_test_totals": null,
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/011-root-full.sh"
+        ]
+      }
+    },
+    "012": {
+      "returncode": 0,
+      "finished": 1791955801.3891203,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/012.log",
+      "log_sha256": "9adfbecd3f2d0b9c42856617080df8d940d86c594026e82a0cd1e6c8effac955",
+      "rust_test_totals": {
+        "passed": 1945,
+        "failed": 0,
+        "ignored": 35
+      },
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/012-compat-full.sh"
+        ]
+      }
+    },
+    "013": {
+      "returncode": 0,
+      "finished": 1791955978.6682994,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/013.log",
+      "log_sha256": "4f542b7cee33574f8db3f6def991da11244e76b6fc7771070e3543f5f0727971",
+      "rust_test_totals": {
+        "passed": 1818,
+        "failed": 0,
+        "ignored": 30
+      },
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/013-root-full.sh"
+        ]
+      }
+    },
+    "014": {
+      "returncode": 0,
+      "finished": 1791955979.9781475,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/014.log",
+      "log_sha256": "665f400c638a3facfb6568bbc8c3855881939fd4f7933afa9f4a14e71ba90370",
+      "rust_test_totals": null,
+      "go_package_results": [
+        {
+          "package": "github.com/n42blockchain/N42/cmd/n42-reth-state-dump",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/cmd/n42-reth-state-dump",
+          "action": "pass"
+        }
+      ],
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/014-gov-export.sh"
+        ]
+      }
+    },
+    "015": {
+      "returncode": 0,
+      "finished": 1791956012.132887,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/015.log",
+      "log_sha256": "966d1a836f34c5021bcd8ae21f713c090618b7d9aeaf5d68c836701723ca378e",
+      "rust_test_totals": {
+        "passed": 20,
+        "failed": 0,
+        "ignored": 0
+      },
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/015-rs-flood-repeat.sh"
+        ]
+      }
+    },
+    "016": {
+      "returncode": 0,
+      "finished": 1791956051.7093382,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/016.log",
+      "log_sha256": "690bfab124264604a97a1f517303dac291edd98749584fa144c8dac4878f2e59",
+      "rust_test_totals": {
+        "passed": 394,
+        "failed": 0,
+        "ignored": 8
+      },
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/016-root-dirty-storage.sh"
+        ]
+      }
+    },
+    "017": {
+      "returncode": 0,
+      "finished": 1791956281.43841,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/017.log",
+      "log_sha256": "6918167a7fec8b60fd91004f127eb521905f4d7957b33f6da5b12d67e9e48243",
+      "rust_test_totals": {
+        "passed": 1946,
+        "failed": 0,
+        "ignored": 35
+      },
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/017-compat-full.sh"
+        ]
+      }
+    },
+    "018": {
+      "returncode": 0,
+      "finished": 1791956532.0736263,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/018.log",
+      "log_sha256": "6542f65f234b898116ecf97e8833959fa9eae8fc7601862f73140b0f8f258608",
+      "rust_test_totals": {
+        "passed": 1821,
+        "failed": 0,
+        "ignored": 30
+      },
+      "go_package_results": [
+        {
+          "package": "test",
+          "action": "pass"
+        }
+      ],
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/018-root-full.sh"
+        ]
+      }
+    },
+    "019": {
+      "returncode": 0,
+      "finished": 1791956742.5150118,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/019.log",
+      "log_sha256": "bda1be1bd7c9ba92f63d8bb5b735811490924477ebc26de865219b184d0170e1",
+      "rust_test_totals": null,
+      "go_package_results": [
+        {
+          "package": "github.com/n42blockchain/N42/cmd/n42-reth-state-dump",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/cmd/n42-consensus-anchor",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/lib/qmdb",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/modules/state/commitment",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/lib/qmdb",
+          "action": "pass"
+        },
+        {
+          "package": "github.com/n42blockchain/N42/cmd/n42-reth-state-dump",
+          "action": "pass"
+        }
+      ],
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/019-gov-published-auth.sh"
+        ]
+      }
+    },
+    "020": {
+      "returncode": 0,
+      "finished": 1791956994.194929,
+      "log": "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/build-service/020.log",
+      "log_sha256": "de5b42d219fe25aadcddad4b3cebf13743b6b94af30627e1df8a0a0b80fc7b0b",
+      "rust_test_totals": {
+        "passed": 1823,
+        "failed": 0,
+        "ignored": 30
+      },
+      "go_package_results": [
+        {
+          "package": "2026-10-14T05:49:30.264727Z",
+          "action": "pass"
+        }
+      ],
+      "commands": {
+        "command": [
+          "bash",
+          "/home/n42/src/n42/n42-26/.artifacts/monthly-audit-20261014/020-root-randomness-full.sh"
+        ]
+      }
+    }
+  },
+  "gov5_adopted_source": {
+    "lib/qmdb/checked_read.go": "407472c26816f7b306191125869301a18350ae9deafbc431858d61a643fb238a",
+    "lib/qmdb/checked_read_test.go": "41dd7533540033d0f98a02d49c4de3efab841151f042ad01bd1ba25d401794de",
+    "lib/qmdb/verify_persisted.go": "fc1f6fd7bb64fce108b0a0ea10c3b943008678ddddaaee8465340728ae0cada9",
+    "lib/qmdb/verify_persisted_test.go": "0d6a248f20180374abd1a34d633363cda381b21d00a73228906675cb5428be6a",
+    "cmd/n42-reth-state-dump/main.go": "82dbd17b0e0055443094ebabcb5ae6f2a0110b21bcd2a643485a77376869b0dd",
+    "cmd/n42-reth-state-dump/authentication_test.go": "40cc059e7585c8b3bc76b567a1bcec576773469dcc8c317474c7f54533db4185",
+    "cmd/n42-reth-state-dump/run_test.go": "96bb48ac9764821e258e6c22300af096ca14f49696e1d5da4b9d2f6c8fd8c9e3"
+  },
+  "limitations": [
+    "Native critical paths audited; imported upstream/docs/vendor not claimed individually line-audited",
+    "Long ignored benchmarks were not executed",
+    "No new seven-node hour/recovery or TPS claim for these new source revisions",
+    "Gov5 dirty worktree preserved; isolated publish branch used"
+  ],
+  "final_acceptance_jobs": {
+    "n42-26": "020",
+    "n42-rs": "009",
+    "n42-rs-chain94": "017",
+    "gov5-publish": "019",
+    "gov5-live-core-and-race": "006",
+    "rs-flood-20-repeats": "015"
+  },
+  "superseded_failures": {
+    "005": "flood test observed final transaction count before final frame descriptor drained; repaired then full job 009 passed",
+    "007": "missing ConfigureEvm import in canonical benchmark; repaired",
+    "011": "old helper signature in three integration tests; updated these and replay binary, full job 013 passed"
+  },
+  "published_repairs": {
+    "n42-26": [
+      "d339d1a",
+      "8ad1292",
+      "9744159",
+      "9cab8a6",
+      "7c5fcc6"
+    ],
+    "n42-rs": [
+      "8920ef505",
+      "8c11a94dd",
+      "f84e7dae4",
+      "523759372"
+    ],
+    "n42-rs-chain94": [
+      "31aa8ef39",
+      "fecb43bbd"
+    ],
+    "N42-gov5": [
+      "71444d7c",
+      "3d0c64e5",
+      "a2631cd7",
+      "458e85f0",
+      "2ca87d83",
+      "792c495b"
+    ]
+  },
+  "resource_release": {
+    "time": 1791957012.2186086,
+    "event": "released"
+  },
+  "root_frozen_source_comparison": {
+    "rust_source_file_count": 257,
+    "missing": [],
+    "functional_differences": [],
+    "doc_comment_only_differences": [
+      "crates/n42-consensus/src/bin/n42-verify-commit.rs"
+    ],
+    "method": "byte comparison; ignore only standalone /// and //! lines for document-only classification"
+  }
+}
