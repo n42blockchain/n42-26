@@ -11,7 +11,10 @@ use n42_node::qmdb_state::{
 use n42_twig_core::qmdb_compat::gov5_storage_key;
 use reth_chainspec::{ChainSpecBuilder, MAINNET};
 use reth_ethereum_primitives::{Block, BlockBody, Transaction, TransactionSigned};
-use reth_evm::{ConfigureEvm, execute::{BasicBlockExecutor, Executor}};
+use reth_evm::{
+    ConfigureEvm,
+    execute::{BasicBlockExecutor, Executor},
+};
 use reth_primitives_traits::{RecoveredBlock, crypto::secp256k1::public_key_to_address};
 use reth_testing_utils::generators::sign_tx_with_key_pair;
 use revm::{bytecode::Bytecode, database::CacheDB, state::AccountInfo};
@@ -64,7 +67,24 @@ fn execute(
     initial: U256,
     values: &[U256],
     seed: u8,
-) -> (RecoveredBlock<Block>, revm::database::states::BundleState, B256) {
+) -> (
+    RecoveredBlock<Block>,
+    revm::database::states::BundleState,
+    B256,
+) {
+    execute_code(initial, values, seed, store_calldata_bytecode())
+}
+
+fn execute_code(
+    initial: U256,
+    values: &[U256],
+    seed: u8,
+    code: Bytes,
+) -> (
+    RecoveredBlock<Block>,
+    revm::database::states::BundleState,
+    B256,
+) {
     let chain_spec = Arc::new(
         ChainSpecBuilder::from(&*MAINNET)
             .shanghai_activated()
@@ -79,7 +99,6 @@ fn execute(
             ..Default::default()
         },
     );
-    let code = store_calldata_bytecode();
     db.insert_account_info(
         CONTRACT,
         AccountInfo {
@@ -118,7 +137,8 @@ fn execute(
         senders,
     );
     let config = N42EvmConfig::new(chain_spec);
-    let env_key = n42_execution::restored_slots_env_key(&config.evm_env(block.header()).unwrap().block_env);
+    let env_key =
+        n42_execution::restored_slots_env_key(&config.evm_env(block.header()).unwrap().block_env);
     let output = BasicBlockExecutor::new(config, db)
         .execute(&block)
         .expect("block executes");
@@ -143,8 +163,8 @@ fn a_slot_changed_and_restored_within_the_block_is_rewritten() {
     assert!(account.storage.contains_key(&OTHER_SLOT));
 
     // The executor filed it under the key the root job derives from the block.
-    let restored =
-        restored_slots_for(gov5_restored_slots_key(&block, env_key)).expect("the block was executed here");
+    let restored = restored_slots_for(gov5_restored_slots_key(&block, env_key))
+        .expect("the block was executed here");
     assert_eq!(
         restored.as_slice(),
         &[
@@ -180,8 +200,8 @@ fn a_slot_that_stays_changed_is_written_once() {
     );
 
     // Recorded with its value at the block's start, as every changed slot is.
-    let restored =
-        restored_slots_for(gov5_restored_slots_key(&block, env_key)).expect("the block was executed here");
+    let restored = restored_slots_for(gov5_restored_slots_key(&block, env_key))
+        .expect("the block was executed here");
     assert_eq!(
         restored.as_slice(),
         &[
@@ -211,7 +231,34 @@ fn a_write_of_the_value_a_slot_already_holds_is_not_a_change() {
     let (block, _, env_key) = execute(U256::from(5), &[U256::from(5)], 0x23);
     // The slot under test is written with the value it already has: revm
     // reports no change for it, so only the other slot is recorded.
-    let restored =
-        restored_slots_for(gov5_restored_slots_key(&block, env_key)).expect("the block was executed here");
+    let restored = restored_slots_for(gov5_restored_slots_key(&block, env_key))
+        .expect("the block was executed here");
     assert_eq!(restored.as_slice(), &[(CONTRACT, OTHER_SLOT, U256::ZERO)]);
+}
+
+#[test]
+fn a_slot_changed_and_restored_within_one_transaction_is_rewritten() {
+    let code = alloy_primitives::bytes!("60076000556005600055600160015500");
+    let (block, bundle, env_key) = execute_code(U256::from(5), &[U256::ZERO], 0x24, code);
+    assert!(
+        !bundle
+            .state
+            .get(&CONTRACT)
+            .unwrap()
+            .storage
+            .contains_key(&SLOT)
+    );
+    let restored = restored_slots_for(gov5_restored_slots_key(&block, env_key)).unwrap();
+    assert!(restored.contains(&(CONTRACT, SLOT, U256::from(5))));
+    let plain = gov5_qmdb_operations(&bundle);
+    let with = gov5_qmdb_operations_with_restored(&bundle, &restored);
+    assert_eq!(with.len(), plain.len() + 1);
+}
+
+#[test]
+fn an_unchanged_sstore_is_not_a_dirty_rewrite() {
+    let code = alloy_primitives::bytes!("6005600055600160015500");
+    let (block, _, env_key) = execute_code(U256::from(5), &[U256::ZERO], 0x25, code);
+    let restored = restored_slots_for(gov5_restored_slots_key(&block, env_key)).unwrap();
+    assert!(!restored.iter().any(|(_, slot, _)| *slot == SLOT));
 }

@@ -22,9 +22,8 @@
 //! known to both the executor and state-root job — in a
 //! bounded registry the root job and the payload builder read.
 //!
-//! Not covered: a slot changed and restored within one transaction — revm
-//! reports the transaction's net effect, and gov5's journal would still mark
-//! the slot dirty. It has not been seen on chain 94's traffic.
+//! Successful SSTORE operations are also observed so a slot changed and
+//! restored within one transaction is not lost in revm's net result.
 
 use alloy_consensus::transaction::TxHashRef;
 use alloy_eips::eip4895::Withdrawal;
@@ -265,13 +264,17 @@ where
     ) -> Result<Self::Result, BlockExecutionError> {
         let (tx_env, recovered) = tx.into_parts();
         let hash = *recovered.tx().tx_hash();
-        let result = self
+        let capture = crate::dirty_storage::Capture::start();
+        let executed = self
             .inner
-            .execute_transaction_without_commit((tx_env, recovered))?;
+            .execute_transaction_without_commit((tx_env, recovered));
+        let stores = capture.finish();
+        let result = executed?;
         // Every slot this transaction changed, with the value it saw at its
         // start — the state it was loaded from, which is the block's start
         // for the first transaction to touch it.
         let mut changed = Vec::new();
+        let mut listed = std::collections::HashSet::new();
         for (address, account) in &result.result().state {
             if account.is_selfdestructed() {
                 continue;
@@ -279,7 +282,26 @@ where
             for (slot, value) in &account.storage {
                 if value.is_changed() {
                     changed.push((*address, *slot, value.original_value()));
+                    listed.insert((*address, *slot));
                 }
+            }
+        }
+        for (address, slot, written) in stores {
+            if listed.contains(&(address, slot)) {
+                continue;
+            }
+            let Some(account) = result.result().state.get(&address) else {
+                continue;
+            };
+            if account.is_selfdestructed() {
+                continue;
+            }
+            let Some(entry) = account.storage.get(&slot) else {
+                continue;
+            };
+            if written != entry.original_value() {
+                changed.push((address, slot, entry.original_value()));
+                listed.insert((address, slot));
             }
         }
         self.pending = Some((hash, changed));

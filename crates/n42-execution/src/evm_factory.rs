@@ -91,7 +91,11 @@ impl EvmFactory for N42EvmFactory {
         let inner = EthEvmBuilder::new(db, evm_env)
             .precompiles(PrecompilesMap::from_static(n42_precompiles(spec)))
             .build();
-        crate::fast_transfer::N42Evm::new(inner, false, self.fast_transfers)
+        crate::fast_transfer::N42Evm::new(
+            crate::dirty_storage::watch(inner, false),
+            false,
+            self.fast_transfers,
+        )
     }
 
     fn create_evm_with_inspector<DB: alloy_evm::Database, I: Inspector<Self::Context<DB>>>(
@@ -110,6 +114,10 @@ impl EvmFactory for N42EvmFactory {
             .precompiles(PrecompilesMap::from_static(n42_precompiles(spec)))
             .activate_inspector(inspector)
             .build();
-        crate::fast_transfer::N42Evm::new(inner, true, self.fast_transfers)
+        crate::fast_transfer::N42Evm::new(
+            crate::dirty_storage::watch(inner, true),
+            true,
+            self.fast_transfers,
+        )
     }
 }
