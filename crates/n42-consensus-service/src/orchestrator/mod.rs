@@ -884,6 +884,10 @@ pub struct ConsensusService {
     /// Ordered commit lifecycle. A later execution-ready child never overtakes
     /// an earlier committed parent when canonical FCUs are dispatched.
     async_commit_states: BTreeMap<u64, AsyncCommitState>,
+    /// Catch-up can complete its Valid FCU before the CommitQC output arrives.
+    /// Retain exact hashes so late outputs do not re-arm a completed lifecycle.
+    h2_v4_catchup_finalized: HashSet<B256>,
+    h2_v4_catchup_finalized_order: VecDeque<B256>,
     /// Blocks that returned `Syncing` from new_payload, queued for retry.
     /// Each entry is `(serialized_data, retry_count)` — dropped after 3 retries.
     syncing_blocks: VecDeque<(Vec<u8>, u32)>,
@@ -2645,6 +2649,8 @@ impl ConsensusService {
             pending_executions: HashSet::new(),
             pending_finalization: None,
             async_commit_states: BTreeMap::new(),
+            h2_v4_catchup_finalized: HashSet::new(),
+            h2_v4_catchup_finalized_order: VecDeque::new(),
             syncing_blocks: VecDeque::new(),
             bad_blocks: bad_block_cache::BadBlockCache::default(),
             tx_import_tx: None,
@@ -2899,6 +2905,8 @@ impl ConsensusService {
             pending_executions: HashSet::new(),
             pending_finalization: None,
             async_commit_states: BTreeMap::new(),
+            h2_v4_catchup_finalized: HashSet::new(),
+            h2_v4_catchup_finalized_order: VecDeque::new(),
             syncing_blocks: VecDeque::new(),
             bad_blocks: bad_block_cache::BadBlockCache::default(),
             tx_import_tx: None,
@@ -7103,6 +7111,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn catchup_valid_fcu_before_commit_output_does_not_block_live_finalization() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid, PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+        orch.async_finalize_fcu = false;
+        orch.head_block_number = 100;
+        orch.head_block_hash = B256::repeat_byte(0x70);
+        orch.execution_validated_head_view = 200;
+        let (hash, rlp) = test_gov5_block_rlp(orch.head_block_hash, 101, 201);
+        assert!(orch.import_h2_v4_catchup_block(
+            n42_network::PeerId::random(),
+            n42_network::decode_gov5_block_rlp(&rlp).unwrap(), 201,
+        ).await);
+        // Both a late original commit and a later view reusing that exact
+        // hash are already finalized. Neither should dispatch an older FCU.
+        for view in [201, 202] {
+            orch.handle_block_committed(view, hash, test_commit_qc(view, hash), None).await;
+            assert_eq!(orch.async_commit_states[&view].stage, AsyncCommitStage::Finalized);
+        }
+        assert_eq!(mock.fcu_heads(), vec![hash]);
+        orch.handle_finalize_done(201, hash, test_commit_qc(201, hash), false).await;
+        assert_eq!(orch.async_commit_states[&201].stage, AsyncCommitStage::Finalized);
+        let next = B256::repeat_byte(0x71);
+        orch.handle_block_committed(203, next, test_commit_qc(203, next), None).await;
+        assert_eq!(orch.async_commit_states[&203].stage, AsyncCommitStage::Committed);
+        orch.handle_eager_import_done(next, 203, hash, 102, false, None).await;
+        assert_eq!(mock.fcu_heads(), vec![hash, next]);
+        assert_eq!(orch.async_commit_states[&203].stage, AsyncCommitStage::Finalized);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn catchup_finalized_hash_history_is_bounded_and_deduplicated() {
+        let mut orch = make_test_orchestrator_with_state(None);
+        let limit = h2_v4_catchup_buffer_blocks();
+        for number in 0..=limit {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&(number as u64).to_be_bytes());
+            let hash = B256::from(bytes);
+            orch.mark_catchup_commits_finalized(hash);
+            orch.mark_catchup_commits_finalized(hash);
+        }
+        assert_eq!(orch.h2_v4_catchup_finalized.len(), limit);
+        assert_eq!(orch.h2_v4_catchup_finalized_order.len(), limit);
+        assert!(!orch.h2_v4_catchup_finalized.contains(&B256::ZERO));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn catchup_nonvalid_fcu_preserves_commit_barrier() {
         for status in [PayloadStatusEnum::Syncing, PayloadStatusEnum::Accepted] {
             let (engine, output_rx) = make_test_engine();
@@ -7124,6 +7184,7 @@ mod tests {
                 n42_network::PeerId::random(),
                 n42_network::decode_gov5_block_rlp(&rlp).unwrap(), 201,
             ).await);
+            assert!(orch.h2_v4_catchup_finalized.is_empty());
             assert_eq!(orch.async_commit_states[&201].stage, AsyncCommitStage::Committed);
             assert_eq!(orch.head_block_number, 100);
         }

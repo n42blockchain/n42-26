@@ -1,4 +1,4 @@
-use super::{AsyncCommitStage, AsyncCommitState, ConsensusService, ImportOutcome};
+use super::{AsyncCommitStage, AsyncCommitState, ConsensusService, ImportOutcome, h2_v4_catchup_buffer_blocks};
 use super::{LeaderBuildWaitMode, state_mgmt::max_consecutive_empty_skips};
 use crate::el::{ExecutionLayer, ExecutionPath};
 use crate::exec_cache::ExecutionOutputCache;
@@ -863,6 +863,9 @@ impl ConsensusService {
         if execution_ready {
             self.mark_async_commit_execution_ready(block_hash);
         }
+        if self.h2_v4_catchup_finalized.contains(&block_hash) {
+            self.mark_async_commit_finalized(view, block_hash);
+        }
         gauge!("n42_async_commits_pending").set(
             self.async_commit_states
                 .values()
@@ -941,6 +944,14 @@ impl ConsensusService {
     /// A synchronous catch-up FCU can finalize a hash before the ordinary
     /// lifecycle driver sees its execution-ready notification.
     pub(super) fn mark_catchup_commits_finalized(&mut self, block_hash: B256) {
+        if self.h2_v4_catchup_finalized.insert(block_hash) {
+            self.h2_v4_catchup_finalized_order.push_back(block_hash);
+            while self.h2_v4_catchup_finalized_order.len() > h2_v4_catchup_buffer_blocks() {
+                if let Some(oldest) = self.h2_v4_catchup_finalized_order.pop_front() {
+                    self.h2_v4_catchup_finalized.remove(&oldest);
+                }
+            }
+        }
         let views: Vec<_> = self.async_commit_states.iter()
             .filter(|(_, state)| state.block_hash == block_hash)
             .map(|(view, _)| *view)
@@ -1213,6 +1224,12 @@ impl ConsensusService {
         commit_qc: QuorumCertificate,
         finalized: bool,
     ) {
+        // An older in-flight FCU may answer after synchronous catch-up has
+        // already finalized this hash. Its result must not re-arm the queue
+        // or apply side effects to an older canonical head.
+        if self.h2_v4_catchup_finalized.contains(&block_hash) {
+            return;
+        }
         if finalized {
             self.mark_async_commit_finalized(view, block_hash);
             // Case A: Block already in reth (leader built + new_payload already done,
