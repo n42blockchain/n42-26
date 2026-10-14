@@ -160,7 +160,7 @@ Geth 对照：[prestate OnTxStart](https://github.com/ethereum/go-ethereum/blob/
 RS main 专项原快照（含新增 diff 检查）与另外 17 个 RPC E2E 均通过，工件 092.log。
 兼容分支 095.log 中还包含一次独立 prestate 专项，因此把所有 summary 直接相加会
 多算一次（1942）；表中只计完整 workspace 的 1941。095 整体任务在随后重建命令
-遗漏 package selector 时返回 101；未改写为成功，正确分 package 重建由任务 099 执行。
+遗漏 package selector 时返回 101；未改写为成功，099 的错误 bin selector 仍失败；103 使用正确 example target 重建成功，117 再次重建诊断修复后的 validator。
 完整脚本和原失败记录均保留。声明忽略项未记成通过。
 
 本工程最终节点构建成功，SHA256
