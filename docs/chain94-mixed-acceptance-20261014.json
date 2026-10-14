@@ -1,0 +1,67 @@
+{
+  "smoke": {
+    "status": "PASS",
+    "scope": "committed chain/receipt/QC consistency; durability requires restart verification",
+    "first": 13654771,
+    "last": 13654813,
+    "elapsed_seconds": 90.00075068599836,
+    "producers": [
+      "0x1ccde065f222f44709797be2908fc72b7801eda5",
+      "0x301631ce4b15f1a0d62a35d6c421dd5a845e555e",
+      "0x580339c31c60b974ac9f70e2f8307b2b4490f70a",
+      "0xa97ab21a7efbcb7995b67ed39287ba408850a9f1",
+      "0xd2a316a1cd3a777141cb7e5aace46fb01df90eac",
+      "0xe5eb05fc41cdad4433f52988f83f78f46bb27e61",
+      "0xf7dc5c92fa9e812eb0c3157492da65457ae5de46"
+    ],
+    "successful_transactions": 153,
+    "failed_transactions": 0
+  },
+  "soak": {
+    "status": "PASS",
+    "scope": "committed chain/receipt/QC consistency; durability requires restart verification",
+    "first": 13654824,
+    "last": 13656623,
+    "elapsed_seconds": 3600.0005890030006,
+    "producers": [
+      "0x1ccde065f222f44709797be2908fc72b7801eda5",
+      "0x301631ce4b15f1a0d62a35d6c421dd5a845e555e",
+      "0x580339c31c60b974ac9f70e2f8307b2b4490f70a",
+      "0xa97ab21a7efbcb7995b67ed39287ba408850a9f1",
+      "0xd2a316a1cd3a777141cb7e5aace46fb01df90eac",
+      "0xe5eb05fc41cdad4433f52988f83f78f46bb27e61",
+      "0xf7dc5c92fa9e812eb0c3157492da65457ae5de46"
+    ],
+    "successful_transactions": 7184,
+    "failed_transactions": 0
+  },
+  "faults": {
+    "status": "PASS",
+    "scope": "committed chain/receipt/QC consistency; durability requires restart verification",
+    "first": 13656626,
+    "last": 13656662,
+    "elapsed_seconds": 60.00070790800237,
+    "producers": [
+      "0x1ccde065f222f44709797be2908fc72b7801eda5",
+      "0x301631ce4b15f1a0d62a35d6c421dd5a845e555e",
+      "0x580339c31c60b974ac9f70e2f8307b2b4490f70a",
+      "0xa97ab21a7efbcb7995b67ed39287ba408850a9f1",
+      "0xd2a316a1cd3a777141cb7e5aace46fb01df90eac",
+      "0xe5eb05fc41cdad4433f52988f83f78f46bb27e61",
+      "0xf7dc5c92fa9e812eb0c3157492da65457ae5de46"
+    ],
+    "successful_transactions": 102,
+    "failed_transactions": 0
+  },
+  "recovery": {
+    "status": "FAIL",
+    "scope": "owned process crash-stop/graceful recovery; fixed seven-key quorum and canonical receipts",
+    "error": "all-seven catch-up timed out"
+  },
+  "binary_sha256": {
+    "n42-gov5": "c6a7366bdf2370116a40d07a480e7942cd8f80f220e1ef287d1f00c9863e2533",
+    "n42-node": "5b281a26b4979cbeceeb37cd5de6cef576f97207eacc1be6c203e86a103dd9de",
+    "rs27/n42": "e83ef4d41bb0661adf394a727d85d37ac1a0345fc7e39cb675e25816c0e22ffd",
+    "rs27/h2_validator": "ccd3d95c655c8f227c06ac56ab32e0f9097b847f0ce23c3ec2f5d5f291f54489"
+  }
+}
