@@ -18,8 +18,8 @@
 //! the start of that transaction; the first sighting of a slot in a block is
 //! its value at the block's start, and that is the value gov5 rewrites when
 //! the slot ends up back there. The block's list is filed at `finish` under
-//! keccak(parent hash ‖ transaction hashes) — what the executor knows before
-//! the header exists and what the root job knows from the block — in a
+//! the parent, full execution context and ordered transaction hashes —
+//! known to both the executor and state-root job — in a
 //! bounded registry the root job and the payload builder read.
 //!
 //! Not covered: a slot changed and restored within one transaction — revm
@@ -27,8 +27,9 @@
 //! the slot dirty. It has not been seen on chain 94's traffic.
 
 use alloy_consensus::transaction::TxHashRef;
+use alloy_eips::eip4895::Withdrawal;
 use alloy_evm::{
-    EvmFactory, RecoveredTx,
+    Evm, EvmFactory, RecoveredTx,
     block::{
         BlockExecutionError, BlockExecutionResult, BlockExecutor, BlockExecutorFactory,
         ExecutableTx, GasOutput, StateDB, TxResult,
@@ -37,7 +38,7 @@ use alloy_evm::{
 };
 use alloy_primitives::{Address, B256, U256, keccak256};
 use reth_primitives_traits::SignedTransaction;
-use revm::Inspector;
+use revm::{Inspector, context_interface::Block as EvmBlock};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex, PoisonError},
@@ -47,15 +48,60 @@ use std::{
 /// block's start: `(address, slot, that value)`.
 pub type RestoredSlot = (Address, U256, U256);
 
-/// The key a block's restored slots are filed under: keccak of the parent
-/// hash and the committed transactions' hashes, in order.
-pub fn restored_slots_key(parent_hash: B256, tx_hashes: impl IntoIterator<Item = B256>) -> B256 {
+/// Bind the committed transactions, in order, to an execution context.
+pub fn restored_slots_key(context_key: B256, tx_hashes: impl IntoIterator<Item = B256>) -> B256 {
     let mut preimage = Vec::with_capacity(32 * 64);
-    preimage.extend_from_slice(parent_hash.as_slice());
+    preimage.extend_from_slice(context_key.as_slice());
     for hash in tx_hashes {
         preimage.extend_from_slice(hash.as_slice());
     }
     keccak256(&preimage)
+}
+
+/// Bind restored writes to the block environment, not just parent and txs.
+/// Two speculative builds may execute identical transactions at different
+/// timestamps, coinbases or blob prices and restore different storage slots.
+pub fn restored_slots_env_key(block: &impl EvmBlock) -> B256 {
+    let mut bytes = Vec::with_capacity(256);
+    bytes.extend_from_slice(&block.number().to_be_bytes::<32>());
+    bytes.extend_from_slice(&block.timestamp().to_be_bytes::<32>());
+    bytes.extend_from_slice(block.beneficiary().as_slice());
+    bytes.extend_from_slice(&block.gas_limit().to_be_bytes());
+    bytes.extend_from_slice(&block.basefee().to_be_bytes());
+    bytes.extend_from_slice(&block.difficulty().to_be_bytes::<32>());
+    bytes.push(u8::from(block.prevrandao().is_some()));
+    bytes.extend_from_slice(block.prevrandao().unwrap_or_default().as_slice());
+    bytes.push(u8::from(block.blob_excess_gas().is_some()));
+    bytes.extend_from_slice(&block.blob_excess_gas().unwrap_or_default().to_be_bytes());
+    bytes.extend_from_slice(&block.blob_gasprice().unwrap_or_default().to_be_bytes());
+    bytes.extend_from_slice(&block.slot_num().to_be_bytes());
+    keccak256(bytes)
+}
+
+pub fn restored_slots_execution_key(
+    parent_hash: B256,
+    env_key: B256,
+    parent_beacon_root: Option<B256>,
+    withdrawals: Option<&[Withdrawal]>,
+    tx_hashes: impl IntoIterator<Item = B256>,
+) -> B256 {
+    let mut bytes = Vec::with_capacity(32 * 64);
+    bytes.extend_from_slice(b"N42 restored storage context v1");
+    bytes.extend_from_slice(parent_hash.as_slice());
+    bytes.extend_from_slice(env_key.as_slice());
+    bytes.push(u8::from(parent_beacon_root.is_some()));
+    bytes.extend_from_slice(parent_beacon_root.unwrap_or_default().as_slice());
+    let withdrawals = withdrawals.unwrap_or_default();
+    bytes.extend_from_slice(&(withdrawals.len() as u64).to_be_bytes());
+    for withdrawal in withdrawals {
+        // The index fields do not change the executed balance credit.
+        bytes.extend_from_slice(withdrawal.address.as_slice());
+        bytes.extend_from_slice(&withdrawal.amount.to_be_bytes());
+    }
+    for hash in tx_hashes {
+        bytes.extend_from_slice(hash.as_slice());
+    }
+    keccak256(bytes)
 }
 
 /// Restored slots of recently executed blocks, by key. Bounded: a block is
@@ -147,9 +193,17 @@ where
         I: Inspector<<F::EvmFactory as EvmFactory>::Context<DB>>,
     {
         let parent_hash = ctx.parent_hash;
+        let env_key = restored_slots_env_key(evm.block());
+        let context_key = restored_slots_execution_key(
+            parent_hash,
+            env_key,
+            ctx.parent_beacon_block_root,
+            ctx.withdrawals.as_deref(),
+            [],
+        );
         TrackingExecutor {
             inner: self.inner.create_executor(evm, ctx),
-            parent_hash,
+            context_key,
             tx_hashes: Vec::new(),
             first_seen: HashMap::new(),
             pending: None,
@@ -163,7 +217,7 @@ where
 #[derive(Debug)]
 pub struct TrackingExecutor<E> {
     inner: E,
-    parent_hash: B256,
+    context_key: B256,
     /// The committed transactions, in order.
     tx_hashes: Vec<B256>,
     /// Each slot changed so far, with its value at the block's start.
@@ -253,7 +307,7 @@ where
             .collect();
         restored.sort_unstable();
         record_restored_slots(
-            restored_slots_key(self.parent_hash, self.tx_hashes.iter().copied()),
+            restored_slots_key(self.context_key, self.tx_hashes.iter().copied()),
             restored,
         );
         self.inner.finish()
@@ -275,6 +329,39 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_context_separates_same_parent_and_transactions() {
+        let parent = B256::repeat_byte(0xCC);
+        let tx = B256::repeat_byte(0xDD);
+        let env = revm::context::BlockEnv::default();
+        let key = |env: &revm::context::BlockEnv, beacon, withdrawals| {
+            let context = restored_slots_execution_key(
+                parent,
+                restored_slots_env_key(env),
+                beacon,
+                withdrawals,
+                [],
+            );
+            restored_slots_key(context, [tx])
+        };
+        let original = key(&env, None, None);
+        let mut later = env.clone();
+        later.timestamp += U256::from(1);
+        assert_ne!(original, key(&later, None, None));
+        later = env.clone();
+        later.beneficiary = Address::repeat_byte(1);
+        assert_ne!(original, key(&later, None, None));
+        assert_ne!(original, key(&env, Some(B256::ZERO), None));
+        let rewards = [Withdrawal {
+            index: 0,
+            validator_index: 0,
+            address: Address::repeat_byte(2),
+            amount: 1,
+        }];
+        assert_ne!(original, key(&env, None, Some(&rewards)));
+        assert_eq!(original, key(&env, None, Some(&[])));
+    }
 
     /// One test for the whole registry: it is process-global, so separate
     /// tests would race each other's evictions.
@@ -300,6 +387,27 @@ mod tests {
         // An empty list is "executed, nothing restored", not "unknown".
         record_restored_slots(key, Vec::new());
         assert!(restored_slots_for(key).unwrap().is_empty());
+
+        let env = revm::context::BlockEnv::default();
+        let mut later = env.clone();
+        later.timestamp += U256::from(1);
+        let contexts = [&env, &later].map(|env| {
+            restored_slots_execution_key(
+                B256::repeat_byte(0xC1),
+                restored_slots_env_key(env),
+                None,
+                None,
+                [],
+            )
+        });
+        let contexts =
+            contexts.map(|context| restored_slots_key(context, [B256::repeat_byte(0xC2)]));
+        let first = vec![(Address::repeat_byte(1), U256::from(1), U256::from(7))];
+        let second = vec![(Address::repeat_byte(2), U256::from(2), U256::from(8))];
+        record_restored_slots(contexts[0], first.clone());
+        record_restored_slots(contexts[1], second.clone());
+        assert_eq!(*restored_slots_for(contexts[0]).unwrap(), first);
+        assert_eq!(*restored_slots_for(contexts[1]).unwrap(), second);
 
         let keys: Vec<B256> = (0..RESTORED_SLOTS_KEPT + 8)
             .map(|i| restored_slots_key(B256::repeat_byte(0xB0), [B256::from(U256::from(i))]))

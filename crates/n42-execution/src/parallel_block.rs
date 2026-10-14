@@ -373,8 +373,17 @@ mod tests {
             try_execute_transfer_block(&config, db.clone(), &block, &|| Some(db.clone()))
                 .unwrap()
                 .expect("all transfers qualify");
+        let env = config.evm_env(block.header()).unwrap();
+        let ctx = config.context_for_block(block.sealed_block()).unwrap();
+        let context = crate::restored_slots_execution_key(
+            ctx.parent_hash,
+            crate::restored_slots_env_key(&env.block_env),
+            ctx.parent_beacon_block_root,
+            ctx.withdrawals.as_deref(),
+            [],
+        );
         let key = restored_slots_key(
-            block.header().parent_hash,
+            context,
             block.body().transactions.iter().map(|tx| *tx.tx_hash()),
         );
         assert!(

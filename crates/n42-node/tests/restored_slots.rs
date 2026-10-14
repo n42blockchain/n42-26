@@ -11,7 +11,7 @@ use n42_node::qmdb_state::{
 use n42_twig_core::qmdb_compat::gov5_storage_key;
 use reth_chainspec::{ChainSpecBuilder, MAINNET};
 use reth_ethereum_primitives::{Block, BlockBody, Transaction, TransactionSigned};
-use reth_evm::execute::{BasicBlockExecutor, Executor};
+use reth_evm::{ConfigureEvm, execute::{BasicBlockExecutor, Executor}};
 use reth_primitives_traits::{RecoveredBlock, crypto::secp256k1::public_key_to_address};
 use reth_testing_utils::generators::sign_tx_with_key_pair;
 use revm::{bytecode::Bytecode, database::CacheDB, state::AccountInfo};
@@ -64,7 +64,7 @@ fn execute(
     initial: U256,
     values: &[U256],
     seed: u8,
-) -> (RecoveredBlock<Block>, revm::database::states::BundleState) {
+) -> (RecoveredBlock<Block>, revm::database::states::BundleState, B256) {
     let chain_spec = Arc::new(
         ChainSpecBuilder::from(&*MAINNET)
             .shanghai_activated()
@@ -117,19 +117,21 @@ fn execute(
         },
         senders,
     );
-    let output = BasicBlockExecutor::new(N42EvmConfig::new(chain_spec), db)
+    let config = N42EvmConfig::new(chain_spec);
+    let env_key = n42_execution::restored_slots_env_key(&config.evm_env(block.header()).unwrap().block_env);
+    let output = BasicBlockExecutor::new(config, db)
         .execute(&block)
         .expect("block executes");
     for receipt in &output.receipts {
         assert!(receipt.success, "every store call succeeds");
     }
-    (block, output.state)
+    (block, output.state, env_key)
 }
 
 #[test]
 fn a_slot_changed_and_restored_within_the_block_is_rewritten() {
     let initial = U256::from(5);
-    let (block, bundle) = execute(initial, &[U256::from(1), initial], 0x21);
+    let (block, bundle, env_key) = execute(initial, &[U256::from(1), initial], 0x21);
 
     // revm dropped the slot: its final value equals its original value.
     let account = bundle.state.get(&CONTRACT).expect("contract touched");
@@ -142,7 +144,7 @@ fn a_slot_changed_and_restored_within_the_block_is_rewritten() {
 
     // The executor filed it under the key the root job derives from the block.
     let restored =
-        restored_slots_for(gov5_restored_slots_key(&block)).expect("the block was executed here");
+        restored_slots_for(gov5_restored_slots_key(&block, env_key)).expect("the block was executed here");
     assert_eq!(
         restored.as_slice(),
         &[
@@ -169,7 +171,7 @@ fn a_slot_changed_and_restored_within_the_block_is_rewritten() {
 #[test]
 fn a_slot_that_stays_changed_is_written_once() {
     let initial = U256::from(5);
-    let (block, bundle) = execute(initial, &[U256::from(1), U256::from(2)], 0x22);
+    let (block, bundle, env_key) = execute(initial, &[U256::from(1), U256::from(2)], 0x22);
 
     let account = bundle.state.get(&CONTRACT).expect("contract touched");
     assert_eq!(
@@ -179,7 +181,7 @@ fn a_slot_that_stays_changed_is_written_once() {
 
     // Recorded with its value at the block's start, as every changed slot is.
     let restored =
-        restored_slots_for(gov5_restored_slots_key(&block)).expect("the block was executed here");
+        restored_slots_for(gov5_restored_slots_key(&block, env_key)).expect("the block was executed here");
     assert_eq!(
         restored.as_slice(),
         &[
@@ -206,10 +208,10 @@ fn a_slot_that_stays_changed_is_written_once() {
 
 #[test]
 fn a_write_of_the_value_a_slot_already_holds_is_not_a_change() {
-    let (block, _) = execute(U256::from(5), &[U256::from(5)], 0x23);
+    let (block, _, env_key) = execute(U256::from(5), &[U256::from(5)], 0x23);
     // The slot under test is written with the value it already has: revm
     // reports no change for it, so only the other slot is recorded.
     let restored =
-        restored_slots_for(gov5_restored_slots_key(&block)).expect("the block was executed here");
+        restored_slots_for(gov5_restored_slots_key(&block, env_key)).expect("the block was executed here");
     assert_eq!(restored.as_slice(), &[(CONTRACT, OTHER_SLOT, U256::ZERO)]);
 }

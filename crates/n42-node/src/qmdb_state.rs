@@ -160,11 +160,19 @@ pub fn gov5_qmdb_operations_from_output(
 /// and the transaction hashes in order (`n42_execution::restored_slots_key`). Derived from the
 /// block itself, so the root job and the payload builder find what the executor recorded
 /// without a block hash, which the builder does not have before sealing.
-pub fn gov5_restored_slots_key(block: &SealedBlock<Block>) -> B256 {
-    restored_slots_key(
+pub fn gov5_restored_slots_key(block: &SealedBlock<Block>, env_key: B256) -> B256 {
+    let context = n42_execution::restored_slots_execution_key(
         block.header().parent_hash,
-        block.body().transactions().map(|tx| *tx.tx_hash()),
-    )
+        env_key,
+        block.header().parent_beacon_block_root,
+        block
+            .body()
+            .withdrawals
+            .as_ref()
+            .map(|values| values.as_slice()),
+        [],
+    );
+    restored_slots_key(context, block.body().transactions().map(|tx| *tx.tx_hash()))
 }
 
 /// `SYSTEM_ADDRESS` (EIP-4788), the caller of every system call.

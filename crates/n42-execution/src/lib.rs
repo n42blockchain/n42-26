@@ -21,5 +21,5 @@ pub use executor::{
 pub use read_log::{ReadLogDatabase, ReadLogEntry};
 pub use restored_slots::{
     RestoredSlot, TrackingBlockExecutorFactory, TrackingExecutor, record_restored_slots,
-    restored_slots_for, restored_slots_key,
+    restored_slots_env_key, restored_slots_execution_key, restored_slots_for, restored_slots_key,
 };

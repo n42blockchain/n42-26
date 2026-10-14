@@ -2348,12 +2348,13 @@ where
 
     fn prepare(
         &self,
-        _ctx: StateRootJobContext<'_, EthPrimitives, P, Evm>,
+        ctx: StateRootJobContext<'_, EthPrimitives, P, Evm>,
     ) -> ProviderResult<PreparedStateRootJob<EthPrimitives>> {
         Ok(PreparedStateRootJob::new(
             Box::new(Gov5QmdbStateRootJob {
                 store: self.store.clone(),
                 chain_spec: self.chain_spec.clone(),
+                env_key: n42_execution::restored_slots_env_key(&ctx.env().evm_env.block_env),
             }),
             None,
         ))
@@ -2364,6 +2365,7 @@ where
 struct Gov5QmdbStateRootJob {
     store: Arc<Gov5QmdbStateRootStore>,
     chain_spec: Option<Arc<reth_chainspec::ChainSpec>>,
+    env_key: B256,
 }
 
 impl StateRootJob<EthPrimitives> for Gov5QmdbStateRootJob {
@@ -2381,7 +2383,8 @@ impl StateRootJob<EthPrimitives> for Gov5QmdbStateRootJob {
         // one changed and restored within the block, which revm drops from
         // the bundle; the executor wrapper recorded those for this block.
         let restored =
-            n42_execution::restored_slots_for(gov5_restored_slots_key(block)).unwrap_or_default();
+            n42_execution::restored_slots_for(gov5_restored_slots_key(block, self.env_key))
+                .unwrap_or_default();
         let mut operations = gov5_qmdb_operations_with_restored(&output.state, &restored);
         if std::env::var_os("N42_QMDB_DEBUG_ROOT").is_some() {
             eprintln!(
@@ -3958,6 +3961,7 @@ mod tests {
         let mut job = Gov5QmdbStateRootJob {
             store: store.clone(),
             chain_spec: None,
+            env_key: B256::ZERO,
         };
         let hashed = LazyHashedPostState::ready(Arc::new(Default::default()));
         let original = Arc::new(BlockExecutionOutput::default());
@@ -4084,6 +4088,7 @@ mod tests {
         let mut job = Gov5QmdbStateRootJob {
             store: store.clone(),
             chain_spec: None,
+            env_key: B256::ZERO,
         };
         let hashed = LazyHashedPostState::ready(Arc::new(Default::default()));
         let result = job

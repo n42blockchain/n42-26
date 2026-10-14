@@ -423,7 +423,7 @@ fn main() -> eyre::Result<()> {
             ));
         }
 
-        let restored = restored_slots_for(gov5_restored_slots_key(recovered.sealed_block()))
+        let restored = restored_slots_for(gov5_restored_slots_key(recovered.sealed_block(), n42_execution::restored_slots_env_key(&evm_config.evm_env(recovered.header())?.block_env)))
             .unwrap_or_default();
         let mut operations = gov5_qmdb_operations_with_restored(&output.state, &restored);
         let restored_used = operations

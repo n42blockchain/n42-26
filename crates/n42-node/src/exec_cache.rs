@@ -192,7 +192,7 @@ fn serialize_execution_output(
 fn take_gov5_normalization_roots(
     execution: &alloy_rpc_types_engine::ExecutionData,
     qmdb_store: Option<&crate::qmdb_state_root::Gov5QmdbStateRootStore>,
-    chain_spec: &reth_chainspec::ChainSpec,
+    chain_spec: &Arc<reth_chainspec::ChainSpec>,
 ) -> Option<(B256, B256)> {
     let hash = &execution.block_hash();
     let parent_hash = execution.parent_hash();
@@ -200,8 +200,19 @@ fn take_gov5_normalization_roots(
         reth_evm::payload_cache::take_broadcast_execution::<CachedPayloadData>(hash)?;
     let receipts_root = n42_network::gov5_native_receipts_root(&output.result.receipts);
     let payload = execution.payload.as_v1();
-    let key = n42_execution::restored_slots_key(
+    use reth_evm::ConfigureEngineEvm;
+    let config = n42_execution::N42EvmConfig::new(Arc::clone(chain_spec));
+    let env = config.evm_env_for_payload(execution).ok()?;
+    let ctx = config.context_for_payload(execution).ok()?;
+    let context = n42_execution::restored_slots_execution_key(
         parent_hash,
+        n42_execution::restored_slots_env_key(&env.block_env),
+        ctx.parent_beacon_block_root,
+        ctx.withdrawals.as_deref(),
+        [],
+    );
+    let key = n42_execution::restored_slots_key(
+        context,
         payload.transactions.iter().map(alloy_primitives::keccak256),
     );
     let restored = n42_execution::restored_slots_for(key).unwrap_or_default();

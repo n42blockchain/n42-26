@@ -17,7 +17,10 @@ use n42_twig_core::{
     qmdb_leaf_tree::QmdbLeafTree,
 };
 use reth_ethereum_primitives::{Block, BlockBody, Transaction};
-use reth_evm::execute::{BasicBlockExecutor, Executor};
+use reth_evm::{
+    ConfigureEvm,
+    execute::{BasicBlockExecutor, Executor},
+};
 use reth_primitives_traits::{
     RecoveredBlock, SignedTransaction, crypto::secp256k1::public_key_to_address,
 };
@@ -273,8 +276,16 @@ fn run_fork(
         };
         let execution_ms = started.elapsed().as_secs_f64() * 1000.0;
         let delta_started = Instant::now();
-        let restored = restored_slots_for(crate::qmdb_state::gov5_restored_slots_key(&block))
-            .expect("canonical tracking executor recorded this block");
+        let restored = restored_slots_for(crate::qmdb_state::gov5_restored_slots_key(
+            &block,
+            n42_execution::restored_slots_env_key(
+                &config
+                    .evm_env(block.header())
+                    .expect("valid benchmark environment")
+                    .block_env,
+            ),
+        ))
+        .expect("canonical tracking executor recorded this block");
         let mut operations =
             crate::qmdb_state::gov5_qmdb_operations_with_restored(&output.state, &restored);
         operations.sort_unstable_by_key(|operation| operation.key);
