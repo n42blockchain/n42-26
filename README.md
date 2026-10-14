@@ -4,6 +4,8 @@
 
 **Chain94 acceptance:** [七节点混合恢复修复与验收](docs/chain94-recovery-repair-20261014.md) — 混合持续运行及正常停机／重启恢复通过；结果按各窗口的冻结二进制追溯。
 
+**Code audit:** [三工程近一个月深度审计与修复](docs/monthly-code-audit-20261014.md) — 执行确定性、QMDB 写入兼容、缓存/队列上界、Gov5 导出认证及回归证据。
+
 **Research agenda:** [两个硕士课题（HTML）](docs/research/two-master-theses-20261012.html) — 共享执行与原生调度、QMDB 跨实现一致性与崩溃恢复，含研究动向和实验计划。
 
 A high-performance blockchain system combining **HotStuff-2** BFT consensus with **reth** EVM execution, featuring parallel mobile device verification for enhanced security.
