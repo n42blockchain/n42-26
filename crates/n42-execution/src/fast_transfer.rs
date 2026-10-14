@@ -373,6 +373,10 @@ where
     }
 
     fn transact_raw(&mut self, tx: TxEnv) -> Result<ResultAndState, Self::Error> {
+        // EVMs can be interleaved or execute on a different thread from construction.
+        crate::precompile_random::set_block_randomness(
+            self.inner.block().prevrandao.unwrap_or_default(),
+        );
         if self.fast && self.inspecting {
             self.stats.rejected[11] += 1;
         }
@@ -392,6 +396,9 @@ where
         contract: Address,
         data: Bytes,
     ) -> Result<ResultAndState, Self::Error> {
+        crate::precompile_random::set_block_randomness(
+            self.inner.block().prevrandao.unwrap_or_default(),
+        );
         self.inner.transact_system_call(caller, contract, data)
     }
 
@@ -418,7 +425,7 @@ mod tests {
     //! The transfer path against the interpreter: same result, same accounts.
     use super::*;
     use alloy_evm::EvmFactory;
-    use alloy_primitives::{TxKind, address};
+    use alloy_primitives::{B256, TxKind, address};
     use revm::{
         Database as _, DatabaseCommit,
         database::{CacheDB, EmptyDB},
@@ -485,6 +492,51 @@ mod tests {
             chain_id: Some(1),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn randomness_is_bound_to_the_executing_evm_not_the_last_constructed_one() {
+        let first_random = B256::repeat_byte(0xA1);
+        let second_random = B256::repeat_byte(0xB2);
+        let target = Address::from(crate::precompile_random::RANDOMNESS_ADDRESS);
+        for fast in [false, true] {
+            let factory = N42EvmFactory::with_fast_transfers(fast);
+            let mut first_env = env();
+            first_env.block_env.prevrandao = Some(first_random);
+            let mut second_env = env();
+            second_env.block_env.prevrandao = Some(second_random);
+            let mut first = factory.create_evm(db(), first_env);
+            let _second = factory.create_evm(db(), second_env);
+            let out = first
+                .transact_raw(tx(target, 0, 0, BASEFEE as u128, None))
+                .unwrap();
+            assert!(out.result.is_success());
+            assert_eq!(
+                out.result.output().unwrap().as_ref(),
+                alloy_primitives::keccak256(first_random).as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn absent_randomness_cannot_inherit_a_previous_blocks_value() {
+        let mut environment = env();
+        environment.block_env.prevrandao = None;
+        let factory = N42EvmFactory::with_fast_transfers(false);
+        let mut evm = factory.create_evm(db(), environment);
+        crate::precompile_random::set_block_randomness(B256::repeat_byte(0xCC));
+        // The system-call path also rebinds the executing environment.
+        let out = evm
+            .transact_system_call(
+                SENDER,
+                Address::from(crate::precompile_random::RANDOMNESS_ADDRESS),
+                Bytes::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            out.result.output().unwrap().as_ref(),
+            alloy_primitives::keccak256(B256::ZERO).as_slice()
+        );
     }
 
     /// Runs `tx` on both paths from the same pre-state; returns (fast, slow),

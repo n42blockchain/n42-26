@@ -156,10 +156,10 @@ pub fn gov5_qmdb_operations_from_output(
     gov5_qmdb_operations(&output.state)
 }
 
-/// The key under which the executor filed a block's restored slots: keccak of the parent hash
-/// and the transaction hashes in order (`n42_execution::restored_slots_key`). Derived from the
-/// block itself, so the root job and the payload builder find what the executor recorded
-/// without a block hash, which the builder does not have before sealing.
+/// Derive the executor's restored-write key from the parent, actual execution
+/// environment, beacon root, withdrawal credits and ordered transaction hashes.
+/// `env_key` must come from the matching EVM configuration; a block hash is
+/// not available to a builder before sealing and is not part of this key.
 pub fn gov5_restored_slots_key(block: &SealedBlock<Block>, env_key: B256) -> B256 {
     let context = n42_execution::restored_slots_execution_key(
         block.header().parent_hash,
