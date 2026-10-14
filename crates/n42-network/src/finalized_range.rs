@@ -192,7 +192,10 @@ fn parse_finalized_range_stream<R: Read>(
     if block_count == 0
         || block_count > MAX_FINALIZED_RANGE_BLOCKS
         || from_block > to_block
-        || to_block - from_block + 1 != block_count
+        || to_block
+            .checked_sub(from_block)
+            .and_then(|span| span.checked_add(1))
+            != Some(block_count)
     {
         return Err(FinalizedRangeError::Bounds);
     }
@@ -496,6 +499,22 @@ mod tests {
         let digest = blake3::hash(&bytes);
         bytes.extend_from_slice(digest.as_bytes());
         bytes
+    }
+
+    #[test]
+    fn full_u64_range_is_rejected_without_arithmetic_overflow() {
+        let mut encoded = fixture();
+        // Range header follows magic, chain id and genesis hash.
+        encoded[48..56].copy_from_slice(&0u64.to_le_bytes());
+        encoded[56..64].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(matches!(
+            decode_finalized_range_stream(Cursor::new(&encoded), 1143, B256::repeat_byte(0x11)),
+            Err(FinalizedRangeError::Bounds)
+        ));
+        assert!(matches!(
+            verify_finalized_range_stream(Cursor::new(&encoded), 1143, B256::repeat_byte(0x11)),
+            Err(FinalizedRangeError::Bounds)
+        ));
     }
 
     fn fixture() -> Vec<u8> {
