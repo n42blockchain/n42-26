@@ -1,6 +1,6 @@
 # Reth v2.7.0：两 Rust 工程稳定版适配补全
 
-日期：2026-10-14。状态：完整工作区回归与混合一小时通过；混合恢复追块失败，联合运行验收未完成。
+日期：2026-10-14。状态：完整工作区回归、混合一小时与混合恢复验收均通过；各运行窗口保留独立二进制身份。
 
 用户明确选择官方最新稳定版 v2.7.0，而非上游未发布 main。
 基线为 `3d592ece6de8c4559987416a544fc215fd6d6921`。
@@ -153,9 +153,9 @@ Geth 对照：[prestate OnTxStart](https://github.com/ethereum/go-ethereum/blob/
 | 最终回归 | 通过 | 失败 | 声明忽略 | 工件 |
 |---|---:|---:|---:|---|
 | n42-rs main 完整 workspace | 3352 | 0 | 87 | build-service/093.log，退出 0 |
-| n42-26 锁定 Reth 源完整 workspace | 1813 | 0 | 30 | build-service/108.log，退出 0 |
-| RS 升级 chain94 完整 workspace | 1942 | 0 | 35 | build-service/113.log，退出 0；另有 example 4 通过 |
-| Python 审计/驱动回归 | 101 | 0 | 0 | python-final-tests.log |
+| n42-26 锁定 Reth 源完整 workspace | 1815 | 0 | 30 | build-service/124.log，退出 0 |
+| RS 升级 chain94 完整 workspace | 1943 | 0 | 35 | build-service/126.log，退出 0；此前 example 4 通过 |
+| Python 审计/驱动回归 | 102 | 0 | 0 | repair-python-all.log |
 
 RS main 专项原快照（含新增 diff 检查）与另外 17 个 RPC E2E 均通过，工件 092.log。
 兼容分支 095.log 中还包含一次独立 prestate 专项，因此把所有 summary 直接相加会
@@ -179,3 +179,8 @@ RS main 专项原快照（含新增 diff 检查）与另外 17 个 RPC E2E 均�
 - 116 恢复 FAIL：健康前置通过，停止 RS 节点后六节点 60 秒从 13656666→13656693 继续提交；重启 RS 后 all-seven catch-up 在 300 秒内未完成。首次拉取 13656668 时 EL 返回 -32603，随后缺少 body 的重复处理；原因尚未闭环，不能宣称混合恢复验收完成。后续两节点掉线、四在线无 quorum、恢复 quorum 和整队重启阶段未执行。
 
 上述 1–4 已实际执行，结果为前三项通过、第四项失败。原失败工件保留，不能用三个工程独立恢复 PASS 替代混合恢复结果。二进制哈希及各窗口原始摘要见 [机器可读验收记录](chain94-mixed-acceptance-20261014.json)。注入为正确性负载，不代表极限 TPS。
+
+
+## 恢复修复最终验收
+
+原混合恢复失败已由启动 readiness 与迟到 CommitQC 时序修复闭环。任务 125 完整恢复 PASS；最新完整回归见上表。最终节点与窗口身份、恢复时长及范围见 [混合恢复修复验收](chain94-recovery-repair-20261014.md)。旧小时数据与失败日志保持原身份。
