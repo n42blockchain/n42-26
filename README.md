@@ -57,7 +57,7 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 
 - **HotStuff-2 Consensus**: 2-round optimistic commit with 3-round timeout recovery
 - **BLS12-381 Signatures**: Aggregated signatures for compact quorum certificates
-- **reth v2.7.0 Integration**: Uses upstream commit `3d592ece6de8c4559987416a544fc215fd6d6921` plus the six checked-in N42 integration patches; aligned with Alloy 2.5.0 / REVM 43.0.3. LLVM JIT remains explicit opt-in.
+- **reth v2.8.1 Integration**: Uses upstream commit `d763342fa185e4e90ee79dc65f6a5706168b0bcb` plus the six checked-in N42 integration patches; aligned with Alloy 2.5.0 / REVM 43.0.3. LLVM JIT remains explicit opt-in.
 - **Reserve SBMT Path**: `N42_JMT=1` explicitly selects the legacy-compatible 16-shard sparse binary backend and RPC surface
 - **Compact Block Propagation**: Leader caches execution output; the default follower path skips duplicate EVM execution (cache hit ~3ms)
 - **QMDB Binary Twig Backend**: The QMDB-style 16-shard binary twig tree is the default N42 state-proof backend (`N42_TWIG` defaults on)
@@ -291,7 +291,7 @@ Both configurations are well within the **8-second slot target**.
 ### Prerequisites
 
 - Rust 1.97+ (development and CI are pinned to Rust 1.97.1)
-- N42 `reth` v2.7.0 source checked out at `../reth` (`3d592ece6de8c4559987416a544fc215fd6d6921`), with the pinned N42 patch set applied
+- N42 `reth` v2.8.1 source checked out at `../reth` (`d763342fa185e4e90ee79dc65f6a5706168b0bcb`), with the pinned N42 patch set applied
 - Android local builds: JDK 17 recommended for Gradle/Kotlin
 - SP1 toolchain v4.2.1 (optional, for ZK proof guest build): `curl -L https://sp1up.succinct.xyz | bash && sp1up --version v4.2.1`
 

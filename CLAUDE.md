@@ -25,20 +25,21 @@ GIT_COMMITTER_NAME="Nyxen" GIT_COMMITTER_EMAIL="40690755+MiraWells@users.noreply
 
 ### Reth 稳定版基线
 
-当前基线为官方 **v2.7.0**，上游 commit
-`3d592ece6de8c4559987416a544fc215fd6d6921`，加六个 N42 补丁后为
-`3452d7d0217095446b0f2632a283e314951da273`。版本、补丁序列与直接依赖以
+当前基线为官方 **v2.8.1**，上游 commit
+`d763342fa185e4e90ee79dc65f6a5706168b0bcb`，加六个 N42 补丁后为
+`5a8b035c3420f6cb5b5b074a51dab2d4272009e6`。版本、补丁序列与直接依赖以
 [`reth-source.lock`](reth-source.lock) 为准；CI 检出官方源并应用 `patches/reth-*.patch`。
 
 本机原 `../reth` 是包含未提交改动的旧 checkout，不可直接作为当前构建源或覆盖修改。
-已适配源位于 `.artifacts/reth-upgrade/reth-worktree`；使用独立 workspace，
-将其中 Cargo.toml 的 Reth path 依赖指向该源，再运行
-`bash scripts/check-reth-source.sh <reth-source>` 验证。
+已适配源位于 `.artifacts/reth-upgrade-281/reth-worktree`，同目录的 `reth` 链接指向它；
+在 `.artifacts/reth-upgrade-281/` 下建 n42-26 的 git worktree，其 `../reth` 即解析到适配源，
+无需改写 Cargo.toml。用 `bash scripts/check-reth-source.sh <reth-source>` 验证源码。
 
 直接依赖为 revm 43.0.3、alloy-evm 0.39.0、reth-primitives-traits 0.8.2、
-Alloy 2.5.0 与 alloy-primitives 1.7.3。不要为旧源码降低这些依赖。
+Alloy 2.5.0 与 alloy-primitives 1.7.3（reth v2.8.1 未移动这些版本）。不要为旧源码降低这些依赖。
 QMDB bin 状态读取、交易根缓存、导入批处理及 Engine 状态 provider 补丁均须保留；
-迁移记录见 [Reth 2.7.0 适配](docs/devlog-177-reth-27-upgrade-20261003.md)。
+迁移记录见 [Reth 2.8.1 升级](docs/devlog-178-reth-281-upgrade-20261025.md)，
+上一轮见 [Reth 2.7.0 适配](docs/devlog-177-reth-27-upgrade-20261003.md)。
 
 ## 常用命令
 

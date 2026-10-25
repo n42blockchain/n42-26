@@ -16,6 +16,7 @@ Logs are split into separate files by phase for easy maintenance:
 
 | File | Content | Phase |
 |------|---------|-------|
+| [devlog-178-reth-281-upgrade-20261025](docs/devlog-178-reth-281-upgrade-20261025.md) | Reth v2.8.1 six-patch port (one conflict), multiproof_v2 API change, revm-inspectors 0.44.3, dependency refresh, 1823/0/30 workspace tests | Upgrade |
 | [devlog-177-reth-27-upgrade-20261003](docs/devlog-177-reth-27-upgrade-20261003.md) | Reth v2.7.0 six-patch port, N42 compatibility changes, immediate persistence, workspace verification and remaining fleet gates | Upgrade |
 | [devlog-145-ci-reth-cache-api-20260914](docs/devlog-145-ci-reth-cache-api-20260914.md) | 修复 CI 缺少 reth 交易根缓存 API 导致的三个编译失败检查 | CI |
 | [devlog-144-independent-chain94-fleet-20260904](docs/devlog-144-independent-chain94-fleet-20260904.md) | Gov5 历史快照上的纯 Rust 七节点独立舰队、原生出块、重启验收 | Deployment |
