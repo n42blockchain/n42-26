@@ -70,7 +70,7 @@ pub fn frame_tree_root_of(tx_hashes: &[B256], layout: &[usize]) -> Option<B256> 
     let covered = layout
         .iter()
         .try_fold(0usize, |total, len| total.checked_add(*len))?;
-    if layout.iter().any(|len| *len == 0) || covered != tx_hashes.len() {
+    if layout.contains(&0) || covered != tx_hashes.len() {
         return None;
     }
     let mut at = 0usize;

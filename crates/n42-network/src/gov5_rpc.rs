@@ -1245,19 +1245,23 @@ impl request_response::Codec for Gov5BlockByHashCodec {
         T: AsyncWrite + Unpin + Send,
     {
         let mut response = response;
-        if response.rlp.is_empty() {
-            if let Some((reader, hash)) = response.fallback.take() {
-                let lookup = move || reader.block_rlp_by_hash(hash);
-                let result = if tokio::runtime::Handle::try_current().is_ok() {
-                    tokio::task::spawn_blocking(lookup).await.map_err(io::Error::other)?
-                } else {
-                    lookup()
-                };
-                response.rlp = result.map_err(|error| {
+        if response.rlp.is_empty()
+            && let Some((reader, hash)) = response.fallback.take()
+        {
+            let lookup = move || reader.block_rlp_by_hash(hash);
+            let result = if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::task::spawn_blocking(lookup)
+                    .await
+                    .map_err(io::Error::other)?
+            } else {
+                lookup()
+            };
+            response.rlp = result
+                .map_err(|error| {
                     tracing::warn!(?hash, %error, "persistent Gov5 block-by-hash lookup failed");
                     io::Error::other(error)
-                })?.unwrap_or_default();
-            }
+                })?
+                .unwrap_or_default();
         }
         if response.rlp.is_empty() {
             // Gov5's first response byte is its RPC status. A non-zero status

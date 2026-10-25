@@ -826,7 +826,7 @@ mod merged_batch_tests {
             {
                 let pool: Vec<AltSigTx> = (0..n).map(|_| make()).collect();
                 let at = std::time::Instant::now();
-                let body: Vec<AltSigTx> = pool.iter().cloned().collect();
+                let body: Vec<AltSigTx> = pool.to_vec();
                 best[which] = best[which].min(at.elapsed().as_micros());
                 drop(body);
             }

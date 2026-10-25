@@ -53,10 +53,10 @@ fn record<H: Host + ?Sized>(
         _ => None,
     };
     let result = host::sstore(ctx);
-    if result.is_ok() {
-        if let Some(store) = store {
-            note(store);
-        }
+    if result.is_ok()
+        && let Some(store) = store
+    {
+        note(store);
     }
     result
 }
