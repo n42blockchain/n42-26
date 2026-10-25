@@ -132,7 +132,7 @@ zeroize = { version = "1", features = ["derive"] }
 bitvec = { version = "1.0", features = ["serde"] }
 
 # Caching
-lru = "0.18"
+lru = "0.19"
 
 
 # Serialization
@@ -180,7 +180,7 @@ blake3 = "1"
 # JMT
 jmt = "0.12"
 rayon = "1.10"
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # Random
 rand = "0.10"
@@ -193,7 +193,7 @@ scrypt = "0.12"
 bytes = "1"
 
 # Compression
-zstd = "0.13"
+zstd = "0.14"
 
 # Testing
 tempfile = "3"
@@ -230,6 +230,6 @@ strip = false
 
 [patch.crates-io]
 # Fee-disabled traceCall must retain the Geth beneficiary prestate.
-revm-inspectors = { path = "vendor/dependency-repairs/revm-inspectors-0.44.1" }
+revm-inspectors = { path = "vendor/dependency-repairs/revm-inspectors-0.44.3" }
 # TestRng trait compatibility with proptest 1.11 / rand 0.10.
 proptest-arbitrary-interop = { path = "vendor/dependency-repairs/proptest-arbitrary-interop-0.1.0" }

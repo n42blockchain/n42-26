@@ -16,7 +16,7 @@ alloy-primitives = { workspace = true }
 # Concurrency
 rayon = "1.10"
 dashmap = "6.1"
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # Logging & metrics
 tracing = { workspace = true }

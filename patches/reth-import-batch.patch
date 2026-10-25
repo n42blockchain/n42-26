@@ -1,5 +1,5 @@
 diff --git a/crates/engine/tree/src/tree/mod.rs b/crates/engine/tree/src/tree/mod.rs
-index c2cb7dc1b..f77ae4941 100644
+index 5e5cea7f5..826554a92 100644
 --- a/crates/engine/tree/src/tree/mod.rs
 +++ b/crates/engine/tree/src/tree/mod.rs
 @@ -121,7 +121,8 @@ pub struct EngineApiTreeState<N: NodePrimitives> {
@@ -13,10 +13,10 @@ index c2cb7dc1b..f77ae4941 100644
          max_invalid_header_cache_length: u32,
          invalid_header_hit_eviction_threshold: u8,
 diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
-index 354ca3b30..1f805a451 100644
+index 3ccb9dda2..1552f6522 100644
 --- a/crates/engine/tree/src/tree/payload_validator.rs
 +++ b/crates/engine/tree/src/tree/payload_validator.rs
-@@ -1062,6 +1062,7 @@ where
+@@ -1064,6 +1064,7 @@ where
      {
          debug!(target: "engine::tree::payload_validator", "Executing block");
  
@@ -24,7 +24,7 @@ index 354ca3b30..1f805a451 100644
          let has_bal = input.has_block_access_list();
          let mut db = debug_span!(target: "engine::tree", "build_state_db").in_scope(|| {
              State::builder()
-@@ -1110,14 +1111,61 @@ where
+@@ -1114,15 +1115,63 @@ where
          let execution_start = Instant::now();
  
          // Execute all transactions and finalize
@@ -35,6 +35,7 @@ index 354ca3b30..1f805a451 100644
 -            &receipt_tx,
 -            &executed_tx_index,
 -            has_bal,
+-            prewarm_results.as_deref(),
 -        )?;
 +        let mut batch_finalize = None;
 +        let (executor, senders) = if !has_bal && batch_env.is_some() {
@@ -77,6 +78,7 @@ index 354ca3b30..1f805a451 100644
 +                    &receipt_tx,
 +                    &executed_tx_index,
 +                    false,
++                    prewarm_results.as_deref(),
 +                    true,
 +                )?
 +            }
@@ -88,13 +90,14 @@ index 354ca3b30..1f805a451 100644
 +                &receipt_tx,
 +                &executed_tx_index,
 +                has_bal,
++                prewarm_results.as_deref(),
 +                false,
 +            )?
 +        };
          drop(receipt_tx);
- 
-         // Finish execution and get the result
-@@ -1138,7 +1186,11 @@ where
+         // Free stale results off the execution path.
+         if let Some(prewarm_results) = prewarm_results {
+@@ -1147,7 +1196,11 @@ where
              alloy: revm_bal.clone().into_alloy_bal(),
              revm: Arc::new(revm_bal),
          });
@@ -107,16 +110,16 @@ index 354ca3b30..1f805a451 100644
  
          let execution_duration = execution_start.elapsed();
          self.metrics.record_block_execution(&output, execution_duration);
-@@ -1277,6 +1329,7 @@ where
-         receipt_tx: &crossbeam_channel::Sender<IndexedReceipt<N::Receipt>>,
+@@ -1288,6 +1341,7 @@ where
          executed_tx_index: &AtomicUsize,
          has_bal: bool,
+         prewarm_results: Option<&PrewarmResults<HaltReasonFor<Evm>>>,
 +        pre_execution_applied: bool,
      ) -> Result<(E, Vec<Address>), BlockExecutionError>
      where
-         E: BlockExecutor<Receipt = N::Receipt, Evm: alloy_evm::Evm<DB = &'a mut State<DB>>>,
-@@ -1288,10 +1341,12 @@ where
-         let mut senders = Vec::with_capacity(transaction_count);
+         E: BlockExecutor<
+@@ -1303,10 +1357,12 @@ where
+         let mut reuse_stats = PrewarmReuseStats::default();
  
          // Apply pre-execution changes (e.g., beacon root update)
 -        let pre_exec_start = Instant::now();
@@ -133,7 +136,7 @@ index 354ca3b30..1f805a451 100644
          // Bump BAL index after pre-execution changes (EIP-7928: index 0 is pre-execution)
          if has_bal {
 diff --git a/crates/evm/evm/src/execute.rs b/crates/evm/evm/src/execute.rs
-index 5edee39ea..e25f715be 100644
+index 7aa2d2619..d5c1a80c7 100644
 --- a/crates/evm/evm/src/execute.rs
 +++ b/crates/evm/evm/src/execute.rs
 @@ -611,22 +611,50 @@ where
@@ -215,7 +218,7 @@ index 5edee39ea..e25f715be 100644
      }
  
 diff --git a/crates/evm/evm/src/lib.rs b/crates/evm/evm/src/lib.rs
-index d86083947..755f536bd 100644
+index ab85a36c1..175d11d4f 100644
 --- a/crates/evm/evm/src/lib.rs
 +++ b/crates/evm/evm/src/lib.rs
 @@ -351,6 +351,24 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
@@ -243,7 +246,7 @@ index d86083947..755f536bd 100644
      /// Creates a strategy with given EVM and execution context.
      fn create_executor<'a, DB, I>(
          &'a self,
-@@ -504,6 +522,10 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
+@@ -576,6 +594,10 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
      }
  }
  

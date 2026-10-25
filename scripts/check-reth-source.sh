@@ -48,4 +48,4 @@ done
 # Reuse the applier's source-revision and patch-series validation after all
 # reverse checks have proved this invocation cannot modify the source.
 bash "$script_dir/apply-reth-patches.sh" "$reth_dir"
-echo "Reth source matches the v2.7.0 N42 patch lock."
+echo "Reth source matches the v2.8.1 N42 patch lock."

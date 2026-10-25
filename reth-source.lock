@@ -1,33 +1,33 @@
 {
   "schema": 1,
   "source": "https://github.com/paradigmxyz/reth",
-  "upstream_tag": "v2.7.0",
-  "upstream_commit": "3d592ece6de8c4559987416a544fc215fd6d6921",
-  "adapted_commit": "3452d7d0217095446b0f2632a283e314951da273",
+  "upstream_tag": "v2.8.1",
+  "upstream_commit": "d763342fa185e4e90ee79dc65f6a5706168b0bcb",
+  "adapted_commit": "5a8b035c3420f6cb5b5b074a51dab2d4272009e6",
   "patch_series": [
     {
       "name": "reth-qmdb-state-reader",
-      "commit": "6bd30e58a30160474fa7822286acc78e0dabb141"
+      "commit": "ccb3fa2bbc0d0de46b90ee5746b6c5bd7bbc50b4"
     },
     {
       "name": "reth-n42-perf",
-      "commit": "285b918f3f76f171ccd838730c7d47a52a7818e3"
+      "commit": "9d57b535415000b58c71827eac0ee5e57fb9ea13"
     },
     {
       "name": "reth-payload-transactions-root",
-      "commit": "3c7fa828df51a192e34d266a753c6ac2f5680e3a"
+      "commit": "d5a9f5c6e90c898f7906049f7117d1b708a1a386"
     },
     {
       "name": "reth-gov5-cached-state-root",
-      "commit": "92bff7ca66de188f6e6a58cb7b99f4b5e955a24d"
+      "commit": "98b5a371e0128a37cbc24d8f3dd7873bbf68c468"
     },
     {
       "name": "reth-import-batch",
-      "commit": "401aa9105bf36b8caec6b0d8f250a0499d64ef3a"
+      "commit": "bdd5abb9f69e1b8c476cf174990a6131c44ffdac"
     },
     {
       "name": "reth-engine-state-provider-factory",
-      "commit": "3452d7d0217095446b0f2632a283e314951da273"
+      "commit": "5a8b035c3420f6cb5b5b074a51dab2d4272009e6"
     }
   ],
   "workspace_dependency_versions": {

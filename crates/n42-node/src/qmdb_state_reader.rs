@@ -273,7 +273,7 @@ reth_storage_api::macros::delegate_impls_to_as_ref!(
     StateProofProvider {
         fn proof(&self, input: reth_trie_common::TrieInput, address: Address, slots: &[B256]) -> ProviderResult<reth_trie_common::AccountProof>;
         fn multiproof(&self, input: reth_trie_common::TrieInput, targets: reth_trie_common::MultiProofTargets) -> ProviderResult<reth_trie_common::MultiProof>;
-        fn multiproof_v2(&self, input: reth_trie_common::TrieInput, targets: reth_trie_common::MultiProofTargetsV2) -> ProviderResult<reth_trie_common::DecodedMultiProofV2>;
+        fn multiproof_v2(&self, targets: reth_trie_common::MultiProofTargetsV2, requires_masks: bool) -> ProviderResult<reth_trie_common::DecodedMultiProofV2>;
         fn witness(&self, input: reth_trie_common::TrieInput, target: reth_trie_common::HashedPostState, mode: reth_trie_common::ExecutionWitnessMode) -> ProviderResult<Vec<alloy_primitives::Bytes>>;
     }
 );

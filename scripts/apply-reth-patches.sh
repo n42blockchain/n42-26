@@ -5,8 +5,8 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 reth_dir=${1:-"$script_dir/../../reth"}
 patch_dir=${N42_RETH_PATCH_DIR:-"$script_dir/../patches"}
-base_revision=${N42_RETH_BASE_REVISION:-3d592ece6de8c4559987416a544fc215fd6d6921}
-adapted_revision=${N42_RETH_ADAPTED_REVISION:-3452d7d0217095446b0f2632a283e314951da273}
+base_revision=${N42_RETH_BASE_REVISION:-d763342fa185e4e90ee79dc65f6a5706168b0bcb}
+adapted_revision=${N42_RETH_ADAPTED_REVISION:-5a8b035c3420f6cb5b5b074a51dab2d4272009e6}
 current_revision=$(git -C "$reth_dir" rev-parse HEAD 2>/dev/null || true)
 if [[ "$current_revision" != "$base_revision" && "$current_revision" != "$adapted_revision" ]]; then
     echo "Reth checkout must be exactly pinned base $base_revision or adapted revision $adapted_revision." >&2

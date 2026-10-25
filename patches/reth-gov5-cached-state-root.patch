@@ -1,5 +1,5 @@
 diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
-index 89f5f7fc5..354ca3b30 100644
+index 83cea64e5..3ccb9dda2 100644
 --- a/crates/engine/tree/src/tree/payload_validator.rs
 +++ b/crates/engine/tree/src/tree/payload_validator.rs
 @@ -609,21 +609,36 @@ where
@@ -107,10 +107,10 @@ index 89f5f7fc5..354ca3b30 100644
              executed_bal.map(|ExecutedBal { alloy, revm }| (alloy, revm)).unzip();
  
 diff --git a/crates/engine/tree/src/tree/state_root_strategy/mod.rs b/crates/engine/tree/src/tree/state_root_strategy/mod.rs
-index aefd61b06..20f9bf5ef 100644
+index a066ac4e8..688b3d476 100644
 --- a/crates/engine/tree/src/tree/state_root_strategy/mod.rs
 +++ b/crates/engine/tree/src/tree/state_root_strategy/mod.rs
-@@ -116,6 +116,23 @@ where
+@@ -115,6 +115,23 @@ where
          ctx: StateRootJobContext<'_, N, P, Evm>,
      ) -> ProviderResult<PreparedStateRootJob<N>>;
  
@@ -134,7 +134,7 @@ index aefd61b06..20f9bf5ef 100644
      /// Prepares the optional payload-builder state-root handle used for FCU-triggered block
      /// building.
      ///
-@@ -810,6 +827,18 @@ where
+@@ -884,6 +901,18 @@ where
          + 'static,
      Evm: ConfigureEvm<Primitives = N> + 'static,
  {

@@ -1,5 +1,5 @@
 diff --git a/crates/storage/provider/src/providers/blockchain_provider.rs b/crates/storage/provider/src/providers/blockchain_provider.rs
-index 78e2bdfcd..0187a3986 100644
+index 8a8d33dae..4739bae8f 100644
 --- a/crates/storage/provider/src/providers/blockchain_provider.rs
 +++ b/crates/storage/provider/src/providers/blockchain_provider.rs
 @@ -808,7 +808,7 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {

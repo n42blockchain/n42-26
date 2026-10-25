@@ -1,8 +1,8 @@
 diff --git a/crates/engine/tree/src/tree/state_root_strategy/mod.rs b/crates/engine/tree/src/tree/state_root_strategy/mod.rs
-index 20f9bf5ef..29cad6b52 100644
+index 688b3d476..e2b96b087 100644
 --- a/crates/engine/tree/src/tree/state_root_strategy/mod.rs
 +++ b/crates/engine/tree/src/tree/state_root_strategy/mod.rs
-@@ -316,6 +316,11 @@ where
+@@ -315,6 +315,11 @@ where
          self.executor
      }
  

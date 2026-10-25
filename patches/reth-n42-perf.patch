@@ -1,5 +1,5 @@
 diff --git a/crates/evm/evm/src/lib.rs b/crates/evm/evm/src/lib.rs
-index 4dfb0b6a8..d86083947 100644
+index d6ed4cc95..ab85a36c1 100644
 --- a/crates/evm/evm/src/lib.rs
 +++ b/crates/evm/evm/src/lib.rs
 @@ -50,6 +50,20 @@ pub use sender_recovery::SenderRecoveryCache;
