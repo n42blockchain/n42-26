@@ -60,7 +60,57 @@ revm 43.0.3、Alloy 2.5.0、alloy-evm 0.39.0、alloy-primitives 1.7.3、reth-pri
 
 - [x] 六补丁迁至 v2.8.1，lock、补丁文件、apply/check 脚本、四个 CI workflow 固定点同步
 - [x] 依赖更新、编译、clippy、全量测试
-- [ ] 七节点舰队运行：本升级未做任何舰队、TPS 或恢复验收；历史混合验收均绑定 v2.7.0 二进制。
-      新二进制混合 soak 首次尝试（v2.7.0 + 审计修复）在 RS 节点块体缺失处 FAIL，
-      现场见 `.artifacts/chain94-soak-20261012/mixed27-fleet/newbin-soak-attempt1-rs-missing-body/`，待决定修复方案后与本升级一起重测。
+- [x] 七节点混合 soak（新二进制）：第二轮 smoke + 一小时 soak 均 PASS，见下节
 - [ ] chain94 兼容分支（n42-rs-wt-reth27-chain94）仍为 reth v2.7.0；n42-rs 主线已在 v2.8.1。
+
+## 新二进制七节点混合 soak（2026-10-26）
+
+拓扑：Go `n42-gov5` 节点 0–4、n42-26 Root 节点 5、RS 兼容节点 6；驱动
+`.artifacts/reth-stable-completion-20261012/run-mixed.py`（第二轮为仅给 rs-validator6 打开
+`n42.h2.node=debug` 的副本），共享机按 `BOX-CLAIM-PROTOCOL.md` 认领后独占运行。
+
+### 第一轮：FAIL（v2.7.0 二进制 + 审计修复）
+
+smoke PASS（13657309→13657356）；soak 93 s 后 RS 节点报 `committed block is unavailable in
+the execution layer`：块 13657418（`0x86c435…78b2`，view 5283，Root 出块）提案到达时无块体，
+35 ms 后 Decide，FCU 返回 SYNCING，块体此后再未到达。Root 对 RS 的直推一直是
+`UnsupportedProtocols`，RS 只能向 peer 拉取块体；而 `h2-node/src/service.rs` 的
+`awaiting_bodies` 是一次性去重集合，块体只请求一次，丢失后永不重试。现场保存在
+`mixed27-fleet/newbin-soak-attempt1-rs-missing-body/`。
+
+### RS 修复（n42-rs `upgrade/reth-v2.7.0-chain94-20261012`，已推送）
+
+- `cf1b599ac` fix(h2-node)：`BodyRequests` 记录每个待取块体的上次请求时间与次数，
+  每 250 ms 重发，最多 40 次；事件循环增加重试定时分支。
+- `4fc928eae` fix(h2-execution)：commit 时 FCU 非 Valid 则保留该块为 `unconfirmed_commit`，
+  块体随后到达并执行 Valid 时补发 FCU，使迟到块体的已提交块成为 canonical。
+- RS 兼容工作区测试 1950 passed / 0 failed / 35 ignored（新增 4 个）。
+
+### 第二轮：PASS
+
+| 二进制 | sha256 前缀 |
+|---|---|
+| n42-node（本仓库 reth v2.8.1，`2a6f101`） | `64e4f311d9ae` |
+| rs27/n42 | `518c49f523b4` |
+| rs27/h2_validator | `d59436e0b0af` |
+| n42-gov5（未重建） | `c6a7366bdf23` |
+
+| 阶段 | 区块 | 时长 | 出块者 | 交易 |
+|---|---|---|---|---|
+| smoke | 13657418→13657468 | 90 s | 7 | 163 成功 / 0 失败 |
+| soak | 13657479→13659278（1800 块） | 3600 s | 7 | 7180 成功 / 0 失败 |
+
+审计范围：已提交链 / 收据 / QC 一致性；持久化需重启验证，本轮未做。
+
+重试证据：smoke 启动时 RS 对第一轮丢失的 `0x86c435…` 重新请求（"block body still missing;
+asking peers again"）并恢复。soak 中 view 5349 出现一次无块体提案（`0x742330…59cc`），
+首次请求即取回、正常投票，未触发重试；全程无 SYNCING、无错误。
+
+日志：`.artifacts/soak-newbin-20261025/job2.log`，`mixed27-fleet/newbin2-{smoke,soak}-*.log`
+及 `newbin2-{smoke,soak}-audit/summary.json`。
+
+### 后续
+
+- [ ] 新二进制恢复演练（重启 / 持久化验证）
+- [ ] Root→RS 直推 `UnsupportedProtocols` 根因（目前依赖 RS 拉取，功能正确但多一跳）
+- [ ] chain94 兼容分支升级到 reth v2.8.1
