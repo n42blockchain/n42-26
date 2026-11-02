@@ -52,6 +52,8 @@ pub enum VerifyError {
     Execution(#[from] BlockExecutionError),
     #[error("missing bytecode for code_hash {0}")]
     MissingBytecode(B256),
+    #[error("malformed bytecode for code_hash {0}")]
+    InvalidBytecode(B256),
     #[error("stream read log exhausted at cursor {0} (expected more entries)")]
     StreamExhausted(usize),
     #[error("unexpected entry type at cursor {cursor}: expected {expected}, got {actual}")]
@@ -140,7 +142,12 @@ fn build_cached_reads(
                 .cloned()
                 .or_else(|| uncached_map.get(&wa.code_hash).map(|b| (*b).clone()));
             match code {
-                Some(b) => Some(Bytecode::new_raw(b)),
+                // `new_raw` panics on a malformed EIP-7702 prefix, and this data
+                // comes from the hub and reaches here through `extern "C"`.
+                Some(b) => Some(
+                    Bytecode::new_raw_checked(b)
+                        .map_err(|_| VerifyError::InvalidBytecode(wa.code_hash))?,
+                ),
                 None => return Err(VerifyError::MissingBytecode(wa.code_hash)),
             }
         };
@@ -191,6 +198,8 @@ pub enum StreamDbError {
     },
     #[error("missing bytecode for hash {0}")]
     MissingCode(B256),
+    #[error("malformed bytecode for hash {0}")]
+    InvalidCode(B256),
 }
 
 impl DBErrorMarker for StreamDbError {}
@@ -385,7 +394,8 @@ impl revm::database_interface::Database for StreamReplayDB<'_> {
         if let Some(cache) = self.code_cache.as_mut()
             && let Some(code) = cache.get(&code_hash)
         {
-            let bytecode = Bytecode::new_raw(code.clone());
+            let bytecode = Bytecode::new_raw_checked(code.clone())
+                .map_err(|_| StreamDbError::InvalidCode(code_hash))?;
             self.bytecodes.insert(code_hash, bytecode.clone());
             return Ok(bytecode);
         }
@@ -472,8 +482,12 @@ pub fn verify_block_stream(
     let bytecodes_map: HashMap<B256, Bytecode> = packet
         .bytecodes
         .iter()
-        .map(|(hash, code)| (*hash, Bytecode::new_raw(code.clone())))
-        .collect();
+        .map(|(hash, code)| {
+            Bytecode::new_raw_checked(code.clone())
+                .map(|bytecode| (*hash, bytecode))
+                .map_err(|_| VerifyError::InvalidBytecode(*hash))
+        })
+        .collect::<Result<_, _>>()?;
 
     let db = StreamReplayDB::new(packet.read_log_data.clone(), bytecodes_map, code_cache);
     let result = N42EvmConfig::new(chain_spec)
@@ -806,6 +820,24 @@ mod tests {
             result,
             Err(VerifyError::HeaderHashMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn test_verify_block_stream_malformed_bytecode_is_an_error() {
+        use n42_execution::read_log::encode_read_log;
+        let (_, header_rlp, block_hash) = make_sealed_header();
+        let code_hash = B256::with_last_byte(0xEE);
+        let packet = StreamPacket {
+            block_hash,
+            header_rlp,
+            transactions: vec![],
+            read_log_data: encode_read_log(&[]),
+            bytecodes: vec![(code_hash, Bytes::from_static(&[0xEF, 0x01]))],
+        };
+        let mut cache = CodeCache::new(10);
+        let chain_spec = n42_chainspec::n42_dev_chainspec();
+        let result = verify_block_stream(&packet, &mut cache, chain_spec);
+        assert!(matches!(result, Err(VerifyError::InvalidBytecode(hash)) if hash == code_hash));
     }
 
     #[test]
