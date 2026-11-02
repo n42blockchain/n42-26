@@ -1,5 +1,5 @@
 use alloy_primitives::B256;
-use alloy_rpc_types_engine::PayloadStatusEnum;
+use alloy_rpc_types_engine::{PayloadStatusEnum, PayloadValidationError};
 use metrics::{counter, gauge};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -111,6 +111,19 @@ impl BadBlockCache {
                 validation_error,
                 "not caching rejection for a sender-declared block hash mismatch"
             );
+            return false;
+        }
+        // Reth answers from its own invalid-header cache here; nothing was
+        // executed. That cache also holds hashes rejected over a forged compact
+        // output, and reth expires its entries after repeated lookups. Recording
+        // the echo would turn such a rejection into a permanent local verdict.
+        // Lookups are cheap, so the arrival bound from caching is not needed.
+        if *validation_error == PayloadValidationError::LinksToRejectedPayload.to_string() {
+            counter!(
+                "n42_bad_block_cache_engine_echo_skips_total",
+                "source" => source
+            )
+            .increment(1);
             return false;
         }
         self.insert_invalid_payload(hash, validation_error, source);
@@ -265,5 +278,22 @@ mod tests {
         assert!(cache.insert_if_invalid(bad_hash, &status, "test"));
         assert!(cache.should_skip(bad_hash, "test"));
         assert_eq!(cache.len(), 1);
+    }
+
+    /// A forged compact output makes reth reject an honest block and remember
+    /// the hash in its own invalid-header cache. The retry without the forged
+    /// bytes then answers with this echo instead of re-executing the block.
+    /// Caching the echo would pin the honest hash for the process lifetime.
+    #[test]
+    fn engine_echo_of_an_earlier_rejection_never_blacklists_the_hash() {
+        let cache = BadBlockCache::with_capacity(2);
+        let honest_hash = B256::repeat_byte(8);
+        let status = PayloadStatusEnum::Invalid {
+            validation_error: PayloadValidationError::LinksToRejectedPayload.to_string(),
+        };
+
+        assert!(!cache.insert_if_invalid(honest_hash, &status, "test"));
+        assert!(!cache.should_skip(honest_hash, "test"));
+        assert_eq!(cache.len(), 0);
     }
 }
