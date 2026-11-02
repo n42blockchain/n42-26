@@ -2647,7 +2647,8 @@ fn main() {
                         n42_node::exec_cache::RethExecutionOutputCache::new(
                             qmdb_execution_store.clone(),
                             full_node.provider.chain_spec(),
-                        ),
+                        )
+                        .with_peer_outputs(!authoritative_qmdb_execution),
                     ));
                     if let Some(schedule) = epoch_schedule.clone() {
                         observer =
@@ -3225,7 +3226,8 @@ fn main() {
                     n42_node::exec_cache::RethExecutionOutputCache::new(
                         qmdb_execution_store.clone(),
                         full_node.provider.chain_spec(),
-                    ),
+                    )
+                    .with_peer_outputs(!authoritative_qmdb_execution),
                 ))
                 .with_staking_sink(std::sync::Arc::new(
                     n42_node::sinks::ManagerStakingSink(staking_manager.clone()),

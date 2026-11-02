@@ -18,6 +18,7 @@ pub use n42_consensus_service::exec_cache::ExecutionOutputCache;
 pub struct RethExecutionOutputCache {
     qmdb_store: Option<Arc<crate::qmdb_state_root::Gov5QmdbStateRootStore>>,
     chain_spec: Arc<reth_chainspec::ChainSpec>,
+    accept_peer_outputs: bool,
 }
 
 impl RethExecutionOutputCache {
@@ -28,7 +29,19 @@ impl RethExecutionOutputCache {
         Self {
             qmdb_store,
             chain_spec,
+            accept_peer_outputs: true,
         }
+    }
+
+    /// Controls whether peer-supplied compact outputs may enter the payload cache.
+    ///
+    /// Must be false whenever the Gov5 QMDB store (or the trusted-root mode) is
+    /// authoritative. No honest node emits a compact output there, the output
+    /// is unauthenticated, and the trusted-root job never compares a root, so
+    /// a forged bundle would be committed as the block's state.
+    pub fn with_peer_outputs(mut self, accept: bool) -> Self {
+        self.accept_peer_outputs = accept;
+        self
     }
 }
 
@@ -73,6 +86,10 @@ impl ExecutionOutputCache for RethExecutionOutputCache {
     }
 
     fn inject(&self, hash: B256, compressed: &[u8], source: &'static str) -> bool {
+        if !self.accept_peer_outputs {
+            metrics::counter!("n42_compact_block_peer_output_refused_total").increment(1);
+            return false;
+        }
         inject_compact_block(&hash, compressed, source)
     }
 
@@ -361,6 +378,40 @@ mod tests {
         assert!(
             reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&hash).is_none()
         );
+    }
+
+    #[test]
+    fn peer_output_is_refused_when_gov5_state_is_authoritative() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+        let hash = B256::repeat_byte(0x45);
+        let root = B256::repeat_byte(0x46);
+        let compressed = compress_payload(
+            &serde_json::to_vec(&CompactBlockExecution {
+                bundle_state: Default::default(),
+                receipts: Vec::new(),
+                requests: Default::default(),
+                gas_used: 0,
+                blob_gas_used: 0,
+                senders: Vec::new(),
+                transactions_root: Some(root),
+            })
+            .unwrap(),
+        );
+
+        let cache = RethExecutionOutputCache::new(None, reth_chainspec::MAINNET.clone())
+            .with_peer_outputs(false);
+        assert!(!cache.inject(hash, &compressed, "test"));
+        assert!(
+            reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&hash).is_none()
+        );
+        assert_eq!(
+            reth_evm::payload_cache::payload_transactions_root(&hash),
+            None
+        );
+
+        let cache = RethExecutionOutputCache::new(None, reth_chainspec::MAINNET.clone());
+        assert!(cache.inject(hash, &compressed, "test"));
+        cache.evict(hash);
     }
 
     #[test]
