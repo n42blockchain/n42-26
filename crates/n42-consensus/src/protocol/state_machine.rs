@@ -3820,6 +3820,54 @@ mod tests {
         )));
     }
 
+    /// Changes left from a timed-out or equivocating proposal must not be staged
+    /// by a Decide whose CommitQC signed a different changes hash.
+    #[test]
+    fn test_decide_never_stages_pending_changes_with_another_hash() {
+        let (mut engine, sks, vs, mut rx) = make_engine(4, 0);
+        let block_hash = B256::repeat_byte(0xDA);
+        let view = 2u64;
+        let stale = [n42_primitives::consensus::ValidatorChange::Remove {
+            address: Address::repeat_byte(0x77),
+        }];
+        engine.epoch_manager.replace_pending_from_proposal(&stale);
+
+        let changes_hash = B256::repeat_byte(0x42);
+        let commit_qc = build_test_commit_qc_with_changes(
+            view,
+            block_hash,
+            &sks,
+            &vs,
+            &[0, 1, 2],
+            &changes_hash,
+        );
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                view,
+                block_hash,
+                commit_qc,
+                validator_changes_hash: changes_hash,
+            })))
+            .expect("decide with mismatching pending changes should still commit");
+
+        let outputs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::BlockCommitted {
+                validator_changes: None,
+                ..
+            }
+        )));
+        assert!(outputs.iter().any(|o| matches!(
+            o,
+            EngineOutput::SyncRequired {
+                local_view: 1,
+                target_view: 2,
+            }
+        )));
+        assert!(engine.epoch_manager.has_pending_changes());
+    }
+
     #[test]
     fn test_late_committed_proposal_recovers_validator_changes_before_boundary() {
         use crate::protocol::quorum::proposal_signing_message;

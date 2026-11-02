@@ -343,17 +343,23 @@ impl ConsensusEngine {
 
         self.round_state.commit(commit_qc.clone());
 
-        // Capture changes BEFORE commit clears pending (needed for Decide + BlockCommitted).
-        let committed_changes = self.epoch_manager.pending_changes_for_proposal();
-        let changes_hash = match &committed_changes {
-            Some(c) => crate::EpochManager::hash_changes(c),
-            None => alloy_primitives::B256::ZERO,
-        };
+        // The Decide must carry the hash the commit votes signed. Changes queued
+        // after the proposal stay pending for a later block; staging them here
+        // would commit a change no block carried and break every follower's
+        // CommitQC check.
+        let changes_hash = self.cached_changes_hash(&block_hash);
 
+        // Capture changes BEFORE commit clears pending (needed for Decide + BlockCommitted).
         // Commit-then-Activate: if validator changes were proposed, stage them now.
-        if self.epoch_manager.has_pending_changes() {
+        let committed_changes = if changes_hash != alloy_primitives::B256::ZERO
+            && self.epoch_manager.pending_changes_hash() == changes_hash
+        {
+            let changes = self.epoch_manager.pending_changes_for_proposal();
             self.epoch_manager.commit_pending_changes()?;
-        }
+            changes
+        } else {
+            None
+        };
 
         let decide = n42_primitives::consensus::Decide {
             view,

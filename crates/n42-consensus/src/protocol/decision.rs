@@ -90,13 +90,17 @@ impl ConsensusEngine {
         // changes — which would cause epoch divergence with nodes that never had
         // those pending_adds.
         let committed_changes = if decide.validator_changes_hash != alloy_primitives::B256::ZERO {
-            // Capture changes before commit clears them.
-            let changes = self.epoch_manager.pending_changes_for_proposal();
-            if self.epoch_manager.has_pending_changes() {
+            // Stage only what the CommitQC signed. Pending changes with another
+            // hash come from a timed-out or equivocating proposal; staging them
+            // would diverge this node's validator set at the next boundary.
+            if self.epoch_manager.pending_changes_hash() == decide.validator_changes_hash {
+                // Capture changes before commit clears them.
+                let changes = self.epoch_manager.pending_changes_for_proposal();
                 self.epoch_manager.commit_pending_changes()?;
+                changes
             } else {
-                // The committed Proposal carried validator changes but this follower
-                // missed it.  Log prominently so the operator notices; the node will
+                // The committed Proposal carried validator changes this follower
+                // missed or holds under another hash.  Log prominently so the operator notices; the node will
                 // need to resync (or receive the changes in a subsequent Proposal
                 // before the epoch boundary) to avoid validator-set divergence.
                 tracing::error!(
@@ -113,8 +117,8 @@ impl ConsensusEngine {
                     local_view: decide.view.saturating_sub(1),
                     target_view: decide.view,
                 })?;
+                None
             }
-            changes
         } else {
             // No validator changes in this block.  If this node has local pending_adds
             // queued from an RPC call, keep them — they will be included in the next
