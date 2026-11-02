@@ -18,6 +18,8 @@ pub const MAX_BLOCK_DIRECT_SIZE: usize = 256 * 1024 * 1024;
 pub const MIN_BLOCK_DIRECT_CHUNK_SIZE: usize = 2 * 1024 * 1024;
 pub const MAX_BLOCK_DIRECT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 const FRAME_HEADER_MAX: usize = 64;
+/// Largest buffer growth a sender can cause before providing the bytes.
+const READ_STEP: usize = 64 * 1024;
 pub const MAX_BLOCK_DIRECT_FRAME_SIZE: usize = MAX_BLOCK_DIRECT_CHUNK_SIZE + FRAME_HEADER_MAX;
 
 const FRAME_COMPLETE: u8 = 0;
@@ -168,9 +170,14 @@ impl request_response::Codec for BlockDirectCodec {
                         "invalid block direct chunk {index} length {chunk_len}, expected {expected}"
                     )));
                 }
-                let offset = data.len();
-                data.resize(offset + chunk_len, 0);
-                io.read_exact(&mut data[offset..]).await?;
+                // Commit memory only as bytes arrive. This runs before the peer
+                // is authorized, so a declared chunk length must not touch pages.
+                let chunk_end = data.len() + chunk_len;
+                while data.len() < chunk_end {
+                    let offset = data.len();
+                    data.resize(offset + READ_STEP.min(chunk_end - offset), 0);
+                    io.read_exact(&mut data[offset..]).await?;
+                }
             }
             if blake3::hash(&data).as_bytes() != &manifest.transfer_id {
                 return Err(invalid_data("block direct transfer digest mismatch"));
@@ -450,6 +457,55 @@ mod tests {
         assert!(
             matches!(decoded, BlockDirectFrame::Transfer { manifest: decoded_manifest, data: decoded } if decoded_manifest == manifest && decoded.as_slice() == data.as_slice())
         );
+    }
+
+    /// Records the buffer sizes the codec reads into.
+    struct RecordingReader {
+        data: futures::io::Cursor<Vec<u8>>,
+        largest_read: usize,
+    }
+
+    impl futures::AsyncRead for RecordingReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.largest_read = self.largest_read.max(buf.len());
+            std::pin::Pin::new(&mut self.data).poll_read(cx, buf)
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_never_buffers_a_chunk_before_its_bytes_arrive() {
+        let chunk_size = block_direct_chunk_size();
+        assert!(chunk_size > READ_STEP);
+        let data = Arc::new(vec![0x5a; chunk_size + 17]);
+        let manifest = BlockDirectManifest {
+            transfer_id: *blake3::hash(data.as_slice()).as_bytes(),
+            total_len: data.len() as u64,
+            chunk_size: chunk_size as u32,
+            chunk_count: 2,
+        };
+        let mut writer = futures::io::Cursor::new(Vec::new());
+        let mut codec = BlockDirectCodec;
+        let protocol = StreamProtocol::new(BLOCK_DIRECT_PROTOCOL);
+        codec
+            .write_request(
+                &protocol,
+                &mut writer,
+                BlockDirectRequest {
+                    frame: BlockDirectFrame::Transfer { manifest, data },
+                },
+            )
+            .await
+            .unwrap();
+        let mut reader = RecordingReader {
+            data: futures::io::Cursor::new(writer.into_inner()),
+            largest_read: 0,
+        };
+        codec.read_request(&protocol, &mut reader).await.unwrap();
+        assert!(reader.largest_read <= READ_STEP);
     }
 
     #[tokio::test]
