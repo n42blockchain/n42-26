@@ -417,13 +417,20 @@ async fn handle_phone_connection(
     // Handshake: read 48-byte BLS12-381 public key from first uni stream.
     let verifier_pubkey =
         match tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.accept_uni()).await {
-            Ok(Ok(mut recv)) => match recv.read_to_end(48).await {
-                Ok(data) if data.len() == 48 => {
+            // A stream that never finishes must not park this task: it is not
+            // yet counted in `sessions`, so `max_connections` does not bound it.
+            Ok(Ok(mut recv)) => match tokio::time::timeout(
+                HANDSHAKE_TIMEOUT,
+                recv.read_to_end(48),
+            )
+            .await
+            {
+                Ok(Ok(data)) if data.len() == 48 => {
                     let mut pubkey = [0u8; 48];
                     pubkey.copy_from_slice(&data);
                     pubkey
                 }
-                Ok(data) => {
+                Ok(Ok(data)) => {
                     tracing::warn!(
                         session_id,
                         len = data.len(),
@@ -433,10 +440,16 @@ async fn handle_phone_connection(
                     connection.close(1u32.into(), b"invalid handshake");
                     return;
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::debug!(session_id, error = %e, "handshake read failed");
                     metrics::counter!("n42_mobile_handshake_failures").increment(1);
                     connection.close(1u32.into(), b"handshake read error");
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(session_id, "handshake read timeout");
+                    metrics::counter!("n42_mobile_handshake_failures").increment(1);
+                    connection.close(1u32.into(), b"handshake timeout");
                     return;
                 }
             },
