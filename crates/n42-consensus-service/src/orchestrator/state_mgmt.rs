@@ -831,6 +831,23 @@ impl ConsensusService {
             return;
         }
 
+        // Honest servers stop at MAX_SYNC_BLOCKS. An oversized reply would run
+        // two aggregate verifications per entry on the consensus task.
+        if response.blocks.len() > MAX_SYNC_BLOCKS
+            || response.execution_lineage.len() > MAX_SYNC_BLOCKS
+        {
+            warn!(
+                target: "n42::cl::sync",
+                %peer,
+                blocks = response.blocks.len(),
+                lineage = response.execution_lineage.len(),
+                "dropping oversized sync response"
+            );
+            counter!("n42_sync_responses_oversized_total").increment(1);
+            self.finish_sync_response_group(false);
+            return;
+        }
+
         info!(
             target: "n42::cl::sync",
             %peer,

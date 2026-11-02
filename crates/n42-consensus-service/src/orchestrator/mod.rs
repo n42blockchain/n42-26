@@ -8124,6 +8124,47 @@ mod tests {
         assert_eq!(skipped, Some(DebugValue::Counter(1)));
     }
 
+    /// One peer in the request group must not be able to stall the consensus
+    /// task with a frame full of entries that each need BLS verification.
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_sync_response_is_dropped_before_any_verification() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let peer = n42_network::PeerId::random();
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.sync_request_range = Some((10, 20));
+        orch.sync_requested_peers.insert(peer);
+
+        let block = n42_network::SyncBlock {
+            view: 15,
+            block_hash: B256::repeat_byte(0x34),
+            commit_qc: QuorumCertificate::genesis(),
+            payload: vec![1],
+            validator_changes: None,
+        };
+        let response = n42_network::BlockSyncResponse {
+            blocks: vec![block; 129],
+            peer_committed_view: 20,
+            execution_lineage: Vec::new(),
+        };
+        orch.handle_sync_response(peer, response).await;
+
+        let oversized =
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(key, _, _, value)| {
+                    (key.key().name() == "n42_sync_responses_oversized_total").then_some(value)
+                });
+        assert_eq!(oversized, Some(DebugValue::Counter(1)));
+    }
+
     /// T2a: a sync response block outside the requested `[from_view, to_view]`
     /// range is dropped before QC verification and never counted.
     #[tokio::test(flavor = "current_thread")]
