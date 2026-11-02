@@ -270,6 +270,27 @@ fn take_gov5_normalization_roots(
     Some((state_root, receipts_root))
 }
 
+/// Checks the parts of a peer's compact output that reth's cached-output path
+/// never compares against the block. The state root commits to code hashes, not
+/// code, and every `contracts` entry is written to the bytecode table: a wrong
+/// body would overwrite the code of an existing contract on this node for good.
+/// Reth also adopts `senders` without a length check; receipts are bound to the
+/// transaction count by the receipts root. A refusal only costs re-execution.
+fn validate_compact_structure(compact: &CompactBlockExecution) -> Result<(), &'static str> {
+    if compact.senders.len() != compact.receipts.len() {
+        return Err("sender count differs from receipt count");
+    }
+    if compact
+        .bundle_state
+        .contracts
+        .iter()
+        .any(|(hash, code)| code.hash_slow() != *hash)
+    {
+        return Err("bytecode does not match its code hash");
+    }
+    Ok(())
+}
+
 /// Deserialize compact block execution output and load it into the payload cache.
 pub(crate) fn inject_compact_block(hash: &B256, compressed: &[u8], source: &'static str) -> bool {
     let duplicate_attempt = observe_compact_inject_attempt(*hash, source);
@@ -294,6 +315,12 @@ pub(crate) fn inject_compact_block(hash: &B256, compressed: &[u8], source: &'sta
         }
     };
     let deser_ms = deser_start.elapsed().as_millis() as u64;
+
+    if let Err(reason) = validate_compact_structure(&compact) {
+        metrics::counter!("n42_compact_block_structure_rejects_total").increment(1);
+        warn!(target: "n42::cl::exec_bridge", %hash, source, reason, "compact block: refusing peer output");
+        return false;
+    }
 
     let store_start = std::time::Instant::now();
     let output = BlockExecutionOutput {
@@ -412,6 +439,59 @@ mod tests {
         let cache = RethExecutionOutputCache::new(None, reth_chainspec::MAINNET.clone());
         assert!(cache.inject(hash, &compressed, "test"));
         cache.evict(hash);
+    }
+
+    #[test]
+    fn compact_output_with_unbound_bytecode_or_senders_is_refused() {
+        use alloy_primitives::{Bytes, keccak256};
+        use revm::{bytecode::Bytecode, database::BundleState};
+
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+        let hash = B256::repeat_byte(0x47);
+        let code = Bytes::from_static(&[0x60, 0x00, 0x00]);
+        let compact = |contract_hash: B256, senders: Vec<Address>| {
+            let mut bundle_state = BundleState::default();
+            bundle_state
+                .contracts
+                .insert(contract_hash, Bytecode::new_raw(code.clone()));
+            compress_payload(
+                &serde_json::to_vec(&CompactBlockExecution {
+                    bundle_state,
+                    receipts: Vec::new(),
+                    requests: Default::default(),
+                    gas_used: 0,
+                    blob_gas_used: 0,
+                    senders,
+                    transactions_root: None,
+                })
+                .unwrap(),
+            )
+        };
+
+        // Another contract's code hash paired with attacker-chosen code.
+        assert!(!inject_compact_block(
+            &hash,
+            &compact(B256::repeat_byte(0x48), Vec::new()),
+            "test"
+        ));
+        // More senders than the block has transactions.
+        assert!(!inject_compact_block(
+            &hash,
+            &compact(keccak256(&code), vec![Address::ZERO]),
+            "test"
+        ));
+        assert!(
+            reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&hash).is_none()
+        );
+
+        assert!(inject_compact_block(
+            &hash,
+            &compact(keccak256(&code), Vec::new()),
+            "test"
+        ));
+        assert!(
+            reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&hash).is_some()
+        );
     }
 
     #[test]
