@@ -597,10 +597,10 @@ impl ConsensusService {
         timing.build_complete = Some(tokio::time::Instant::now());
         self.record_pipeline_timing(hash, timing);
 
-        // Update timestamp tracking from the broadcast's direct field.
-        if broadcast.timestamp > 0 {
-            self.last_committed_timestamp = self.last_committed_timestamp.max(broadcast.timestamp);
-        }
+        // `broadcast.timestamp` is unauthenticated and must not reach the build
+        // floor: `last_committed_timestamp` sets the next block's timestamp, and
+        // no post-merge header rule bounds it. The eager import below feeds the
+        // floor from the payload once reth has returned Valid for it.
 
         let pending_finalization_hash = self
             .pending_finalization
@@ -643,7 +643,6 @@ impl ConsensusService {
             let payload_compressed = broadcast.payload_json;
             let execution_output_compressed = broadcast.execution_output;
             let view = broadcast.view;
-            let block_ts = broadcast.timestamp;
             let leader_ready_unix_ms = broadcast.leader_ready_unix_ms;
             let block_data_received = std::time::Instant::now();
             let eager_done_tx = self.eager_import_done_tx.clone();
@@ -686,6 +685,7 @@ impl ConsensusService {
                     metrics::counter!("n42_block_data_payload_hash_mismatch_total").increment(1);
                     return;
                 }
+                let block_ts = execution_data.payload.timestamp();
                 let deser_ms = deser_start.elapsed().as_millis() as u64;
                 let ready_to_decode_ms = elapsed_since_unix_ms(leader_ready_unix_ms);
                 if let Some(elapsed) = ready_to_decode_ms {
@@ -951,11 +951,6 @@ impl ConsensusService {
             None => return false,
         };
 
-        // Update timestamp from the direct field.
-        if broadcast.timestamp > 0 {
-            self.last_committed_timestamp = self.last_committed_timestamp.max(broadcast.timestamp);
-        }
-
         let payload_wire = match super::decompress_payload(&broadcast.payload_json) {
             Ok(d) => d,
             Err(e) => {
@@ -982,6 +977,7 @@ impl ConsensusService {
             return false;
         }
         let execution_parent_hash = execution_data.parent_hash();
+        let payload_timestamp = execution_data.payload.timestamp();
         if self
             .bad_blocks
             .should_skip(broadcast.block_hash, "sync_import_pre_submit")
@@ -1005,6 +1001,8 @@ impl ConsensusService {
         {
             Ok(status) => {
                 if matches!(status.status, PayloadStatusEnum::Valid) {
+                    self.last_committed_timestamp =
+                        self.last_committed_timestamp.max(payload_timestamp);
                     self.handle_valid_import(
                         &broadcast,
                         execution_parent_hash,
@@ -1272,6 +1270,7 @@ impl ConsensusService {
                 continue;
             }
             let retry_parent_hash = retry_exec.parent_hash();
+            let retry_timestamp = retry_exec.payload.timestamp();
             if self
                 .bad_blocks
                 .should_skip(retry_hash, "syncing_retry_pre_submit")
@@ -1295,6 +1294,8 @@ impl ConsensusService {
                 .await
             {
                 Ok(rs) if matches!(rs.status, PayloadStatusEnum::Valid) => {
+                    self.last_committed_timestamp =
+                        self.last_committed_timestamp.max(retry_timestamp);
                     if self.import_would_regress_head(retry_broadcast.view, retry_hash) {
                         debug!(
                             target: "n42::cl::exec_bridge",

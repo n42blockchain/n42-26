@@ -1382,9 +1382,6 @@ impl ConsensusService {
             }
         };
 
-        // Use the direct timestamp field from the broadcast struct.
-        let block_timestamp = broadcast.timestamp;
-
         let payload_wire = match super::decompress_payload(&broadcast.payload_json) {
             Ok(d) => d,
             Err(e) => {
@@ -1411,6 +1408,9 @@ impl ConsensusService {
             counter!("n42_block_data_payload_hash_mismatch_total").increment(1);
             return (ImportOutcome::Invalid, 0);
         }
+        // Read from the hash-bound payload: `broadcast.timestamp` sits outside
+        // the block hash, so a relay can change it on an honest block.
+        let block_timestamp = execution_data.payload.timestamp();
         if bad_blocks.should_skip(block_hash, "committed_import_pre_submit") {
             return (ImportOutcome::Invalid, 0);
         }

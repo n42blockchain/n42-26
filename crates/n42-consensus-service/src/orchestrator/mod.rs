@@ -8817,6 +8817,37 @@ mod tests {
         assert_eq!(mock.new_payload_hashes(), vec![honest_hash]);
     }
 
+    /// `BlockDataBroadcast` is unsigned and its timestamp sits outside the block
+    /// hash. It must not move the floor the next leader build is stamped from,
+    /// or one gossip message drags chain time arbitrarily far forward.
+    #[tokio::test(flavor = "current_thread")]
+    async fn forged_broadcast_timestamp_never_reaches_the_build_floor() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let parent = B256::repeat_byte(0x37);
+        let block_hash = B256::repeat_byte(0x38);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+
+        let mut broadcast: BlockDataBroadcast =
+            bincode::deserialize(&test_block_data(parent, block_hash, 1)).unwrap();
+        broadcast.timestamp = u64::MAX;
+
+        // Gossip arrival: nothing has authenticated the envelope yet.
+        orch.handle_block_data(bincode::serialize(&broadcast).unwrap())
+            .await;
+        assert_eq!(orch.last_committed_timestamp, 0);
+
+        // Sync import: only the hash-bound payload timestamp counts, after Valid.
+        assert!(orch.import_and_notify(broadcast).await);
+        assert_eq!(orch.last_committed_timestamp, 1);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn direct_block_arrival_is_filtered_by_bad_block_cache() {
         let (engine, output_rx) = make_test_engine();
