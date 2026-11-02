@@ -31,6 +31,8 @@ pub enum Gov5BlockError {
     HeaderProfile(String),
     #[error("gov5 block transaction root mismatch")]
     TransactionRootMismatch,
+    #[error("gov5 block rewards do not match the header commitment")]
+    RewardsRootMismatch,
     #[error("execution payload cannot reconstruct a gov5 block: {0}")]
     PayloadReconstruction(String),
     #[error("execution payload block hash does not match its reconstructed header")]
@@ -51,6 +53,7 @@ impl Gov5BlockError {
             Self::HeaderProfile(_) => true,
             Self::InvalidRlp
             | Self::TransactionRootMismatch
+            | Self::RewardsRootMismatch
             | Self::PayloadReconstruction(_)
             | Self::PayloadHashMismatch
             | Self::UnexpectedBlockHash { .. } => false,
@@ -496,6 +499,20 @@ pub fn decode_gov5_block_rlp(encoded: &[u8]) -> Result<Gov5GossipBlock, Gov5Bloc
     if calculate_transaction_root(&transactions) != header.transactions_root {
         return Err(Gov5BlockError::TransactionRootMismatch);
     }
+    // The block hash commits to the rewards only through the header. Without
+    // this check a peer can append a reward to an honest body and keep its hash,
+    // replacing the served copy and retiring the fetch for that hash. Same rule
+    // as the import plan, which would only reject the body much later.
+    let rewards_match = match header
+        .withdrawals_root
+        .filter(|_| n42_consensus::validate_gov5_replay_v2_header(&header).is_err())
+    {
+        Some(root) => n42_consensus::gov5_native_rewards_root(&rewards) == root,
+        None => rewards.is_empty(),
+    };
+    if !rewards_match {
+        return Err(Gov5BlockError::RewardsRootMismatch);
+    }
 
     // Remember the exact encoding: the engine seals the block with this hash
     // and must be able to prove the header behind it.
@@ -800,6 +817,50 @@ mod tests {
         assert_eq!(decoded.mobile_registry_root, Some(B256::ZERO));
     }
 
+    fn append_reward_to_block_rlp(encoded: &[u8]) -> Vec<u8> {
+        let mut payload = encoded;
+        RlpHeader::decode(&mut payload).unwrap();
+        let header = take_rlp_item(&mut payload).unwrap();
+        let transactions = take_rlp_item(&mut payload).unwrap();
+        let verifiers = take_rlp_item(&mut payload).unwrap();
+        let mut rewards = take_rlp_list_item(&mut payload).unwrap();
+        RlpHeader::decode(&mut rewards).unwrap();
+
+        let address = Address::repeat_byte(0x32);
+        let amount = U256::from(1u64);
+        let mut items = rewards.to_vec();
+        RlpHeader {
+            list: true,
+            payload_length: address.length() + amount.length(),
+        }
+        .encode(&mut items);
+        address.encode(&mut items);
+        amount.encode(&mut items);
+
+        let mut rewards_rlp = Vec::new();
+        RlpHeader {
+            list: true,
+            payload_length: items.len(),
+        }
+        .encode(&mut rewards_rlp);
+        rewards_rlp.extend_from_slice(&items);
+
+        let mut forged = Vec::new();
+        RlpHeader {
+            list: true,
+            payload_length: header.len()
+                + transactions.len()
+                + verifiers.len()
+                + rewards_rlp.len(),
+        }
+        .encode(&mut forged);
+        forged.extend_from_slice(header);
+        forged.extend_from_slice(transactions);
+        forged.extend_from_slice(verifiers);
+        forged.extend_from_slice(&rewards_rlp);
+        forged
+    }
+
     #[test]
     fn native_producer_preserves_rewards_committee_and_mobile_header() {
         use alloy_eips::eip4895::{Withdrawal, Withdrawals};
@@ -861,6 +922,12 @@ mod tests {
             n42_consensus::gov5_withdrawals_to_rewards(&withdrawals)
         );
         assert_eq!(gov5_header_view(&decoded.header).unwrap(), 11031);
+
+        // A reward appended to the honest body leaves the block hash unchanged.
+        let forged = append_reward_to_block_rlp(&encoded);
+        let error = decode_gov5_block_rlp(&forged).unwrap_err();
+        assert!(matches!(error, Gov5BlockError::RewardsRootMismatch));
+        assert!(!error.is_permanent());
 
         let mut tampered = normalized.clone();
         tampered.payload.as_v1_mut().state_root = B256::ZERO;
