@@ -299,7 +299,7 @@ Both configurations are well within the **8-second slot target**.
 
 ```bash
 git clone https://github.com/paradigmxyz/reth.git ../reth
-git -C ../reth checkout 3d592ece6de8c4559987416a544fc215fd6d6921
+git -C ../reth checkout d763342fa185e4e90ee79dc65f6a5706168b0bcb
 bash scripts/apply-reth-patches.sh ../reth
 bash scripts/check-reth-source.sh ../reth
 ```
@@ -436,7 +436,7 @@ JAVA_HOME=$(/usr/libexec/java_home -v 17) \
 
 ```bash
 git -C ../reth fetch origin
-git -C ../reth checkout 3d592ece6de8c4559987416a544fc215fd6d6921
+git -C ../reth checkout d763342fa185e4e90ee79dc65f6a5706168b0bcb
 bash scripts/apply-reth-patches.sh ../reth
 bash scripts/check-reth-source.sh ../reth
 ```
