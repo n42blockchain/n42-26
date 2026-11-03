@@ -694,10 +694,7 @@ impl Gov5QmdbStateRootStore {
                 let persisted: PersistedQmdbBranchState =
                     bincode::deserialize_from(std::io::BufReader::new(file))
                         .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))?;
-                if persisted.version != PERSISTED_BRANCH_STATE_VERSION
-                    || persisted.base_block_hash != store.base_block_hash
-                    || persisted.base_root != store.base_root
-                {
+                if persisted.version != PERSISTED_BRANCH_STATE_VERSION {
                     return Err(Gov5QmdbStateRootError::PersistedBaseMismatch);
                 }
                 let mut blocks = persisted
@@ -706,6 +703,25 @@ impl Gov5QmdbStateRootStore {
                     .map(|(hash, block)| (hash, IndexedQmdbBlock::resident(block)))
                     .collect();
                 load_wal(&wal_path(&path), &mut blocks)?;
+                // Earlier releases rolled the base file forward in place and left
+                // the checkpoint on the old base. Such a base is still authentic
+                // when the retained lineage reaches it with the same root.
+                let same_base = persisted.base_block_hash == store.base_block_hash
+                    && persisted.base_root == store.base_root;
+                if !same_base
+                    && !base_extends_retained_lineage(
+                        &blocks,
+                        store.base_block_hash,
+                        store.base_root,
+                        persisted.base_block_hash,
+                    )
+                {
+                    return Err(Gov5QmdbStateRootError::PersistedBaseMismatch);
+                }
+                // The WAL is append-only, so a moved base keeps its own frame.
+                if !same_base {
+                    blocks.remove(&store.base_block_hash);
+                }
                 let mut state = store
                     .state
                     .lock()
@@ -1787,7 +1803,9 @@ impl Gov5QmdbStateRootStore {
         self.commits_since_rebase.store(0, Ordering::Relaxed);
         let (tree, at, depth) = match self.state.lock() {
             Ok(mut state) => {
-                if Self::discard_prepared(&mut state).is_err() {
+                let tip_not_durable =
+                    state.pending_durable.is_some() && state.pending_durable == Some(state.tree_at);
+                if tip_not_durable || Self::discard_prepared(&mut state).is_err() {
                     self.rebase_in_flight.store(false, Ordering::Release);
                     return;
                 }
@@ -1805,7 +1823,7 @@ impl Gov5QmdbStateRootStore {
                 return;
             }
         };
-        let path = self.persistence_path.clone().expect("checked above");
+        let rolling = rolling_checkpoint_path(self.persistence_path.as_ref().expect("checked above"));
         let identity = self.identity;
         let in_flight = self.rebase_in_flight.clone();
         let block_number = identity.block_number.saturating_add(depth as u64);
@@ -1813,7 +1831,7 @@ impl Gov5QmdbStateRootStore {
             .name("qmdb-rebase".into())
             .spawn(move || {
                 let started = std::time::Instant::now();
-                match write_base_file(&path, &tree, identity, block_number, at, root) {
+                match write_base_file(&rolling, &tree, identity, block_number, at, root) {
                     Ok(()) => tracing::info!(
                         target: "n42::qmdb",
                         block_number,
@@ -2031,6 +2049,38 @@ fn write_base_file(
     std::fs::rename(&tmp, &path)
         .and_then(|()| n42_jmt::snapshot::sync_parent_directory(&path))
         .map_err(|error| Gov5QmdbStateRootError::Persistence(error.to_string()))
+}
+
+/// Checkpoint stem of the rolling export. The tree can sit on an unfinalized
+/// side branch or ahead of Reth's durable head, so this copy must never replace
+/// the base file a restart opens: a start from it could not reach Reth's head.
+fn rolling_checkpoint_path(checkpoint_path: &Path) -> PathBuf {
+    let mut rolling = checkpoint_path.as_os_str().to_os_string();
+    rolling.push(".rolling");
+    PathBuf::from(rolling)
+}
+
+/// Whether `base` is a retained block with `base_root` descending from `ancestor`.
+fn base_extends_retained_lineage(
+    blocks: &HashMap<B256, IndexedQmdbBlock>,
+    base: B256,
+    base_root: B256,
+    ancestor: B256,
+) -> bool {
+    if blocks.get(&base).is_none_or(|block| block.root != base_root) {
+        return false;
+    }
+    let mut cursor = base;
+    for _ in 0..=blocks.len() {
+        if cursor == ancestor {
+            return true;
+        }
+        let Some(block) = blocks.get(&cursor) else {
+            return false;
+        };
+        cursor = block.parent_hash;
+    }
+    false
 }
 
 fn wal_path(checkpoint_path: &Path) -> PathBuf {
@@ -3019,6 +3069,106 @@ mod tests {
         );
     }
 
+    /// Restart reads whatever `.base.qmdb` holds, as bin/n42-node does.
+    fn reopen_from_base_file(path: &Path) -> Result<Gov5QmdbStateRootStore, Gov5QmdbStateRootError> {
+        let (tree, header) =
+            Gov5QmdbStateRootStore::read_base_file(&base_file_path(path)).unwrap();
+        Gov5QmdbStateRootStore::persistent_from_leaf_tree(
+            B256::from(header.block_hash),
+            B256::from(header.root),
+            tree,
+            DEFAULT_QMDB_REPLAY_DEPTH,
+            path.to_path_buf(),
+        )
+    }
+
+    fn commit_chain(
+        store: &Gov5QmdbStateRootStore,
+        snapshot: &QmdbSnapshot,
+    ) -> Vec<(B256, B256)> {
+        let mut parent = store.base_block_hash();
+        let mut history = Vec::new();
+        let mut chain = Vec::new();
+        for byte in 2u8..5 {
+            let operations = vec![operation(byte, byte)];
+            history.push(operations.clone());
+            let hash = B256::repeat_byte(byte + 0x60);
+            let root = expected_root(snapshot, &history);
+            store
+                .compute_and_commit(parent, hash, root, operations)
+                .unwrap();
+            chain.push((hash, root));
+            parent = hash;
+        }
+        chain
+    }
+
+    #[test]
+    fn restart_after_a_background_rebase_opens_and_replays_the_chain() {
+        let (base, snapshot) = store();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rebased.bin");
+        let mut store = persistent_store(&base, &snapshot, &path);
+        store.write_base_file().unwrap();
+        store.rebase_every = 1;
+        let chain = commit_chain(&store, &snapshot);
+        let started = std::time::Instant::now();
+        while store.rebase_in_flight.load(Ordering::Acquire) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(store);
+
+        let reopened = reopen_from_base_file(&path).unwrap();
+        for (hash, root) in chain {
+            assert_eq!(reopened.root_for(hash).unwrap(), Some(root));
+        }
+    }
+
+    #[test]
+    fn rebase_never_exports_a_tip_that_is_not_durable_yet() {
+        let (base, snapshot) = store();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending-rolling.bin");
+        let mut store = persistent_store(&base, &snapshot, &path);
+        store.rebase_every = 1;
+        {
+            let mut state = store.state.lock().unwrap();
+            state.pending_durable = Some(state.tree_at);
+        }
+        store.maybe_rebase_in_background();
+        assert!(!store.rebase_in_flight.load(Ordering::Acquire));
+        assert!(!base_file_path(&rolling_checkpoint_path(&path)).exists());
+        store.state.lock().unwrap().pending_durable = None;
+    }
+
+    /// Datadirs written by earlier releases already hold a moved base file.
+    #[test]
+    fn restart_accepts_a_base_moved_along_the_retained_lineage() {
+        let (base, snapshot) = store();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-moved.bin");
+        let store = persistent_store(&base, &snapshot, &path);
+        let (tip, tip_root) = *commit_chain(&store, &snapshot).last().unwrap();
+        assert_eq!(store.write_base_file().unwrap().unwrap().0, tip);
+        drop(store);
+
+        let reopened = reopen_from_base_file(&path).unwrap();
+        assert_eq!(reopened.base_block_hash(), tip);
+        assert_eq!(reopened.root_for(tip).unwrap(), Some(tip_root));
+        let child = B256::repeat_byte(0x7a);
+        let operations = vec![operation(9, 9)];
+        let child_root = reopened.compute_candidate(tip, &operations).unwrap();
+        reopened
+            .compute_and_commit(tip, child, child_root, operations)
+            .unwrap();
+        drop(reopened);
+
+        let reopened = reopen_from_base_file(&path).unwrap();
+        assert_eq!(reopened.base_block_hash(), tip);
+        assert_eq!(reopened.root_for(child).unwrap(), Some(child_root));
+    }
+
     #[test]
     fn prepared_candidate_is_never_written_into_a_durable_base() {
         for background in [false, true] {
@@ -3041,8 +3191,13 @@ mod tests {
                 store.write_base_file().unwrap();
             }
             assert!(store.state.lock().unwrap().prepared.is_none());
+            let written = if background {
+                rolling_checkpoint_path(&path)
+            } else {
+                path.clone()
+            };
             let (mut tree, header) =
-                Gov5QmdbStateRootStore::read_base_file(&base_file_path(&path)).unwrap();
+                Gov5QmdbStateRootStore::read_base_file(&base_file_path(&written)).unwrap();
             assert_eq!(B256::from(header.block_hash), base.base_block_hash());
             assert_eq!(B256::from(tree.root()), base.base_root());
             assert_eq!(tree.get(&[1; 32]), Some(&[1][..]));
