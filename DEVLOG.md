@@ -17,6 +17,7 @@ Logs are split into separate files by phase for easy maintenance:
 | File | Content | Phase |
 |------|---------|-------|
 | [devlog-178-reth-281-upgrade-20261025](docs/devlog-178-reth-281-upgrade-20261025.md) | Reth v2.8.1 six-patch port (one conflict), multiproof_v2 API change, revm-inspectors 0.44.3, dependency refresh, 1823/0/30 workspace tests; 7-node mixed 1 h soak PASS after RS body-retry fix | Upgrade |
+| [devlog-179-reth-290-evm2-assessment-20261103](docs/devlog-179-reth-290-evm2-assessment-20261103.md) | Reth v2.9.0 assessment: evm2 replaces revm/alloy-evm/reth-revm; four of six N42 patches ported (archived in patches/wip-reth-v2.9.0), import-batch needs a redesign; paused with a to-do list while the shared box is lent out | Maintenance |
 | [devlog-177-reth-27-upgrade-20261003](docs/devlog-177-reth-27-upgrade-20261003.md) | Reth v2.7.0 six-patch port, N42 compatibility changes, immediate persistence, workspace verification and remaining fleet gates | Upgrade |
 | [devlog-145-ci-reth-cache-api-20260914](docs/devlog-145-ci-reth-cache-api-20260914.md) | 修复 CI 缺少 reth 交易根缓存 API 导致的三个编译失败检查 | CI |
 | [devlog-144-independent-chain94-fleet-20260904](docs/devlog-144-independent-chain94-fleet-20260904.md) | Gov5 历史快照上的纯 Rust 七节点独立舰队、原生出块、重启验收 | Deployment |

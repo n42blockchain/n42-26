@@ -1,0 +1,140 @@
+From 77a2af332d82c6e91ebbc660dc9373486e1582c9 Mon Sep 17 00:00:00 2001
+From: MiraWells <1020080523@qq.com>
+Date: Sat, 3 Oct 2026 00:51:30 -0400
+Subject: [PATCH 2/4] n42: add payload and root cache APIs for Reth 2.7
+
+(cherry picked from commit 285b918f3f76f171ccd838730c7d47a52a7818e3)
+---
+ crates/evm/evm/src/lib.rs           | 14 +++++
+ crates/evm/evm/src/payload_cache.rs | 94 +++++++++++++++++++++++++++++
+ 2 files changed, 108 insertions(+)
+ create mode 100644 crates/evm/evm/src/payload_cache.rs
+
+diff --git a/crates/evm/evm/src/lib.rs b/crates/evm/evm/src/lib.rs
+index a1b473b0da..8889307f7f 100644
+--- a/crates/evm/evm/src/lib.rs
++++ b/crates/evm/evm/src/lib.rs
+@@ -179,6 +179,20 @@ pub mod noop;
+ /// Helper types for execution witness generation.
+ #[cfg(feature = "witness")]
+ pub mod witness;
++#[cfg(feature = "std")]
++pub mod payload_cache;
++
++/// Whether N42 benchmark configuration requests skipping state-root validation.
++#[cfg(feature = "std")]
++pub fn n42_skip_state_root() -> bool {
++    payload_cache::n42_skip_state_root()
++}
++
++/// Whether N42 benchmark configuration requests deferring state-root validation.
++#[cfg(feature = "std")]
++pub fn n42_defer_state_root() -> bool {
++    payload_cache::n42_defer_state_root()
++}
+ 
+ /// A complete configuration of EVM for Reth.
+ ///
+diff --git a/crates/evm/evm/src/payload_cache.rs b/crates/evm/evm/src/payload_cache.rs
+new file mode 100644
+index 0000000000..10ab99ee41
+--- /dev/null
++++ b/crates/evm/evm/src/payload_cache.rs
+@@ -0,0 +1,94 @@
++//! Process-local payload results shared between the payload builder and engine.
++//!
++//! Each slot retains only the most recent payload, matching the sequential
++//! leader build path. Entries are keyed by the sealed block hash so stale data
++//! cannot be consumed for a different payload.
++
++use alloy_primitives::B256;
++use std::{
++    any::Any,
++    sync::{Mutex, OnceLock},
++};
++
++struct CachedPayload {
++    block_hash: B256,
++    data: Box<dyn Any + Send + Sync>,
++}
++
++type CacheSlot = OnceLock<Mutex<Option<CachedPayload>>>;
++
++static PAYLOAD_CACHE: CacheSlot = OnceLock::new();
++static BROADCAST_CACHE: CacheSlot = OnceLock::new();
++static TRANSACTION_ROOT_CACHE: OnceLock<Mutex<Option<(B256, B256)>>> = OnceLock::new();
++
++fn store(slot: &CacheSlot, block_hash: B256, data: impl Any + Send + Sync + 'static) {
++    let cache = slot.get_or_init(|| Mutex::new(None));
++    let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());
++    *guard = Some(CachedPayload { block_hash, data: Box::new(data) });
++}
++
++fn take<T: 'static>(slot: &CacheSlot, block_hash: &B256) -> Option<T> {
++    let cache = slot.get_or_init(|| Mutex::new(None));
++    let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());
++    if guard.as_ref().is_some_and(|entry| &entry.block_hash == block_hash) {
++        return guard.take().and_then(|entry| entry.data.downcast::<T>().ok()).map(|data| *data);
++    }
++    None
++}
++
++/// Store the execution output for a locally built payload.
++pub fn store_payload_execution(block_hash: B256, data: impl Any + Send + Sync + 'static) {
++    store(&PAYLOAD_CACHE, block_hash, data);
++}
++
++/// Take the cached execution output when it belongs to `block_hash`.
++pub fn take_payload_execution<T: 'static>(block_hash: &B256) -> Option<T> {
++    take(&PAYLOAD_CACHE, block_hash)
++}
++
++/// Store execution data used to broadcast a compact block.
++pub fn store_broadcast_execution(block_hash: B256, data: impl Any + Send + Sync + 'static) {
++    store(&BROADCAST_CACHE, block_hash, data);
++}
++
++/// Take compact-block execution data when it belongs to `block_hash`.
++pub fn take_broadcast_execution<T: 'static>(block_hash: &B256) -> Option<T> {
++    take(&BROADCAST_CACHE, block_hash)
++}
++
++/// Store the transaction root belonging to a locally built or compact payload.
++pub fn store_payload_transactions_root(block_hash: B256, transactions_root: B256) {
++    let cache = TRANSACTION_ROOT_CACHE.get_or_init(|| Mutex::new(None));
++    let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());
++    *guard = Some((block_hash, transactions_root));
++}
++
++/// Return the cached transaction root when it belongs to `block_hash`.
++pub fn payload_transactions_root(block_hash: &B256) -> Option<B256> {
++    let cache = TRANSACTION_ROOT_CACHE.get_or_init(|| Mutex::new(None));
++    let guard = cache.lock().unwrap_or_else(|error| error.into_inner());
++    guard.as_ref().and_then(|(cached_hash, root)| (cached_hash == block_hash).then_some(*root))
++}
++
++/// Remove a cached transaction root for a rejected payload.
++pub fn remove_payload_transactions_root(block_hash: &B256) {
++    let cache = TRANSACTION_ROOT_CACHE.get_or_init(|| Mutex::new(None));
++    let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());
++    if guard.as_ref().is_some_and(|(cached_hash, _)| cached_hash == block_hash) {
++        *guard = None;
++    }
++}
++
++/// Whether N42 benchmark configuration requests skipping state-root validation.
++#[cfg(feature = "std")]
++pub fn n42_skip_state_root() -> bool {
++    static SKIP: OnceLock<bool> = OnceLock::new();
++    *SKIP.get_or_init(|| std::env::var("N42_SKIP_STATE_ROOT").is_ok_and(|value| value == "1"))
++}
++
++/// Whether N42 benchmark configuration requests deferring state-root validation.
++#[cfg(feature = "std")]
++pub fn n42_defer_state_root() -> bool {
++    static DEFER: OnceLock<bool> = OnceLock::new();
++    *DEFER.get_or_init(|| std::env::var("N42_DEFER_STATE_ROOT").is_ok_and(|value| value == "1"))
++}
+-- 
+2.53.0
+

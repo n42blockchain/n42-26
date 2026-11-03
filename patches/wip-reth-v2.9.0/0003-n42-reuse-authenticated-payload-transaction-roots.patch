@@ -1,0 +1,120 @@
+From 48e80a53834d631e5cff907c11bc520282ccb99e Mon Sep 17 00:00:00 2001
+From: MiraWells <1020080523@qq.com>
+Date: Sat, 3 Oct 2026 01:05:16 -0400
+Subject: [PATCH 3/4] n42: reuse authenticated payload transaction roots
+
+(cherry picked from commit 3c7fa828df51a192e34d266a753c6ac2f5680e3a)
+---
+ crates/ethereum/payload/Cargo.toml       |  1 +
+ crates/ethereum/payload/src/lib.rs       | 22 ++++++++++++++---
+ crates/ethereum/payload/src/validator.rs | 30 +++++++++++++++++++++---
+ 3 files changed, 47 insertions(+), 6 deletions(-)
+
+diff --git a/crates/ethereum/payload/Cargo.toml b/crates/ethereum/payload/Cargo.toml
+index 39f9145ff9..cd0b6d5a24 100644
+--- a/crates/ethereum/payload/Cargo.toml
++++ b/crates/ethereum/payload/Cargo.toml
+@@ -39,4 +39,5 @@ alloy-eips.workspace = true
+ alloy-consensus.workspace = true
+ alloy-primitives.workspace = true
+ 
++rayon.workspace = true
+ tracing.workspace = true
+diff --git a/crates/ethereum/payload/src/lib.rs b/crates/ethereum/payload/src/lib.rs
+index 5569483d15..2b528fa984 100644
+--- a/crates/ethereum/payload/src/lib.rs
++++ b/crates/ethereum/payload/src/lib.rs
+@@ -23,7 +23,8 @@ use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
+ use reth_evm::{
+     database::StateProviderDatabase,
+     execute::{
+-        BlockBuilder, BlockBuilderOutcome, BlockExecutionError, BlockExecutor, BlockValidationError,
++        BlockBuilder, BlockBuilderOutcome, BlockExecutionError, BlockExecutionOutput, BlockExecutor,
++        BlockValidationError,
+     },
+     ConfigureEvm, EvmEnv, NextBlockEnvAttributes, OnStateHook,
+ };
+@@ -450,7 +451,8 @@ where
+         return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads })
+     }
+ 
+-    let BlockBuilderOutcome { execution_result, block, block_access_list, .. } = if skip_state_root
++    let BlockBuilderOutcome { execution_result, execution_state, block, block_access_list, .. } =
++        if skip_state_root
+     {
+         debug!(
+             target: "payload_builder",
+@@ -489,7 +491,21 @@ where
+ 
+     let requests = chain_spec
+         .is_prague_active_at_timestamp(attributes.timestamp())
+-        .then_some(execution_result.requests);
++        .then(|| execution_result.requests.clone());
++
++    // Retain the transaction root and execution output so compact followers
++    // can reuse work already authenticated by the leader's sealed block hash.
++    let block_hash = block.hash();
++    let transactions_root = block.header().transactions_root();
++    let senders = block.senders().to_vec();
++    let execution_output =
++        BlockExecutionOutput { state: execution_state, result: execution_result };
++    reth_evm::payload_cache::store_payload_transactions_root(block_hash, transactions_root);
++    reth_evm::payload_cache::store_broadcast_execution(
++        block_hash,
++        (execution_output.clone(), senders.clone()),
++    );
++    reth_evm::payload_cache::store_payload_execution(block_hash, (execution_output, senders));
+ 
+     debug!(
+         target: "payload_builder",
+diff --git a/crates/ethereum/payload/src/validator.rs b/crates/ethereum/payload/src/validator.rs
+index 84f8ccecf7..b2d1b0733a 100644
+--- a/crates/ethereum/payload/src/validator.rs
++++ b/crates/ethereum/payload/src/validator.rs
+@@ -1,7 +1,8 @@
+ //! Validates execution payload wrt Ethereum consensus rules
+ 
+-use alloy_consensus::Block;
++use alloy_consensus::{Block, BlockBody};
+ use alloy_rpc_types_engine::{ExecutionData, PayloadError};
++use rayon::prelude::*;
+ use reth_chainspec::EthereumHardforks;
+ use reth_payload_validator::{amsterdam, cancun, prague, shanghai};
+ use reth_primitives_traits::{Block as _, SealedBlock, SignedTransaction};
+@@ -75,8 +76,31 @@ where
+ 
+     let expected_hash = payload.block_hash();
+ 
+-    // First parse the block
+-    let sealed_block = payload.try_into_block_with_sidecar(&sidecar)?.seal_slow();
++    // A locally built or compact-injected payload may carry the transaction
++    // root already authenticated for this exact sealed hash. Reuse it while
++    // decoding independent envelopes in parallel, then retain the normal hash
++    // comparison below to bind the root to the supplied header.
++    let sealed_block = if let Some(transactions_root) =
++        reth_evm::payload_cache::payload_transactions_root(&expected_hash)
++    {
++        let Block { header, body } =
++            payload.into_block_with_sidecar_raw_with_transactions_root(&sidecar, transactions_root)?;
++        let BlockBody { transactions, ommers, withdrawals } = body;
++        let decode = |tx: alloy_primitives::Bytes| {
++            T::decode_2718_exact(tx.as_ref())
++                .map_err(alloy_rlp::Error::from)
++                .map_err(PayloadError::from)
++        };
++        let transaction_count = transactions.len();
++        let transactions = if transaction_count >= 1_024 {
++            transactions.into_par_iter().map(decode).collect::<Result<Vec<_>, _>>()?
++        } else {
++            transactions.into_iter().map(decode).collect::<Result<Vec<_>, _>>()?
++        };
++        Block { header, body: BlockBody { transactions, ommers, withdrawals } }.seal_slow()
++    } else {
++        payload.try_into_block_with_sidecar(&sidecar)?.seal_slow()
++    };
+ 
+     // Ensure the hash included in the payload matches the block hash
+     if expected_hash != sealed_block.hash() {
+-- 
+2.53.0
+
