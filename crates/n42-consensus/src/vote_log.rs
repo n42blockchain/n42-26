@@ -12,6 +12,7 @@
 //! See `Plan #1` in `~/.claude/plans/atomic-dreaming-hare.md`.
 
 use crate::error::{ConsensusError, ConsensusResult};
+use n42_primitives::consensus::QuorumCertificate;
 
 /// A sink that durably records the highest R1 and R2 views this validator has
 /// signed. Implementations must `fsync` (or equivalent) before returning
@@ -24,6 +25,14 @@ pub trait VoteLogWriter: Send + Sync + std::fmt::Debug {
     /// Record `view` as the latest signed R2 CommitVote view. MUST `fsync`
     /// before returning.
     fn record_commit_vote(&self, view: u64) -> ConsensusResult<()>;
+
+    /// Durably record the lock held when an R2 CommitVote is about to be
+    /// signed. The vote log alone only stops re-signing a view: a validator
+    /// that lost its lock could still vote for a conflicting proposal in a
+    /// later view after CommitVotes it already cast helped commit a block.
+    fn record_lock(&self, _qc: &QuorumCertificate) -> ConsensusResult<()> {
+        Ok(())
+    }
 }
 
 /// No-op writer used by tests, single-validator dev mode, and any path where

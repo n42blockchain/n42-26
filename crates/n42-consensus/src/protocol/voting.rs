@@ -189,6 +189,7 @@ impl ConsensusEngine {
                 "leader already cast a commit vote in this view; suppressing R2 self-vote");
             return Ok(());
         }
+        self.vote_log.record_lock(self.round_state.locked_qc())?;
         self.round_state.record_commit_vote(view);
         self.vote_log.record_commit_vote(view)?;
         let changes_hash = self.cached_changes_hash(&block_hash);

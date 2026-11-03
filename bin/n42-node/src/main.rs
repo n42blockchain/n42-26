@@ -1765,6 +1765,10 @@ fn main() {
                 )
             })?;
 
+        let durable_lock = persistence::load_durable_lock(&vote_log_path).map_err(|e| {
+            eyre::eyre!("failed to read durable consensus lock: {e}")
+        })?;
+
         let initial_validator_infos = initial_validator_set.validator_infos();
         let startup_epoch_manager = build_epoch_manager(
             &initial_validator_set,
@@ -3089,7 +3093,7 @@ fn main() {
                         consensus_config.max_timeout_ms,
                         output_tx,
                         recovered_view,
-                        snapshot.locked_qc,
+                        persistence::higher_lock(snapshot.locked_qc, durable_lock),
                         snapshot.last_committed_qc,
                         snapshot.consecutive_timeouts,
                         lvv,

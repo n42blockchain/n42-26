@@ -13,6 +13,7 @@ use std::sync::Mutex;
 const EXECUTION_LINEAGE_MAGIC: &[u8; 4] = b"N42E";
 const EXECUTION_LINEAGE_RECORD_LEN: usize = 4 + 8 + 32 + 16;
 const MAX_DURABLE_VOTE_WATERMARK_AHEAD: u64 = 128;
+const DURABLE_LOCK_MAGIC: &[u8; 4] = b"N42L";
 
 fn execution_lineage_path(snapshot_path: &Path) -> PathBuf {
     let mut path = snapshot_path.as_os_str().to_os_string();
@@ -464,6 +465,52 @@ pub fn load_last_voted_view(path: &Path) -> io::Result<u64> {
     load_last_vote_views(path).map(|(prepare_view, _)| prepare_view)
 }
 
+/// Path of the durable lock kept beside the vote log.
+pub fn durable_lock_path(vote_log_path: &Path) -> PathBuf {
+    vote_log_path.with_file_name("locked_qc.bin")
+}
+
+/// Loads the lock recorded before the last R2 vote, if any. An unreadable file
+/// is an error: guessing here could release a lock a CommitVote relied on.
+pub fn load_durable_lock(vote_log_path: &Path) -> io::Result<Option<QuorumCertificate>> {
+    let path = durable_lock_path(vote_log_path);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let invalid = |reason: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("durable lock {}: {reason}", path.display()),
+        )
+    };
+    let body = bytes
+        .strip_prefix(DURABLE_LOCK_MAGIC)
+        .ok_or_else(|| invalid("bad magic"))?;
+    if body.len() < 32 {
+        return Err(invalid("truncated"));
+    }
+    let (checksum, encoded) = body.split_at(32);
+    if blake3::hash(encoded).as_bytes() != checksum {
+        return Err(invalid("checksum mismatch"));
+    }
+    bincode::deserialize(encoded)
+        .map(Some)
+        .map_err(|e| invalid(&e.to_string()))
+}
+
+/// Picks the lock a restart must honour.
+pub fn higher_lock(
+    snapshot_lock: QuorumCertificate,
+    durable_lock: Option<QuorumCertificate>,
+) -> QuorumCertificate {
+    match durable_lock {
+        Some(lock) if lock.view > snapshot_lock.view => lock,
+        _ => snapshot_lock,
+    }
+}
+
 /// Persistent file-backed vote log. Always 16 bytes; fields are overwritten in place.
 pub struct FileVoteLog {
     path: PathBuf,
@@ -546,12 +593,80 @@ impl VoteLogWriter for FileVoteLog {
     fn record_commit_vote(&self, view: u64) -> ConsensusResult<()> {
         self.record_at(VOTE_LOG_FIELD_BYTES, view)
     }
+
+    fn record_lock(&self, qc: &QuorumCertificate) -> ConsensusResult<()> {
+        let encoded = bincode::serialize(qc)
+            .map_err(|e| ConsensusError::VoteLogFsync(format!("encode lock: {e}")))?;
+        let mut bytes = Vec::with_capacity(DURABLE_LOCK_MAGIC.len() + 32 + encoded.len());
+        bytes.extend_from_slice(DURABLE_LOCK_MAGIC);
+        bytes.extend_from_slice(blake3::hash(&encoded).as_bytes());
+        bytes.extend_from_slice(&encoded);
+
+        // The vote-log mutex also serializes lock writers.
+        let _guard = self
+            .file
+            .lock()
+            .map_err(|e| ConsensusError::VoteLogFsync(format!("vote log mutex poisoned: {e}")))?;
+        let path = durable_lock_path(&self.path);
+        let tmp_path = path.with_extension("bin.tmp");
+        let mut tmp = File::create(&tmp_path).map_err(map_io_err)?;
+        tmp.write_all(&bytes).map_err(map_io_err)?;
+        tmp.sync_data().map_err(map_io_err)?;
+        drop(tmp);
+        std::fs::rename(&tmp_path, &path).map_err(map_io_err)?;
+        n42_jmt::snapshot::sync_parent_directory(&path).map_err(map_io_err)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use n42_primitives::consensus::QuorumCertificate;
+
+    fn lock_at(view: u64) -> QuorumCertificate {
+        QuorumCertificate {
+            view,
+            block_hash: B256::repeat_byte(0x2A),
+            ..QuorumCertificate::genesis()
+        }
+    }
+
+    #[test]
+    fn durable_lock_survives_restart_and_outranks_a_stale_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vote_log.bin");
+        assert_eq!(load_durable_lock(&path).unwrap(), None);
+
+        let log = FileVoteLog::open(path.clone()).unwrap();
+        log.record_lock(&lock_at(7)).unwrap();
+        log.record_lock(&lock_at(9)).unwrap();
+        drop(log);
+
+        let durable = load_durable_lock(&path).unwrap();
+        assert_eq!(durable, Some(lock_at(9)));
+        assert_eq!(higher_lock(lock_at(5), durable.clone()).view, 9);
+        assert_eq!(higher_lock(lock_at(12), durable).view, 12);
+        assert_eq!(higher_lock(lock_at(5), None).view, 5);
+    }
+
+    #[test]
+    fn damaged_durable_lock_fails_instead_of_releasing_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vote_log.bin");
+        let log = FileVoteLog::open(path.clone()).unwrap();
+        log.record_lock(&lock_at(9)).unwrap();
+        drop(log);
+
+        let lock_file = durable_lock_path(&path);
+        let mut bytes = std::fs::read(&lock_file).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        std::fs::write(&lock_file, &bytes).unwrap();
+        assert!(load_durable_lock(&path).is_err());
+
+        std::fs::write(&lock_file, b"N42").unwrap();
+        assert!(load_durable_lock(&path).is_err());
+    }
 
     #[test]
     fn vote_log_open_initializes_empty() {

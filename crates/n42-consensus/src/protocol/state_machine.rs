@@ -3086,6 +3086,105 @@ mod tests {
         );
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingVoteLog(std::sync::Mutex<Vec<String>>);
+
+    impl VoteLogWriter for RecordingVoteLog {
+        fn record_vote(&self, view: u64) -> ConsensusResult<()> {
+            self.0.lock().unwrap().push(format!("vote:{view}"));
+            Ok(())
+        }
+
+        fn record_commit_vote(&self, view: u64) -> ConsensusResult<()> {
+            self.0.lock().unwrap().push(format!("commit:{view}"));
+            Ok(())
+        }
+
+        fn record_lock(&self, qc: &QuorumCertificate) -> ConsensusResult<()> {
+            self.0.lock().unwrap().push(format!("lock:{}", qc.view));
+            Ok(())
+        }
+    }
+
+    /// A CommitVote can help commit a block, so the lock it rests on must be
+    /// durable first; otherwise a restart accepts a conflicting proposal.
+    #[test]
+    fn test_follower_makes_lock_durable_before_commit_vote() {
+        let (_fresh_engine, sks, vs, _fresh_rx) = make_engine(4, 0);
+        let (output_tx, mut output_rx) = mpsc::channel(32);
+        let log = Arc::new(RecordingVoteLog::default());
+        let mut engine = ConsensusEngine::with_recovered_state_and_vote_log(
+            0,
+            sks[0].clone(),
+            EpochManager::new(vs.clone()),
+            60_000,
+            120_000,
+            output_tx,
+            1,
+            QuorumCertificate::genesis(),
+            QuorumCertificate::genesis(),
+            0,
+            0,
+            0,
+            log.clone(),
+        );
+        let block_hash = B256::repeat_byte(0xC8);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(
+                n42_primitives::consensus::PrepareQC {
+                    view: 1,
+                    block_hash,
+                    qc: build_test_prepare_qc(1, block_hash, &sks, &vs, &[0, 1, 2]),
+                },
+            )))
+            .unwrap();
+
+        assert_eq!(*log.0.lock().unwrap(), ["lock:1", "commit:1"]);
+        assert!(output_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn test_leader_makes_lock_durable_before_commit_self_vote() {
+        use crate::protocol::quorum::signing_message;
+
+        let (_fresh_engine, sks, vs, _fresh_rx) = make_engine(4, 0);
+        let (output_tx, mut output_rx) = mpsc::channel(32);
+        let log = Arc::new(RecordingVoteLog::default());
+        let mut engine = ConsensusEngine::with_recovered_state_and_vote_log(
+            1,
+            sks[1].clone(),
+            EpochManager::new(vs.clone()),
+            60_000,
+            120_000,
+            output_tx,
+            1,
+            QuorumCertificate::genesis(),
+            QuorumCertificate::genesis(),
+            0,
+            0,
+            0,
+            log.clone(),
+        );
+        let block_hash = B256::repeat_byte(0xC9);
+        engine
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
+            .unwrap();
+        for voter in [0u32, 2] {
+            let vote = Vote {
+                view: 1,
+                block_hash,
+                voter,
+                signature: sks[voter as usize].sign(&signing_message(1, &block_hash)),
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+                .unwrap();
+        }
+
+        assert_eq!(*log.0.lock().unwrap(), ["vote:1", "lock:1", "commit:1"]);
+        assert!(output_rx.try_recv().is_ok());
+    }
+
     #[test]
     fn test_recovered_r2_vote_guard_suppresses_same_view_commit_vote() {
         let (_fresh_engine, sks, vs, _fresh_rx) = make_engine(4, 0);

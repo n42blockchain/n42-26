@@ -506,7 +506,9 @@ impl ConsensusEngine {
                 "suppressed duplicate commit vote (already commit-voted in this view)");
             return Ok(());
         }
-        // Persist before signing for the same crash-safety reason as R1.
+        // Persist before signing for the same crash-safety reason as R1. The
+        // lock goes first: losing it is what a restart must not be able to do.
+        self.vote_log.record_lock(self.round_state.locked_qc())?;
         self.round_state.record_commit_vote(view);
         self.vote_log.record_commit_vote(view)?;
 
