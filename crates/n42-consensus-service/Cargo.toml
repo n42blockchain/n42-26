@@ -19,6 +19,7 @@ n42-zkproof.workspace = true
 # reth-payload-* / reth-transaction-pool / reth-execution-types).
 revm.workspace = true
 reth-ethereum-primitives.workspace = true
+n42-tx-types.workspace = true
 
 alloy-consensus.workspace = true
 alloy-eips.workspace = true

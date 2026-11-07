@@ -112,10 +112,7 @@ impl ExecutionOutputCache for RethExecutionOutputCache {
     }
 }
 
-type CachedPayloadData = (
-    BlockExecutionOutput<reth_ethereum_primitives::Receipt>,
-    Vec<Address>,
-);
+type CachedPayloadData = (BlockExecutionOutput<n42_tx_types::Receipt>, Vec<Address>);
 
 #[derive(Default)]
 struct CompactInjectTracker {
@@ -166,7 +163,7 @@ pub(crate) fn take_and_serialize_execution_output(hash: &B256) -> Option<Vec<u8>
 
 fn serialize_execution_output(
     hash: &B256,
-    output: BlockExecutionOutput<reth_ethereum_primitives::Receipt>,
+    output: BlockExecutionOutput<n42_tx_types::Receipt>,
     senders: Vec<Address>,
 ) -> Option<Vec<u8>> {
     let ser_start = std::time::Instant::now();
@@ -370,7 +367,7 @@ mod tests {
         reth_evm::payload_cache::store_broadcast_execution(
             hash,
             (
-                BlockExecutionOutput::<reth_ethereum_primitives::Receipt>::default(),
+                BlockExecutionOutput::<n42_tx_types::Receipt>::default(),
                 Vec::<Address>::new(),
             ),
         );
@@ -512,7 +509,7 @@ mod tests {
             mobile_registry_root: None,
         };
         let parent_hash = n42_consensus::remember_gov5_native_header(&parent.encode());
-        let mut block = reth_ethereum_primitives::Block::default();
+        let mut block = n42_tx_types::Block::default();
         block.header.parent_hash = parent_hash;
         block.header.number = 1;
         block.header.base_fee_per_gas = Some(0);
@@ -530,7 +527,7 @@ mod tests {
             &original,
             1,
             B256::repeat_byte(0xa1),
-            n42_network::gov5_native_receipts_root(&[]),
+            n42_network::gov5_native_receipts_root::<alloy_consensus::TxType>(&[]),
         )
         .unwrap();
         let new_hash = normalized.block_hash();
@@ -542,7 +539,7 @@ mod tests {
         reth_evm::payload_cache::store_payload_execution(
             old_hash,
             (
-                BlockExecutionOutput::<reth_ethereum_primitives::Receipt>::default(),
+                BlockExecutionOutput::<n42_tx_types::Receipt>::default(),
                 Vec::<Address>::new(),
             ),
         );
@@ -567,7 +564,7 @@ mod tests {
         reth_evm::payload_cache::store_payload_execution(
             old_hash,
             (
-                BlockExecutionOutput::<reth_ethereum_primitives::Receipt>::default(),
+                BlockExecutionOutput::<n42_tx_types::Receipt>::default(),
                 Vec::<Address>::new(),
             ),
         );
@@ -599,13 +596,13 @@ mod tests {
             Arc::new(Gov5QmdbStateRootStore::new(base_hash, base_root, base.snapshot()).unwrap());
         let cache =
             RethExecutionOutputCache::new(Some(store.clone()), reth_chainspec::MAINNET.clone());
-        let mut block = reth_ethereum_primitives::Block::default();
+        let mut block = n42_tx_types::Block::default();
         block.header.parent_hash = base_hash;
         block.header.number = 1;
         let hash = block.header.hash_slow();
         let execution = alloy_rpc_types_engine::ExecutionData::from_block_unchecked(hash, &block);
         let address = Address::repeat_byte(0x62);
-        let mut output = BlockExecutionOutput::<reth_ethereum_primitives::Receipt>::default();
+        let mut output = BlockExecutionOutput::<n42_tx_types::Receipt>::default();
         output.state.state.insert(
             address,
             BundleAccount::new(

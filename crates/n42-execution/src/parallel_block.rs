@@ -11,7 +11,7 @@ use crate::{
 };
 use alloy_consensus::{Transaction, transaction::TxHashRef};
 use alloy_evm::{Evm, ToTxEnv, block::BlockExecutor, eth::EthTxResult};
-use reth_ethereum_primitives::{Block, Receipt};
+use n42_tx_types::{Block, N42TxEnvelope, N42TxType, Receipt};
 use reth_evm::{
     ConfigureEvm,
     execute::{BlockExecutionError, BlockExecutionOutput},
@@ -75,9 +75,7 @@ where
 pub(crate) fn try_commit_import_batch<'a, DB, G>(
     executor: &mut reth_evm::BlockExecutorForEvm<'a, N42EvmConfig, DB>,
     env: &alloy_evm::EvmEnv,
-    transactions: &[alloy_consensus::transaction::Recovered<
-        reth_ethereum_primitives::TransactionSigned,
-    >],
+    transactions: &[alloy_consensus::transaction::Recovered<N42TxEnvelope>],
     open: &(dyn Fn() -> Option<G> + Sync),
 ) -> Result<Option<crate::parallel_transfer::Graft>, BlockExecutionError>
 where
@@ -137,7 +135,7 @@ where
         ));
     }
     let (_, graft) = commit_transfer_batch(executor, run, env.block_env.beneficiary, |tx| {
-        (*tx.tx_hash(), tx.tx_type())
+        (*tx.tx_hash(), alloy_consensus::TransactionEnvelope::tx_type(&***tx))
     })?;
     Ok(Some(graft))
 }
@@ -150,17 +148,14 @@ pub fn commit_transfer_batch<'a, DB, E, T>(
     executor: &mut crate::restored_slots::TrackingExecutor<E>,
     run: crate::parallel_transfer::BuildRun<T>,
     beneficiary: alloy_primitives::Address,
-    metadata: impl Fn(&T) -> (alloy_primitives::B256, reth_ethereum_primitives::TxType),
+    metadata: impl Fn(&T) -> (alloy_primitives::B256, N42TxType),
 ) -> Result<(Vec<T>, crate::parallel_transfer::Graft), BlockExecutionError>
 where
     DB: Database + 'a,
     E: BlockExecutor<
             Evm: Evm<DB = &'a mut State<DB>>,
-            Transaction = reth_ethereum_primitives::TransactionSigned,
-            Result = EthTxResult<
-                revm::context::result::HaltReason,
-                reth_ethereum_primitives::TxType,
-            >,
+            Transaction = N42TxEnvelope,
+            Result = EthTxResult<revm::context::result::HaltReason, N42TxType>,
         >,
 {
     if !executor.receipts().is_empty() {
@@ -225,10 +220,11 @@ where
 mod tests {
     use super::*;
     use crate::{N42EvmFactory, restored_slots_for, restored_slots_key};
+    use alloy_consensus::BlockBody;
     use alloy_consensus::{Header, SignableTransaction, TxLegacy};
     use alloy_eips::{eip2935, eip4788, eip4895::Withdrawal, eip7002, eip7251};
     use alloy_primitives::{Address, B256, Bytes, Signature, TxKind, U256, address};
-    use reth_ethereum_primitives::{BlockBody, TransactionSigned};
+    use reth_ethereum_primitives::TransactionSigned;
     use reth_evm::execute::{BasicBlockExecutor, Executor};
     use revm::{
         bytecode::Bytecode,
@@ -341,7 +337,7 @@ mod tests {
                     ..Default::default()
                 },
                 body: BlockBody {
-                    transactions: txs,
+                    transactions: txs.into_iter().map(Into::into).collect(),
                     withdrawals: Some(
                         vec![
                             Withdrawal {

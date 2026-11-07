@@ -196,7 +196,7 @@ impl TxAltSig {
             .map_err(|_| AltSigError::PubkeyLength(self.pubkey.len(), ED25519_PUBKEY_LEN))?;
         // Decompressed once per key, not once per signature (see
         // `sender_cache::verifying_key`).
-        let key = crate::key_cache::verifying_key(bytes).ok_or(AltSigError::BadPubkey)?;
+        let key = crate::sender_cache::verifying_key(bytes).ok_or(AltSigError::BadPubkey)?;
         if key.is_weak() {
             return Err(AltSigError::BadPubkey);
         }

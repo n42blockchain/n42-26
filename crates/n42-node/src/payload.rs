@@ -1,13 +1,15 @@
 use crate::consensus_state::SharedConsensusState;
+use crate::engine_types::N42BuiltPayload;
+use crate::native_payload::default_n42_payload;
+use alloy_rpc_types_engine::PayloadAttributes as EthPayloadAttributes;
 use n42_execution::ExecutionPath;
+use n42_tx_types::{N42Primitives, N42TxEnvelope};
 use rayon::prelude::*;
 use reth_basic_payload_builder::{
     BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder, PayloadConfig,
 };
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
-use reth_ethereum_engine_primitives::{EthBuiltPayload, EthPayloadAttributes};
-use reth_ethereum_payload_builder::{EthereumBuilderConfig, default_ethereum_payload};
-use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
+use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_node_api::{FullNodeTypes, NodeTypes, TxTy};
 use reth_node_builder::{
     BuilderContext, PayloadBuilderConfig, PayloadTypes, components::PayloadBuilderBuilder,
@@ -404,13 +406,13 @@ impl N42PayloadBuilder {
 impl<Types, Node, Pool> PayloadBuilderBuilder<Node, Pool, n42_execution::N42EvmConfig>
     for N42PayloadBuilder
 where
-    Types: NodeTypes<ChainSpec: EthereumHardforks, Primitives = EthPrimitives>,
+    Types: NodeTypes<ChainSpec: EthereumHardforks, Primitives = N42Primitives>,
     Node: FullNodeTypes<Types = Types>,
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
         + Unpin
         + 'static,
     Types::Payload:
-        PayloadTypes<BuiltPayload = EthBuiltPayload, PayloadAttributes = EthPayloadAttributes>,
+        PayloadTypes<BuiltPayload = N42BuiltPayload, PayloadAttributes = EthPayloadAttributes>,
 {
     type PayloadBuilder = N42InnerPayloadBuilder<Pool, Node::Provider, n42_execution::N42EvmConfig>;
 
@@ -487,15 +489,15 @@ impl<Pool, Client> PayloadBuilder
     for N42InnerPayloadBuilder<Pool, Client, n42_execution::N42EvmConfig>
 where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks> + Clone,
-    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = N42TxEnvelope>>,
 {
     type Attributes = EthPayloadAttributes;
-    type BuiltPayload = EthBuiltPayload;
+    type BuiltPayload = N42BuiltPayload;
 
     fn try_build(
         &self,
-        args: BuildArguments<EthPayloadAttributes, EthBuiltPayload>,
-    ) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError> {
+        args: BuildArguments<EthPayloadAttributes, N42BuiltPayload>,
+    ) -> Result<BuildOutcome<N42BuiltPayload>, PayloadBuilderError> {
         // Log pool depth before building — key diagnostic for TPS bottleneck analysis.
         let pool_pending = self.pool.pool_size().pending;
         let pool_queued = self.pool.pool_size().queued;
@@ -621,7 +623,7 @@ where
     fn build_empty_payload(
         &self,
         config: PayloadConfig<Self::Attributes>,
-    ) -> Result<EthBuiltPayload, PayloadBuilderError> {
+    ) -> Result<N42BuiltPayload, PayloadBuilderError> {
         let args = BuildArguments::new(
             Default::default(),
             Default::default(),
@@ -630,7 +632,7 @@ where
             Default::default(),
             None,
         );
-        default_ethereum_payload(
+        default_n42_payload(
             self.evm_config.clone(),
             self.client.clone(),
             self.pool.clone(),

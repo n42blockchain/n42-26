@@ -57,6 +57,7 @@ reth-cli-runner.workspace = true
 reth-stages-types.workspace = true
 reth-static-file-types.workspace = true
 reth-ethereum-primitives.workspace = true
+n42-tx-types.workspace = true
 reth-transaction-pool.workspace = true
 reth-tasks.workspace = true
 reth-primitives-traits.workspace = true

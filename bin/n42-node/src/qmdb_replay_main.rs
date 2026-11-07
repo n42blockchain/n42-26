@@ -21,10 +21,10 @@ use n42_network::{decode_finalized_range_stream, decode_gov5_block_rlp};
 use n42_node::N42Node;
 use n42_node::qmdb_state::{gov5_qmdb_operations_with_restored, gov5_restored_slots_key};
 use n42_node::qmdb_state_root::Gov5QmdbStateRootStore;
+use n42_tx_types::N42TxEnvelope;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardfork, ForkCondition};
 use reth_cli_commands::common::{AccessRights, Environment, EnvironmentArgs};
 use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
-use reth_ethereum_primitives::TransactionSigned;
 use reth_evm::{ConfigureEvm, execute::Executor};
 use reth_primitives_traits::{SealedBlock, SealedHeader};
 use reth_provider::{BlockHashReader, BlockNumReader};
@@ -382,11 +382,11 @@ fn main() -> eyre::Result<()> {
         let withdrawals = gov5_rewards_to_withdrawals(&gossip.rewards)
             .map_err(|error| eyre::eyre!("block {}: rewards: {error}", recorded.number))?;
         let header: Header = native.header.clone();
-        // The wire carries alloy envelopes; the executor wants reth's.
+        // The wire carries alloy envelopes; the executor wants N42 envelopes.
         let transactions = gossip
             .transactions
             .iter()
-            .map(|tx| TransactionSigned::decode_2718(&mut tx.encoded_2718().as_slice()))
+            .map(|tx| N42TxEnvelope::decode_2718(&mut tx.encoded_2718().as_slice()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| eyre::eyre!("block {}: transaction: {error}", recorded.number))?;
         let body = BlockBody {
@@ -423,8 +423,13 @@ fn main() -> eyre::Result<()> {
             ));
         }
 
-        let restored = restored_slots_for(gov5_restored_slots_key(recovered.sealed_block(), n42_execution::restored_slots_env_key(&evm_config.evm_env(recovered.header())?.block_env)))
-            .unwrap_or_default();
+        let restored = restored_slots_for(gov5_restored_slots_key(
+            recovered.sealed_block(),
+            n42_execution::restored_slots_env_key(
+                &evm_config.evm_env(recovered.header())?.block_env,
+            ),
+        ))
+        .unwrap_or_default();
         let mut operations = gov5_qmdb_operations_with_restored(&output.state, &restored);
         let restored_used = operations
             .len()

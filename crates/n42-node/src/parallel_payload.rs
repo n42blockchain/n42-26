@@ -2,25 +2,29 @@
 //! Based on pinned Reth 23316e3ff8adca8c3bd5085ff0565fcae019202a payload builder
 //! plus this workspace's Reth patches. Keep the serial limits/finalization aligned.
 
+use alloy_consensus::TransactionEnvelope as _;
+use alloy_consensus::transaction::TxHashRef as _;
+use crate::engine_types::N42BuiltPayload;
+use crate::native_payload::default_n42_payload;
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_evm::ToTxEnv;
 use alloy_primitives::{Bytes, U256};
 use alloy_rlp::Encodable;
 use alloy_rpc_types_engine::PayloadAttributes as EthPayloadAttributes;
 use n42_execution::N42EvmConfig;
+use n42_tx_types::{N42Primitives, N42TxEnvelope};
 use reth_basic_payload_builder::{BuildArguments, BuildOutcome, PayloadConfig, is_better_payload};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
 use reth_errors::{BlockExecutionError, BlockValidationError, ConsensusError};
-use reth_ethereum_payload_builder::{EthereumBuilderConfig, default_ethereum_payload};
-use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
+use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_evm::{
     ConfigureEvm, Evm, NextBlockEnvAttributes,
     block::TxResult,
     execute::{BasicBlockBuilder, BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput},
 };
 use reth_execution_cache::{CachedStateMetrics, CachedStateMetricsSource, CachedStateProvider};
-use reth_payload_builder::{BlobSidecars, EthBuiltPayload};
+use reth_payload_builder::BlobSidecars;
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::PayloadAttributes;
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
@@ -49,17 +53,17 @@ pub(crate) fn build_with_parallel<Client, Pool, F>(
     client: Client,
     pool: Pool,
     builder_config: EthereumBuilderConfig,
-    args: BuildArguments<EthPayloadAttributes, EthBuiltPayload>,
+    args: BuildArguments<EthPayloadAttributes, N42BuiltPayload>,
     best_txs: F,
     parallel: bool,
-) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
+) -> Result<BuildOutcome<N42BuiltPayload>, PayloadBuilderError>
 where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks>,
-    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = N42TxEnvelope>>,
     F: FnOnce(BestTransactionsAttributes) -> BestTransactionsIter<Pool>,
 {
     if !parallel {
-        return default_ethereum_payload(evm_config, client, pool, builder_config, args, best_txs);
+        return default_n42_payload(evm_config, client, pool, builder_config, args, best_txs);
     }
     let BuildArguments {
         mut cached_reads,
@@ -133,7 +137,7 @@ where
         <N42EvmConfig as ConfigureEvm>::BlockExecutorFactory,
         _,
         _,
-        EthPrimitives,
+        N42Primitives,
     > {
         executor: evm_config.create_executor(evm, ctx.clone()),
         ctx,
@@ -687,7 +691,7 @@ where
 
     let block_access_list: Option<Bytes> =
         block_access_list.map(|block_access_list| alloy_rlp::encode(&block_access_list).into());
-    let payload = EthBuiltPayload::new(Arc::new(block), total_fees, requests, block_access_list)
+    let payload = N42BuiltPayload::new(Arc::new(block), total_fees, requests, block_access_list)
         // add blob sidecars from the executed txs
         .with_sidecars(blob_sidecars);
 
@@ -744,14 +748,16 @@ impl<T: PoolTransaction> BestTransactions for ReplayTransactions<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_pool::N42PooledTransaction;
     use alloy_consensus::{Header, SignableTransaction, TxLegacy};
     use alloy_primitives::{Address, B256, Signature, TxKind, address};
-    use reth_ethereum_primitives::Receipt;
+    use n42_tx_types::Receipt;
+    use reth_ethereum_primitives::TransactionSigned;
     use reth_evm::execute::{BasicBlockExecutor, Executor};
     use reth_primitives_traits::{Recovered, SealedHeader};
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_transaction_pool::{
-        EthPooledTransaction, TransactionOrigin,
+        TransactionOrigin,
         identifier::{SenderId, TransactionId},
         noop::NoopTransactionPool,
     };
@@ -761,7 +767,7 @@ mod tests {
     const C: Address = address!("3000000000000000000000000000000000000003");
     const FEE: Address = address!("4000000000000000000000000000000000000004");
     const CONTRACT: Address = address!("6000000000000000000000000000000000000006");
-    type Item = Arc<ValidPoolTransaction<EthPooledTransaction>>;
+    type Item = Arc<ValidPoolTransaction<N42PooledTransaction>>;
     type Output = (BlockExecutionOutput<Receipt>, Vec<Address>);
 
     fn transaction(
@@ -784,8 +790,9 @@ mod tests {
         .into_signed(Signature::new(U256::from(1), U256::from(1), false))
         .into();
         Arc::new(ValidPoolTransaction {
-            transaction: EthPooledTransaction::try_from_consensus(Recovered::new_unchecked(
-                signed, from,
+            transaction: N42PooledTransaction::try_from_consensus(Recovered::new_unchecked(
+                N42TxEnvelope::from(signed),
+                from,
             ))
             .unwrap(),
             transaction_id: TransactionId::new(
@@ -799,7 +806,9 @@ mod tests {
         })
     }
 
-    fn provider() -> MockEthProvider {
+    type MockProvider = MockEthProvider<N42Primitives>;
+
+    fn provider() -> MockProvider {
         let mut chain = n42_chainspec::n42_dev_chainspec();
         let chain_mut = Arc::make_mut(&mut chain);
         chain_mut.hardforks.insert(
@@ -807,7 +816,7 @@ mod tests {
             reth_chainspec::ForkCondition::Timestamp(0),
         );
         chain_mut.genesis.config.prague_time = Some(0);
-        let provider = MockEthProvider::default().with_chain_spec((*chain).clone());
+        let provider = MockProvider::new().with_chain_spec((*chain).clone());
         for (address, balance) in [
             (A, 100_000_000_000u64),
             (B, 100_000_000_000),
@@ -827,11 +836,11 @@ mod tests {
     }
 
     fn build(
-        provider: MockEthProvider,
+        provider: MockProvider,
         txs: &[Item],
         parallel: bool,
         gas_limit: u64,
-    ) -> (EthBuiltPayload, Output) {
+    ) -> (N42BuiltPayload, Output) {
         let config = N42EvmConfig::with_evm_factory(
             provider.chain_spec(),
             n42_execution::N42EvmFactory::with_fast_transfers(false),
@@ -862,7 +871,7 @@ mod tests {
             Default::default(),
             None,
         );
-        let pool = NoopTransactionPool::default();
+        let pool = NoopTransactionPool::<N42PooledTransaction>::new();
         // Mock root is only a sentinel proving the synchronous provider call;
         // state correctness is checked through the complete published bundle below.
         let sentinel = B256::repeat_byte(0xa7);
@@ -930,7 +939,7 @@ mod tests {
         (payload, output)
     }
 
-    fn compare_provider(provider: MockEthProvider, txs: &[Item], gas_limit: u64) {
+    fn compare_provider(provider: MockProvider, txs: &[Item], gas_limit: u64) {
         let (serial, (mut serial_output, serial_senders)) =
             build(provider.clone(), txs, false, gas_limit);
         let (parallel, (mut parallel_output, parallel_senders)) =

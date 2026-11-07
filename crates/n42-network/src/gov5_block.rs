@@ -746,7 +746,7 @@ mod tests {
             &standard,
             19,
             native_state_root,
-            gov5_native_receipts_root(&[]),
+            gov5_native_receipts_root::<alloy_consensus::TxType>(&[]),
         )
         .unwrap();
         assert_ne!(normalized.block_hash(), standard_hash);
@@ -961,7 +961,7 @@ mod tests {
             &local,
             23,
             B256::repeat_byte(0x23),
-            gov5_native_receipts_root(&[]),
+            gov5_native_receipts_root::<alloy_consensus::TxType>(&[]),
         )
         .unwrap();
         let recovered =
@@ -990,7 +990,7 @@ mod tests {
         let standard_hash = block.header.hash_slow();
         let standard = ExecutionData::from_block_unchecked(standard_hash, &block);
 
-        let native_receipts_root = gov5_native_receipts_root(&[]);
+        let native_receipts_root = gov5_native_receipts_root::<alloy_consensus::TxType>(&[]);
         let native_state_root = B256::repeat_byte(0x29);
         let normalized = normalize_execution_payload_for_gov5_h2(
             &standard,

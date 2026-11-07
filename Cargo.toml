@@ -102,6 +102,10 @@ reth-libmdbx = { path = "../reth/crates/storage/libmdbx-rs" }
 reth-storage-api = { path = "../reth/crates/storage/storage-api" }
 reth-rpc-builder = { path = "../reth/crates/rpc/rpc-builder" }
 reth-rpc-server-types = { path = "../reth/crates/rpc/rpc-server-types" }
+reth-rpc = { path = "../reth/crates/rpc/rpc" }
+reth-rpc-convert = { path = "../reth/crates/rpc/rpc-convert" }
+reth-rpc-eth-api = { path = "../reth/crates/rpc/rpc-eth-api" }
+reth-rpc-eth-types = { path = "../reth/crates/rpc/rpc-eth-types" }
 reth-node-core = { path = "../reth/crates/node/core" }
 
 # Alloy (aligned with Reth v2.7.0)

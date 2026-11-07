@@ -441,7 +441,7 @@ mod tests {
     use std::io::Cursor;
 
     fn empty_receipt_root() -> B256 {
-        gov5_native_receipts_root(&[])
+        gov5_native_receipts_root::<alloy_consensus::TxType>(&[])
     }
 
     fn empty_transaction_root() -> B256 {

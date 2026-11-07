@@ -9,14 +9,15 @@
 static NODE_TEST_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use super::*;
-use alloy_consensus::{Header, TxLegacy};
+use alloy_consensus::{BlockBody, Header, TxLegacy};
 use alloy_primitives::{Bytes, TxKind};
 use n42_execution::{N42EvmConfig, restored_slots_for};
 use n42_twig_core::{
     qmdb_compat::{QmdbOperation, encode_gov5_account_value, gov5_account_key},
     qmdb_leaf_tree::QmdbLeafTree,
 };
-use reth_ethereum_primitives::{Block, BlockBody, Transaction};
+use n42_tx_types::{Block, N42TxEnvelope};
+use reth_ethereum_primitives::Transaction;
 use reth_evm::{
     ConfigureEvm,
     execute::{BasicBlockExecutor, Executor},
@@ -195,7 +196,7 @@ fn run_fork(
                     * U256::from(gas_price - u128::from(base_fee)),
         ));
         let expected_root = B256::from(oracle.apply_sorted_ops(expected).unwrap());
-        let signed: Vec<_> = keys
+        let signed: Vec<N42TxEnvelope> = keys
             .iter()
             .enumerate()
             .map(|(n, (key, _))| {
@@ -211,6 +212,7 @@ fn run_fork(
                         input: Bytes::new(),
                     }),
                 )
+                .into()
             })
             .collect();
         let recovery_started = Instant::now();

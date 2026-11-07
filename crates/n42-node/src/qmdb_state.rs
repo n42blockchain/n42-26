@@ -1,5 +1,6 @@
 //! Conversion from reth execution changes to gov5 replay-v2 QMDB mutations.
 
+use alloy_consensus::transaction::TxHashRef as _;
 use alloy_eips::{
     eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE},
     eip4788::{BEACON_ROOTS_ADDRESS, BEACON_ROOTS_CODE},
@@ -13,7 +14,7 @@ use n42_twig_core::qmdb_compat::{
     QmdbCompatTree, QmdbOperation, QmdbOperationError, encode_gov5_account_value, gov5_account_key,
     gov5_storage_key,
 };
-use reth_ethereum_primitives::{Block, Receipt};
+use n42_tx_types::{Block, Receipt};
 use reth_execution_types::BlockExecutionOutput;
 use reth_primitives_traits::SealedBlock;
 use revm::database::states::BundleState;

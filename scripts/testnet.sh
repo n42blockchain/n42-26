@@ -543,6 +543,15 @@ genesis = {
     "excessBlobGas": "0x0", "blobGasUsed": "0x0",
 }
 
+# Native 0x50 (Ed25519) transactions are opt-in: N42_ALT_SIG_TX=1 enables them
+# in genesis, and N42_ALT_SIG_FUND (comma-separated addresses, e.g. from
+# `alt_sig_raw --address`) funds Ed25519 sender accounts.
+if os.environ.get("N42_ALT_SIG_TX") == "1":
+    genesis["config"]["altSigTx"] = True
+    for address in filter(None, os.environ.get("N42_ALT_SIG_FUND", "").split(",")):
+        genesis["alloc"][address.strip()] = {"balance": INITIAL_BALANCE}
+    print("  Native 0x50 transactions enabled (altSigTx)")
+
 with open(os.path.join(data_dir, "genesis.json"), "w") as f:
     json.dump(genesis, f, indent=2)
 with open(os.path.join(data_dir, "test-accounts.json"), "w") as f:

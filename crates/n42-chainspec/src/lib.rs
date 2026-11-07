@@ -1,3 +1,5 @@
+pub mod native;
+
 use alloy_genesis::{Genesis, GenesisAccount};
 use alloy_primitives::{Address, Bytes, U256, address, bytes};
 use libp2p::PeerId;

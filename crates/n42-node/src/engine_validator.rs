@@ -5,9 +5,10 @@ use n42_consensus::{
     remembered_gov5_native_header, validate_gov5_h2_header, validate_gov5_header_extra,
     validate_gov5_replay_v2_header,
 };
+use n42_tx_types::{Block as N42Block, N42Primitives, N42TxEnvelope};
 use reth_chainspec::{EthereumHardforks, Hardforks};
 use reth_engine_primitives::{EngineApiValidator, EngineTypes, PayloadValidator};
-use reth_ethereum_primitives::{Block as EthBlock, EthPrimitives, TransactionSigned};
+use reth_ethereum_payload_builder::EthereumExecutionPayloadValidator;
 use reth_node_api::{AddOnsContext, FullNodeComponents};
 use reth_node_builder::{node::NodeTypes, rpc::PayloadValidatorBuilder};
 use reth_node_ethereum::node::EthereumEngineValidator;
@@ -43,13 +44,17 @@ impl Drop for PayloadConversionTimer {
 #[derive(Clone, Debug)]
 pub struct N42EngineValidator<ChainSpec> {
     inner: EthereumEngineValidator<ChainSpec>,
+    /// Decodes payload bodies as [`N42TxEnvelope`]; `inner` is bound to
+    /// Ethereum's transaction type and only checks attributes and versions.
+    payload: EthereumExecutionPayloadValidator<ChainSpec>,
     header_profile: N42HeaderProfile,
 }
 
 impl<ChainSpec> N42EngineValidator<ChainSpec> {
-    pub const fn new(chain_spec: Arc<ChainSpec>, header_profile: N42HeaderProfile) -> Self {
+    pub fn new(chain_spec: Arc<ChainSpec>, header_profile: N42HeaderProfile) -> Self {
         Self {
-            inner: EthereumEngineValidator::new(chain_spec),
+            inner: EthereumEngineValidator::new(chain_spec.clone()),
+            payload: EthereumExecutionPayloadValidator::new(chain_spec),
             header_profile,
         }
     }
@@ -60,17 +65,17 @@ where
     ChainSpec: reth_chainspec::EthChainSpec + EthereumHardforks + 'static,
     Types: PayloadTypes<ExecutionData = ExecutionData>,
 {
-    type Block = EthBlock;
+    type Block = N42Block;
 
     fn convert_payload_to_block(
         &self,
         payload: ExecutionData,
     ) -> Result<SealedBlock<Self::Block>, NewPayloadError> {
         if self.header_profile == N42HeaderProfile::Ethereum {
-            return <EthereumEngineValidator<ChainSpec> as PayloadValidator<Types>>::convert_payload_to_block(
-                &self.inner,
-                payload,
-            );
+            return self
+                .payload
+                .ensure_well_formed_payload::<N42TxEnvelope>(payload)
+                .map_err(Into::into);
         }
 
         let expected_hash = payload.block_hash();
@@ -87,7 +92,7 @@ where
         let mut standard_payload = payload;
         standard_payload.payload.set_extra_data(Bytes::new());
         if replay_v2_shape {
-            let mut standard_block = standard_payload.try_into_block::<TransactionSigned>()?;
+            let mut standard_block = standard_payload.try_into_block::<N42TxEnvelope>()?;
             standard_block.header.extra_data = original_extra;
             standard_block.header.withdrawals_root = Some(keccak256([]));
             validate_gov5_replay_v2_header(&standard_block.header)
@@ -111,10 +116,9 @@ where
             .set_block_hash(standard_header.hash_slow());
         drop(prepare_timer);
         let standard_timer = PayloadConversionTimer::new("ethereum_validate");
-        let standard = <EthereumEngineValidator<ChainSpec> as PayloadValidator<Types>>::convert_payload_to_block(
-            &self.inner,
-            standard_payload,
-        )?;
+        let standard = self
+            .payload
+            .ensure_well_formed_payload::<N42TxEnvelope>(standard_payload)?;
         drop(standard_timer);
         let _native_timer = PayloadConversionTimer::new("native_header_bind");
         let mut block = standard.into_block();
@@ -274,7 +278,7 @@ where
             ChainSpec: Hardforks + EthereumHardforks + Clone + 'static,
             Payload: EngineTypes<ExecutionData = ExecutionData>
                          + PayloadTypes<PayloadAttributes = PayloadAttributes>,
-            Primitives = EthPrimitives,
+            Primitives = N42Primitives,
         >,
     Node: FullNodeComponents<Types = Types>,
 {
@@ -291,9 +295,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine_types::N42EngineTypes as EthEngineTypes;
     use alloy_consensus::{Block as ConsensusBlock, BlockBody, Header};
     use reth_chainspec::ChainSpec;
-    use reth_ethereum_engine_primitives::EthEngineTypes;
+    use reth_ethereum_primitives::TransactionSigned;
 
     fn zero_ommers_payload_with_difficulty(difficulty: U256) -> ExecutionData {
         let extra_data = [b"N42H".as_slice(), &[0_u8; 8], &[0_u8; 96]].concat();
@@ -305,7 +310,7 @@ mod tests {
                 extra_data: extra_data.into(),
                 ..Default::default()
             },
-            body: BlockBody::<TransactionSigned>::default(),
+            body: BlockBody::<N42TxEnvelope>::default(),
         };
         ExecutionData::from_block_unchecked(block.header.hash_slow(), &block)
     }
@@ -314,7 +319,7 @@ mod tests {
         zero_ommers_payload_with_difficulty(U256::ZERO)
     }
 
-    fn transaction_block(difficulty: U256) -> EthBlock {
+    fn transaction_block(difficulty: U256) -> N42Block {
         use alloy_consensus::{SignableTransaction, TxLegacy, proofs::calculate_transaction_root};
         use alloy_primitives::Signature;
 
@@ -328,9 +333,10 @@ mod tests {
                 .into()
             })
             .collect();
+        let transactions: Vec<N42TxEnvelope> = transactions.into_iter().map(Into::into).collect();
         let mut payload = zero_ommers_payload_with_difficulty(difficulty);
         payload.payload.set_extra_data(Bytes::new());
-        let mut block = payload.try_into_block::<TransactionSigned>().unwrap();
+        let mut block = payload.try_into_block::<N42TxEnvelope>().unwrap();
         block.header.extra_data = [b"N42H".as_slice(), &[0_u8; 8], &[0_u8; 96]]
             .concat()
             .into();
@@ -511,7 +517,7 @@ mod tests {
         assert_ne!(hash, header.hash_slow());
         let block = ConsensusBlock {
             header,
-            body: BlockBody::<TransactionSigned> {
+            body: BlockBody::<N42TxEnvelope> {
                 transactions,
                 withdrawals: Some(Withdrawals::default()),
                 ..Default::default()

@@ -1,7 +1,7 @@
 use crate::{ExecutionPath, N42EvmConfig, state_diff::StateDiff, witness::ExecutionWitness};
 use alloy_evm::ToTxEnv;
 use metrics::histogram;
-use reth_ethereum_primitives::EthPrimitives;
+use n42_tx_types::N42Primitives;
 use reth_evm::{
     ConfigureEvm, Database,
     execute::{BlockExecutionError, BlockExecutionOutput, Executor},
@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 /// Result of block execution with witness data.
 pub struct ExecutionWithWitness {
     /// Standard block execution output (bundle state + receipts).
-    pub output: BlockExecutionOutput<<EthPrimitives as NodePrimitives>::Receipt>,
+    pub output: BlockExecutionOutput<<N42Primitives as NodePrimitives>::Receipt>,
     /// Execution witness capturing all state accessed during execution.
     pub witness: ExecutionWitness,
     /// Wall-clock execution time in milliseconds.
@@ -24,7 +24,7 @@ pub struct ExecutionWithWitness {
 /// Result of block execution with both witness and state diff.
 pub struct FullExecutionResult {
     /// Standard block execution output.
-    pub output: BlockExecutionOutput<<EthPrimitives as NodePrimitives>::Receipt>,
+    pub output: BlockExecutionOutput<<N42Primitives as NodePrimitives>::Receipt>,
     /// Execution witness for independent verification.
     pub witness: ExecutionWitness,
     /// State diff showing all changes made by this block.
@@ -39,7 +39,7 @@ pub struct FullExecutionResult {
 pub fn execute_block_with_witness<DB: Database>(
     evm_config: &N42EvmConfig,
     db: DB,
-    block: &RecoveredBlock<<EthPrimitives as NodePrimitives>::Block>,
+    block: &RecoveredBlock<<N42Primitives as NodePrimitives>::Block>,
 ) -> Result<ExecutionWithWitness, BlockExecutionError> {
     let start = Instant::now();
     debug!(target: "n42::execution", "execute_block_with_witness starting");
@@ -73,7 +73,7 @@ pub fn execute_block_with_witness<DB: Database>(
 pub fn execute_block_full<DB: Database>(
     evm_config: &N42EvmConfig,
     db: DB,
-    block: &RecoveredBlock<<EthPrimitives as NodePrimitives>::Block>,
+    block: &RecoveredBlock<<N42Primitives as NodePrimitives>::Block>,
 ) -> Result<FullExecutionResult, BlockExecutionError> {
     let start = Instant::now();
     debug!(target: "n42::execution", "execute_block_full starting");
@@ -161,7 +161,7 @@ pub struct ParallelExecutionSummary {
 pub fn execute_block_parallel<DB: DatabaseRef + Send + Sync>(
     evm_config: &N42EvmConfig,
     db: &DB,
-    block: &RecoveredBlock<<EthPrimitives as NodePrimitives>::Block>,
+    block: &RecoveredBlock<<N42Primitives as NodePrimitives>::Block>,
 ) -> Result<ParallelExecutionSummary, BlockExecutionError>
 where
     DB::Error: core::error::Error + Send + Sync + 'static,

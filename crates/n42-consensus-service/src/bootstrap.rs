@@ -604,7 +604,7 @@ mod tests {
             parent_hash: genesis_hash,
             state_root: root,
             transactions_root: empty_transactions_root,
-            receipts_root: gov5_native_receipts_root(&[]),
+            receipts_root: gov5_native_receipts_root::<alloy_consensus::TxType>(&[]),
             number: 1,
             ..Default::default()
         };

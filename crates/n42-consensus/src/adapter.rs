@@ -4,10 +4,10 @@ use alloy_consensus::{
 };
 use alloy_primitives::{B256, Bloom, Bytes, U256, keccak256};
 use arc_swap::ArcSwapOption;
+use n42_tx_types::{Block as N42Block, N42Primitives};
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator};
 use reth_ethereum_consensus::EthBeaconConsensus;
-use reth_ethereum_primitives::{Block as EthBlock, EthPrimitives};
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{Block, RecoveredBlock, SealedBlock, SealedHeader};
 use std::fmt::Debug;
@@ -151,7 +151,7 @@ fn normalized_gov5_header(header: &Header) -> Result<Header, N42HeaderProfileErr
 /// keeps guarding the body while the gov5 commitment guards the rewards.
 fn normalize_gov5_rewards(
     header: &mut Header,
-    body: &<EthBlock as reth_primitives_traits::Block>::Body,
+    body: &<N42Block as reth_primitives_traits::Block>::Body,
 ) -> Result<(), N42HeaderProfileError> {
     match (header.withdrawals_root, body.withdrawals.as_deref()) {
         (Some(committed), Some(withdrawals)) => {
@@ -328,15 +328,15 @@ where
     }
 }
 
-impl<C> FullConsensus<EthPrimitives> for N42Consensus<C>
+impl<C> FullConsensus<N42Primitives> for N42Consensus<C>
 where
     C: EthChainSpec<Header = Header> + EthereumHardforks + Debug + Send + Sync,
 {
     fn validate_block_post_execution(
         &self,
-        block: &RecoveredBlock<EthBlock>,
+        block: &RecoveredBlock<N42Block>,
         result: &BlockExecutionResult<
-            <EthPrimitives as reth_primitives_traits::NodePrimitives>::Receipt,
+            <N42Primitives as reth_primitives_traits::NodePrimitives>::Receipt,
         >,
         receipt_root_bloom: Option<reth_consensus::ReceiptRootBloom>,
         block_access_list_hash: Option<B256>,
@@ -376,7 +376,7 @@ where
                 normalized.header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
             }
             let normalized = RecoveredBlock::new_unhashed(normalized, senders);
-            return <EthBeaconConsensus<C> as FullConsensus<EthPrimitives>>::validate_block_post_execution(
+            return <EthBeaconConsensus<C> as FullConsensus<N42Primitives>>::validate_block_post_execution(
                 &self.inner,
                 &normalized,
                 result,
@@ -384,7 +384,7 @@ where
                 block_access_list_hash,
             );
         }
-        <EthBeaconConsensus<C> as FullConsensus<EthPrimitives>>::validate_block_post_execution(
+        <EthBeaconConsensus<C> as FullConsensus<N42Primitives>>::validate_block_post_execution(
             &self.inner,
             block,
             result,
@@ -394,13 +394,13 @@ where
     }
 }
 
-impl<C> Consensus<EthBlock> for N42Consensus<C>
+impl<C> Consensus<N42Block> for N42Consensus<C>
 where
     C: EthChainSpec<Header = Header> + EthereumHardforks + Debug + Send + Sync,
 {
     fn validate_body_against_header(
         &self,
-        body: &<EthBlock as reth_primitives_traits::Block>::Body,
+        body: &<N42Block as reth_primitives_traits::Block>::Body,
         header: &SealedHeader<Header>,
     ) -> Result<(), ConsensusError> {
         if self.header_profile == N42HeaderProfile::Gov5H2 {
@@ -414,13 +414,13 @@ where
                 normalize_gov5_rewards(&mut normalized, &normalized_body)
                     .map_err(ConsensusError::other)?;
             }
-            return <EthBeaconConsensus<C> as Consensus<EthBlock>>::validate_body_against_header(
+            return <EthBeaconConsensus<C> as Consensus<N42Block>>::validate_body_against_header(
                 &self.inner,
                 &normalized_body,
                 &SealedHeader::seal_slow(normalized),
             );
         }
-        <EthBeaconConsensus<C> as Consensus<EthBlock>>::validate_body_against_header(
+        <EthBeaconConsensus<C> as Consensus<N42Block>>::validate_body_against_header(
             &self.inner,
             body,
             header,
@@ -429,7 +429,7 @@ where
 
     fn validate_block_pre_execution(
         &self,
-        block: &SealedBlock<EthBlock>,
+        block: &SealedBlock<N42Block>,
     ) -> Result<(), ConsensusError> {
         if self.header_profile == N42HeaderProfile::Gov5H2 {
             let mut normalized = block.clone().into_block();
@@ -584,7 +584,7 @@ mod tests {
         let chain_spec = n42_chainspec::n42_dev_chainspec();
         let standard = N42Consensus::new(chain_spec.clone());
         let gov5 = N42Consensus::new(chain_spec).with_header_profile(N42HeaderProfile::Gov5H2);
-        let body = BlockBody::<reth_ethereum_primitives::TransactionSigned>::default();
+        let body = BlockBody::<n42_tx_types::N42TxEnvelope>::default();
         let valid_extra = [b"N42H".as_slice(), &[0_u8; 8]].concat();
         let header = SealedHeader::seal_slow(Header {
             ommers_hash: B256::ZERO,
@@ -741,7 +741,7 @@ mod tests {
 
         // Post-execution: an empty request list matches; a produced request does not.
         let receipt = EthereumReceipt {
-            tx_type: TxType::Legacy,
+            tx_type: n42_tx_types::N42TxType::Eth(TxType::Legacy),
             success: true,
             cumulative_gas_used: 21_000,
             logs: Vec::new(),
@@ -751,7 +751,7 @@ mod tests {
         header.receipts_root = native_root;
         header.gas_used = 21_000;
         let block = RecoveredBlock::new_unhashed(
-            EthBlock {
+            N42Block {
                 header,
                 body: Default::default(),
             },
@@ -782,14 +782,14 @@ mod tests {
         let standard = N42Consensus::new(chain_spec.clone());
         let gov5 = N42Consensus::new(chain_spec).with_header_profile(N42HeaderProfile::Gov5H2);
         let receipt = EthereumReceipt {
-            tx_type: TxType::Legacy,
+            tx_type: n42_tx_types::N42TxType::Eth(TxType::Legacy),
             success: true,
             cumulative_gas_used: 21_000,
             logs: Vec::new(),
         };
         let native_root = gov5_native_receipts_root(std::slice::from_ref(&receipt));
         let block = RecoveredBlock::new_unhashed(
-            EthBlock {
+            N42Block {
                 header: Header {
                     number: 13_000_000,
                     gas_used: 21_000,

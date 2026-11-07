@@ -1,22 +1,31 @@
 use crate::components::{N42ConsensusBuilder, N42ExecutorBuilder};
 use crate::consensus_state::SharedConsensusState;
+use crate::engine_types::N42EngineTypes;
 use crate::engine_validator::N42EngineValidatorBuilder;
+use crate::native_rpc::N42EthApiBuilder;
 use crate::payload::N42PayloadBuilder;
 use crate::pool::N42PoolBuilder;
 use crate::qmdb_state_root::{Gov5QmdbStateRootStore, N42EngineTreeValidatorBuilder};
 use crate::rpc_compat::Gov5RpcCompatLayer;
 use n42_consensus::{N42HeaderProfile, ValidatorSetResolver};
-use reth_chainspec::ChainSpec;
-use reth_ethereum_engine_primitives::EthEngineTypes;
-use reth_ethereum_primitives::EthPrimitives;
+use n42_tx_types::{N42Primitives, N42TxEnvelope};
+use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks, Hardforks};
+use reth_evm::{ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes};
+use reth_node_api::{FullNodeComponents, NodeAddOns};
 use reth_node_builder::{
     Node, NodeAdapter,
     components::{BasicPayloadServiceBuilder, ComponentsBuilder},
     node::{FullNodeTypes, NodeTypes},
-    rpc::{BasicEngineApiBuilder, Identity, RpcAddOns},
+    rpc::{
+        BasicEngineApiBuilder, EngineApiBuilder, EngineValidatorAddOn, EngineValidatorBuilder,
+        EthApiBuilder, Identity, PayloadValidatorBuilder, RethRpcAddOns, RethRpcMiddleware,
+        RpcAddOns, RpcHandle, RpcHooks,
+    },
 };
-use reth_node_ethereum::node::{EthereumAddOns, EthereumEthApiBuilder, EthereumNetworkBuilder};
+use reth_node_ethereum::node::EthereumNetworkBuilder;
 use reth_provider::EthStorage;
+use reth_rpc_eth_types::{EthApiError, error::FromEvmError};
+use revm::context::TxEnv;
 use std::sync::Arc;
 
 /// N42 node type configuration.
@@ -89,10 +98,115 @@ impl N42Node {
 }
 
 impl NodeTypes for N42Node {
-    type Primitives = EthPrimitives;
+    type Primitives = N42Primitives;
     type ChainSpec = ChainSpec;
-    type Storage = EthStorage;
-    type Payload = EthEngineTypes;
+    type Storage = EthStorage<N42TxEnvelope>;
+    type Payload = N42EngineTypes;
+}
+
+/// RPC add-ons over [`N42Primitives`].
+///
+/// reth's `EthereumAddOns` is bound to Ethereum's primitives. This is the same
+/// wrapper around [`RpcAddOns`] for N42's, without the Ethereum-only extra
+/// modules (flashbots block validation, `eth_config`, the testing builder and
+/// the Engine SSZ proxy), which this node never enabled.
+#[derive(Debug)]
+pub struct N42AddOns<
+    N: FullNodeComponents,
+    EthB: EthApiBuilder<N>,
+    PVB,
+    EB = BasicEngineApiBuilder<PVB>,
+    EVB = reth_node_builder::rpc::BasicEngineValidatorBuilder<PVB>,
+    RpcMiddleware = Identity,
+> {
+    inner: RpcAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>,
+}
+
+impl<N, EthB, PVB, EB, EVB, RpcMiddleware> N42AddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
+where
+    N: FullNodeComponents,
+    EthB: EthApiBuilder<N>,
+{
+    /// Creates the add-ons from the inner `RpcAddOns`.
+    pub const fn new(inner: RpcAddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<N, EthB, PVB, EB, EVB, RpcMiddleware> NodeAddOns<N>
+    for N42AddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
+where
+    N: FullNodeComponents<
+            Types: NodeTypes<
+                ChainSpec: EthChainSpec + Hardforks + EthereumHardforks,
+                Primitives = N42Primitives,
+                Payload: reth_engine_primitives::EngineTypes<
+                    ExecutionData = alloy_rpc_types_engine::ExecutionData,
+                >,
+            >,
+            Evm: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
+        >,
+    EthB: EthApiBuilder<N>,
+    PVB: PayloadValidatorBuilder<N>,
+    EB: EngineApiBuilder<N>,
+    EVB: EngineValidatorBuilder<N>,
+    EthApiError: FromEvmError<N::Evm>,
+    EvmFactoryFor<N::Evm>: EvmFactory<Tx = TxEnv>,
+    RpcMiddleware: RethRpcMiddleware,
+{
+    type Handle = RpcHandle<N, EthB::EthApi>;
+
+    async fn launch_add_ons(
+        self,
+        ctx: reth_node_api::AddOnsContext<'_, N>,
+    ) -> eyre::Result<Self::Handle> {
+        self.inner.launch_add_ons(ctx).await
+    }
+}
+
+impl<N, EthB, PVB, EB, EVB, RpcMiddleware> RethRpcAddOns<N>
+    for N42AddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
+where
+    N: FullNodeComponents<
+            Types: NodeTypes<
+                ChainSpec: EthChainSpec + Hardforks + EthereumHardforks,
+                Primitives = N42Primitives,
+                Payload: reth_engine_primitives::EngineTypes<
+                    ExecutionData = alloy_rpc_types_engine::ExecutionData,
+                >,
+            >,
+            Evm: ConfigureEvm<NextBlockEnvCtx = NextBlockEnvAttributes>,
+        >,
+    EthB: EthApiBuilder<N>,
+    PVB: PayloadValidatorBuilder<N>,
+    EB: EngineApiBuilder<N>,
+    EVB: EngineValidatorBuilder<N>,
+    EthApiError: FromEvmError<N::Evm>,
+    EvmFactoryFor<N::Evm>: EvmFactory<Tx = TxEnv>,
+    RpcMiddleware: RethRpcMiddleware,
+{
+    type EthApi = EthB::EthApi;
+
+    fn hooks_mut(&mut self) -> &mut RpcHooks<N, Self::EthApi> {
+        self.inner.hooks_mut()
+    }
+}
+
+impl<N, EthB, PVB, EB, EVB, RpcMiddleware> EngineValidatorAddOn<N>
+    for N42AddOns<N, EthB, PVB, EB, EVB, RpcMiddleware>
+where
+    N: FullNodeComponents,
+    EthB: EthApiBuilder<N>,
+    PVB: Send,
+    EB: EngineApiBuilder<N>,
+    EVB: EngineValidatorBuilder<N>,
+    RpcMiddleware: Send,
+{
+    type ValidatorBuilder = EVB;
+
+    fn engine_validator_builder(&self) -> Self::ValidatorBuilder {
+        self.inner.engine_validator_builder()
+    }
 }
 
 impl<N> Node<N> for N42Node
@@ -108,9 +222,9 @@ where
         N42ConsensusBuilder,
     >;
 
-    type AddOns = EthereumAddOns<
+    type AddOns = N42AddOns<
         NodeAdapter<N>,
-        EthereumEthApiBuilder,
+        N42EthApiBuilder,
         N42EngineValidatorBuilder,
         BasicEngineApiBuilder<N42EngineValidatorBuilder>,
         N42EngineTreeValidatorBuilder,
@@ -141,8 +255,8 @@ where
         let validator = N42EngineValidatorBuilder::new(self.header_profile);
         let rpc_middleware =
             Gov5RpcCompatLayer::new(self.header_profile == N42HeaderProfile::Gov5H2);
-        EthereumAddOns::new(RpcAddOns::new(
-            EthereumEthApiBuilder::default(),
+        N42AddOns::new(RpcAddOns::new(
+            N42EthApiBuilder,
             validator,
             BasicEngineApiBuilder::default(),
             N42EngineTreeValidatorBuilder::new(validator, self.qmdb_state_root_store.clone())

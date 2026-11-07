@@ -38,6 +38,7 @@ reth-revm.workspace = true
 reth-evm.workspace = true
 reth-primitives-traits.workspace = true
 reth-ethereum-primitives.workspace = true
+n42-tx-types.workspace = true
 reth-chainspec.workspace = true
 revm.workspace = true
 

@@ -7,8 +7,8 @@ use alloy_eips::Decodable2718;
 use alloy_primitives::{Address, B256, KECCAK256_EMPTY, U256};
 use alloy_rlp::Decodable;
 use n42_execution::N42EvmConfig;
+use n42_tx_types::{N42Primitives, Receipt};
 use reth_chainspec::ChainSpec;
-use reth_ethereum_primitives::{EthPrimitives, Receipt};
 use reth_evm::{
     ConfigureEvm,
     execute::{BlockExecutionError, Executor},
@@ -23,8 +23,8 @@ use revm::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// The signed transaction type used by Ethereum primitives.
-type EthTx = <EthPrimitives as NodePrimitives>::SignedTx;
+/// The signed transaction type of N42 primitives (Ethereum types plus 0x50).
+type EthTx = <N42Primitives as NodePrimitives>::SignedTx;
 
 /// Block verification result.
 #[derive(Debug, Clone)]
@@ -84,7 +84,7 @@ fn decode_and_verify_header(
 fn decode_and_recover(
     sealed_header: SealedHeader,
     transactions: &[alloy_primitives::Bytes],
-) -> Result<RecoveredBlock<reth_ethereum_primitives::Block>, VerifyError> {
+) -> Result<RecoveredBlock<n42_tx_types::Block>, VerifyError> {
     let txs: Vec<EthTx> = transactions
         .iter()
         .map(|rlp| EthTx::decode_2718(&mut &rlp[..]))

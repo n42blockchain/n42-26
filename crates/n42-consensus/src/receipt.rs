@@ -5,7 +5,7 @@ use alloy_rlp::{Encodable, Header};
 /// Reproduces gov5 native `hash.DeriveSha(block.Receipts)` exactly. This is intentionally not the
 /// Ethereum receipt trie: replay-v2 hashes the concatenation of RLP
 /// `[status, cumulativeGasUsed, logs]` receipts, and the empty list is `keccak256("")`.
-pub fn gov5_native_receipts_root(receipts: &[EthereumReceipt]) -> B256 {
+pub fn gov5_native_receipts_root<T>(receipts: &[EthereumReceipt<T>]) -> B256 {
     let mut encoded = Vec::new();
     for receipt in receipts {
         let status = u64::from(receipt.success);
@@ -43,7 +43,7 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            gov5_native_receipts_root(&[]),
+            gov5_native_receipts_root::<alloy_consensus::TxType>(&[]),
             "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
                 .parse::<B256>()
                 .unwrap()

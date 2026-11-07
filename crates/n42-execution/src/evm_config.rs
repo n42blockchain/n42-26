@@ -1,35 +1,77 @@
 use alloy_eips::Decodable2718;
+use alloy_evm::eth::{
+    EthBlockExecutionCtx, EthBlockExecutorFactory,
+    receipt_builder::{ReceiptBuilder, ReceiptBuilderCtx},
+};
 use alloy_primitives::{B256, Bytes};
 use alloy_rpc_types_engine::ExecutionData;
+use n42_tx_types::{AltSigSenderCache, N42Primitives, N42TxEnvelope, N42TxType, Receipt};
 use reth_chainspec::ChainSpec;
 use reth_evm::{
-    ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutableTxIterator, ExecutionCtxFor,
+    ConfigureEngineEvm, ConfigureEvm, Evm, EvmEnvFor, ExecutableTxIterator, ExecutionCtxFor,
     SenderRecoveryCache,
 };
-use reth_evm_ethereum::EthEvmConfig;
+use reth_evm_ethereum::{EthBlockAssembler, EthEvmConfig};
 use reth_primitives_traits::{
     BlockTy, HeaderTy, SealedBlock, SealedHeader, SignedTransaction, TxTy,
 };
 use reth_storage_api::{StateProvider, StateProviderBox};
 use reth_storage_errors::{any::AnyError, provider::ProviderResult};
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use crate::{evm_factory::N42EvmFactory, restored_slots::TrackingBlockExecutorFactory};
 
-/// The inner EthEvmConfig type we delegate to (parameterized with N42EvmFactory).
+/// The Ethereum EVM configuration the header and payload environments are
+/// taken from. Those depend only on the header and the chain spec, never on
+/// the transaction type, so they are shared with Ethereum unchanged.
 type InnerConfig = EthEvmConfig<ChainSpec, N42EvmFactory>;
 
-/// N42 EVM configuration wrapping `EthEvmConfig<ChainSpec>`.
-/// All `ConfigureEvm` methods delegate to the inner config, except that every
-/// block executor is wrapped by [`TrackingBlockExecutorFactory`] so the slots
-/// a block changes and restores are recorded for the QMDB root job (see
-/// `restored_slots`). Provides a distinct type for N42-specific extensions.
+/// Receipts for N42 transactions: Ethereum's receipt shape with the N42 type
+/// byte, so a 0x50 transaction's receipt reports type 0x50.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct N42ReceiptBuilder;
+
+impl ReceiptBuilder for N42ReceiptBuilder {
+    type Transaction = N42TxEnvelope;
+    type Receipt = Receipt;
+
+    fn build_receipt<E: Evm>(&self, ctx: ReceiptBuilderCtx<'_, N42TxType, E>) -> Self::Receipt {
+        let ReceiptBuilderCtx {
+            tx_type,
+            result,
+            cumulative_gas_used,
+            ..
+        } = ctx;
+        Receipt {
+            tx_type,
+            success: result.is_success(),
+            cumulative_gas_used,
+            logs: result.into_logs(),
+        }
+    }
+}
+
+/// The block executor factory over N42 transactions and receipts.
+pub type N42BlockExecutorFactory =
+    EthBlockExecutorFactory<N42ReceiptBuilder, Arc<ChainSpec>, N42EvmFactory>;
+
+/// N42 EVM configuration over [`N42Primitives`].
+///
+/// Header and payload environments delegate to the Ethereum configuration.
+/// Blocks are executed by an Ethereum block executor whose receipt builder
+/// knows the N42 type byte, and every block executor is wrapped by
+/// [`TrackingBlockExecutorFactory`] so the slots a block changes and restores
+/// are recorded for the QMDB root job (see `restored_slots`).
 #[derive(Debug, Clone)]
 pub struct N42EvmConfig {
-    /// Inner Ethereum EVM configuration.
+    /// Ethereum configuration used for the header/payload environments and
+    /// for the shared secp256k1 sender-recovery cache.
     inner: InnerConfig,
-    /// The inner block executor factory, watched for restored slots.
-    factory: TrackingBlockExecutorFactory<<InnerConfig as ConfigureEvm>::BlockExecutorFactory>,
+    /// The block executor factory, watched for restored slots.
+    factory: TrackingBlockExecutorFactory<N42BlockExecutorFactory>,
+    /// Assembles blocks of N42 transactions.
+    assembler: EthBlockAssembler<ChainSpec>,
     parallel_import: Option<ParallelImportProvider>,
 }
 
@@ -53,11 +95,16 @@ impl N42EvmConfig {
     /// Configure the transaction executor while retaining block-level system calls,
     /// receipts, withdrawals and restored-slot tracking.
     pub fn with_evm_factory(chain_spec: Arc<ChainSpec>, evm_factory: N42EvmFactory) -> Self {
-        let inner = EthEvmConfig::new_with_evm_factory(chain_spec, evm_factory);
-        let factory = TrackingBlockExecutorFactory::new(inner.block_executor_factory().clone());
+        let inner = EthEvmConfig::new_with_evm_factory(chain_spec.clone(), evm_factory.clone());
+        let factory = TrackingBlockExecutorFactory::new(EthBlockExecutorFactory::new(
+            N42ReceiptBuilder,
+            chain_spec.clone(),
+            evm_factory,
+        ));
         Self {
             inner,
             factory,
+            assembler: EthBlockAssembler::new(chain_spec),
             parallel_import: None,
         }
     }
@@ -72,12 +119,12 @@ impl N42EvmConfig {
         self
     }
 
-    /// Returns a reference to the inner `EthEvmConfig`.
+    /// Returns a reference to the inner Ethereum configuration.
     pub fn inner(&self) -> &InnerConfig {
         &self.inner
     }
 
-    /// Shares verified sender recovery results with transaction ingress.
+    /// Shares verified secp256k1 sender recovery results with transaction ingress.
     pub fn with_sender_recovery_cache(mut self, cache: SenderRecoveryCache) -> Self {
         self.inner = self.inner.with_sender_recovery_cache(cache);
         self
@@ -90,12 +137,11 @@ impl N42EvmConfig {
 }
 
 impl ConfigureEvm for N42EvmConfig {
-    type Primitives = <InnerConfig as ConfigureEvm>::Primitives;
+    type Primitives = N42Primitives;
     type Error = <InnerConfig as ConfigureEvm>::Error;
     type NextBlockEnvCtx = <InnerConfig as ConfigureEvm>::NextBlockEnvCtx;
-    type BlockExecutorFactory =
-        TrackingBlockExecutorFactory<<InnerConfig as ConfigureEvm>::BlockExecutorFactory>;
-    type BlockAssembler = <InnerConfig as ConfigureEvm>::BlockAssembler;
+    type BlockExecutorFactory = TrackingBlockExecutorFactory<N42BlockExecutorFactory>;
+    type BlockAssembler = EthBlockAssembler<ChainSpec>;
 
     fn batch_import_enabled(&self) -> bool {
         self.parallel_import.is_some()
@@ -106,9 +152,7 @@ impl ConfigureEvm for N42EvmConfig {
         executor: &mut reth_evm::BlockExecutorForEvm<'a, Self, DB>,
         env: &EvmEnvFor<Self>,
         parent_hash: alloy_primitives::B256,
-        transactions: &[alloy_consensus::transaction::Recovered<
-            reth_ethereum_primitives::TransactionSigned,
-        >],
+        transactions: &[alloy_consensus::transaction::Recovered<N42TxEnvelope>],
     ) -> Result<Option<reth_evm::ImportBatchFinalize>, reth_evm::execute::BlockExecutionError> {
         let Some(provider) = &self.parallel_import else {
             return Ok(None);
@@ -134,7 +178,7 @@ impl ConfigureEvm for N42EvmConfig {
     }
 
     fn block_assembler(&self) -> &Self::BlockAssembler {
-        self.inner.block_assembler()
+        &self.assembler
     }
 
     fn evm_env(&self, header: &HeaderTy<Self::Primitives>) -> Result<EvmEnvFor<Self>, Self::Error> {
@@ -153,7 +197,20 @@ impl ConfigureEvm for N42EvmConfig {
         &self,
         block: &'a SealedBlock<BlockTy<Self::Primitives>>,
     ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
-        self.inner.context_for_block(block)
+        // Mirrors the Ethereum context; only the body's transaction type differs.
+        Ok(EthBlockExecutionCtx {
+            tx_count_hint: Some(block.transaction_count()),
+            parent_hash: block.header().parent_hash,
+            parent_beacon_block_root: block.header().parent_beacon_block_root,
+            ommers: &block.body().ommers,
+            withdrawals: block
+                .body()
+                .withdrawals
+                .as_ref()
+                .map(|w| Cow::Borrowed(w.as_slice())),
+            extra_data: block.header().extra_data.clone(),
+            slot_number: block.header().slot_number,
+        })
     }
 
     fn context_for_next_block(
@@ -186,10 +243,25 @@ impl ConfigureEngineEvm<ExecutionData> for N42EvmConfig {
         let convert = move |tx: Bytes| {
             let tx =
                 TxTy::<Self::Primitives>::decode_2718_exact(tx.as_ref()).map_err(AnyError::new)?;
-            let signer = if let Some(cache) = &sender_recovery_cache {
-                cache.recover(&tx)
-            } else {
-                tx.try_recover()
+            let signer = match &tx {
+                // Ed25519 senders verified at admission are reused; anything
+                // else is verified here and remembered.
+                N42TxEnvelope::AltSig(alt) => {
+                    let cache = AltSigSenderCache::global();
+                    match cache.get(alt.hash()) {
+                        Some(sender) => Ok(sender),
+                        None => tx
+                            .try_recover()
+                            .inspect(|sender| cache.insert(*alt.hash(), *sender)),
+                    }
+                }
+                N42TxEnvelope::Eth(_) => {
+                    if let Some(cache) = &sender_recovery_cache {
+                        cache.recover(&tx)
+                    } else {
+                        tx.try_recover()
+                    }
+                }
             }
             .map_err(AnyError::new)?;
             Ok::<_, AnyError>(tx.with_signer(signer))

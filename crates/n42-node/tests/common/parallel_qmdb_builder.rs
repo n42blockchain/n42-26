@@ -3,6 +3,7 @@
 use alloy_consensus::{Header, TxLegacy};
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
 use n42_execution::{N42EvmConfig, N42EvmFactory};
+use n42_node::native_pool::N42PooledTransaction;
 use n42_node::{
     consensus_state::SharedConsensusState,
     exec_cache::{ExecutionOutputCache, RethExecutionOutputCache},
@@ -13,22 +14,22 @@ use n42_node::{
 use n42_twig_core::qmdb_compat::{
     QmdbCompatTree, QmdbOperation, encode_gov5_account_value, gov5_account_key,
 };
+use n42_tx_types::{Block, N42TxEnvelope};
 use reth_basic_payload_builder::{BuildArguments, PayloadBuilder, PayloadConfig};
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
-use reth_ethereum_primitives::{Block, Transaction};
+use reth_ethereum_primitives::Transaction;
 use reth_evm::execute::{BasicBlockExecutor, BlockExecutionOutput, Executor};
 use reth_primitives_traits::{
     Block as _, SignedTransaction, crypto::secp256k1::public_key_to_address,
 };
 use reth_provider::{
-    providers::BlockchainProvider, test_utils::create_test_provider_factory_with_chain_spec,
+    providers::BlockchainProvider, test_utils::create_test_provider_factory_with_node_types,
 };
 use reth_storage_api::{BlockWriter, StateProvider, StateProviderFactory};
 use reth_testing_utils::generators::sign_tx_with_key_pair;
 use reth_transaction_pool::{
-    CoinbaseTipOrdering, EthPooledTransaction, Pool, PoolConfig, PoolTransaction,
-    TransactionOrigin, TransactionPool, blobstore::InMemoryBlobStore,
-    noop::MockTransactionValidator,
+    CoinbaseTipOrdering, Pool, PoolConfig, PoolTransaction, TransactionOrigin, TransactionPool,
+    blobstore::InMemoryBlobStore, noop::MockTransactionValidator,
 };
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use std::sync::Arc;
@@ -104,7 +105,7 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
         genesis
     };
     let parent = genesis.hash();
-    let factory = create_test_provider_factory_with_chain_spec(chain.clone());
+    let factory = create_test_provider_factory_with_node_types::<n42_node::N42Node>(chain.clone());
     let writer = factory.provider_rw()?;
     writer.insert_block(&genesis.clone().try_recover()?)?;
     writer.commit()?;
@@ -128,7 +129,7 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
     // Use the real in-memory pool and transaction representation. Its test
     // validator supplies admission metadata; every signature is checked below.
     let pool = Pool::new(
-        MockTransactionValidator::<EthPooledTransaction>::default(),
+        MockTransactionValidator::<N42PooledTransaction>::default(),
         CoinbaseTipOrdering::default(),
         InMemoryBlobStore::default(),
         PoolConfig {
@@ -152,13 +153,13 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
                     input: Bytes::new(),
                 }),
             );
-            let recovered = signed
+            let recovered = N42TxEnvelope::from(signed)
                 .try_into_recovered()
                 .map_err(|_| eyre::eyre!("signature recovery failed"))?;
             assert_eq!(recovered.signer(), *sender);
             pool.add_transaction(
                 TransactionOrigin::Local,
-                EthPooledTransaction::try_from_consensus(recovered)?,
+                N42PooledTransaction::try_from_consensus(recovered)?,
             )
             .await?;
         }
@@ -223,10 +224,7 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
         0
     );
     let hash = payload.block().hash();
-    type Cached = (
-        BlockExecutionOutput<reth_ethereum_primitives::Receipt>,
-        Vec<Address>,
-    );
+    type Cached = (BlockExecutionOutput<n42_tx_types::Receipt>, Vec<Address>);
     let (mut cached, cached_senders) =
         reth_evm::payload_cache::take_payload_execution::<Cached>(&hash).unwrap();
     let db = reth_revm::database::StateProviderDatabase::new(
@@ -398,7 +396,7 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
     let engine_block = if let Some(payload) = &native_payload {
         use reth_engine_primitives::PayloadValidator;
         <n42_node::engine_validator::N42EngineValidator<_> as PayloadValidator<
-            reth_ethereum_engine_primitives::EthEngineTypes,
+            n42_node::engine_types::N42EngineTypes,
         >>::convert_payload_to_block(
             &n42_node::engine_validator::N42EngineValidator::new(chain.clone(), profile),
             payload.clone(),
@@ -450,7 +448,7 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
         let bad_root = bad_root.seal_slow();
         assert!(
             engine
-                .validate_block_with_state::<reth_ethereum_engine_primitives::EthEngineTypes>(
+                .validate_block_with_state::<n42_node::engine_types::N42EngineTypes>(
                     BlockOrPayload::Block(bad_root.clone().into()),
                     TreeCtx::new(&mut state, &canonical),
                 )
@@ -467,7 +465,7 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
         let fallback_recorder = metrics_util::debugging::DebuggingRecorder::new();
         assert!(
             metrics::with_local_recorder(&fallback_recorder, || {
-                engine.validate_block_with_state::<reth_ethereum_engine_primitives::EthEngineTypes>(
+                engine.validate_block_with_state::<n42_node::engine_types::N42EngineTypes>(
                     BlockOrPayload::Block(bad_nonce.clone().into()),
                     TreeCtx::new(&mut state, &canonical),
                 )
@@ -487,7 +485,7 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
         );
         let engine_recorder = metrics_util::debugging::DebuggingRecorder::new();
         let checked = metrics::with_local_recorder(&engine_recorder, || {
-            engine.validate_block_with_state::<reth_ethereum_engine_primitives::EthEngineTypes>(
+            engine.validate_block_with_state::<n42_node::engine_types::N42EngineTypes>(
                 if let Some(payload) = &native_payload {
                     BlockOrPayload::Payload(payload.clone())
                 } else {

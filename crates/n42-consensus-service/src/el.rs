@@ -19,7 +19,7 @@ pub struct ElError(pub String);
 
 /// Node-neutral result of a completed payload build. Carries only alloy/std
 /// types so the [`ExecutionLayer`] trait stays free of reth concretes (the
-/// in-process adapter converts reth's `EthBuiltPayload` into this). The
+/// in-process adapter converts `N42BuiltPayload` into this). The
 /// orchestrator broadcasts + eager-imports from these fields.
 #[derive(Debug, Clone)]
 pub struct BuiltBlock {
@@ -180,7 +180,7 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     /// Resolve a started build to its payload (blocks until the pending build
     /// completes). `None` ⇒ no such job. Returns a node-neutral [`BuiltBlock`]
     /// so this trait carries no reth types — the in-process adapter converts
-    /// reth's `EthBuiltPayload`.
+    /// `N42BuiltPayload`.
     async fn resolve_payload(
         &self,
         id: PayloadId,

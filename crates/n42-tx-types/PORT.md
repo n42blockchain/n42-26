@@ -27,3 +27,13 @@ Reference source SHA256:
 
 Execution adapter reference: `b03e71c8f307074df388caaae43c26b764b9417d`, `evm.rs` SHA256 `5bf5ff039a7f6b52b3162e5f489448966ca9028b9e368799b29adc9f46d490a7`.
 Native wire/hash/receipt identity remains 0x50; internal TxEnv type 2 carries fee semantics.
+
+## Sync to the 5.2M tag (2026-11-06)
+
+Reference: n42-rs tag `fleet7-x22-5.2M-20261024` (`47b8180ab`, reth v2.8.1, revm 43.0.3).
+`alt_sig`, `compact`, `envelope`, `frame` and `primitives` were token-compared with the tag: they
+match apart from formatting, the key-cache module path and this port's checked layout sum.
+Added from the tag: `rpc.rs` (SHA256 `1dabfd0a68f8e810b1f40a90f2234d3fb6f08b7c70625fbc4625afe8b271a3bd`) and
+`sender_cache.rs` (SHA256 `792445bae54bf3e01a64ea353322ea04c731f8f89c7d7e8c46e7d3649d570db6`), which replaces this port's
+`key_cache.rs` (the same key cache, plus the ingest sender cache and verify-mode helpers).
+`execution.rs` keeps the tag's `evm.rs` conversions plus `AdmittedTransaction::execution_env`.

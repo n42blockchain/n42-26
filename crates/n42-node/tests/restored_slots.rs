@@ -2,6 +2,7 @@
 //! the same block: revm's bundle forgets it, gov5 writes it, and the QMDB
 //! root job must add the rewrite from what the executor recorded.
 
+use alloy_consensus::BlockBody;
 use alloy_consensus::{Header, TxLegacy};
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256, keccak256};
 use n42_execution::{N42EvmConfig, restored_slots_for};
@@ -9,8 +10,9 @@ use n42_node::qmdb_state::{
     gov5_qmdb_operations, gov5_qmdb_operations_with_restored, gov5_restored_slots_key,
 };
 use n42_twig_core::qmdb_compat::gov5_storage_key;
+use n42_tx_types::{Block, N42TxEnvelope};
 use reth_chainspec::{ChainSpecBuilder, MAINNET};
-use reth_ethereum_primitives::{Block, BlockBody, Transaction, TransactionSigned};
+use reth_ethereum_primitives::Transaction;
 use reth_evm::{
     ConfigureEvm,
     execute::{BasicBlockExecutor, Executor},
@@ -43,7 +45,7 @@ fn sender(seed: u8) -> (Keypair, Address) {
     (key_pair, public_key_to_address(key_pair.public_key()))
 }
 
-fn store_call(key_pair: Keypair, chain_id: u64, nonce: u64, value: U256) -> TransactionSigned {
+fn store_call(key_pair: Keypair, chain_id: u64, nonce: u64, value: U256) -> N42TxEnvelope {
     let mut input = value.to_be_bytes::<32>().to_vec();
     // The other slot takes the call's nonce plus one: never restored.
     input.extend_from_slice(&U256::from(nonce + 1).to_be_bytes::<32>());
@@ -59,6 +61,7 @@ fn store_call(key_pair: Keypair, chain_id: u64, nonce: u64, value: U256) -> Tran
             input: Bytes::from(input),
         }),
     )
+    .into()
 }
 
 /// Executes one block of `values` written in turn to the contract's slot 0,

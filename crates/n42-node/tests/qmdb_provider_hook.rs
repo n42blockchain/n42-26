@@ -10,7 +10,9 @@ use n42_twig_core::qmdb_compat::{
     QmdbCompatTree, encode_gov5_account_value, gov5_account_key, gov5_storage_key,
 };
 use reth_primitives_traits::Block;
-use reth_provider::{providers::BlockchainProvider, test_utils::create_test_provider_factory};
+use reth_provider::{
+    providers::BlockchainProvider, test_utils::create_test_provider_factory_with_node_types,
+};
 use reth_storage_api::{BlockWriter, StateProviderFactory};
 use std::sync::Arc;
 
@@ -27,11 +29,13 @@ async fn blockchain_provider_reads_the_exact_qmdb_version() -> eyre::Result<()> 
         gov5_storage_key(address.as_ref(), &slot.0),
         U256::from(42).to_be_bytes::<32>().to_vec(),
     );
-    let mut block = reth_ethereum_primitives::Block::default();
+    let mut block = n42_tx_types::Block::default();
     block.header.state_root = B256::from(tree.root());
     let genesis = block.seal_slow();
     let hash = genesis.hash();
-    let factory = create_test_provider_factory();
+    let factory = create_test_provider_factory_with_node_types::<n42_node::N42Node>(
+        reth_chainspec::MAINNET.clone(),
+    );
     let writer = factory.provider_rw()?;
     writer.insert_block(&genesis.try_recover()?)?;
     writer.commit()?;

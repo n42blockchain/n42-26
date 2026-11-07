@@ -20,12 +20,12 @@ use n42_twig_core::qmdb_compat::{
 use n42_twig_core::qmdb_leaf_tree::{
     QmdbLeafFormHeader, QmdbLeafFormIoError, QmdbLeafTree, QmdbLeafTreeError,
 };
+use n42_tx_types::{N42Primitives, Receipt};
 use reth_engine_tree::tree::state_root_strategy::{
     LazyHashedPostState, PreparedStateRootJob, StateRootJob, StateRootJobContext,
     StateRootJobOutcome, StateRootStrategy,
 };
 use reth_engine_tree::tree::{BasicEngineValidator, TreeConfig};
-use reth_ethereum_primitives::{EthPrimitives, Receipt};
 use reth_evm::{ConfigureEngineEvm, ConfigureEvm};
 use reth_node_api::FullNodeComponents;
 use reth_node_builder::rpc::{BasicEngineValidatorBuilder, EngineValidatorBuilder};
@@ -1823,7 +1823,8 @@ impl Gov5QmdbStateRootStore {
                 return;
             }
         };
-        let rolling = rolling_checkpoint_path(self.persistence_path.as_ref().expect("checked above"));
+        let rolling =
+            rolling_checkpoint_path(self.persistence_path.as_ref().expect("checked above"));
         let identity = self.identity;
         let in_flight = self.rebase_in_flight.clone();
         let block_number = identity.block_number.saturating_add(depth as u64);
@@ -2067,7 +2068,10 @@ fn base_extends_retained_lineage(
     base_root: B256,
     ancestor: B256,
 ) -> bool {
-    if blocks.get(&base).is_none_or(|block| block.root != base_root) {
+    if blocks
+        .get(&base)
+        .is_none_or(|block| block.root != base_root)
+    {
         return false;
     }
     let mut cursor = base;
@@ -2388,9 +2392,9 @@ impl Gov5QmdbStateRootStrategy {
     }
 }
 
-impl<P, Evm> StateRootStrategy<EthPrimitives, P, Evm> for Gov5QmdbStateRootStrategy
+impl<P, Evm> StateRootStrategy<N42Primitives, P, Evm> for Gov5QmdbStateRootStrategy
 where
-    Evm: ConfigureEvm<Primitives = EthPrimitives>,
+    Evm: ConfigureEvm<Primitives = N42Primitives>,
 {
     fn supports_cached_output(&self) -> bool {
         true
@@ -2398,8 +2402,8 @@ where
 
     fn prepare(
         &self,
-        ctx: StateRootJobContext<'_, EthPrimitives, P, Evm>,
-    ) -> ProviderResult<PreparedStateRootJob<EthPrimitives>> {
+        ctx: StateRootJobContext<'_, N42Primitives, P, Evm>,
+    ) -> ProviderResult<PreparedStateRootJob<N42Primitives>> {
         Ok(PreparedStateRootJob::new(
             Box::new(Gov5QmdbStateRootJob {
                 store: self.store.clone(),
@@ -2418,14 +2422,14 @@ struct Gov5QmdbStateRootJob {
     env_key: B256,
 }
 
-impl StateRootJob<EthPrimitives> for Gov5QmdbStateRootJob {
+impl StateRootJob<N42Primitives> for Gov5QmdbStateRootJob {
     fn name(&self) -> &'static str {
         "gov5-qmdb"
     }
 
     fn finish(
         &mut self,
-        block: &RecoveredBlock<reth_ethereum_primitives::Block>,
+        block: &RecoveredBlock<n42_tx_types::Block>,
         output: Arc<BlockExecutionOutput<Receipt>>,
         _hashed_state: &LazyHashedPostState,
     ) -> ProviderResult<StateRootJobOutcome> {
@@ -2504,9 +2508,9 @@ impl StateRootJob<EthPrimitives> for Gov5QmdbStateRootJob {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Gov5TrustedStateRootStrategy;
 
-impl<P, Evm> StateRootStrategy<EthPrimitives, P, Evm> for Gov5TrustedStateRootStrategy
+impl<P, Evm> StateRootStrategy<N42Primitives, P, Evm> for Gov5TrustedStateRootStrategy
 where
-    Evm: ConfigureEvm<Primitives = EthPrimitives>,
+    Evm: ConfigureEvm<Primitives = N42Primitives>,
 {
     fn supports_cached_output(&self) -> bool {
         true
@@ -2514,8 +2518,8 @@ where
 
     fn prepare(
         &self,
-        _ctx: StateRootJobContext<'_, EthPrimitives, P, Evm>,
-    ) -> ProviderResult<PreparedStateRootJob<EthPrimitives>> {
+        _ctx: StateRootJobContext<'_, N42Primitives, P, Evm>,
+    ) -> ProviderResult<PreparedStateRootJob<N42Primitives>> {
         Ok(PreparedStateRootJob::new(
             Box::new(Gov5TrustedStateRootJob),
             None,
@@ -2526,14 +2530,14 @@ where
 #[derive(Debug)]
 struct Gov5TrustedStateRootJob;
 
-impl StateRootJob<EthPrimitives> for Gov5TrustedStateRootJob {
+impl StateRootJob<N42Primitives> for Gov5TrustedStateRootJob {
     fn name(&self) -> &'static str {
         "gov5-trusted"
     }
 
     fn finish(
         &mut self,
-        block: &RecoveredBlock<reth_ethereum_primitives::Block>,
+        block: &RecoveredBlock<n42_tx_types::Block>,
         _output: Arc<BlockExecutionOutput<Receipt>>,
         _hashed_state: &LazyHashedPostState,
     ) -> ProviderResult<StateRootJobOutcome> {
@@ -2607,13 +2611,13 @@ where
         self,
         ctx: &reth_node_api::AddOnsContext<'_, Node>,
         tree_config: TreeConfig,
-        overlay_manager: OverlayManager<EthPrimitives>,
+        overlay_manager: OverlayManager<N42Primitives>,
     ) -> eyre::Result<Self::EngineValidator> {
         let validator = self
             .inner
             .build_tree_validator(ctx, tree_config, overlay_manager)
             .await?;
-        let guard = |strategy: Arc<dyn StateRootStrategy<EthPrimitives, Node::Provider, Node::Evm>>| -> Arc<dyn StateRootStrategy<EthPrimitives, Node::Provider, Node::Evm>> {
+        let guard = |strategy: Arc<dyn StateRootStrategy<N42Primitives, Node::Provider, Node::Evm>>| -> Arc<dyn StateRootStrategy<N42Primitives, Node::Provider, Node::Evm>> {
             if self.eof_guard {
                 Arc::new(crate::eof_guard::EofGuardedStateRootStrategy::new(strategy))
             } else {
@@ -3070,9 +3074,10 @@ mod tests {
     }
 
     /// Restart reads whatever `.base.qmdb` holds, as bin/n42-node does.
-    fn reopen_from_base_file(path: &Path) -> Result<Gov5QmdbStateRootStore, Gov5QmdbStateRootError> {
-        let (tree, header) =
-            Gov5QmdbStateRootStore::read_base_file(&base_file_path(path)).unwrap();
+    fn reopen_from_base_file(
+        path: &Path,
+    ) -> Result<Gov5QmdbStateRootStore, Gov5QmdbStateRootError> {
+        let (tree, header) = Gov5QmdbStateRootStore::read_base_file(&base_file_path(path)).unwrap();
         Gov5QmdbStateRootStore::persistent_from_leaf_tree(
             B256::from(header.block_hash),
             B256::from(header.root),
@@ -3082,10 +3087,7 @@ mod tests {
         )
     }
 
-    fn commit_chain(
-        store: &Gov5QmdbStateRootStore,
-        snapshot: &QmdbSnapshot,
-    ) -> Vec<(B256, B256)> {
+    fn commit_chain(store: &Gov5QmdbStateRootStore, snapshot: &QmdbSnapshot) -> Vec<(B256, B256)> {
         let mut parent = store.base_block_hash();
         let mut history = Vec::new();
         let mut chain = Vec::new();
@@ -4108,7 +4110,7 @@ mod tests {
         };
         let (store, _) = store();
         let store = Arc::new(store);
-        let mut block = reth_ethereum_primitives::Block::default();
+        let mut block = n42_tx_types::Block::default();
         block.header.parent_hash = store.base_block_hash();
         block.header.state_root = store.base_root();
         block.header.number = 1;
@@ -4235,7 +4237,7 @@ mod tests {
         use reth_primitives_traits::Block;
         let (store, _) = store();
         let store = Arc::new(store);
-        let mut block = reth_ethereum_primitives::Block::default();
+        let mut block = n42_tx_types::Block::default();
         block.header.parent_hash = store.base_block_hash();
         block.header.state_root = B256::ZERO;
         block.header.number = 1;

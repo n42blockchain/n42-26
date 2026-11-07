@@ -195,18 +195,15 @@ pub fn decompress_payload(data: &[u8]) -> std::io::Result<Vec<u8>> {
                 // same frame with an independent context before declaring a
                 // committed block unexecutable. A genuinely damaged frame is
                 // still rejected by both decoders.
-                let independent = zstd::bulk::decompress(
-                    data,
-                    MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE,
-                );
+                let independent =
+                    zstd::bulk::decompress(data, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE);
                 if independent.is_ok() {
                     ZSTD_DECOMPRESSOR.with(|slot| *slot.borrow_mut() = None);
                     tracing::warn!(target: "n42::cl", error = %pooled_error,
                         "pooled zstd decompression failed; independent retry succeeded");
                 }
-                independent.map_err(|error| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-                })
+                independent
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
             }
         }
     } else {
@@ -521,7 +518,7 @@ pub(super) struct PayloadBuildReady {
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct CompactBlockExecution {
     pub bundle_state: revm::database::states::BundleState,
-    pub receipts: Vec<reth_ethereum_primitives::Receipt>,
+    pub receipts: Vec<n42_tx_types::Receipt>,
     pub requests: alloy_eips::eip7685::Requests,
     pub gas_used: u64,
     pub blob_gas_used: u64,
@@ -1276,7 +1273,8 @@ impl ConsensusService {
 
     fn remember_h2_v4_block_number(&mut self, hash: B256, number: u64) {
         self.h2_v4_block_numbers.insert(hash, number);
-        let limit = self.h2_v4_catchup_buffer_blocks
+        let limit = self
+            .h2_v4_catchup_buffer_blocks
             .saturating_add(DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS);
         while self.h2_v4_block_numbers.len() > limit {
             self.h2_v4_block_numbers.pop_first();
@@ -1490,7 +1488,11 @@ impl ConsensusService {
         // in successive views. The verified H2 binding, when present, orders
         // these executions; the immutable header view is only its lower bound.
         // Transitively authenticated parents have no certificate binding yet.
-        let view = if bound_view == 0 { header_view } else { bound_view };
+        let view = if bound_view == 0 {
+            header_view
+        } else {
+            bound_view
+        };
         self.remember_h2_v4_block_view(block.block_hash, view);
         if block.header.number <= self.head_block_number {
             self.prune_executed_h2_v4_catchup_history();
@@ -4392,7 +4394,10 @@ mod tests {
         assert_eq!(decoded.block_hash, hash);
         let raw = n42_consensus::gov5_native_header_rlp(&hash).unwrap();
         assert!(remember_direct_native_header(hash, &raw));
-        assert!(!remember_direct_native_header(B256::repeat_byte(0x42), &raw));
+        assert!(!remember_direct_native_header(
+            B256::repeat_byte(0x42),
+            &raw
+        ));
         assert!(!remember_direct_native_header(hash, &[0xc0]));
     }
 
@@ -6224,18 +6229,28 @@ mod tests {
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mock = Arc::new(MockExecutionLayer::new(
-            PayloadStatusEnum::Valid, PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
         ));
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.el = Some(mock.clone());
         orch.async_finalize_fcu = false;
         let hash = B256::repeat_byte(0xc2);
-        orch.handle_block_committed(1, hash, test_commit_qc(1, hash), None).await;
-        orch.handle_eager_import_done(hash, 1, B256::ZERO, 1, false, None).await;
+        orch.handle_block_committed(1, hash, test_commit_qc(1, hash), None)
+            .await;
+        orch.handle_eager_import_done(hash, 1, B256::ZERO, 1, false, None)
+            .await;
         assert!(orch.h2_v4_catchup_finalized.is_empty());
-        assert_eq!(orch.async_commit_states[&1].stage, AsyncCommitStage::Finalized);
-        orch.handle_finalize_done(1, hash, test_commit_qc(1, hash), false).await;
-        assert_eq!(orch.async_commit_states[&1].stage, AsyncCommitStage::Finalized);
+        assert_eq!(
+            orch.async_commit_states[&1].stage,
+            AsyncCommitStage::Finalized
+        );
+        orch.handle_finalize_done(1, hash, test_commit_qc(1, hash), false)
+            .await;
+        assert_eq!(
+            orch.async_commit_states[&1].stage,
+            AsyncCommitStage::Finalized
+        );
         assert_eq!(mock.fcu_heads(), vec![hash]);
     }
 
@@ -7098,7 +7113,8 @@ mod tests {
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mock = Arc::new(MockExecutionLayer::new(
-            PayloadStatusEnum::Valid, PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
         ));
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.el = Some(mock.clone());
@@ -7113,22 +7129,39 @@ mod tests {
             (202, hash, AsyncCommitStage::Committed),
             (203, next, AsyncCommitStage::ExecutionReady),
         ] {
-            orch.async_commit_states.insert(view, AsyncCommitState {
-                view, block_hash, commit_qc: test_commit_qc(view, block_hash),
-                stage, finalize_in_flight: false, committed_at: Instant::now(),
-            });
+            orch.async_commit_states.insert(
+                view,
+                AsyncCommitState {
+                    view,
+                    block_hash,
+                    commit_qc: test_commit_qc(view, block_hash),
+                    stage,
+                    finalize_in_flight: false,
+                    committed_at: Instant::now(),
+                },
+            );
         }
-        assert!(orch.import_h2_v4_catchup_block(
-            n42_network::PeerId::random(),
-            n42_network::decode_gov5_block_rlp(&rlp).unwrap(), 201,
-        ).await);
+        assert!(
+            orch.import_h2_v4_catchup_block(
+                n42_network::PeerId::random(),
+                n42_network::decode_gov5_block_rlp(&rlp).unwrap(),
+                201,
+            )
+            .await
+        );
         for view in [201, 202] {
-            assert_eq!(orch.async_commit_states[&view].stage, AsyncCommitStage::Finalized);
+            assert_eq!(
+                orch.async_commit_states[&view].stage,
+                AsyncCommitStage::Finalized
+            );
         }
         assert_eq!(mock.fcu_heads(), vec![hash]);
         orch.drive_async_commits().await;
         assert_eq!(mock.fcu_heads(), vec![hash, next]);
-        assert_eq!(orch.async_commit_states[&203].stage, AsyncCommitStage::Finalized);
+        assert_eq!(
+            orch.async_commit_states[&203].stage,
+            AsyncCommitStage::Finalized
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7137,7 +7170,8 @@ mod tests {
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mock = Arc::new(MockExecutionLayer::new(
-            PayloadStatusEnum::Valid, PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
         ));
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.el = Some(mock.clone());
@@ -7146,25 +7180,45 @@ mod tests {
         orch.head_block_hash = B256::repeat_byte(0x70);
         orch.execution_validated_head_view = 200;
         let (hash, rlp) = test_gov5_block_rlp(orch.head_block_hash, 101, 201);
-        assert!(orch.import_h2_v4_catchup_block(
-            n42_network::PeerId::random(),
-            n42_network::decode_gov5_block_rlp(&rlp).unwrap(), 201,
-        ).await);
+        assert!(
+            orch.import_h2_v4_catchup_block(
+                n42_network::PeerId::random(),
+                n42_network::decode_gov5_block_rlp(&rlp).unwrap(),
+                201,
+            )
+            .await
+        );
         // Both a late original commit and a later view reusing that exact
         // hash are already finalized. Neither should dispatch an older FCU.
         for view in [201, 202] {
-            orch.handle_block_committed(view, hash, test_commit_qc(view, hash), None).await;
-            assert_eq!(orch.async_commit_states[&view].stage, AsyncCommitStage::Finalized);
+            orch.handle_block_committed(view, hash, test_commit_qc(view, hash), None)
+                .await;
+            assert_eq!(
+                orch.async_commit_states[&view].stage,
+                AsyncCommitStage::Finalized
+            );
         }
         assert_eq!(mock.fcu_heads(), vec![hash]);
-        orch.handle_finalize_done(201, hash, test_commit_qc(201, hash), false).await;
-        assert_eq!(orch.async_commit_states[&201].stage, AsyncCommitStage::Finalized);
+        orch.handle_finalize_done(201, hash, test_commit_qc(201, hash), false)
+            .await;
+        assert_eq!(
+            orch.async_commit_states[&201].stage,
+            AsyncCommitStage::Finalized
+        );
         let next = B256::repeat_byte(0x71);
-        orch.handle_block_committed(203, next, test_commit_qc(203, next), None).await;
-        assert_eq!(orch.async_commit_states[&203].stage, AsyncCommitStage::Committed);
-        orch.handle_eager_import_done(next, 203, hash, 102, false, None).await;
+        orch.handle_block_committed(203, next, test_commit_qc(203, next), None)
+            .await;
+        assert_eq!(
+            orch.async_commit_states[&203].stage,
+            AsyncCommitStage::Committed
+        );
+        orch.handle_eager_import_done(next, 203, hash, 102, false, None)
+            .await;
         assert_eq!(mock.fcu_heads(), vec![hash, next]);
-        assert_eq!(orch.async_commit_states[&203].stage, AsyncCommitStage::Finalized);
+        assert_eq!(
+            orch.async_commit_states[&203].stage,
+            AsyncCommitStage::Finalized
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7190,38 +7244,54 @@ mod tests {
             let (network, _cmd_rx, _prx) = make_test_network();
             let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
             let mock = Arc::new(MockExecutionLayer::new(PayloadStatusEnum::Valid, status));
-            let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+            let mut orch =
+                ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
             orch.el = Some(mock);
             orch.head_block_number = 100;
             orch.head_block_hash = B256::repeat_byte(0x70);
             orch.execution_validated_head_view = 200;
             let (hash, rlp) = test_gov5_block_rlp(orch.head_block_hash, 101, 201);
-            orch.async_commit_states.insert(201, AsyncCommitState {
-                view: 201, block_hash: hash, commit_qc: test_commit_qc(201, hash),
-                stage: AsyncCommitStage::Committed, finalize_in_flight: false,
-                committed_at: Instant::now(),
-            });
-            assert!(!orch.import_h2_v4_catchup_block(
-                n42_network::PeerId::random(),
-                n42_network::decode_gov5_block_rlp(&rlp).unwrap(), 201,
-            ).await);
+            orch.async_commit_states.insert(
+                201,
+                AsyncCommitState {
+                    view: 201,
+                    block_hash: hash,
+                    commit_qc: test_commit_qc(201, hash),
+                    stage: AsyncCommitStage::Committed,
+                    finalize_in_flight: false,
+                    committed_at: Instant::now(),
+                },
+            );
+            assert!(
+                !orch
+                    .import_h2_v4_catchup_block(
+                        n42_network::PeerId::random(),
+                        n42_network::decode_gov5_block_rlp(&rlp).unwrap(),
+                        201,
+                    )
+                    .await
+            );
             assert!(orch.h2_v4_catchup_finalized.is_empty());
-            assert_eq!(orch.async_commit_states[&201].stage, AsyncCommitStage::Committed);
+            assert_eq!(
+                orch.async_commit_states[&201].stage,
+                AsyncCommitStage::Committed
+            );
             assert_eq!(orch.head_block_number, 100);
         }
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn eager_leader_height_waits_for_fcu_and_reconnects_the_catchup_suffix() {
-        let mut orch = make_test_orchestrator_with_state(None)
-            .with_h2_v4_participant(test_h2_identity());
+        let mut orch =
+            make_test_orchestrator_with_state(None).with_h2_v4_participant(test_h2_identity());
         let parent = B256::repeat_byte(0x70);
         orch.head_block_hash = parent;
         orch.head_block_number = 100;
         orch.execution_validated_head_view = 200;
         let (leader, _) = test_gov5_block_rlp(parent, 101, 201);
         // No leader envelope has reached the metadata cache yet.
-        orch.handle_eager_import_done(leader, 1, parent, 101, false, None).await;
+        orch.handle_eager_import_done(leader, 1, parent, 101, false, None)
+            .await;
         assert_eq!(orch.head_block_hash, parent);
         assert_eq!(orch.head_block_number, 100);
         assert_eq!(orch.h2_v4_block_numbers[&leader], 101);
@@ -7230,7 +7300,11 @@ mod tests {
         assert!(!orch.h2_v4_block_numbers.contains_key(&leader));
         let (_, child) = test_gov5_block_rlp(leader, 102, 202);
         assert!(orch.stage_h2_v4_catchup_block(
-            n42_network::PeerId::random(), child, 102, 202, true,
+            n42_network::PeerId::random(),
+            child,
+            102,
+            202,
+            true,
         ));
         assert_eq!(orch.ready_h2_v4_catchup_heights(), Some(vec![102]));
     }

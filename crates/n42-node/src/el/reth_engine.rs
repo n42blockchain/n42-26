@@ -2,12 +2,13 @@
 //! handles — the single implementation today. Each method delegates 1:1 to the
 //! call the orchestrator makes inline today, erasing the reth error type.
 
+use alloy_consensus::transaction::TxHashRef as _;
 use super::{BuiltBlock, ElError, ExecutionLayer, ResolveKind};
+use crate::engine_types::{N42BuiltPayload, N42EngineTypes};
 use alloy_consensus::Typed2718;
 use alloy_rpc_types_engine::{
     ExecutionData, ForkchoiceState, ForkchoiceUpdated, PayloadAttributes, PayloadId, PayloadStatus,
 };
-use reth_ethereum_engine_primitives::EthEngineTypes;
 use reth_node_builder::ConsensusEngineHandle;
 use reth_payload_builder::PayloadBuilderHandle;
 use reth_payload_primitives::{PayloadKind, PayloadTypes};
@@ -17,16 +18,16 @@ use reth_payload_primitives::{PayloadKind, PayloadTypes};
 /// share via `Arc`. The payload builder is optional because non-producing roles
 /// (the observer) only need `new_payload`/`fork_choice_updated`, never builds.
 pub struct RethExecutionLayer {
-    engine: ConsensusEngineHandle<EthEngineTypes>,
-    payload_builder: Option<PayloadBuilderHandle<EthEngineTypes>>,
+    engine: ConsensusEngineHandle<N42EngineTypes>,
+    payload_builder: Option<PayloadBuilderHandle<N42EngineTypes>>,
     import_gate: Option<super::import_gate::ImportGate>,
 }
 
 impl RethExecutionLayer {
     /// Full adapter (leader/follower): can build payloads.
     pub fn new(
-        engine: ConsensusEngineHandle<EthEngineTypes>,
-        payload_builder: PayloadBuilderHandle<EthEngineTypes>,
+        engine: ConsensusEngineHandle<N42EngineTypes>,
+        payload_builder: PayloadBuilderHandle<N42EngineTypes>,
     ) -> Self {
         Self {
             engine,
@@ -36,7 +37,7 @@ impl RethExecutionLayer {
     }
 
     /// Import-only adapter (observer): `resolve_payload` is never called.
-    pub fn engine_only(engine: ConsensusEngineHandle<EthEngineTypes>) -> Self {
+    pub fn engine_only(engine: ConsensusEngineHandle<N42EngineTypes>) -> Self {
         Self {
             engine,
             payload_builder: None,
@@ -110,10 +111,10 @@ impl ExecutionLayer for RethExecutionLayer {
     }
 }
 
-/// Converts reth's `EthBuiltPayload` into the node-neutral [`BuiltBlock`] — all
+/// Converts `N42BuiltPayload` into the node-neutral [`BuiltBlock`] — all
 /// reth block introspection (header/body/blob hashes + `block_to_payload`) lives
 /// here so the orchestrator and the `ExecutionLayer` trait stay reth-free.
-fn to_built_block(payload: reth_payload_builder::EthBuiltPayload) -> BuiltBlock {
+fn to_built_block(payload: N42BuiltPayload) -> BuiltBlock {
     let block = payload.block();
     let blob_tx_hashes = block
         .body()
@@ -126,7 +127,7 @@ fn to_built_block(payload: reth_payload_builder::EthBuiltPayload) -> BuiltBlock 
         number: block.header().number,
         timestamp: block.header().timestamp,
         tx_count: block.body().transactions().count(),
-        execution_data: <EthEngineTypes as PayloadTypes>::block_to_payload(block.clone(), None),
+        execution_data: <N42EngineTypes as PayloadTypes>::block_to_payload(block.clone(), None),
         blob_tx_hashes,
     }
 }

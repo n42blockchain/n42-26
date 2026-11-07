@@ -20,14 +20,15 @@
 //!                               [u32 LE credit_available]
 //!   num_txs = 0 → close connection gracefully.
 
+use crate::native_pool::N42PooledTransaction;
 use crate::now_unix_ms;
 use alloy_consensus::{Transaction, transaction::Recovered};
 use alloy_primitives::{Address, U256};
-use reth_ethereum_primitives::TransactionSigned;
+use n42_tx_types::N42TxEnvelope;
 use reth_transaction_pool::{
-    AddedTransactionOutcome, CoinbaseTipOrdering, EthPooledTransaction, Pool, PoolResult,
-    PoolTransaction, TransactionOrigin, TransactionPool, TransactionValidationOutcome,
-    TransactionValidator, blobstore::BlobStore, validate::ValidTransaction,
+    AddedTransactionOutcome, CoinbaseTipOrdering, Pool, PoolResult, PoolTransaction,
+    TransactionOrigin, TransactionPool, TransactionValidationOutcome, TransactionValidator,
+    blobstore::BlobStore, validate::ValidTransaction,
 };
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -123,22 +124,22 @@ pub trait DirectPoolIngest: Send + Sync + 'static {
     /// Skips TransactionValidationTaskExecutor entirely.
     fn add_prevalidated(
         &self,
-        txs: Vec<EthPooledTransaction>,
+        txs: Vec<N42PooledTransaction>,
     ) -> Vec<PoolResult<AddedTransactionOutcome>>;
 
     /// Returns the current number of transactions in the pending sub-pool.
     fn pending_count(&self) -> usize;
 }
 
-/// Implement DirectPoolIngest for any reth Pool with EthPooledTransaction.
-impl<V, S> DirectPoolIngest for Pool<V, CoinbaseTipOrdering<EthPooledTransaction>, S>
+/// Implement DirectPoolIngest for any reth Pool with N42PooledTransaction.
+impl<V, S> DirectPoolIngest for Pool<V, CoinbaseTipOrdering<N42PooledTransaction>, S>
 where
-    V: TransactionValidator<Transaction = EthPooledTransaction> + 'static,
+    V: TransactionValidator<Transaction = N42PooledTransaction> + 'static,
     S: BlobStore + Clone + 'static,
 {
     fn add_prevalidated(
         &self,
-        txs: Vec<EthPooledTransaction>,
+        txs: Vec<N42PooledTransaction>,
     ) -> Vec<PoolResult<AddedTransactionOutcome>> {
         let outcomes = txs.into_iter().map(|tx| {
             // Use tx nonce as state_nonce so the pool sees NO nonce gap.
@@ -839,7 +840,7 @@ where
         let mut batch_decode_errors = 0u64;
         for (range, sender) in raw_txs.iter().take(take_limit) {
             let tx_bytes = &batch_data[range.clone()];
-            let tx: TransactionSigned =
+            let tx: N42TxEnvelope =
                 match alloy_eips::eip2718::Decodable2718::decode_2718(&mut &tx_bytes[..]) {
                     Ok(tx) => tx,
                     Err(_) => {
@@ -849,7 +850,7 @@ where
                 };
 
             let recovered = Recovered::new_unchecked(tx, *sender);
-            match EthPooledTransaction::try_from_consensus(recovered) {
+            match N42PooledTransaction::try_from_consensus(recovered) {
                 Ok(pooled) => pooled_txs.push(pooled),
                 Err(_) => batch_decode_errors += 1,
             }
@@ -1002,7 +1003,7 @@ mod tests {
     impl DirectPoolIngest for NoopPool {
         fn add_prevalidated(
             &self,
-            txs: Vec<EthPooledTransaction>,
+            txs: Vec<N42PooledTransaction>,
         ) -> Vec<PoolResult<AddedTransactionOutcome>> {
             assert!(txs.is_empty(), "test never submits transactions");
             Vec::new()

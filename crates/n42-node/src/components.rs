@@ -4,8 +4,8 @@ use n42_consensus::{
     shared_committee_pool,
 };
 use n42_execution::N42EvmConfig;
+use n42_tx_types::N42Primitives;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
-use reth_ethereum_primitives::EthPrimitives;
 use reth_node_builder::{
     BuilderContext,
     components::{ConsensusBuilder, ExecutorBuilder},
@@ -21,7 +21,7 @@ pub struct N42ExecutorBuilder;
 
 impl<Types, Node> ExecutorBuilder<Node> for N42ExecutorBuilder
 where
-    Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>,
+    Types: NodeTypes<ChainSpec = ChainSpec, Primitives = N42Primitives>,
     Node: FullNodeTypes<Types = Types>,
 {
     type EVM = N42EvmConfig;
@@ -93,7 +93,7 @@ impl N42ConsensusBuilder {
 impl<Node> ConsensusBuilder<Node> for N42ConsensusBuilder
 where
     Node: FullNodeTypes<
-        Types: NodeTypes<ChainSpec: EthChainSpec + EthereumHardforks, Primitives = EthPrimitives>,
+        Types: NodeTypes<ChainSpec: EthChainSpec + EthereumHardforks, Primitives = N42Primitives>,
     >,
 {
     type Consensus = Arc<N42Consensus<<Node::Types as NodeTypes>::ChainSpec>>;
