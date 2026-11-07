@@ -1,4 +1,6 @@
 mod keystore;
+#[cfg(feature = "pprof")]
+mod pprof_capture;
 
 // jemalloc is unix-only; tikv-jemallocator is a target.'cfg(unix)' dependency,
 // so the `feature = "jemalloc"` cfg is gated on `unix` to keep Windows builds happy.
@@ -1198,6 +1200,14 @@ fn main() {
         // SAFETY: Called from main() before any threads are spawned.
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
+
+    // After the environment is final: the watcher is the first extra thread.
+    #[cfg(feature = "pprof")]
+    pprof_capture::spawn_from_env(
+        std::env::var_os("N42_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| ".".into()),
+    );
 
     // Leave HTTP RPC disabled by default for release-oriented startup.
     //
@@ -3200,9 +3210,13 @@ fn main() {
                 // Enable with N42_INGEST_PORT=19900. Legacy fallback: N42_INJECT_PORT.
                 if std::env::var("N42_INGEST_PORT").is_ok() || std::env::var("N42_INJECT_PORT").is_ok() {
                     let inject_pool = full_node.pool.clone();
+                    let ingest_chain_id = full_node.chain_spec().chain().id();
                     task_executor.spawn_critical_task(
                         "n42-ingest-server",
-                        Box::pin(n42_node::ingest::run_ingest_server(inject_pool)),
+                        Box::pin(n42_node::ingest::run_ingest_server(
+                            inject_pool,
+                            ingest_chain_id,
+                        )),
                     );
                 }
 

@@ -6,8 +6,8 @@
 //! built-payload types so 0x50 transactions can be packed. Keep the logic in
 //! step with upstream when rebasing reth.
 
-use alloy_consensus::transaction::TxHashRef as _;
 use crate::engine_types::N42BuiltPayload;
+use alloy_consensus::transaction::TxHashRef as _;
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_primitives::U256;
 use alloy_rlp::Encodable;

@@ -91,11 +91,17 @@ rand.workspace = true
 # jemalloc is unix-only; on Windows the default feature is a no-op for the allocator.
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { version = "0.7", optional = true }
+# pprof
+pprof = { version = "0.15", default-features = false, optional = true }
 
 [features]
-default = ["jemalloc"]
+default = ["jemalloc", "asm-keccak"]
+# Assembly Keccak-f (keccak-asm) instead of the portable Rust permutation.
+asm-keccak = ["alloy-primitives/asm-keccak"]
 jemalloc = ["dep:tikv-jemallocator"]
 sp1 = ["n42-zkproof/sp1"]
+# Unprivileged on-demand CPU profiles (`pprof_capture.rs`); build with `--profile profiling`.
+pprof = ["dep:pprof"]
 
 [dev-dependencies]
 tempfile.workspace = true

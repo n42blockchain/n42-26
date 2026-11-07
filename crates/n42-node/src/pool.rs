@@ -131,7 +131,9 @@ where
 
         // Native 0x50 (Ed25519) transactions are admitted only on chains whose
         // genesis sets `altSigTx`; otherwise the pool stays Ethereum-only.
-        let alt_sig = n42_chainspec::native::alt_sig_tx_enabled(reth_chainspec::EthChainSpec::genesis(&*ctx.chain_spec()));
+        let alt_sig = n42_chainspec::native::alt_sig_tx_enabled(
+            reth_chainspec::EthChainSpec::genesis(&*ctx.chain_spec()),
+        );
         n42_tx_types::set_alt_sig_enabled(alt_sig);
         info!(target: "n42::pool", alt_sig, "native 0x50 transaction admission");
 

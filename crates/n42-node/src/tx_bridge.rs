@@ -1,5 +1,5 @@
-use alloy_consensus::transaction::TxHashRef as _;
 use crate::native_pool::N42PooledTransaction;
+use alloy_consensus::transaction::TxHashRef as _;
 use alloy_primitives::B256;
 use n42_tx_types::N42TxEnvelope;
 use reth_primitives_traits::SignedTransaction;

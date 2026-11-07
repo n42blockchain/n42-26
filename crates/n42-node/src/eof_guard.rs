@@ -20,8 +20,8 @@
 //!
 //! EIP-7702 delegation designators start with `0xEF01` and are not EOF.
 
-use alloy_consensus::transaction::TxHashRef as _;
 use alloy_consensus::transaction::Transaction as _;
+use alloy_consensus::transaction::TxHashRef as _;
 use alloy_primitives::{Address, B256, Bytes, KECCAK256_EMPTY as KECCAK_EMPTY};
 use n42_tx_types::{Block, N42Primitives, N42TxEnvelope, Receipt};
 use reth_engine_tree::tree::state_root_strategy::{

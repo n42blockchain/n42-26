@@ -2,10 +2,10 @@
 //! handles — the single implementation today. Each method delegates 1:1 to the
 //! call the orchestrator makes inline today, erasing the reth error type.
 
-use alloy_consensus::transaction::TxHashRef as _;
 use super::{BuiltBlock, ElError, ExecutionLayer, ResolveKind};
 use crate::engine_types::{N42BuiltPayload, N42EngineTypes};
 use alloy_consensus::Typed2718;
+use alloy_consensus::transaction::TxHashRef as _;
 use alloy_rpc_types_engine::{
     ExecutionData, ForkchoiceState, ForkchoiceUpdated, PayloadAttributes, PayloadId, PayloadStatus,
 };

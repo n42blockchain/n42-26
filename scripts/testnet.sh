@@ -548,7 +548,13 @@ genesis = {
 # `alt_sig_raw --address`) funds Ed25519 sender accounts.
 if os.environ.get("N42_ALT_SIG_TX") == "1":
     genesis["config"]["altSigTx"] = True
-    for address in filter(None, os.environ.get("N42_ALT_SIG_FUND", "").split(",")):
+    fund = os.environ.get("N42_ALT_SIG_FUND", "")
+    # N42_ALT_SIG_FUND_FILE: the same list in a file, for more senders than an
+    # environment variable can hold (e.g. `native-flood --print-addresses`).
+    if os.environ.get("N42_ALT_SIG_FUND_FILE"):
+        with open(os.environ["N42_ALT_SIG_FUND_FILE"]) as f:
+            fund += "," + f.read().strip()
+    for address in filter(None, fund.split(",")):
         genesis["alloc"][address.strip()] = {"balance": INITIAL_BALANCE}
     print("  Native 0x50 transactions enabled (altSigTx)")
 

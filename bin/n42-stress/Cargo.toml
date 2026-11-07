@@ -31,3 +31,6 @@ tiny-keccak = { version = "2", features = ["keccak"] }
 
 rayon.workspace = true
 tempfile.workspace = true
+# native-flood: presigned 0x50 frames over the binary ingest.
+n42-tx-types.workspace = true
+ed25519-dalek = { version = "3.0", default-features = false, features = ["fast"] }

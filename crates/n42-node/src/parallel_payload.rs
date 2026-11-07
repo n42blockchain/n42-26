@@ -2,10 +2,10 @@
 //! Based on pinned Reth 23316e3ff8adca8c3bd5085ff0565fcae019202a payload builder
 //! plus this workspace's Reth patches. Keep the serial limits/finalization aligned.
 
-use alloy_consensus::TransactionEnvelope as _;
-use alloy_consensus::transaction::TxHashRef as _;
 use crate::engine_types::N42BuiltPayload;
 use crate::native_payload::default_n42_payload;
+use alloy_consensus::TransactionEnvelope as _;
+use alloy_consensus::transaction::TxHashRef as _;
 use alloy_consensus::{BlockHeader, Transaction};
 use alloy_evm::ToTxEnv;
 use alloy_primitives::{Bytes, U256};

@@ -104,6 +104,7 @@ reth-testing-utils.workspace = true
 # Keep key types identical to the Reth 2.4.1 / Alloy dependency graph.
 secp256k1 = { version = "0.30", features = ["global-context"] }
 tempfile.workspace = true
+ed25519-dalek = { version = "3.0", default-features = false }
 
 # Match the production node's default allocator in its library-test benchmarks.
 [target.'cfg(unix)'.dev-dependencies]
