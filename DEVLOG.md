@@ -16,6 +16,7 @@ Logs are split into separate files by phase for easy maintenance:
 
 | File | Content | Phase |
 |------|---------|-------|
+| [devlog-179-native-port-phase0-20261106](docs/devlog-179-native-port-phase0-20261106.md) | Native-path port from n42-rs tag fleet7-x22-5.2M (reth 2.8.1): phase 0 difference list (reth forks, header, QMDB root, tx-types sync, Eth-typed code) | Plan |
 | [devlog-178-reth-281-upgrade-20261025](docs/devlog-178-reth-281-upgrade-20261025.md) | Reth v2.8.1 six-patch port (one conflict), multiproof_v2 API change, revm-inspectors 0.44.3, dependency refresh, 1823/0/30 workspace tests; 7-node mixed 1 h soak PASS after RS body-retry fix | Upgrade |
 | [devlog-177-reth-27-upgrade-20261003](docs/devlog-177-reth-27-upgrade-20261003.md) | Reth v2.7.0 six-patch port, N42 compatibility changes, immediate persistence, workspace verification and remaining fleet gates | Upgrade |
 | [devlog-145-ci-reth-cache-api-20260914](docs/devlog-145-ci-reth-cache-api-20260914.md) | 修复 CI 缺少 reth 交易根缓存 API 导致的三个编译失败检查 | CI |
