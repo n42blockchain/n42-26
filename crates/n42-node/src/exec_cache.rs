@@ -177,7 +177,7 @@ fn serialize_execution_output(
         senders,
         transactions_root,
     };
-    match serde_json::to_vec(&compact) {
+    match compact.encode() {
         Ok(serialized) => {
             let compressed = compress_payload(&serialized);
             let ser_ms = ser_start.elapsed().as_millis() as u64;
@@ -304,7 +304,7 @@ pub(crate) fn inject_compact_block(hash: &B256, compressed: &[u8], source: &'sta
     let decompress_ms = decompress_start.elapsed().as_millis() as u64;
 
     let deser_start = std::time::Instant::now();
-    let compact: CompactBlockExecution = match serde_json::from_slice(&decompressed) {
+    let compact = match CompactBlockExecution::decode(&decompressed) {
         Ok(c) => c,
         Err(e) => {
             warn!(target: "n42::cl::exec_bridge", %hash, error = %e, "compact block: failed to deserialize");
@@ -374,8 +374,8 @@ mod tests {
         let compressed = cache
             .take_serialized(hash)
             .expect("cached execution output");
-        let compact: CompactBlockExecution =
-            serde_json::from_slice(&decompress_payload(&compressed).unwrap()).unwrap();
+        let compact =
+            CompactBlockExecution::decode(&decompress_payload(&compressed).unwrap()).unwrap();
         assert_eq!(compact.transactions_root, Some(root));
 
         reth_evm::payload_cache::remove_payload_transactions_root(&hash);

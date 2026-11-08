@@ -7135,6 +7135,7 @@ dependencies = [
  "n42-zkproof",
  "reth-ethereum-primitives",
  "revm",
+ "rmp-serde",
  "serde",
  "serde_json",
  "sha2 0.11.1",

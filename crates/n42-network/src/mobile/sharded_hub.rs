@@ -52,6 +52,15 @@ pub struct ShardedStarHubHandle {
 }
 
 impl ShardedStarHubHandle {
+    /// Phones connected across all shards.
+    pub async fn active_sessions(&self) -> usize {
+        let mut total = 0;
+        for handle in &self.shard_handles {
+            total += handle.active_sessions().await;
+        }
+        total
+    }
+
     /// Broadcasts a verification packet to all shards.
     ///
     /// `Bytes::clone()` is O(1), so fan-out to N shards copies no payload.

@@ -148,6 +148,14 @@ pub async fn mobile_packet_loop<P>(
                     );
                     continue;
                 }
+                // A packet costs a state replay and compression on every node; with
+                // no phone attached here nobody would receive it. A phone that joins
+                // later starts from the next block, and its cache sync carries the
+                // codes sent so far.
+                if hub_handle.active_sessions().await == 0 {
+                    metrics::counter!("n42_mobile_packet_skipped_no_phones_total").increment(1);
+                    continue;
+                }
                 debug!(%block_hash, "generating mobile stream packet");
 
                 let mut last_err = None;

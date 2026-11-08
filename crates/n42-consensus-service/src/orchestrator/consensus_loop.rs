@@ -2428,14 +2428,14 @@ impl ConsensusService {
                 return None;
             }
         };
-        let compact: super::CompactBlockExecution = match serde_json::from_slice(&decompressed) {
+        let compact = match super::CompactBlockExecution::decode(&decompressed) {
             Ok(compact) => compact,
             Err(error) => {
                 warn!(
                     target: "n42::cl::consensus_loop",
                     %block_hash,
                     error = %error,
-                    "failed to decode compact execution JSON for state-tree update"
+                    "failed to decode compact execution output for state-tree update"
                 );
                 return None;
             }

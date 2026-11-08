@@ -255,7 +255,10 @@ where
                 replay.push_back(pool_tx);
                 break;
             };
-            let plain = pool_tx.tx_type() <= 2
+            // 0x50 executes as an EIP-1559 call from its key's address
+            // (`n42_tx_types::execution`), so a plain 0x50 transfer is one too.
+            let plain = (pool_tx.tx_type() <= 2
+                || pool_tx.tx_type() == n42_tx_types::ALT_SIG_TX_TYPE_ID)
                 && pool_tx.transaction.input().is_empty()
                 && pool_tx
                     .transaction

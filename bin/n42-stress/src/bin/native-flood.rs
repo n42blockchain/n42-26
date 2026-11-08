@@ -41,7 +41,7 @@ const MAX_FRAME_ATTEMPTS: u32 = 500;
 #[derive(Parser, Debug)]
 #[command(about = "Presigned 0x50 frames over the binary ingest")]
 struct Args {
-    /// Comma-separated ingest endpoints (host:port); frames are spread round-robin.
+    /// Comma-separated ingest endpoints (host:port); each sender group goes to one of them (all of them with `--broadcast`).
     #[arg(long)]
     ingest: Option<String>,
     #[arg(long, default_value_t = 4242)]
@@ -70,6 +70,11 @@ struct Args {
     /// Distinct recipients, spread as n42-rs `tx_flood` / `n42-stress` do; 1 = one sink.
     #[arg(long, default_value_t = 1)]
     recipients: u32,
+    /// Send every frame to every endpoint (as n42-rs delivers the same frames to
+    /// all nodes), so each node caches the senders before it imports the block;
+    /// default: each sender group goes to one endpoint.
+    #[arg(long)]
+    broadcast: bool,
     /// Print the sender addresses (comma-separated) and the gateway public key, then exit.
     #[arg(long)]
     print_addresses: bool,
@@ -198,6 +203,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
     let total_txs = frames.len() as u64 * args.frame_size as u64;
+    // Accepted counts every copy; per-node figures divide by this.
     eprintln!(
         "presigned {} frames ({total_txs} txs, attested: {}) in {:.1}s",
         frames.len(),
@@ -215,6 +221,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .flat_map(|endpoint| std::iter::repeat_n(endpoint.clone(), args.connections))
         .collect();
     let count = connections.len();
+    // Broadcast: the `--connections` of one endpoint split all groups between them.
+    let stride = if args.broadcast {
+        args.connections.max(1)
+    } else {
+        count
+    };
+    let copies = if args.broadcast {
+        endpoints.len() as u64
+    } else {
+        1
+    };
     let accepted = Arc::new(AtomicU64::new(0));
     let deferred = Arc::new(AtomicU64::new(0));
     let send_started = Instant::now();
@@ -225,8 +242,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (frames, accepted, deferred) = (frames.clone(), accepted.clone(), deferred.clone());
             let mut queue: VecDeque<usize> = (0..args.frames_per_sender as usize)
                 .flat_map(|nonce| {
-                    (connection..groups)
-                        .step_by(count)
+                    (connection % stride..groups)
+                        .step_by(stride)
                         .map(move |group| nonce * groups + group)
                 })
                 .collect();
@@ -293,9 +310,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     done.store(true, Ordering::Relaxed);
     let _ = reporter.join();
     let elapsed = send_started.elapsed().as_secs_f64();
-    let accepted = accepted.load(Ordering::Relaxed);
+    let accepted = accepted.load(Ordering::Relaxed) / copies;
     println!(
-        "accepted {accepted}/{total_txs} txs in {elapsed:.2}s ({:.0} tx/s ingest), deferred frames {}",
+        "accepted {accepted}/{total_txs} txs (per node) in {elapsed:.2}s ({:.0} tx/s ingest), deferred frames {}",
         accepted as f64 / elapsed,
         deferred.load(Ordering::Relaxed)
     );

@@ -147,6 +147,7 @@ toml = "1.1"
 # bincode 1.x is protocol-pinned: consensus/network/snapshot bytes are deployed.
 # Moving to bincode 3 requires an explicit versioned wire migration.
 bincode = "1.3"
+rmp-serde = "1.3"
 
 # Async
 tokio = { version = "1.53.2", features = ["full"] }

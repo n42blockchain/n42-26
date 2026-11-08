@@ -446,7 +446,10 @@ impl ConsensusService {
         let current_view = build_context.view;
         let blob_store = self.blob_store.clone();
         let eager_import_done_tx = self.eager_import_done_tx.clone();
-        let state_diff_ready_tx = self.state_diff_ready_tx.clone();
+        // The diff feeds only the JMT/Twig sidecars; without one, decoding the
+        // execution output a second time is wasted work on every block.
+        let state_diff_ready_tx =
+            (self.jmt.is_some() || self.twig.is_some()).then(|| self.state_diff_ready_tx.clone());
         let build_complete_tx = self.build_complete_tx.clone();
         let completed_context = build_context;
         let block_guard = self.eager_import_block_guard.clone();
@@ -646,7 +649,8 @@ impl ConsensusService {
             let leader_ready_unix_ms = broadcast.leader_ready_unix_ms;
             let block_data_received = std::time::Instant::now();
             let eager_done_tx = self.eager_import_done_tx.clone();
-            let state_diff_ready_tx = self.state_diff_ready_tx.clone();
+            let state_diff_ready_tx = (self.jmt.is_some() || self.twig.is_some())
+                .then(|| self.state_diff_ready_tx.clone());
             let block_guard = self.eager_import_block_guard.clone();
             let exec_cache = self.exec_output_cache.clone();
             let bad_blocks = self.bad_blocks.clone();
@@ -729,14 +733,14 @@ impl ConsensusService {
                 // cache injection. Derive the sidecar delta on a blocking
                 // worker while new_payload and consensus progress, then expose
                 // it only if reth validates this exact payload below.
-                let state_diff_task = execution_output_compressed.as_ref().map(|exec_bytes| {
+                let state_diff_task = state_diff_ready_tx.clone().zip(execution_output_compressed.as_ref()).map(|(state_diff_ready_tx, exec_bytes)| {
                     let exec_bytes = exec_bytes.clone();
-                    tokio::task::spawn_blocking(move || {
+                    (state_diff_ready_tx, tokio::task::spawn_blocking(move || {
                         ConsensusService::extract_state_diff_from_execution_output(
                             hash,
                             &exec_bytes,
                         )
-                    })
+                    }))
                 });
 
                 // Compact Block: load execution output into payload cache before `new_payload`.
@@ -848,7 +852,7 @@ impl ConsensusService {
                         {
                             debug!(target: "n42::cl::exec_bridge", %hash, view, "eager import completion receiver dropped");
                         }
-                        if let Some(task) = state_diff_task {
+                        if let Some((state_diff_ready_tx, task)) = state_diff_task {
                             match task.await {
                                 Ok(Some(state_diff)) => {
                                     if state_diff_ready_tx.send((hash, state_diff)).await.is_err() {
@@ -1440,7 +1444,7 @@ async fn handle_built_payload(
     exec_output_cache: Option<Arc<dyn ExecutionOutputCache>>,
     bad_blocks: super::bad_block_cache::BadBlockCache,
     eager_import_done_tx: mpsc::Sender<EagerImportDone>,
-    state_diff_ready_tx: mpsc::Sender<super::StateDiffReady>,
+    state_diff_ready_tx: Option<mpsc::Sender<super::StateDiffReady>>,
     block_guard: Arc<std::sync::atomic::AtomicU64>,
     build_start: Instant,
     build_context: super::PayloadBuildContext,
@@ -1664,12 +1668,15 @@ async fn handle_built_payload(
     // Compact Block: the execution output was serialized alongside payload JSON
     // above so followers can skip EVM re-execution without extending the leader
     // critical path by another full serialization pass.
-    let state_diff_task = execution_output_bytes.as_ref().map(|exec_bytes| {
-        let exec_bytes = exec_bytes.clone();
-        tokio::task::spawn_blocking(move || {
-            ConsensusService::extract_state_diff_from_execution_output(hash, &exec_bytes)
-        })
-    });
+    let state_diff_task = state_diff_ready_tx
+        .zip(execution_output_bytes.as_ref())
+        .map(|(state_diff_ready_tx, exec_bytes)| {
+            let exec_bytes = exec_bytes.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                ConsensusService::extract_state_diff_from_execution_output(hash, &exec_bytes)
+            });
+            (state_diff_ready_tx, task)
+        });
     let leader_ready_unix_ms = now_unix_ms();
     info!(
         target: "n42::cl::exec_bridge",
@@ -1799,7 +1806,7 @@ async fn handle_built_payload(
             {
                 debug!(target: "n42::cl::exec_bridge", %hash, "leader eager import completion receiver dropped");
             }
-            if let Some(task) = state_diff_task {
+            if let Some((state_diff_ready_tx, task)) = state_diff_task {
                 match task.await {
                     Ok(Some(state_diff)) => {
                         if state_diff_ready_tx.send((hash, state_diff)).await.is_err() {

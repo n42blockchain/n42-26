@@ -531,6 +531,248 @@ pub struct CompactBlockExecution {
     pub transactions_root: Option<B256>,
 }
 
+/// First byte of a MessagePack compact execution blob. A JSON blob starts with
+/// `{`, so the decoder tells the two apart and still reads the JSON that older
+/// leaders send.
+const COMPACT_EXECUTION_MSGPACK: u8 = 0x01;
+
+/// The MessagePack body. Receipts get their own plain form: the receipt's serde
+/// writes quantities that do not read back in a binary format.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CompactExecutionWire<B> {
+    bundle_state: B,
+    receipts: Vec<ReceiptWire>,
+    requests: alloy_eips::eip7685::Requests,
+    gas_used: u64,
+    blob_gas_used: u64,
+    senders: Vec<Address>,
+    transactions_root: Option<B256>,
+}
+
+/// One receipt: EIP-2718 type byte, status, cumulative gas, and each log as
+/// (address, topics, data).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReceiptWire(
+    u8,
+    bool,
+    u64,
+    Vec<(Address, Vec<B256>, alloy_primitives::Bytes)>,
+);
+
+impl From<&n42_tx_types::Receipt> for ReceiptWire {
+    fn from(receipt: &n42_tx_types::Receipt) -> Self {
+        Self(
+            u8::from(receipt.tx_type),
+            receipt.success,
+            receipt.cumulative_gas_used,
+            receipt
+                .logs
+                .iter()
+                .map(|log| {
+                    (
+                        log.address,
+                        log.data.topics().to_vec(),
+                        log.data.data.clone(),
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+impl TryFrom<ReceiptWire> for n42_tx_types::Receipt {
+    type Error = String;
+
+    fn try_from(
+        ReceiptWire(ty, success, cumulative_gas_used, logs): ReceiptWire,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            tx_type: n42_tx_types::N42TxType::try_from(ty)
+                .map_err(|_| format!("unknown receipt type {ty:#x}"))?,
+            success,
+            cumulative_gas_used,
+            logs: logs
+                .into_iter()
+                .map(|(address, topics, data)| alloy_primitives::Log {
+                    address,
+                    data: alloy_primitives::LogData::new_unchecked(topics, data),
+                })
+                .collect(),
+        })
+    }
+}
+
+impl CompactBlockExecution {
+    /// The uncompressed wire form: [`COMPACT_EXECUTION_MSGPACK`], then
+    /// [`CompactExecutionWire`] as positional MessagePack. Hashes,
+    /// balances and addresses stay raw bytes instead of JSON's hex strings,
+    /// which is where JSON spent its time.
+    pub fn encode(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+        let wire = CompactExecutionWire {
+            bundle_state: &self.bundle_state,
+            receipts: self.receipts.iter().map(ReceiptWire::from).collect(),
+            requests: self.requests.clone(),
+            gas_used: self.gas_used,
+            blob_gas_used: self.blob_gas_used,
+            senders: self.senders.clone(),
+            transactions_root: self.transactions_root,
+        };
+        let mut out = vec![COMPACT_EXECUTION_MSGPACK];
+        rmp_serde::encode::write(&mut out, &wire)?;
+        Ok(out)
+    }
+
+    /// Reads either form of [`Self::encode`]: MessagePack, or legacy JSON.
+    pub fn decode(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let Some((&COMPACT_EXECUTION_MSGPACK, body)) = bytes.split_first() else {
+            return Ok(serde_json::from_slice(bytes)?);
+        };
+        let wire: CompactExecutionWire<revm::database::states::BundleState> =
+            rmp_serde::from_slice(body)?;
+        Ok(Self {
+            bundle_state: wire.bundle_state,
+            receipts: wire
+                .receipts
+                .into_iter()
+                .map(n42_tx_types::Receipt::try_from)
+                .collect::<Result<_, _>>()?,
+            requests: wire.requests,
+            gas_used: wire.gas_used,
+            blob_gas_used: wire.blob_gas_used,
+            senders: wire.senders,
+            transactions_root: wire.transactions_root,
+        })
+    }
+}
+
+#[cfg(test)]
+mod compact_execution_codec_tests {
+    use super::CompactBlockExecution;
+    use alloy_primitives::{Address, B256, Bytes, Log, LogData, U256};
+    use revm::{bytecode::Bytecode, database::states::BundleState, state::AccountInfo};
+
+    fn sample(accounts: usize) -> CompactBlockExecution {
+        let code = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xf3]));
+        let code_hash = code.hash_slow();
+        let state = (0..accounts).map(|i| {
+            let address = Address::with_last_byte(i as u8).create(i as u64);
+            let info = |nonce: u64| AccountInfo {
+                balance: U256::from(10u128.pow(20)) - U256::from(i),
+                nonce,
+                code_hash: if i == 0 {
+                    code_hash
+                } else {
+                    revm::primitives::KECCAK_EMPTY
+                },
+                code: None,
+                ..Default::default()
+            };
+            let storage = if i % 10 == 0 {
+                [(U256::from(i), (U256::ZERO, U256::from(i + 1)))]
+                    .into_iter()
+                    .collect()
+            } else {
+                Default::default()
+            };
+            (
+                address,
+                Some(info(i as u64)),
+                Some(info(i as u64 + 1)),
+                storage,
+            )
+        });
+        let bundle = BundleState::new(
+            state,
+            Vec::<Vec<(Address, Option<Option<AccountInfo>>, Vec<(U256, U256)>)>>::new(),
+            [(code_hash, code)],
+        );
+        let receipts = (0..accounts)
+            .map(|i| n42_tx_types::Receipt {
+                tx_type: if i % 2 == 0 {
+                    n42_tx_types::N42TxType::AltSig
+                } else {
+                    n42_tx_types::N42TxType::Eth(alloy_consensus::TxType::Eip1559)
+                },
+                success: true,
+                cumulative_gas_used: 21_000 * (i as u64 + 1),
+                logs: if i % 50 == 0 {
+                    vec![Log {
+                        address: Address::repeat_byte(7),
+                        data: LogData::new_unchecked(
+                            vec![B256::repeat_byte(1)],
+                            Bytes::from_static(b"data"),
+                        ),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect();
+        CompactBlockExecution {
+            bundle_state: bundle,
+            receipts,
+            requests: Default::default(),
+            gas_used: 21_000 * accounts as u64,
+            blob_gas_used: 0,
+            senders: (0..accounts)
+                .map(|i| Address::with_last_byte(i as u8))
+                .collect(),
+            transactions_root: Some(B256::repeat_byte(9)),
+        }
+    }
+
+    fn same(a: &CompactBlockExecution, b: &CompactBlockExecution) {
+        assert_eq!(a.bundle_state, b.bundle_state);
+        assert_eq!(a.receipts, b.receipts);
+        assert_eq!(a.requests, b.requests);
+        assert_eq!((a.gas_used, a.blob_gas_used), (b.gas_used, b.blob_gas_used));
+        assert_eq!(a.senders, b.senders);
+        assert_eq!(a.transactions_root, b.transactions_root);
+    }
+
+    #[test]
+    fn msgpack_round_trips_and_json_still_decodes() {
+        let compact = sample(200);
+        same(
+            &compact,
+            &CompactBlockExecution::decode(&compact.encode().unwrap()).unwrap(),
+        );
+        same(
+            &compact,
+            &CompactBlockExecution::decode(&serde_json::to_vec(&compact).unwrap()).unwrap(),
+        );
+        assert!(CompactBlockExecution::decode(&[0x01, 0xff]).is_err());
+        assert!(CompactBlockExecution::decode(&[]).is_err());
+    }
+
+    /// `cargo test -p n42-consensus-service --release compact_codec_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn compact_codec_speed() {
+        let compact = sample(95_238);
+        let time = |label: &str, f: &dyn Fn() -> usize| {
+            let start = std::time::Instant::now();
+            let len = f();
+            println!("{label}: {:?} ({len} bytes)", start.elapsed());
+        };
+        let json = serde_json::to_vec(&compact).unwrap();
+        let msgpack = compact.encode().unwrap();
+        time("json encode", &|| {
+            serde_json::to_vec(&compact).unwrap().len()
+        });
+        time("msgpack encode", &|| compact.encode().unwrap().len());
+        time("json decode", &|| {
+            CompactBlockExecution::decode(&json).unwrap().receipts.len()
+        });
+        time("msgpack decode", &|| {
+            CompactBlockExecution::decode(&msgpack)
+                .unwrap()
+                .receipts
+                .len()
+        });
+    }
+}
+
 /// Blob sidecar broadcast via /n42/blobs/1 GossipSub topic.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct BlobSidecarBroadcast {
