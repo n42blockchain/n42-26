@@ -431,12 +431,30 @@ where
             evm_config,
             base_config: EthereumBuilderConfig::new()
                 .with_gas_limit(gas_limit)
-                .with_max_blobs_per_block(conf.max_blobs_per_block()),
+                .with_max_blobs_per_block(conf.max_blobs_per_block())
+                .with_skip_state_root(builder_state_root_replaced()),
             consensus_state: self.consensus_state,
             eof_guard: self.eof_guard,
             parallel_transfers: crate::parallel_payload::enabled(),
         })
     }
+}
+
+static BUILDER_STATE_ROOT_REPLACED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Declares that every payload this process builds has its state root
+/// replaced before it is proposed (H2-v4 participant mode: the consensus
+/// bridge normalizes the block to the Gov5 header profile and writes the QMDB
+/// root). The builder then skips its own MPT state root, which would be
+/// computed only to be discarded. Must be called before the node launches.
+pub fn set_builder_state_root_replaced(replaced: bool) {
+    BUILDER_STATE_ROOT_REPLACED.store(replaced, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether built payloads have their state root replaced before proposal.
+pub fn builder_state_root_replaced() -> bool {
+    BUILDER_STATE_ROOT_REPLACED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Inner payload builder using the standard Ethereum payload flow.

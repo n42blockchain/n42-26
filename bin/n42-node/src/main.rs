@@ -1419,6 +1419,9 @@ fn main() {
                 "N42_OBSERVER_MODE and N42_GOV5_H2_PARTICIPANT are mutually exclusive"
             ));
         }
+        // H2-v4 participants replace the builder's state root with the QMDB
+        // root during Gov5 normalization, so the builder's MPT root is skipped.
+        n42_node::payload::set_builder_state_root_replaced(h2_v4_participant);
         let header_profile = resolve_header_profile(
             observer_mode || h2_v4_participant,
             env_bool("N42_GOV5_HEADER_PROFILE"),

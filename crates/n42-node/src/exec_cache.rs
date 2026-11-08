@@ -57,6 +57,10 @@ impl ExecutionOutputCache for RethExecutionOutputCache {
         take_gov5_normalization_roots(execution, self.qmdb_store.as_deref(), &self.chain_spec)
     }
 
+    fn built_transactions_root(&self, hash: B256) -> Option<B256> {
+        reth_evm::payload_cache::payload_transactions_root(&hash)
+    }
+
     fn rekey_gov5_normalized(
         &self,
         original: &alloy_rpc_types_engine::ExecutionData,

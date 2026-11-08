@@ -1682,6 +1682,19 @@ impl ConsensusService {
         requested_hash: Option<B256>,
     ) {
         const MAX_H2_V4_UNBOUND_BLOCKS: usize = 512;
+        // The leader sends each block as native block data and as a Gov5
+        // block; the native copy usually arrives first. Hashing the header is
+        // enough to recognise it, before the full decode (every transaction
+        // and the transaction root) runs on the consensus loop. A requested
+        // body keeps the full path: its fetch bookkeeping needs the decode.
+        if requested_hash.is_none()
+            && let Some(hash) = n42_network::gov5_attributable_hash(&rlp)
+            && self.pending_block_data.contains_key(&hash)
+        {
+            counter!("n42_h2_v4_gov5_block_already_cached_total").increment(1);
+            self.retire_h2_v4_fetch_satisfied_elsewhere(hash).await;
+            return;
+        }
         let block = match n42_network::decode_gov5_block_rlp(&rlp) {
             Ok(block) => block,
             Err(error) => {
@@ -1935,6 +1948,18 @@ impl ConsensusService {
         block: n42_network::Gov5GossipBlock,
         view: u64,
     ) {
+        // The leader sends each block twice: as native block data and as a Gov5
+        // block. When the native copy is already cached, the envelope built
+        // below is dropped by `handle_block_data` as a duplicate of this hash;
+        // skip building it. Rebuilding the payload (a transactions root over
+        // the whole body), encoding, compressing and decoding it again ran on
+        // the consensus loop and delayed this node's vote by ~300 ms per full
+        // block.
+        if self.pending_block_data.contains_key(&block.block_hash) {
+            counter!("n42_h2_v4_gov5_block_already_cached_total").increment(1);
+            debug!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, "native block data already cached; Gov5 copy not converted");
+            return;
+        }
         let mut execution_data = match crate::replay_import::build_gov5_gossip_execution_data(
             &block,
         ) {

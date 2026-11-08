@@ -1475,11 +1475,15 @@ async fn handle_built_payload(
                 return;
             }
         };
-        let normalized = match n42_network::normalize_execution_payload_for_gov5_h2(
+        let transactions_root = exec_output_cache
+            .as_ref()
+            .and_then(|cache| cache.built_transactions_root(original_hash));
+        let normalized = match n42_network::normalize_execution_payload_for_gov5_h2_with_transactions_root(
             &execution_data,
             current_view,
             gov5_state_root,
             gov5_receipts_root,
+            transactions_root,
         ) {
             Ok(normalized) => normalized,
             Err(error) => {
@@ -1527,67 +1531,20 @@ async fn handle_built_payload(
     if bad_blocks.should_skip(hash, "leader_built_payload") {
         return;
     }
-    if h2_v4_participant {
+    // H2 participants release the proposal only after new_payload(Valid) of
+    // the normalized block. Start that validation now and let it run while
+    // the payload is serialized and sent: followers validate independently
+    // before voting, so sending first does not let an invalid block gather
+    // votes, and it overlaps ~0.5 s of leader validation with the transfer.
+    let leader_validation = h2_v4_participant.then(|| {
+        let el = el.clone();
+        let data = execution_data.clone();
         let import_start = std::time::Instant::now();
-        match el
-            .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, execution_data.clone())
-            .await
-        {
-            Ok(status) if payload_was_fully_validated(&status.status) => {
-                mark_eager_import_valid(block_guard.as_ref(), block_number);
-                info!(
-                    target: "n42::interop::h2v4",
-                    %hash,
-                    block_number,
-                    elapsed_ms = import_start.elapsed().as_millis() as u64,
-                    "validated normalized Gov5 leader payload before proposal release"
-                );
-                if eager_import_done_tx
-                    // This completion precedes Gov5 payload serialization, so
-                    // stay conservative and force the ordinary staking scan.
-                    .send((
-                        hash,
-                        block_timestamp,
-                        actual_parent,
-                        block_number,
-                        true,
-                        None,
-                    ))
-                    .await
-                    .is_err()
-                {
-                    debug!(target: "n42::cl::exec_bridge", %hash, "leader eager import completion receiver dropped");
-                }
-            }
-            Ok(status) => {
-                if let Some(ref cache) = exec_output_cache {
-                    cache.evict(hash);
-                }
-                bad_blocks.insert_if_invalid(hash, &status.status, "gov5_leader_pre_proposal");
-                error!(
-                    target: "n42::interop::h2v4",
-                    %hash,
-                    block_number,
-                    status = ?status.status,
-                    "refusing to release Gov5 leader proposal before new_payload(Valid)"
-                );
-                return;
-            }
-            Err(error) => {
-                if let Some(ref cache) = exec_output_cache {
-                    cache.evict(hash);
-                }
-                error!(
-                    target: "n42::interop::h2v4",
-                    %hash,
-                    block_number,
-                    %error,
-                    "refusing to release Gov5 leader proposal after new_payload failure"
-                );
-                return;
-            }
-        }
-    }
+        let task = tokio::spawn(async move {
+            el.new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, data).await
+        });
+        (import_start, task)
+    });
     {
         let span = tracing::Span::current();
         span.record("hash", tracing::field::display(&hash));
@@ -1696,23 +1653,9 @@ async fn handle_built_payload(
         has_compact_block = execution_output_bytes.is_some(),
         "N42_TIMEOUT_VIEW: leader_ready"
     );
+    // The native header was remembered during normalization; it does not
+    // depend on the Gov5 encoding below.
     let native_header_rlp = if h2_v4_participant {
-        let encode_start = Instant::now();
-        let gov5_rlp = match n42_network::encode_gov5_block_rlp(&execution_data) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                error!(target: "n42::interop::h2v4", %hash, %error, "refusing to propose a payload that cannot be encoded for gov5 peers");
-                return;
-            }
-        };
-        let gov5_encode_ms = encode_start.elapsed().as_millis() as u64;
-        metrics::histogram!("n42_gov5_block_encode_ms").record(gov5_encode_ms as f64);
-        info!(target: "n42::cl::exec_bridge", %hash, tx_count, gov5_encode_ms,
-            gov5_bytes = gov5_rlp.len(), "N42_LEADER_GOV5_ENCODE: native block encoded");
-        if let Err(error) = network.broadcast_gov5_block_reliable(gov5_rlp).await {
-            error!(target: "n42::interop::h2v4", %hash, %error, "refusing to propose after gov5 block broadcast failed");
-            return;
-        }
         match n42_consensus::gov5_native_header_rlp(&hash) {
             Some(raw) => Some(raw.to_vec()),
             None => {
@@ -1723,7 +1666,9 @@ async fn handle_built_payload(
     } else {
         None
     };
-    // 1. Broadcast block data + blob sidecars to followers
+    // 1. Broadcast block data + blob sidecars to followers. Native peers start
+    //    validating now; the Gov5 copy below costs ~130 ms per full block and
+    //    used to run first.
     broadcast_block_data(
         network.clone(),
         &leader_payload_tx,
@@ -1744,6 +1689,90 @@ async fn handle_built_payload(
         current_view,
         blob_store,
     );
+    // The proposal is still released only after the Gov5 copy is out.
+    if h2_v4_participant {
+        let encode_start = Instant::now();
+        let gov5_rlp = match n42_network::encode_gov5_block_rlp(&execution_data) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                error!(target: "n42::interop::h2v4", %hash, %error, "refusing to propose a payload that cannot be encoded for gov5 peers");
+                return;
+            }
+        };
+        let gov5_encode_ms = encode_start.elapsed().as_millis() as u64;
+        metrics::histogram!("n42_gov5_block_encode_ms").record(gov5_encode_ms as f64);
+        info!(target: "n42::cl::exec_bridge", %hash, tx_count, gov5_encode_ms,
+            gov5_bytes = gov5_rlp.len(), "N42_LEADER_GOV5_ENCODE: native block encoded");
+        if let Err(error) = network.broadcast_gov5_block_reliable(gov5_rlp).await {
+            error!(target: "n42::interop::h2v4", %hash, %error, "refusing to propose after gov5 block broadcast failed");
+            return;
+        }
+    }
+
+    if let Some((import_start, task)) = leader_validation {
+        let outcome = match task.await {
+            Ok(outcome) => outcome,
+            Err(join_error) => {
+                error!(target: "n42::interop::h2v4", %hash, block_number, %join_error, "Gov5 leader validation task failed");
+                return;
+            }
+        };
+        match outcome {
+            Ok(status) if payload_was_fully_validated(&status.status) => {
+                mark_eager_import_valid(block_guard.as_ref(), block_number);
+                info!(
+                    target: "n42::interop::h2v4",
+                    %hash,
+                    block_number,
+                    elapsed_ms = import_start.elapsed().as_millis() as u64,
+                    "validated normalized Gov5 leader payload before proposal release"
+                );
+                if eager_import_done_tx
+                    // The staking scan of the serialized payload is not
+                    // wired here; stay conservative and force the scan.
+                    .send((
+                        hash,
+                        block_timestamp,
+                        actual_parent,
+                        block_number,
+                        true,
+                        None,
+                    ))
+                    .await
+                    .is_err()
+                {
+                    debug!(target: "n42::cl::exec_bridge", %hash, "leader eager import completion receiver dropped");
+                }
+            }
+            Ok(status) => {
+                if let Some(ref cache) = exec_output_cache {
+                    cache.evict(hash);
+                }
+                bad_blocks.insert_if_invalid(hash, &status.status, "gov5_leader_pre_proposal");
+                error!(
+                    target: "n42::interop::h2v4",
+                    %hash,
+                    block_number,
+                    status = ?status.status,
+                    "refusing to release Gov5 leader proposal before new_payload(Valid)"
+                );
+                return;
+            }
+            Err(error) => {
+                if let Some(ref cache) = exec_output_cache {
+                    cache.evict(hash);
+                }
+                error!(
+                    target: "n42::interop::h2v4",
+                    %hash,
+                    block_number,
+                    %error,
+                    "refusing to release Gov5 leader proposal after new_payload failure"
+                );
+                return;
+            }
+        }
+    }
 
     // 2. Trigger consensus voting immediately (non-blocking channel send)
     if block_ready_tx

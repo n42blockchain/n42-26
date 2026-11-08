@@ -110,15 +110,50 @@ where
         // This pass only needs the standard header hash. Build it from raw
         // envelopes; the upstream validator below still decodes every
         // transaction and checks the standard header and fork-specific fields.
-        let standard_header = standard_payload.clone().into_block_raw()?.header;
-        standard_payload
-            .payload
-            .set_block_hash(standard_header.hash_slow());
+        //
+        // The transaction root is the costly part (one keccak trie over every
+        // envelope). Reuse a root cached for the native hash, as for a block
+        // this node built, and lend the root to the upstream validator under
+        // the standard hash so it is computed at most once per payload. The
+        // cache is keyed by hash, so a concurrent overwrite only costs a
+        // recomputation. The root comes from these exact envelopes, and both
+        // the standard and the native hash are still checked against the
+        // rebuilt headers.
+        let cached_root = reth_evm::payload_cache::payload_transactions_root(&expected_hash);
+        let standard_header = match cached_root {
+            Some(root) => standard_payload
+                .payload
+                .clone()
+                .into_block_with_sidecar_raw_with_transactions_root(
+                    &standard_payload.sidecar,
+                    root,
+                )?,
+            None => standard_payload.clone().into_block_raw()?,
+        }
+        .header;
+        let standard_hash = standard_header.hash_slow();
+        standard_payload.payload.set_block_hash(standard_hash);
+        let lend_root =
+            reth_evm::payload_cache::payload_transactions_root(&standard_hash).is_none();
+        if lend_root {
+            reth_evm::payload_cache::store_payload_transactions_root(
+                standard_hash,
+                standard_header.transactions_root,
+            );
+        }
         drop(prepare_timer);
         let standard_timer = PayloadConversionTimer::new("ethereum_validate");
         let standard = self
             .payload
-            .ensure_well_formed_payload::<N42TxEnvelope>(standard_payload)?;
+            .ensure_well_formed_payload::<N42TxEnvelope>(standard_payload);
+        if lend_root {
+            // The cache holds one entry: give the slot back to the native hash.
+            reth_evm::payload_cache::remove_payload_transactions_root(&standard_hash);
+            if let Some(root) = cached_root {
+                reth_evm::payload_cache::store_payload_transactions_root(expected_hash, root);
+            }
+        }
+        let standard = standard?;
         drop(standard_timer);
         let _native_timer = PayloadConversionTimer::new("native_header_bind");
         let mut block = standard.into_block();

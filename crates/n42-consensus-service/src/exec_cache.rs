@@ -31,6 +31,12 @@ pub trait ExecutionOutputCache: Send + Sync {
         None
     }
 
+    /// The transaction root this adapter holds for a locally built payload,
+    /// so normalization need not recompute it. `None` when unknown.
+    fn built_transactions_root(&self, _hash: B256) -> Option<B256> {
+        None
+    }
+
     /// Move a locally built execution result to the normalized block hash only
     /// when the adapter can prove the EVM inputs are unchanged. A miss returns
     /// false and the leader validates through ordinary execution.

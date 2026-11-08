@@ -28,6 +28,7 @@ bitvec.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 alloy-consensus.workspace = true
+n42-tx-types.workspace = true
 alloy-eips.workspace = true
 alloy-rpc-types-engine.workspace = true
 
@@ -59,3 +60,4 @@ metrics.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+ed25519-dalek = { version = "3.0", default-features = false }

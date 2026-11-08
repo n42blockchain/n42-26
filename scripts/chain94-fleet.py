@@ -337,13 +337,21 @@ def _start(args, children, cancelled):
     low_memory = not fresh
     disable_forward = bool(getattr(args, "disable_tx_forward", False))
     single_flight = bool(getattr(args, "import_single_flight", False))
+    # Explicit per-run node settings (e.g. the 0x50 frame gateways); the
+    # inherited environment's N42_* variables are still dropped below.
+    extra_env = {}
+    for item in getattr(args, "env", None) or []:
+        key, sep, value = item.partition("=")
+        if not sep or not key.startswith("N42_"):
+            raise ValueError(f"--env takes N42_NAME=value, got {item!r}")
+        extra_env[key] = value
     gov5_reuse = os.environ.get("N42_GOV5_REUSE_BUILDER_EXECUTION", "1")
     if gov5_reuse not in {"0", "1"}:
         raise ValueError("N42_GOV5_REUSE_BUILDER_EXECUTION must be 0 or 1")
     run = dict(foreground=bool(getattr(args, "foreground", False)), low_memory=low_memory, disable_tx_forward=disable_forward, max_txs_per_block=max_txs, build_budget_ms=build_budget, rpc_max_response_mb=rpc_max_response_mb, binary=str(binary), sha256=digest(binary), started=time.time(),
                block_interval_ms=consensus_config["slot_time_ms"],
                immediate_persistence=dict(persistence_threshold=0, state_masking_blocks=0, memory_block_buffer_target=0),
-               import_single_flight=single_flight, fast_transfers=args.fast_transfers, parallel_build=args.parallel_build, parallel_import=args.parallel_import, qmdb_reads=args.qmdb_reads, gov5_reuse_builder_execution=gov5_reuse,
+               import_single_flight=single_flight, extra_env=extra_env, fast_transfers=args.fast_transfers, parallel_build=args.parallel_build, parallel_import=args.parallel_import, qmdb_reads=args.qmdb_reads, gov5_reuse_builder_execution=gov5_reuse,
                log_offsets={str(i): (runtime / f"logs/node{i}.log").stat().st_size
                             if (runtime / f"logs/node{i}.log").exists() else 0 for i in range(count)})
     write_json(runtime / "run.json", run)
@@ -385,6 +393,7 @@ def _start(args, children, cancelled):
             "RAYON_NUM_THREADS": "8", "TOKIO_WORKER_THREADS": "8",
             "RUST_LOG": "info",
         })
+        env.update(extra_env)
         if "max_txs_per_block" in manifest or getattr(args, "max_txs_per_block", None) is not None:
             env["N42_MAX_TXS_PER_BLOCK"] = str(max_txs)
         if "build_budget_ms" in manifest or getattr(args, "build_budget_ms", None) is not None:
@@ -532,6 +541,7 @@ def main():
     start_parser.add_argument("--rpc-max-response-mb", type=int, default=160, help="bounded JSON-RPC response limit in MiB (16..512)")
     start_parser.add_argument("--max-txs-per-block", type=int, help="explicit block transaction cap; defaults to the fleet manifest")
     start_parser.add_argument("--build-budget-ms", type=int, help="explicit payload build time budget; defaults to the fleet manifest")
+    start_parser.add_argument("--env", action="append", metavar="N42_NAME=VALUE", help="extra node setting, repeatable; recorded in run.json and applied after the fleet's own")
     start_parser.add_argument("--qmdb-reads", choices=("off", "verify", "on", "only"), default="off", help="explicit state-reader mode, recorded in run.json and passed to every node")
     sub.add_parser("stop")
     sub.add_parser("status")

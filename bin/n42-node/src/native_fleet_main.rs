@@ -41,6 +41,14 @@ struct Args {
     gas_limit: u64,
     #[arg(long, default_value_t = 220_000)]
     max_txs_per_block: usize,
+    /// Admit native 0x50 (Ed25519) transactions: sets `altSigTx` in genesis.
+    #[arg(long)]
+    alt_sig: bool,
+    /// File of comma-separated addresses to fund, e.g. `native-flood
+    /// --print-addresses` output (0x50 senders derive their address from
+    /// their key, so they are not among the secp256k1 test senders).
+    #[arg(long, requires = "alt_sig")]
+    alt_sig_fund: Option<PathBuf>,
 }
 
 fn write_new(path: &Path, data: &[u8]) -> eyre::Result<()> {
@@ -205,7 +213,20 @@ fn generate(args: Args) -> eyre::Result<()> {
         );
         recipients.push(address);
     }
-    let genesis_value = json!({
+    let mut alt_sig_funded = 0usize;
+    if let Some(path) = &args.alt_sig_fund {
+        for address in fs::read_to_string(path)?.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+            let address: Address = address.parse()?;
+            eyre::ensure!(
+                alloc
+                    .insert(address, json!({"balance":"0x4B3B4CA85A86C47A098A224000000"}))
+                    .is_none(),
+                "0x50 sender {address} collides with another genesis account"
+            );
+            alt_sig_funded += 1;
+        }
+    }
+    let mut genesis_value = json!({
         "config": {
             "chainId":args.chain_id,"homesteadBlock":0,"eip150Block":0,"eip155Block":0,"eip158Block":0,
             "byzantiumBlock":0,"constantinopleBlock":0,"petersburgBlock":0,"istanbulBlock":0,"muirGlacierBlock":0,
@@ -220,7 +241,14 @@ fn generate(args: Args) -> eyre::Result<()> {
         "difficulty":"0x0","mixHash":B256::ZERO,"coinbase":consensus.initial_validators[0].address,
         "alloc":alloc,"baseFeePerGas":"0x7","excessBlobGas":"0x0","blobGasUsed":"0x0"
     });
+    if args.alt_sig {
+        genesis_value["config"][n42_chainspec::native::ALT_SIG_TX_KEY] = json!(true);
+    }
     let genesis: Genesis = serde_json::from_value(genesis_value.clone())?;
+    eyre::ensure!(
+        n42_chainspec::native::alt_sig_tx_enabled(&genesis) == args.alt_sig,
+        "altSigTx did not survive the genesis round trip"
+    );
     let tree = gov5_qmdb_genesis_tree(&genesis)?;
     let chain = reth_chainspec::ChainSpec::from_genesis(genesis);
     let mut header = chain.genesis_header().clone();
@@ -297,6 +325,7 @@ fn generate(args: Args) -> eyre::Result<()> {
         "snapshot":{"block_number":0,"block_hash":hash,"state_root":native.header.state_root},
         "ports":{"http":23400,"auth":23500,"metrics":23600,"consensus":33400,"p2p":31400,"mobile":9840,"ingest":34400},
         "senders":args.senders,"recipients":args.recipients,"gas_limit":args.gas_limit,
+        "alt_sig_tx":args.alt_sig,"alt_sig_funded":alt_sig_funded,
         "max_txs_per_block":args.max_txs_per_block,"build_budget_ms":args.slot_ms,"artifacts_sha256":artifact_hashes,"runtime_sha256":runtime_hashes,
         "source":"new genesis; no existing chain snapshot or signed roster was altered",
         "recipient_rule":"last20(keccak256(UTF8(n42-recipient-{decimal index})))",
@@ -353,11 +382,42 @@ mod tests {
             slot_ms: 200,
             gas_limit: 5_000_000_000,
             max_txs_per_block: 220_000,
+            alt_sig: false,
+            alt_sig_fund: None,
         })
         .unwrap();
         let genesis: Genesis =
             serde_json::from_slice(&fs::read(output.join("artifacts/genesis.json")).unwrap())
                 .unwrap();
         n42_node::sinks::Gov5WithdrawalSource::from_genesis(&genesis, Address::ZERO).unwrap();
+    }
+
+    #[test]
+    fn alt_sig_fleet_sets_the_flag_and_funds_listed_senders() {
+        let directory = tempfile::tempdir().unwrap();
+        let fund = directory.path().join("senders.txt");
+        let senders = [Address::repeat_byte(0x51), Address::repeat_byte(0x52)];
+        fs::write(&fund, format!("{},{}\n", senders[0], senders[1])).unwrap();
+        let output = directory.path().join("alt");
+        generate(Args {
+            output: output.clone(),
+            validators: 4,
+            chain_id: 941050,
+            senders: 1,
+            recipients: 0,
+            slot_ms: 200,
+            gas_limit: 2_000_000_000,
+            max_txs_per_block: 95_238,
+            alt_sig: true,
+            alt_sig_fund: Some(fund),
+        })
+        .unwrap();
+        let genesis: Genesis =
+            serde_json::from_slice(&fs::read(output.join("artifacts/genesis.json")).unwrap())
+                .unwrap();
+        assert!(n42_chainspec::native::alt_sig_tx_enabled(&genesis));
+        for sender in senders {
+            assert!(genesis.alloc[&sender].balance > alloy_primitives::U256::from(1u64) << 100);
+        }
     }
 }

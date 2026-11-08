@@ -1,5 +1,6 @@
 use crate::{decode_compact_receipts, gov5_native_receipts_root};
-use alloy_consensus::{Header as ConsensusHeader, TxEnvelope, proofs::calculate_transaction_root};
+use alloy_consensus::{Header as ConsensusHeader, proofs::calculate_transaction_root};
+use n42_tx_types::N42TxEnvelope;
 use alloy_eips::Decodable2718;
 use alloy_primitives::{B256, keccak256};
 use alloy_rlp::{Decodable, Header as RlpHeader};
@@ -39,7 +40,7 @@ pub struct VerifiedFinalizedRangeEntry {
     header: ConsensusHeader,
     header_rlp: Vec<u8>,
     block_rlp: Vec<u8>,
-    transactions: Vec<TxEnvelope>,
+    transactions: Vec<N42TxEnvelope>,
     receipts: Vec<alloy_consensus::EthereumReceipt>,
 }
 
@@ -99,7 +100,7 @@ impl VerifiedFinalizedRangeEntry {
         &self.block_rlp
     }
 
-    pub fn transactions(&self) -> &[TxEnvelope] {
+    pub fn transactions(&self) -> &[N42TxEnvelope] {
         &self.transactions
     }
 
@@ -258,7 +259,7 @@ fn parse_finalized_range_stream<R: Read>(
         // native Keccak(concatenated receipt RLPs) commitment from block one onward.
         let legacy_genesis_empty_receipts = number == 0
             && receipts.is_empty()
-            && receipts_root == calculate_transaction_root::<TxEnvelope>(&[]);
+            && receipts_root == calculate_transaction_root::<N42TxEnvelope>(&[]);
         if computed_receipts_root != receipts_root && !legacy_genesis_empty_receipts {
             return Err(FinalizedRangeError::ReceiptRootMismatch(number));
         }
@@ -335,7 +336,7 @@ fn embedded_header(block: &[u8]) -> Option<&[u8]> {
     payload.get(..total_len)
 }
 
-fn block_transactions(block: &[u8]) -> Option<Vec<TxEnvelope>> {
+fn block_transactions(block: &[u8]) -> Option<Vec<N42TxEnvelope>> {
     let mut payload = block;
     let outer = RlpHeader::decode(&mut payload).ok()?;
     if !outer.list || outer.payload_length != payload.len() {
@@ -352,7 +353,7 @@ fn block_transactions(block: &[u8]) -> Option<Vec<TxEnvelope>> {
     while !transactions.is_empty() {
         let encoded = rlp_bytes(&mut transactions)?;
         let mut encoded_cursor = encoded;
-        decoded.push(TxEnvelope::decode_2718(&mut encoded_cursor).ok()?);
+        decoded.push(N42TxEnvelope::decode_2718(&mut encoded_cursor).ok()?);
         if !encoded_cursor.is_empty() {
             return None;
         }
@@ -434,7 +435,7 @@ fn io_error(error: std::io::Error) -> FinalizedRangeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_consensus::{SignableTransaction, TxLegacy};
+    use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
     use alloy_eips::Encodable2718;
     use alloy_primitives::{Address, Bytes, Signature, TxKind, U256};
     use alloy_rlp::Encodable;

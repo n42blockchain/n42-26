@@ -1,4 +1,5 @@
-use alloy_consensus::{Block, BlockBody, EMPTY_OMMER_ROOT_HASH, Header, TxEnvelope};
+use alloy_consensus::{Block, BlockBody, EMPTY_OMMER_ROOT_HASH, Header};
+use n42_tx_types::N42TxEnvelope;
 use alloy_eips::eip4895::Withdrawals;
 use alloy_primitives::{B256, keccak256};
 use alloy_rpc_types_engine::ExecutionData;
@@ -99,7 +100,7 @@ pub fn build_replay_execution_plan_with_profile(
 pub fn build_gov5_execution_data(
     block_hash: alloy_primitives::B256,
     header: &Header,
-    transactions: &[TxEnvelope],
+    transactions: &[N42TxEnvelope],
 ) -> Result<ExecutionData, ReplayImportPlanError> {
     build_execution_data(
         block_hash,
@@ -162,7 +163,7 @@ fn gov5_withdrawals(
 fn build_execution_data(
     block_hash: alloy_primitives::B256,
     header: &Header,
-    transactions: &[TxEnvelope],
+    transactions: &[N42TxEnvelope],
     rewards: &[Gov5Reward],
     mobile_registry_root: Option<B256>,
     header_profile: N42HeaderProfile,
@@ -198,7 +199,7 @@ fn build_execution_data(
             .set_extra_data(alloy_primitives::Bytes::new());
     }
     let mut reconstructed = reconstruction_payload
-        .try_into_block::<TxEnvelope>()
+        .try_into_block::<N42TxEnvelope>()
         .map_err(|error| ReplayImportPlanError::PayloadReconstruction(number, error.to_string()))?;
     if replay_v2_header {
         reconstructed.header.withdrawals_root = Some(keccak256([]));
