@@ -38,14 +38,7 @@ if ((${#patch_files[@]} != expected_patch_count)); then
     echo "Expected $expected_patch_count Reth patches from $lock_file; found ${#patch_files[@]}." >&2
     exit 1
 fi
-for patch_file in "${patch_files[@]}"; do
-    if ! git -C "$reth_dir" apply --reverse --check "$patch_file" 2>/dev/null; then
-        echo "Reth source is missing or diverges from $(basename "$patch_file")." >&2
-        exit 1
-    fi
-done
-
-# Reuse the applier's source-revision and patch-series validation after all
-# reverse checks have proved this invocation cannot modify the source.
-bash "$script_dir/apply-reth-patches.sh" "$reth_dir"
+# The applier owns the patch order. In check-only mode it reverses the whole
+# series against the tracked working tree and never modifies the source.
+N42_RETH_CHECK_ONLY=1 bash "$script_dir/apply-reth-patches.sh" "$reth_dir"
 echo "Reth source matches the v2.8.1 N42 patch lock."
