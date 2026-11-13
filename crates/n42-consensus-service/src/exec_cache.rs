@@ -53,6 +53,19 @@ pub trait ExecutionOutputCache: Send + Sync {
     /// whether the inject succeeded.
     fn inject(&self, hash: B256, compressed: &[u8], source: &'static str) -> bool;
 
+    /// Like [`Self::inject`], for a caller that holds the decoded payload the
+    /// output belongs to. An adapter needs the payload when the output carries
+    /// data keyed by the block's execution inputs (shared execution on the
+    /// QMDB route); the default only uses the block hash.
+    fn inject_for_payload(
+        &self,
+        execution: &alloy_rpc_types_engine::ExecutionData,
+        compressed: &[u8],
+        source: &'static str,
+    ) -> bool {
+        self.inject(execution.block_hash(), compressed, source)
+    }
+
     /// Remove a previously injected execution output. Every caller that
     /// injects untrusted bytes must evict them when `new_payload` does not
     /// return `Valid`; otherwise a rejected bundle can poison later arrivals

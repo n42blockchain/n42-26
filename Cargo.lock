@@ -7133,6 +7133,7 @@ dependencies = [
  "n42-twig-core",
  "n42-tx-types",
  "n42-zkproof",
+ "rayon",
  "reth-ethereum-primitives",
  "revm",
  "rmp-serde",

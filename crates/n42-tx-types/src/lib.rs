@@ -9,6 +9,7 @@ mod compact;
 pub mod envelope;
 pub mod execution;
 pub mod frame;
+pub mod frame_store;
 pub mod primitives;
 pub mod rpc;
 pub mod sender_cache;
@@ -22,6 +23,7 @@ pub use frame::{
     binary_merkle_root, frame_attest_message, frame_blocks_requested, frame_root, frame_tree_root,
     frame_tree_root_of,
 };
+pub use frame_store::{FrameStore, StoredFrame, frame_ref_blocks_enabled};
 pub use primitives::{Block, BlockBody, N42Primitives, Receipt};
 pub use rpc::{AltSigRpcReceipt, N42RpcReceipt};
 pub use sender_cache::{

@@ -157,6 +157,8 @@ impl ConfigureEvm for N42EvmConfig {
         let Some(provider) = &self.parallel_import else {
             return Ok(None);
         };
+        let started = std::time::Instant::now();
+        let _record = record_import_batch_time(started);
         crate::parallel_block::try_commit_import_batch(executor, env, transactions, &|| {
             (provider.0)(parent_hash).ok().map(|provider| {
                 reth_revm::database::StateProviderDatabase::new(provider.into_evm_state_provider())
@@ -249,10 +251,17 @@ impl ConfigureEngineEvm<ExecutionData> for N42EvmConfig {
                 N42TxEnvelope::AltSig(alt) => {
                     let cache = AltSigSenderCache::global();
                     match cache.get(alt.hash()) {
-                        Some(sender) => Ok(sender),
-                        None => tx
-                            .try_recover()
-                            .inspect(|sender| cache.insert(*alt.hash(), *sender)),
+                        Some(sender) => {
+                            metrics::counter!("n42_alt_sig_payload_sender_total", "cache" => "hit")
+                                .increment(1);
+                            Ok(sender)
+                        }
+                        None => {
+                            metrics::counter!("n42_alt_sig_payload_sender_total", "cache" => "miss")
+                                .increment(1);
+                            tx.try_recover()
+                                .inspect(|sender| cache.insert(*alt.hash(), *sender))
+                        }
                     }
                 }
                 N42TxEnvelope::Eth(_) => {
@@ -268,6 +277,19 @@ impl ConfigureEngineEvm<ExecutionData> for N42EvmConfig {
         };
         Ok((txs, convert))
     }
+}
+
+/// Records the wall time of one parallel import batch attempt when dropped,
+/// whichever way the attempt ends.
+fn record_import_batch_time(started: std::time::Instant) -> impl Drop {
+    struct Record(std::time::Instant);
+    impl Drop for Record {
+        fn drop(&mut self) {
+            metrics::histogram!("n42_parallel_import_batch_ms")
+                .record(self.0.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    Record(started)
 }
 
 #[cfg(test)]

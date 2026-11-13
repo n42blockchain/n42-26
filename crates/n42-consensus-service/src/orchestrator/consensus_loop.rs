@@ -1393,8 +1393,22 @@ impl ConsensusService {
             match super::decode_execution_payload_owned(payload_wire) {
                 Ok(d) => d,
                 Err(e) => {
-                    warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: failed to parse execution payload");
-                    return (ImportOutcome::Invalid, 0);
+                    // Decode once more from a fresh decompression before a
+                    // committed block is declared unexecutable.
+                    match super::decompress_payload_independent(&broadcast.payload_json)
+                        .and_then(super::decode_execution_payload_owned)
+                    {
+                        Ok(d) => {
+                            metrics::counter!("n42_payload_decode_retry_total", "outcome" => "recovered").increment(1);
+                            warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, "bg import: execution payload decoded on the second attempt");
+                            d
+                        }
+                        Err(retry_error) => {
+                            metrics::counter!("n42_payload_decode_retry_total", "outcome" => "failed").increment(1);
+                            warn!(target: "n42::cl::consensus_loop", %block_hash, error = %e, %retry_error, "bg import: failed to parse execution payload");
+                            return (ImportOutcome::Invalid, 0);
+                        }
+                    }
                 }
             };
         if broadcast.block_hash != block_hash || execution_data.block_hash() != block_hash {

@@ -507,7 +507,7 @@ impl<Pool, Client> PayloadBuilder
     for N42InnerPayloadBuilder<Pool, Client, n42_execution::N42EvmConfig>
 where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks> + Clone,
-    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = N42TxEnvelope>>,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = N42TxEnvelope>> + 'static,
 {
     type Attributes = EthPayloadAttributes;
     type BuiltPayload = N42BuiltPayload;
@@ -532,13 +532,28 @@ where
             self.base_config.clone(),
             args,
             |attributes| {
-                let best = if sender_sharded_drain_enabled() {
-                    Box::new(sender_sharded_transactions(
-                        self.pool.pending_transactions(),
-                        attributes,
+                let pool = self.pool.clone();
+                let ordinary = move || {
+                    if sender_sharded_drain_enabled() {
+                        Box::new(sender_sharded_transactions(
+                            pool.pending_transactions(),
+                            attributes,
+                        )) as Box<_>
+                    } else {
+                        pool.best_transactions_with_attributes(attributes)
+                    }
+                };
+                let best = if crate::frame_order::frame_order_build_enabled() {
+                    // Frames first, in arrival order; the pool-wide order only
+                    // once they are used up.
+                    let lookup_pool = self.pool.clone();
+                    Box::new(crate::frame_order::FrameOrderedTransactions::new(
+                        n42_tx_types::FrameStore::global(),
+                        move |hashes| lookup_pool.get_all(hashes),
+                        ordinary,
                     )) as Box<_>
                 } else {
-                    self.pool.best_transactions_with_attributes(attributes)
+                    ordinary()
                 };
                 if self.eof_guard {
                     Box::new(crate::eof_guard::EofFilteringTransactions::new(best)) as Box<_>

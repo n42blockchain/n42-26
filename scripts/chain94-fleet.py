@@ -339,6 +339,10 @@ def _start(args, children, cancelled):
     single_flight = bool(getattr(args, "import_single_flight", False))
     # Explicit per-run node settings (e.g. the 0x50 frame gateways); the
     # inherited environment's N42_* variables are still dropped below.
+    extra_node_args = list(getattr(args, "node_arg", None) or [])
+    for item in extra_node_args:
+        if not item.startswith("--"):
+            raise ValueError(f"--node-arg takes a node flag such as --cpu-cores=32, got {item!r}")
     extra_env = {}
     for item in getattr(args, "env", None) or []:
         key, sep, value = item.partition("=")
@@ -351,7 +355,7 @@ def _start(args, children, cancelled):
     run = dict(foreground=bool(getattr(args, "foreground", False)), low_memory=low_memory, disable_tx_forward=disable_forward, max_txs_per_block=max_txs, build_budget_ms=build_budget, rpc_max_response_mb=rpc_max_response_mb, binary=str(binary), sha256=digest(binary), started=time.time(),
                block_interval_ms=consensus_config["slot_time_ms"],
                immediate_persistence=dict(persistence_threshold=0, state_masking_blocks=0, memory_block_buffer_target=0),
-               import_single_flight=single_flight, extra_env=extra_env, fast_transfers=args.fast_transfers, parallel_build=args.parallel_build, parallel_import=args.parallel_import, qmdb_reads=args.qmdb_reads, gov5_reuse_builder_execution=gov5_reuse,
+               import_single_flight=single_flight, extra_env=extra_env, extra_node_args=extra_node_args, fast_transfers=args.fast_transfers, parallel_build=args.parallel_build, parallel_import=args.parallel_import, qmdb_reads=args.qmdb_reads, gov5_reuse_builder_execution=gov5_reuse,
                log_offsets={str(i): (runtime / f"logs/node{i}.log").stat().st_size
                             if (runtime / f"logs/node{i}.log").exists() else 0 for i in range(count)})
     write_json(runtime / "run.json", run)
@@ -419,6 +423,7 @@ def _start(args, children, cancelled):
         if fresh:
             command.extend(["--builder.gaslimit", str(manifest["gas_limit"]),
                             "--builder.interval", "50ms", "--builder.max-tasks", "1"])
+        command.extend(extra_node_args)
         with open(runtime / f"logs/node{index}.log", "ab", buffering=0) as log:
             child = subprocess.Popen(command, cwd=REPO, env=env, stdin=subprocess.DEVNULL,
                                      stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -541,6 +546,7 @@ def main():
     start_parser.add_argument("--rpc-max-response-mb", type=int, default=160, help="bounded JSON-RPC response limit in MiB (16..512)")
     start_parser.add_argument("--max-txs-per-block", type=int, help="explicit block transaction cap; defaults to the fleet manifest")
     start_parser.add_argument("--build-budget-ms", type=int, help="explicit payload build time budget; defaults to the fleet manifest")
+    start_parser.add_argument("--node-arg", action="append", metavar="--FLAG[=VALUE]", help="extra node command-line flag, repeatable (use --node-arg=--flag=value); recorded in run.json")
     start_parser.add_argument("--env", action="append", metavar="N42_NAME=VALUE", help="extra node setting, repeatable; recorded in run.json and applied after the fleet's own")
     start_parser.add_argument("--qmdb-reads", choices=("off", "verify", "on", "only"), default="off", help="explicit state-reader mode, recorded in run.json and passed to every node")
     sub.add_parser("stop")

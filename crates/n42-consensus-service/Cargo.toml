@@ -33,6 +33,7 @@ serde.workspace = true
 serde_json.workspace = true
 bincode.workspace = true
 rmp-serde.workspace = true
+rayon.workspace = true
 hex.workspace = true
 bytes.workspace = true
 zstd.workspace = true

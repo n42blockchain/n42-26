@@ -25,8 +25,27 @@ pub fn compact_block_enabled() -> bool {
     })
 }
 
+/// Whether validators on one machine share one execution of each block.
+/// Controlled by `N42_SHARED_EXECUTION=1`; off by default.
+///
+/// With it on, an H2-v4 leader sends its execution output next to the block,
+/// and a follower loads that output instead of executing the block again. The
+/// follower still derives the QMDB state root and the receipts root from the
+/// output and compares both with the header before it votes. It does not check
+/// that the output is what the transactions produce: that is the trust placed
+/// in the co-located leader, so the setting is for validators of one operator
+/// on one machine only.
+pub fn shared_execution_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("N42_SHARED_EXECUTION").is_ok_and(|v| v == "1"))
+}
+
 fn should_broadcast_execution_output(h2_v4_participant: bool) -> bool {
-    compact_block_enabled() && !h2_v4_participant
+    should_broadcast_execution_output_with(h2_v4_participant, shared_execution_enabled())
+}
+
+fn should_broadcast_execution_output_with(h2_v4_participant: bool, shared_execution: bool) -> bool {
+    compact_block_enabled() && (!h2_v4_participant || shared_execution)
 }
 
 fn elapsed_since_unix_ms(start_ms: u64) -> Option<u64> {
@@ -539,13 +558,63 @@ impl ConsensusService {
     /// at finalization time, the node will detect the inconsistency and trigger sync.
     pub(super) async fn handle_block_data(&mut self, data: Vec<u8>) {
         debug!(target: "n42::cl::exec_bridge", bytes = data.len(), "handle_block_data called");
-        let broadcast: BlockDataBroadcast = match bincode::deserialize(&data) {
+        let mut data = data;
+        let mut broadcast: BlockDataBroadcast = match bincode::deserialize(&data) {
             Ok(b) => b,
             Err(e) => {
                 warn!(target: "n42::cl::exec_bridge", "invalid block data broadcast: {e}");
                 return;
             }
         };
+        // A frame-referenced payload is put back into the full form here, so
+        // everything below, and every later reader of the cached bytes, sees
+        // an ordinary block. Without the frames nothing is cached for this
+        // hash: the block's full copy (the Gov5 body in H2-v4) is taken when
+        // it arrives.
+        if super::frame_ref::is_frame_ref_payload(&broadcast.payload_json) {
+            let expand_start = std::time::Instant::now();
+            let wire_bytes = broadcast.payload_json.len();
+            match super::frame_ref::expand_frame_ref_payload(
+                &broadcast.payload_json,
+                n42_tx_types::FrameStore::global(),
+            ) {
+                Ok(full) => {
+                    broadcast.payload_json = full;
+                    data = match bincode::serialize(&broadcast) {
+                        Ok(data) => data,
+                        Err(error) => {
+                            warn!(target: "n42::cl::exec_bridge", %error, "failed to re-encode expanded block data");
+                            return;
+                        }
+                    };
+                    metrics::counter!("n42_frame_ref_blocks_expanded_total", "outcome" => "ok")
+                        .increment(1);
+                    info!(
+                        target: "n42::cl::exec_bridge",
+                        hash = %broadcast.block_hash,
+                        wire_bytes,
+                        full_bytes = broadcast.payload_json.len(),
+                        expand_ms = expand_start.elapsed().as_millis() as u64,
+                        "N42_FRAME_REF: block payload rebuilt from held frames"
+                    );
+                }
+                Err(error) => {
+                    let outcome = match error {
+                        super::frame_ref::FrameRefError::Missing { .. } => "missing",
+                        super::frame_ref::FrameRefError::Malformed(_) => "malformed",
+                    };
+                    metrics::counter!("n42_frame_ref_blocks_expanded_total", "outcome" => outcome)
+                        .increment(1);
+                    warn!(
+                        target: "n42::cl::exec_bridge",
+                        hash = %broadcast.block_hash,
+                        %error,
+                        "N42_FRAME_REF: cannot rebuild block payload; waiting for the full copy"
+                    );
+                    return;
+                }
+            }
+        }
 
         let hash = broadcast.block_hash;
         if let Some(raw) = broadcast.native_header_rlp.as_deref()
@@ -675,8 +744,23 @@ impl ConsensusService {
                     match super::decode_execution_payload_owned(payload_wire) {
                         Ok(data) => data,
                         Err(error) => {
-                            warn!(target: "n42::cl::exec_bridge", %hash, %error, payload_format, "failed to decode execution payload");
-                            return;
+                            // The same bytes decode on the other validators,
+                            // so decode them once more from a fresh
+                            // decompression before giving the block up.
+                            let retried = super::decompress_payload_independent(&payload_compressed)
+                                .and_then(super::decode_execution_payload_owned);
+                            match retried {
+                                Ok(data) => {
+                                    metrics::counter!("n42_payload_decode_retry_total", "outcome" => "recovered").increment(1);
+                                    warn!(target: "n42::cl::exec_bridge", %hash, %error, payload_format, "execution payload decoded on the second attempt");
+                                    data
+                                }
+                                Err(retry_error) => {
+                                    metrics::counter!("n42_payload_decode_retry_total", "outcome" => "failed").increment(1);
+                                    warn!(target: "n42::cl::exec_bridge", %hash, %error, %retry_error, payload_format, "failed to decode execution payload");
+                                    return;
+                                }
+                            }
                         }
                     };
                 if execution_data.block_hash() != hash {
@@ -750,7 +834,7 @@ impl ConsensusService {
                     compact_block_enabled()
                         && exec_cache
                             .as_ref()
-                            .map(|c| c.inject(hash, exec, "block_data_eager"))
+                            .map(|c| c.inject_for_payload(&execution_data, exec, "block_data_eager"))
                             .unwrap_or(false)
                 });
                 let ready_to_compact_inject_ms = execution_output_compressed
@@ -768,10 +852,35 @@ impl ConsensusService {
                 // the canonical chain — speculative blocks may not match what consensus
                 // ultimately commits, and premature FCU causes reorgs that stall the chain.
                 let import_start = std::time::Instant::now();
-                match eh
+                // A verdict reached with a peer's execution output describes
+                // that output. If it is not Valid, drop the output and have
+                // the block executed here once before judging the block.
+                let retry_data = compact_injected.then(|| execution_data.clone());
+                let mut compact_injected = compact_injected;
+                let mut import_result = eh
                     .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, execution_data)
-                    .await
+                    .await;
+                if let Some(retry_data) = retry_data
+                    && !matches!(&import_result, Ok(status) if payload_was_fully_validated(&status.status))
                 {
+                    if let Some(ref cache) = exec_cache {
+                        cache.evict(hash);
+                    }
+                    metrics::counter!("n42_compact_block_cache_misses").increment(1);
+                    metrics::counter!("n42_shared_execution_refused_total").increment(1);
+                    warn!(
+                        target: "n42::cl::exec_bridge",
+                        %hash,
+                        view,
+                        verdict = ?import_result.as_ref().map(|status| &status.status),
+                        "peer execution output not accepted; executing the block locally"
+                    );
+                    compact_injected = false;
+                    import_result = eh
+                        .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, retry_data)
+                        .await;
+                }
+                match import_result {
                     // Only `Valid` marks the block eager-validated. `Accepted`
                     // (stored, not executed) must fall through to the stale arm
                     // so a later commit never promotes an unexecuted block (F3).
@@ -1680,6 +1789,9 @@ async fn handle_built_payload(
         leader_ready_unix_ms,
         native_header_rlp,
         build_start,
+        // Only where a full copy of the block also travels (the Gov5 body):
+        // a follower missing a frame falls back to it.
+        h2_v4_participant && n42_tx_types::frame_ref_blocks_enabled(),
     )
     .await;
     broadcast_blob_sidecars(
@@ -1889,14 +2001,45 @@ async fn broadcast_block_data(
     leader_ready_unix_ms: u64,
     native_header_rlp: Option<Vec<u8>>,
     build_start: Instant,
+    frame_refs: bool,
 ) {
     if payload_wire.is_empty() {
         return;
     }
     let payload_format = super::execution_payload_wire_format(payload_wire);
     let compress_start = std::time::Instant::now();
-    let compressed = super::compress_execution_payload(payload_wire);
+    // Frame references replace the transaction bytes on the wire when this
+    // node holds the frames the block was built from. The full payload is then
+    // kept uncompressed for this node's own cache and for serving sync.
+    let frame_refs = frame_refs
+        .then(|| {
+            super::frame_ref::encode_frame_ref_payload(
+                payload_wire,
+                n42_tx_types::FrameStore::global(),
+            )
+        })
+        .flatten();
+    let compressed = match &frame_refs {
+        Some(_) => payload_wire.to_vec(),
+        None => super::compress_execution_payload(payload_wire),
+    };
     let compress_ms = compress_start.elapsed().as_millis() as u64;
+    if let Some(refs) = &frame_refs {
+        metrics::counter!("n42_frame_ref_blocks_sent_total").increment(1);
+        metrics::counter!("n42_frame_ref_loose_transactions_total").increment(refs.loose as u64);
+        info!(
+            target: "n42::cl::exec_bridge",
+            %hash,
+            frames = refs.frames,
+            runs = refs.runs,
+            referenced = refs.referenced,
+            loose = refs.loose,
+            wire_bytes = refs.bytes.len(),
+            full_bytes = payload_wire.len(),
+            encode_ms = compress_ms,
+            "N42_FRAME_REF: block payload encoded as frame references"
+        );
+    }
     let raw_len = payload_wire.len();
     let compressed_len = compressed.len();
     let execution_output_len = execution_output.as_ref().map_or(0, Vec::len);
@@ -1914,7 +2057,7 @@ async fn broadcast_block_data(
         compress_ms,
         "N42_COMPRESS: payload compressed"
     );
-    let broadcast = BlockDataBroadcast {
+    let mut broadcast = BlockDataBroadcast {
         block_hash: hash,
         view: current_view,
         payload_json: compressed,
@@ -1923,12 +2066,26 @@ async fn broadcast_block_data(
         leader_ready_unix_ms,
         native_header_rlp,
     };
-    let encoded = match bincode::serialize(&broadcast) {
+    let own_copy = match bincode::serialize(&broadcast) {
         Ok(enc) => Arc::new(enc),
         Err(e) => {
             error!(target: "n42::cl::exec_bridge", error = %e, "failed to serialize block data broadcast");
             return;
         }
+    };
+    // `encoded` is what peers receive; `own_copy` always holds the full payload.
+    let encoded = match frame_refs {
+        Some(refs) => {
+            broadcast.payload_json = refs.bytes;
+            match bincode::serialize(&broadcast) {
+                Ok(enc) => Arc::new(enc),
+                Err(e) => {
+                    error!(target: "n42::cl::exec_bridge", error = %e, "failed to serialize frame-referenced block data");
+                    return;
+                }
+            }
+        }
+        None => Arc::clone(&own_copy),
     };
 
     // This is the first and only point where the true on-wire size of a block is
@@ -2174,7 +2331,7 @@ async fn broadcast_block_data(
         "N42_TIMEOUT_VIEW: leader_broadcast_complete"
     );
 
-    if leader_payload_tx.send((hash, encoded)).await.is_err() {
+    if leader_payload_tx.send((hash, own_copy)).await.is_err() {
         debug!(target: "n42::cl::exec_bridge", %hash, "leader payload feedback receiver dropped");
     }
 }
@@ -2435,7 +2592,8 @@ mod blob_frame_tests {
 mod eager_import_guard_tests {
     use super::{
         BuiltPayloadLinkError, eager_import_already_validated, mark_eager_import_valid,
-        payload_was_fully_validated, should_broadcast_execution_output,
+        compact_block_enabled, payload_was_fully_validated,
+        should_broadcast_execution_output_with,
         validate_built_payload_linkage,
     };
     use alloy_primitives::B256;
@@ -2464,11 +2622,18 @@ mod eager_import_guard_tests {
     }
 
     #[test]
-    fn normalized_gov5_payload_never_broadcasts_builder_compact_output() {
-        // Header normalization changes the block hash and selects the QMDB
-        // state-root profile. A builder-side Ethereum execution result is not
-        // valid compact data for that normalized payload.
-        assert!(!should_broadcast_execution_output(true));
+    fn normalized_gov5_payload_broadcasts_builder_output_only_when_shared() {
+        // An H2-v4 follower executes the normalized payload itself unless the
+        // operator opted into shared execution for co-located validators.
+        assert!(!should_broadcast_execution_output_with(true, false));
+        assert_eq!(
+            should_broadcast_execution_output_with(true, true),
+            compact_block_enabled()
+        );
+        assert_eq!(
+            should_broadcast_execution_output_with(false, false),
+            compact_block_enabled()
+        );
     }
 
     #[test]

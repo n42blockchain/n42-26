@@ -6,6 +6,7 @@ pub mod engine_types;
 pub mod engine_validator;
 pub mod eof_guard;
 pub mod exec_cache;
+pub mod frame_order;
 pub mod ingest;
 pub mod mobile_bridge;
 pub mod mobile_evidence;

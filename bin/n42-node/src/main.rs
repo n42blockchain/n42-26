@@ -3259,7 +3259,10 @@ fn main() {
                         qmdb_execution_store.clone(),
                         full_node.provider.chain_spec(),
                     )
-                    .with_peer_outputs(!authoritative_qmdb_execution),
+                    .with_peer_outputs(!authoritative_qmdb_execution)
+                    .with_shared_execution(
+                        n42_consensus_service::orchestrator::shared_execution_enabled(),
+                    ),
                 ))
                 .with_staking_sink(std::sync::Arc::new(
                     n42_node::sinks::ManagerStakingSink(staking_manager.clone()),

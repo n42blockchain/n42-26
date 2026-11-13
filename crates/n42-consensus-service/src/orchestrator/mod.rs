@@ -1,7 +1,8 @@
 pub(crate) mod bad_block_cache;
 mod consensus_loop;
 mod execution_bridge;
-pub use execution_bridge::compact_block_enabled;
+pub mod frame_ref;
+pub use execution_bridge::{compact_block_enabled, shared_execution_enabled};
 mod state_mgmt;
 mod view_jump_throttle;
 
@@ -195,10 +196,13 @@ pub fn decompress_payload(data: &[u8]) -> std::io::Result<Vec<u8>> {
                 // same frame with an independent context before declaring a
                 // committed block unexecutable. A genuinely damaged frame is
                 // still rejected by both decoders.
+                // The pooled context is dropped whether or not the retry
+                // succeeds: a context that failed once must not decode the
+                // next frame on this thread.
+                ZSTD_DECOMPRESSOR.with(|slot| *slot.borrow_mut() = None);
                 let independent =
                     zstd::bulk::decompress(data, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE);
                 if independent.is_ok() {
-                    ZSTD_DECOMPRESSOR.with(|slot| *slot.borrow_mut() = None);
                     tracing::warn!(target: "n42::cl", error = %pooled_error,
                         "pooled zstd decompression failed; independent retry succeeded");
                 }
@@ -206,6 +210,18 @@ pub fn decompress_payload(data: &[u8]) -> std::io::Result<Vec<u8>> {
                     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
             }
         }
+    } else {
+        Ok(data.to_vec())
+    }
+}
+
+/// Decompress with a context of its own, bypassing this thread's pooled one.
+/// Used to decode a payload a second time after the first decode failed.
+pub(super) fn decompress_payload_independent(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
+        ZSTD_DECOMPRESSOR.with(|slot| *slot.borrow_mut() = None);
+        zstd::bulk::decompress(data, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     } else {
         Ok(data.to_vec())
     }
@@ -529,6 +545,12 @@ pub struct CompactBlockExecution {
     /// standard full-root computation.
     #[serde(default)]
     pub transactions_root: Option<B256>,
+    /// Storage slots the block changed and then set back to their parent
+    /// value, as (address, slot, value). The QMDB root counts them as writes,
+    /// and only a node that executed the block knows them, so a shared
+    /// execution output carries the list. `None` outside shared execution.
+    #[serde(default)]
+    pub restored_slots: Option<Vec<(Address, alloy_primitives::U256, alloy_primitives::U256)>>,
 }
 
 /// First byte of a MessagePack compact execution blob. A JSON blob starts with
@@ -547,6 +569,8 @@ struct CompactExecutionWire<B> {
     blob_gas_used: u64,
     senders: Vec<Address>,
     transactions_root: Option<B256>,
+    #[serde(default)]
+    restored_slots: Option<Vec<(Address, alloy_primitives::U256, alloy_primitives::U256)>>,
 }
 
 /// One receipt: EIP-2718 type byte, status, cumulative gas, and each log as
@@ -616,6 +640,7 @@ impl CompactBlockExecution {
             blob_gas_used: self.blob_gas_used,
             senders: self.senders.clone(),
             transactions_root: self.transactions_root,
+            restored_slots: self.restored_slots.clone(),
         };
         let mut out = vec![COMPACT_EXECUTION_MSGPACK];
         rmp_serde::encode::write(&mut out, &wire)?;
@@ -641,6 +666,7 @@ impl CompactBlockExecution {
             blob_gas_used: wire.blob_gas_used,
             senders: wire.senders,
             transactions_root: wire.transactions_root,
+            restored_slots: wire.restored_slots,
         })
     }
 }
@@ -718,6 +744,7 @@ mod compact_execution_codec_tests {
                 .map(|i| Address::with_last_byte(i as u8))
                 .collect(),
             transactions_root: Some(B256::repeat_byte(9)),
+            restored_slots: Some(vec![(Address::with_last_byte(7), U256::from(1), U256::from(2))]),
         }
     }
 
@@ -728,6 +755,7 @@ mod compact_execution_codec_tests {
         assert_eq!((a.gas_used, a.blob_gas_used), (b.gas_used, b.blob_gas_used));
         assert_eq!(a.senders, b.senders);
         assert_eq!(a.transactions_root, b.transactions_root);
+        assert_eq!(a.restored_slots, b.restored_slots);
     }
 
     #[test]
@@ -5130,6 +5158,7 @@ mod tests {
             blob_gas_used: 0,
             senders: Vec::new(),
             transactions_root: None,
+            restored_slots: None,
         };
         let execution_json = serde_json::to_vec(&compact).expect("serialize compact execution");
         let execution_output =
@@ -9091,6 +9120,52 @@ mod tests {
     /// production reth then reports a state-root mismatch. That verdict is
     /// about the injected bytes, not block `H`, so the cache must be evicted
     /// without blacklisting `H`; a later honest compact-free arrival must run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refused_peer_output_is_dropped_and_the_block_executed_locally() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let parent = B256::repeat_byte(0x76);
+        let hash = B256::repeat_byte(0x77);
+        // The verdict with the peer's output is Invalid; local execution says Valid.
+        let mock = Arc::new(MockExecutionLayer::with_new_payload_statuses(
+            [
+                PayloadStatusEnum::Invalid {
+                    validation_error: "cached execution output refused".to_owned(),
+                },
+                PayloadStatusEnum::Valid,
+            ],
+            PayloadStatusEnum::Valid,
+        ));
+        let cache = Arc::new(MockExecutionOutputCache::default());
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_exec_output_cache(cache.clone());
+        orch.el = Some(mock.clone());
+        orch.head_block_hash = parent;
+
+        let data = bincode::serialize(&BlockDataBroadcast {
+            block_hash: hash,
+            view: 1,
+            payload_json: serde_json::to_vec(&test_execution_data(parent, hash)).unwrap(),
+            timestamp: 1,
+            execution_output: Some(vec![0xBA, 0xD0, 0x00, 0x01]),
+            leader_ready_unix_ms: 0,
+            native_header_rlp: None,
+        })
+        .unwrap();
+        orch.handle_block_data(data).await;
+        for _ in 0..400 {
+            if mock.new_payload_hashes().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(mock.new_payload_hashes(), vec![hash, hash]);
+        assert_eq!(cache.evicted(), vec![hash]);
+        assert!(!cache.contains(hash));
+        assert!(!orch.bad_blocks.should_skip(hash, "test"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn forged_compact_output_does_not_blacklist_honest_hash() {
         let (engine, output_rx) = make_test_engine();

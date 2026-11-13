@@ -167,11 +167,16 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
     assert_eq!(pool.pool_size().pending, 4_096);
     let config =
         N42EvmConfig::with_evm_factory(chain.clone(), N42EvmFactory::with_fast_transfers(false));
+    n42_node::payload::set_builder_state_root_replaced(native);
     let builder = N42InnerPayloadBuilder::new(
         provider.clone(),
         pool,
         config.clone(),
-        EthereumBuilderConfig::new().with_gas_limit(200_000_000),
+        // The native profile builds as an H2-v4 participant does: no builder
+        // state root, and the roots normalization replaces are not computed.
+        EthereumBuilderConfig::new()
+            .with_gas_limit(200_000_000)
+            .with_skip_state_root(native),
         Arc::new(SharedConsensusState::new(n42_consensus::ValidatorSet::new(
             &[],
             0,
@@ -241,6 +246,18 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
     }
     assert_eq!(cached.state, serial.state);
     assert_eq!(cached.result, serial.result);
+    if native {
+        let header = payload.block().header();
+        assert_eq!(header.state_root, genesis.state_root);
+        assert_eq!(
+            header.receipts_root,
+            n42_network::gov5_native_receipts_root(&serial.result.receipts)
+        );
+        assert_eq!(
+            header.logs_bloom,
+            alloy_primitives::logs_bloom(serial.result.receipts.iter().flat_map(|r| &r.logs))
+        );
+    }
     if reuse_builder_output {
         // The fixture consumes the builder cache to compare it with serial
         // execution. Restore that verified output for the Engine cache-hit test.

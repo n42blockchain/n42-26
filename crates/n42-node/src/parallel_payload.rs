@@ -7,8 +7,8 @@ use crate::native_payload::default_n42_payload;
 use alloy_consensus::TransactionEnvelope as _;
 use alloy_consensus::transaction::TxHashRef as _;
 use alloy_consensus::{BlockHeader, Transaction};
-use alloy_evm::ToTxEnv;
-use alloy_primitives::{Bytes, U256};
+use alloy_evm::{ToTxEnv, block::BlockExecutor as _};
+use alloy_primitives::{Bloom, Bytes, U256};
 use alloy_rlp::Encodable;
 use alloy_rpc_types_engine::PayloadAttributes as EthPayloadAttributes;
 use n42_execution::N42EvmConfig;
@@ -21,14 +21,21 @@ use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_evm::{
     ConfigureEvm, Evm, NextBlockEnvAttributes,
     block::TxResult,
-    execute::{BasicBlockBuilder, BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput},
+    execute::{
+        BasicBlockBuilder, BlockAssemblerInput, BlockBuilder, BlockBuilderOutcome,
+        BlockExecutionOutput,
+    },
 };
 use reth_execution_cache::{CachedStateMetrics, CachedStateMetricsSource, CachedStateProvider};
 use reth_payload_builder::BlobSidecars;
 use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::PayloadAttributes;
 use reth_primitives_traits::transaction::error::InvalidTransactionError;
-use reth_revm::{database::StateProviderDatabase, db::State};
+use reth_primitives_traits::RecoveredBlock;
+use reth_revm::{
+    database::StateProviderDatabase,
+    db::{State, states::bundle_state::BundleRetention},
+};
 use reth_storage_api::{EvmStateProvider, StateProvider, StateProviderFactory};
 use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
@@ -607,12 +614,59 @@ where
         });
     }
 
+    let finish_start = std::time::Instant::now();
     let BlockBuilderOutcome {
         execution_result,
         block,
         block_access_list,
         ..
-    } = if skip_state_root {
+    } = if skip_state_root && !is_amsterdam && crate::payload::builder_state_root_replaced() {
+        // H2-v4 normalization overwrites both the state root (QMDB root) and the
+        // receipts root (Gov5 flat receipts hash) of every built block, and only
+        // the normalized block is proposed. The upstream finish would still hash
+        // the post state and build the MPT receipts trie; skip both. This mirrors `BasicBlockBuilder::finish` without those two steps; Amsterdam
+        // (block access lists) is excluded above and takes the upstream path.
+        let BasicBlockBuilder {
+            executor,
+            transactions,
+            ctx,
+            parent,
+            assembler,
+        } = builder;
+        let (evm, execution_result) = executor.finish()?;
+        let (finished_db, evm_env) = evm.finish();
+        finished_db.merge_transitions(BundleRetention::Reverts);
+        let receipts_root = n42_network::gov5_native_receipts_root(&execution_result.receipts);
+        let mut logs_bloom = Bloom::ZERO;
+        for log in execution_result.receipts.iter().flat_map(|r| &r.logs) {
+            logs_bloom.accrue_log(log);
+        }
+        let (transactions, senders): (Vec<_>, Vec<_>) =
+            transactions.into_iter().map(|tx| tx.into_parts()).unzip();
+        let block = assembler.assemble_block(
+            BlockAssemblerInput::<<N42EvmConfig as ConfigureEvm>::BlockExecutorFactory>::new(
+                evm_env,
+                ctx,
+                parent,
+                transactions,
+                &execution_result,
+                &finished_db.bundle_state,
+                state_provider.as_ref(),
+                parent_header.state_root(),
+                None,
+            ),
+            None,
+            Some(receipts_root),
+            Some(logs_bloom),
+        )?;
+        BlockBuilderOutcome {
+            execution_result,
+            hashed_state: Default::default(),
+            trie_updates: Default::default(),
+            block: RecoveredBlock::new_unhashed(block, senders),
+            block_access_list: None,
+        }
+    } else if skip_state_root {
         debug!(
             target: "payload_builder",
             id = %payload_id,
@@ -650,6 +704,9 @@ where
         builder.finish(state_provider.as_ref(), None)?
     };
 
+    let finish_ms = finish_start.elapsed().as_secs_f64() * 1000.0;
+    metrics::histogram!("n42_payload_builder_finish_ms").record(finish_ms);
+
     // Extract requests before moving execution_result into cache.
     let requests = chain_spec
         .is_prague_active_at_timestamp(attributes.timestamp)
@@ -668,6 +725,7 @@ where
     // Cache execution output for leader's new_payload AND broadcast to followers.
     // Use the recovered block by reference — it is still needed to build the payload below,
     // so we must not consume it via into_sealed_block().
+    let cache_start = std::time::Instant::now();
     {
         let mut bundle_state = db.take_bundle();
         n42_execution::parallel_transfer::append_reverts(&mut bundle_state, graft_reverts);
@@ -684,9 +742,13 @@ where
             (execution_output.clone(), senders.clone()),
         );
         reth_evm::payload_cache::store_payload_execution(block_hash, (execution_output, senders));
+        let cache_ms = cache_start.elapsed().as_secs_f64() * 1000.0;
+        metrics::histogram!("n42_payload_builder_cache_ms").record(cache_ms);
         info!(
             target: "payload_builder",
             %block_hash,
+            finish_ms,
+            cache_ms,
             "N42_PAYLOAD_CACHE: cached execution output for new_payload + broadcast"
         );
     }

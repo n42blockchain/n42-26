@@ -1111,7 +1111,7 @@ where
     let auth_start = Instant::now();
     let auth_native = native.clone();
     let admitted = tokio::task::spawn_blocking(move || {
-        AdmittedFrame::authenticate(
+        let admitted = AdmittedFrame::authenticate(
             auth_native.chain_id,
             &frame.transactions,
             &frame.attestations,
@@ -1120,12 +1120,23 @@ where
                 max_transactions: MAX_INGEST_BATCH_TXS,
                 max_encoded_bytes: MAX_INGEST_BATCH_BYTES,
             },
-        )
+        )?;
+        // Keep the authenticated frame's exact bytes so a block built from it
+        // can be sent, and put back together, by reference.
+        if n42_tx_types::frame_ref_blocks_enabled() {
+            let hashes = admitted
+                .transactions()
+                .iter()
+                .map(|tx| *tx.transaction().hash())
+                .collect();
+            n42_tx_types::FrameStore::global().insert(admitted.root(), frame.transactions, hashes);
+        }
+        Ok(admitted)
     })
     .await;
     let frame = match admitted {
         Ok(Ok(frame)) => frame,
-        Ok(Err(error)) => {
+        Ok(Err::<_, n42_tx_types::admission::FrameAdmissionError>(error)) => {
             metrics::counter!("n42_ingest_native_frames_total", "outcome" => "rejected")
                 .increment(1);
             stats
