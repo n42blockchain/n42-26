@@ -217,11 +217,16 @@ mod tests {
     fn store_frame(store: &FrameStore, seed: u8, txs: &[&Tx]) -> B256 {
         let hashes: Vec<B256> = txs.iter().map(|tx| *tx.hash()).collect();
         let root = B256::repeat_byte(seed);
-        assert!(store.insert(
-            root,
-            hashes.iter().map(|hash| Bytes::copy_from_slice(hash.as_slice())).collect(),
-            hashes,
-        ));
+        assert!(
+            store.insert(
+                root,
+                hashes
+                    .iter()
+                    .map(|hash| Bytes::copy_from_slice(hash.as_slice()))
+                    .collect(),
+                hashes,
+            )
+        );
         root
     }
 
@@ -243,11 +248,21 @@ mod tests {
 
         // The pool holds everything but the mined frame, and answers in
         // reverse order to show the frame order is restored.
-        let pool = vec![a0.clone(), b0.clone(), a1.clone(), b1.clone(), loose.clone()];
+        let pool = vec![
+            a0.clone(),
+            b0.clone(),
+            a1.clone(),
+            b1.clone(),
+            loose.clone(),
+        ];
         let lookup = {
             let pool = pool.clone();
             move |hashes: Vec<TxHash>| -> Vec<Tx> {
-                pool.iter().rev().filter(|tx| hashes.contains(tx.hash())).cloned().collect()
+                pool.iter()
+                    .rev()
+                    .filter(|tx| hashes.contains(tx.hash()))
+                    .cloned()
+                    .collect()
             }
         };
         let rest = {
@@ -257,7 +272,10 @@ mod tests {
         let order: Vec<B256> = FrameOrderedTransactions::new(store, lookup.clone(), rest.clone())
             .map(|tx| *tx.hash())
             .collect();
-        assert_eq!(order, [&a0, &b0, &a1, &b1, &loose].map(|tx| *tx.hash()).to_vec());
+        assert_eq!(
+            order,
+            [&a0, &b0, &a1, &b1, &loose].map(|tx| *tx.hash()).to_vec()
+        );
 
         // The used-up frame left the walk but is still held.
         let walk: Vec<B256> = store.unbuilt(8).iter().map(|frame| frame.root).collect();
@@ -268,10 +286,7 @@ mod tests {
         let mut best = FrameOrderedTransactions::new(store, lookup, rest);
         let first = best.next().unwrap();
         assert_eq!(first.hash(), a0.hash());
-        best.mark_invalid(
-            &first,
-            InvalidPoolTransactionError::Underpriced,
-        );
+        best.mark_invalid(&first, InvalidPoolTransactionError::Underpriced);
         let order: Vec<B256> = best.map(|tx| *tx.hash()).collect();
         assert_eq!(order, [&b0, &b1, &loose].map(|tx| *tx.hash()).to_vec());
     }

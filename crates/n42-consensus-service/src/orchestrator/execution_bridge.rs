@@ -40,6 +40,21 @@ pub fn shared_execution_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("N42_SHARED_EXECUTION").is_ok_and(|v| v == "1"))
 }
 
+/// Whether a leader that also leads the next view starts building that
+/// view's block as soon as its own execution layer has accepted the current
+/// one, instead of at the commit (`N42_BUILD_ON_SEAL=1`). Useful with
+/// `N42_LEADER_TENURE` above 1. The proposal rules are unchanged: the block
+/// built ahead is proposed in its own view under the QC of its parent, and is
+/// dropped if that QC does not form. In H2-v4 participant mode only.
+///
+/// The execution layer is told to treat the leader's own uncommitted block as
+/// its head while the child is built. With the frame queue, transactions of a
+/// block that is then not committed are not offered again.
+pub fn build_on_seal_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("N42_BUILD_ON_SEAL").is_ok_and(|v| v == "1"))
+}
+
 fn should_broadcast_execution_output(h2_v4_participant: bool) -> bool {
     should_broadcast_execution_output_with(h2_v4_participant, shared_execution_enabled())
 }
@@ -122,6 +137,18 @@ fn validate_built_payload_linkage(
     Ok(())
 }
 
+/// Whether `N42_GOV5_COPY_LATE=1` is set (see the leader's emit path).
+fn gov5_copy_late() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_GOV5_COPY_LATE").is_ok_and(|value| value == "1"))
+}
+
+/// Whether `N42_COLOCATED_VOTE=1` is set (see `handle_block_data`).
+fn colocated_vote_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_COLOCATED_VOTE").is_ok_and(|value| value == "1"))
+}
+
 impl ConsensusService {
     /// The `parentBeaconRoot` a payload built on `parent` must carry. Without
     /// a committee pool it is the zero placeholder every node agrees on; with
@@ -198,6 +225,16 @@ impl ConsensusService {
 
     /// Triggers payload building via fork_choice_updated, then spawns a task to resolve it.
     pub(super) async fn do_trigger_payload_build(&mut self, slot_timestamp: Option<u64>) {
+        self.do_trigger_payload_build_on(None, slot_timestamp).await;
+    }
+
+    /// [`Self::do_trigger_payload_build`], or with `ahead` the build of a
+    /// later view's block on an own block that is not committed yet.
+    pub(super) async fn do_trigger_payload_build_on(
+        &mut self,
+        ahead: Option<super::PayloadBuildContext>,
+        slot_timestamp: Option<u64>,
+    ) {
         if self.leader_disabled {
             info!(target: "n42::cl::exec_bridge", view = self.engine.current_view(),
                 "leader build skipped: this member cannot seal a gov5 block; the view will time out");
@@ -213,7 +250,7 @@ impl ConsensusService {
             }
         };
 
-        let Some(build_context) = self.required_payload_build_context() else {
+        let Some(build_context) = ahead.or_else(|| self.required_payload_build_context()) else {
             error!(target: "n42::cl::exec_bridge", view = self.engine.current_view(),
                 locked_view = self.engine.locked_qc().view,
                 "refusing payload build: non-genesis LockedQC has a zero block hash");
@@ -228,6 +265,28 @@ impl ConsensusService {
         // (same parent, different timestamps). This floods reth with conflicting new_payload
         // calls, triggering pipeline sync and permanent chain stalls.
         let parent = build_context.parent_hash;
+        let is_ahead = ahead.is_some();
+        if let Some(building) = self.ahead_building
+            && building.parent_hash == parent
+        {
+            debug!(target: "n42::cl::exec_bridge", %parent, build_view = building.view,
+                "the build started ahead covers this parent, skipping");
+            if !is_ahead && building == build_context {
+                // That build is this view's build.
+                self.next_build_at = None;
+                self.next_slot_timestamp = None;
+                self.clear_leader_build_wait();
+            }
+            return;
+        }
+        if !is_ahead && self.ahead_emitting == Some(build_context) {
+            debug!(target: "n42::cl::exec_bridge", %parent, view = build_context.view,
+                "this view's block was built ahead and is being released, skipping");
+            self.next_build_at = None;
+            self.next_slot_timestamp = None;
+            self.clear_leader_build_wait();
+            return;
+        }
         if let Some(building) = self.building_on_parent
             && building.parent_hash == parent
         {
@@ -253,9 +312,11 @@ impl ConsensusService {
         // Syncing result. Catch-up completion can invoke this method before that
         // timer fires; leaving it armed would build a second child after the first
         // proposal has already been released.
-        self.next_build_at = None;
-        self.next_slot_timestamp = None;
-        self.clear_leader_build_wait();
+        if !is_ahead {
+            self.next_build_at = None;
+            self.next_slot_timestamp = None;
+            self.clear_leader_build_wait();
+        }
         let build_start = Instant::now();
         let pool_depth = self.pool_depth_snapshot();
         let view = build_context.view;
@@ -314,8 +375,12 @@ impl ConsensusService {
                 return;
             }
         };
-        self.building_on_parent = Some(build_context);
-        self.build_triggered_at = Some(build_start);
+        if is_ahead {
+            self.ahead_building = Some(build_context);
+        } else {
+            self.building_on_parent = Some(build_context);
+            self.build_triggered_at = Some(build_start);
+        }
 
         let attrs = self.build_payload_attributes(slot_timestamp, parent_beacon_block_root);
         let timestamp = attrs.timestamp;
@@ -386,6 +451,13 @@ impl ConsensusService {
                             build_context,
                         );
                     } else {
+                        if is_ahead {
+                            // Nothing is owed yet: the view's own build
+                            // starts when the view does.
+                            self.ahead_building = None;
+                            last_err = None;
+                            break;
+                        }
                         warn!(target: "n42::cl::exec_bridge", "fork_choice_updated did not return payload_id, scheduling retry");
                         // FCU returned SYNCING — reth hasn't caught up yet.
                         // Clear both guards so the retry can re-attempt.
@@ -406,7 +478,12 @@ impl ConsensusService {
                 }
             }
         }
-        if let Some(e) = last_err {
+        if is_ahead {
+            if let Some(e) = last_err {
+                debug!(target: "n42::cl::exec_bridge", error = %e, "build ahead not started");
+                self.ahead_building = None;
+            }
+        } else if let Some(e) = last_err {
             error!(target: "n42::cl::exec_bridge", error = %e, "fork_choice_updated failed after retry");
             // Clear both guards so retry can re-attempt.
             self.building_on_parent = None;
@@ -697,7 +774,14 @@ impl ConsensusService {
         // Native mode preserves optimistic voting on cached data. Gov5 H2
         // participant mode releases its vote only from eager_import_done after
         // reth returns Valid for this exact payload.
-        if self.h2_v4_identity.is_none() {
+        //
+        // N42_COLOCATED_VOTE=1 (measurement route, default off) releases the
+        // H2 vote on cached data as well: the validators of one operator on
+        // one machine vote on the check the block's builder made on its own
+        // block, and import behind the vote. A follower then no longer
+        // executes before it votes, so the setting is wrong for validators
+        // that do not trust each other.
+        if self.h2_v4_identity.is_none() || colocated_vote_enabled() {
             debug!(target: "n42::cl::exec_bridge", %hash, "block data cached, notifying consensus (deferred execution)");
             if let Err(e) = self
                 .engine
@@ -729,7 +813,10 @@ impl ConsensusService {
                 %hash,
                 view,
             );
+            let in_flight =
+                super::EagerImportInFlight::enter(&self.eager_imports_in_flight, hash);
             tokio::spawn(async move {
+                let _in_flight = in_flight;
                 let decompress_start = std::time::Instant::now();
                 let payload_wire = match super::decompress_payload(&payload_compressed) {
                     Ok(d) => d,
@@ -992,7 +1079,7 @@ impl ConsensusService {
                                 "block_data_eager",
                             );
                         }
-                        debug!(target: "n42::cl::exec_bridge", %hash, view, status = ?status.status, compact_injected, "follower eager import: not accepted");
+                        warn!(target: "n42::cl::exec_bridge", %hash, view, %parent_hash, status = ?status.status, compact_injected, elapsed_ms = import_start.elapsed().as_millis() as u64, "follower eager import: not accepted");
                         if compact_injected {
                             metrics::counter!("n42_compact_block_cache_misses").increment(1);
                         }
@@ -1006,7 +1093,7 @@ impl ConsensusService {
                         if compact_injected && let Some(ref cache) = exec_cache {
                             cache.evict(hash);
                         }
-                        debug!(target: "n42::cl::exec_bridge", %hash, view, error = %e, compact_injected, "follower eager import: failed");
+                        warn!(target: "n42::cl::exec_bridge", %hash, view, %parent_hash, error = %e, compact_injected, elapsed_ms = import_start.elapsed().as_millis() as u64, "follower eager import: failed");
                         if compact_injected {
                             metrics::counter!("n42_compact_block_cache_misses").increment(1);
                         }
@@ -1291,7 +1378,7 @@ impl ConsensusService {
             "completing deferred finalization"
         );
         self.pending_finalization = None;
-        self.pending_block_data.clear();
+        self.prune_pending_block_data_through(deferred_view);
         self.pending_executions.clear();
 
         self.enqueue_mobile_packet(
@@ -1587,19 +1674,20 @@ async fn handle_built_payload(
         let transactions_root = exec_output_cache
             .as_ref()
             .and_then(|cache| cache.built_transactions_root(original_hash));
-        let normalized = match n42_network::normalize_execution_payload_for_gov5_h2_with_transactions_root(
-            &execution_data,
-            current_view,
-            gov5_state_root,
-            gov5_receipts_root,
-            transactions_root,
-        ) {
-            Ok(normalized) => normalized,
-            Err(error) => {
-                error!(target: "n42::interop::h2v4", original_hash = %hash, %error, "refusing to propose a payload that cannot be normalized to the gov5 H2 header profile");
-                return;
-            }
-        };
+        let normalized =
+            match n42_network::normalize_execution_payload_for_gov5_h2_with_transactions_root(
+                &execution_data,
+                current_view,
+                gov5_state_root,
+                gov5_receipts_root,
+                transactions_root,
+            ) {
+                Ok(normalized) => normalized,
+                Err(error) => {
+                    error!(target: "n42::interop::h2v4", original_hash = %hash, %error, "refusing to propose a payload that cannot be normalized to the gov5 H2 header profile");
+                    return;
+                }
+            };
         hash = normalized.block_hash();
         // Native Cancun normalization changes commitments and H2 metadata,
         // but preserves the EVM inputs. Move the builder result to the new
@@ -1649,15 +1737,50 @@ async fn handle_built_payload(
         let el = el.clone();
         let data = execution_data.clone();
         let import_start = std::time::Instant::now();
+        let validated_tx = build_on_seal_enabled().then(|| block_ready_tx.clone());
         let task = tokio::spawn(async move {
-            el.new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, data).await
+            let outcome = el
+                .new_payload_for(ExecutionPath::LIVE_SEQUENTIAL, data)
+                .await;
+            // The block is in the local tree now: a child can be built on it
+            // while the Gov5 copy is still being encoded and sent.
+            if let Some(validated_tx) = validated_tx
+                && let Ok(status) = &outcome
+                && payload_was_fully_validated(&status.status)
+            {
+                let _ = validated_tx
+                    .send(super::PayloadBuildReady {
+                        context: build_context,
+                        block_hash: hash,
+                        own_block_validated: true,
+                    })
+                    .await;
+            }
+            outcome
         });
         (import_start, task)
+    });
+    // The Gov5 copy is encoded beside serialization and the native send; it
+    // is still pushed, and the proposal still released, only after both.
+    let gov5_encode = h2_v4_participant.then(|| {
+        let data = execution_data.clone();
+        tokio::task::spawn_blocking(move || {
+            let encode_start = Instant::now();
+            let encoded = n42_network::encode_gov5_block_rlp(&data);
+            (encoded, encode_start.elapsed().as_millis() as u64)
+        })
     });
     {
         let span = tracing::Span::current();
         span.record("hash", tracing::field::display(&hash));
         span.record("block_number", block_number);
+    }
+    // A task spawned from a runtime worker waits in that worker's own slot,
+    // which no other worker takes from, until this task next yields - and the
+    // serialization below does not yield. Without this the validation reached
+    // the engine only after the broadcast, 60-80 ms later (run64).
+    if leader_validation.is_some() {
+        tokio::task::yield_now().await;
     }
 
     // The execution payload and compact execution output are independent wire
@@ -1801,17 +1924,51 @@ async fn handle_built_payload(
         current_view,
         blob_store,
     );
-    // The proposal is still released only after the Gov5 copy is out.
-    if h2_v4_participant {
-        let encode_start = Instant::now();
-        let gov5_rlp = match n42_network::encode_gov5_block_rlp(&execution_data) {
-            Ok(encoded) => encoded,
-            Err(error) => {
+    // The proposal is still released only after the Gov5 copy is out, unless
+    // N42_GOV5_COPY_LATE=1 (measurement route, default off): then the copy is
+    // pushed behind the proposal, and a failure to encode or push it is
+    // logged instead of withholding the proposal. Gov5 members receive the
+    // body after the proposal that names it.
+    let gov5_encode = if gov5_copy_late() {
+        if let Some(gov5_encode) = gov5_encode {
+            let network = network.clone();
+            tokio::spawn(async move {
+                match gov5_encode.await {
+                    Ok((Ok(gov5_rlp), gov5_encode_ms)) => {
+                        metrics::histogram!("n42_gov5_block_encode_ms")
+                            .record(gov5_encode_ms as f64);
+                        info!(target: "n42::cl::exec_bridge", %hash, tx_count, gov5_encode_ms,
+                            gov5_bytes = gov5_rlp.len(), late = true,
+                            "N42_LEADER_GOV5_ENCODE: native block encoded");
+                        if let Err(error) = network.broadcast_gov5_block_reliable(gov5_rlp).await {
+                            error!(target: "n42::interop::h2v4", %hash, %error, "late gov5 block broadcast failed");
+                        }
+                    }
+                    Ok((Err(error), _)) => {
+                        error!(target: "n42::interop::h2v4", %hash, %error, "late gov5 block encoding failed");
+                    }
+                    Err(join_error) => {
+                        error!(target: "n42::interop::h2v4", %hash, %join_error, "late Gov5 block encoding task failed");
+                    }
+                }
+            });
+        }
+        None
+    } else {
+        gov5_encode
+    };
+    if let Some(gov5_encode) = gov5_encode {
+        let (gov5_rlp, gov5_encode_ms) = match gov5_encode.await {
+            Ok((Ok(encoded), encode_ms)) => (encoded, encode_ms),
+            Ok((Err(error), _)) => {
                 error!(target: "n42::interop::h2v4", %hash, %error, "refusing to propose a payload that cannot be encoded for gov5 peers");
                 return;
             }
+            Err(join_error) => {
+                error!(target: "n42::interop::h2v4", %hash, %join_error, "Gov5 block encoding task failed");
+                return;
+            }
         };
-        let gov5_encode_ms = encode_start.elapsed().as_millis() as u64;
         metrics::histogram!("n42_gov5_block_encode_ms").record(gov5_encode_ms as f64);
         info!(target: "n42::cl::exec_bridge", %hash, tx_count, gov5_encode_ms,
             gov5_bytes = gov5_rlp.len(), "N42_LEADER_GOV5_ENCODE: native block encoded");
@@ -1891,6 +2048,7 @@ async fn handle_built_payload(
         .send(super::PayloadBuildReady {
             context: build_context,
             block_hash: hash,
+            own_block_validated: false,
         })
         .await
         .is_err()
@@ -2591,10 +2749,9 @@ mod blob_frame_tests {
 #[cfg(test)]
 mod eager_import_guard_tests {
     use super::{
-        BuiltPayloadLinkError, eager_import_already_validated, mark_eager_import_valid,
-        compact_block_enabled, payload_was_fully_validated,
-        should_broadcast_execution_output_with,
-        validate_built_payload_linkage,
+        BuiltPayloadLinkError, compact_block_enabled, eager_import_already_validated,
+        mark_eager_import_valid, payload_was_fully_validated,
+        should_broadcast_execution_output_with, validate_built_payload_linkage,
     };
     use alloy_primitives::B256;
     use alloy_rpc_types_engine::PayloadStatusEnum;

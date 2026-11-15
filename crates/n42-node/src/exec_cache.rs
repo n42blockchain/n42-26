@@ -312,9 +312,80 @@ fn take_gov5_normalization_roots(
     chain_spec: &Arc<reth_chainspec::ChainSpec>,
 ) -> Option<(B256, B256)> {
     let hash = &execution.block_hash();
+    // The builder derives both roots itself when it holds the store; shared
+    // execution also needs the restored slots filed below, so it does not.
+    if !n42_consensus_service::orchestrator::shared_execution_enabled()
+        && let Some(roots) = take_built_gov5_roots(hash)
+    {
+        return Some(roots);
+    }
+    // The builder keeps a separate broadcast copy only when the output is
+    // sent to peers. Without one, the copy kept for this node's own import is
+    // borrowed and put back.
+    if let Some((output, senders)) =
+        reth_evm::payload_cache::take_broadcast_execution::<CachedPayloadData>(hash)
+    {
+        let roots = gov5_normalization_roots(execution, &output, qmdb_store, chain_spec);
+        if roots.is_some() && n42_consensus_service::orchestrator::shared_execution_enabled() {
+            reth_evm::payload_cache::store_broadcast_execution(*hash, (output, senders));
+        }
+        return roots;
+    }
+    let (output, senders) =
+        reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(hash)?;
+    let roots = gov5_normalization_roots(execution, &output, qmdb_store, chain_spec);
+    reth_evm::payload_cache::store_payload_execution(*hash, (output, senders));
+    roots
+}
+
+/// The roots the builder derived for the block it just assembled, by the
+/// builder's block hash. One entry: a node proposes one block at a time.
+static BUILT_GOV5_ROOTS: Mutex<Option<(B256, (B256, B256))>> = Mutex::new(None);
+
+/// Files the QMDB state root and native receipts root the builder derived
+/// for its block `hash`, for the normalization that follows.
+pub(crate) fn store_built_gov5_roots(hash: B256, roots: (B256, B256)) {
+    *BUILT_GOV5_ROOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((hash, roots));
+}
+
+fn take_built_gov5_roots(hash: &B256) -> Option<(B256, B256)> {
+    BUILT_GOV5_ROOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take_if(|(built, _)| built == hash)
+        .map(|(_, roots)| roots)
+}
+
+/// The QMDB operations of a block's state changes in the tree's canonical
+/// order. The ordering buffer is owned here, before the tree lock is taken.
+pub(crate) fn gov5_sorted_operations(
+    state: &reth_revm::db::BundleState,
+    restored: &[n42_execution::RestoredSlot],
+    prague: bool,
+) -> Vec<n42_twig_core::qmdb_compat::QmdbOperation> {
+    let mut operations = crate::qmdb_state::gov5_qmdb_operations_with_restored(state, restored);
+    if prague {
+        crate::qmdb_state::with_gov5_prague_system_caller(&mut operations);
+    }
+    rayon::slice::ParallelSliceMut::par_sort_unstable_by_key(
+        operations.as_mut_slice(),
+        |operation| operation.key,
+    );
+    operations
+}
+
+/// The QMDB state root and native receipts root of a locally built payload,
+/// from the builder's own execution output.
+fn gov5_normalization_roots(
+    execution: &alloy_rpc_types_engine::ExecutionData,
+    output: &BlockExecutionOutput<n42_tx_types::Receipt>,
+    qmdb_store: Option<&crate::qmdb_state_root::Gov5QmdbStateRootStore>,
+    chain_spec: &Arc<reth_chainspec::ChainSpec>,
+) -> Option<(B256, B256)> {
+    let hash = &execution.block_hash();
     let parent_hash = execution.parent_hash();
-    let (output, _senders) =
-        reth_evm::payload_cache::take_broadcast_execution::<CachedPayloadData>(hash)?;
     let started = std::time::Instant::now();
     let payload = execution.payload.as_v1();
     // The receipts root and the transaction hashes are independent of each
@@ -334,17 +405,14 @@ fn take_gov5_normalization_roots(
     let hashed_ms = started.elapsed().as_secs_f64() * 1000.0;
     let key = gov5_restored_slots_key_for_payload(execution, chain_spec, Some(tx_hashes))?;
     let restored = n42_execution::restored_slots_for(key).unwrap_or_default();
-    let mut operations =
-        crate::qmdb_state::gov5_qmdb_operations_with_restored(&output.state, &restored);
-    if reth_chainspec::EthereumHardforks::is_prague_active_at_timestamp(
-        chain_spec,
-        payload.timestamp,
-    ) {
-        crate::qmdb_state::with_gov5_prague_system_caller(&mut operations);
-    }
-    // Own the ordering buffer here, before entering the tree lock. The tree
-    // can borrow this canonical sequence while the operations remain ours.
-    operations.sort_unstable_by_key(|operation| operation.key);
+    let operations = gov5_sorted_operations(
+        &output.state,
+        &restored,
+        reth_chainspec::EthereumHardforks::is_prague_active_at_timestamp(
+            chain_spec,
+            payload.timestamp,
+        ),
+    );
     let operations_ms = started.elapsed().as_secs_f64() * 1000.0 - hashed_ms;
     let operation_count = operations.len();
     let state_root = match qmdb_store {
@@ -375,7 +443,6 @@ fn take_gov5_normalization_roots(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((*hash, restored.as_ref().clone()));
-        reth_evm::payload_cache::store_broadcast_execution(*hash, (output, _senders));
     }
     let total_ms = started.elapsed().as_secs_f64() * 1000.0;
     metrics::histogram!("n42_gov5_normalization_roots_ms").record(total_ms);
@@ -473,9 +540,8 @@ fn inject_compact_block_with(
             blob_gas_used: compact.blob_gas_used,
         },
     };
-    if let Some(transactions_root) = compact.transactions_root {
-        reth_evm::payload_cache::store_payload_transactions_root(*hash, transactions_root);
-    }
+    // The peer's transactions root is not cached: the engine trusts a cached
+    // root to be the body's root, so this node derives it from the body.
     reth_evm::payload_cache::store_payload_execution(*hash, (output, compact.senders));
     let store_ms = store_start.elapsed().as_millis() as u64;
 
@@ -531,15 +597,22 @@ mod tests {
         // Follower: the list reaches the caller before the output is stored,
         // and a refusal there keeps the output out of the payload cache.
         reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&hash);
-        assert!(!inject_compact_block_with(&hash, &shared, "test", |_| Err("refused")));
+        assert!(!inject_compact_block_with(&hash, &shared, "test", |_| Err(
+            "refused"
+        )));
         assert!(
             reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&hash).is_none()
         );
         let mut seen = None;
-        assert!(inject_compact_block_with(&hash, &shared, "test", |restored| {
-            seen = restored;
-            Ok(())
-        }));
+        assert!(inject_compact_block_with(
+            &hash,
+            &shared,
+            "test",
+            |restored| {
+                seen = restored;
+                Ok(())
+            }
+        ));
         assert_eq!(seen, Some(slots));
         assert!(
             reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&hash).is_some()
@@ -553,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_root_survives_compact_round_trip_and_is_evicted_by_hash() {
+    fn peer_transaction_root_is_not_cached_and_a_local_root_is_evicted_by_hash() {
         let _lock = CACHE_TEST_LOCK.lock().unwrap();
         let hash = B256::repeat_byte(0x42);
         let other_hash = B256::repeat_byte(0x43);
@@ -575,12 +648,17 @@ mod tests {
             CompactBlockExecution::decode(&decompress_payload(&compressed).unwrap()).unwrap();
         assert_eq!(compact.transactions_root, Some(root));
 
+        // A root received from a peer never enters the cache: the engine
+        // takes a cached root as the root of the body.
         reth_evm::payload_cache::remove_payload_transactions_root(&hash);
         assert!(cache.inject(hash, &compressed, "test"));
         assert_eq!(
             reth_evm::payload_cache::payload_transactions_root(&hash),
-            Some(root)
+            None
         );
+
+        // A root this node computed stays until its own hash is evicted.
+        reth_evm::payload_cache::store_payload_transactions_root(hash, root);
         assert_eq!(
             reth_evm::payload_cache::payload_transactions_root(&other_hash),
             None

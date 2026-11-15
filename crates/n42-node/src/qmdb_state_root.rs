@@ -2475,7 +2475,10 @@ impl StateRootJob<N42Primitives> for Gov5QmdbStateRootJob {
         }
         // Sort our existing buffer before entering the store lock. The tree
         // borrows it; WAL and read-view publication retain the same operations.
-        operations.sort_unstable_by_key(|operation| operation.key);
+        rayon::slice::ParallelSliceMut::par_sort_unstable_by_key(
+            operations.as_mut_slice(),
+            |operation| operation.key,
+        );
         let root = match self.store.compute_and_commit(
             block.parent_hash,
             block.hash(),

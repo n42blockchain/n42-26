@@ -215,11 +215,18 @@ fn generate(args: Args) -> eyre::Result<()> {
     }
     let mut alt_sig_funded = 0usize;
     if let Some(path) = &args.alt_sig_fund {
-        for address in fs::read_to_string(path)?.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+        for address in fs::read_to_string(path)?
+            .split(',')
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
             let address: Address = address.parse()?;
             eyre::ensure!(
                 alloc
-                    .insert(address, json!({"balance":"0x4B3B4CA85A86C47A098A224000000"}))
+                    .insert(
+                        address,
+                        json!({"balance":"0x4B3B4CA85A86C47A098A224000000"})
+                    )
                     .is_none(),
                 "0x50 sender {address} collides with another genesis account"
             );

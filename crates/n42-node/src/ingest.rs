@@ -45,7 +45,10 @@ use n42_tx_types::{
 use reth_transaction_pool::{
     AddedTransactionOutcome, CoinbaseTipOrdering, Pool, PoolResult, PoolTransaction,
     TransactionOrigin, TransactionPool, TransactionValidationOutcome, TransactionValidator,
-    blobstore::BlobStore, validate::ValidTransaction,
+    ValidPoolTransaction,
+    blobstore::BlobStore,
+    identifier::{SenderId, TransactionId},
+    validate::ValidTransaction,
 };
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -193,7 +196,12 @@ where
     }
 
     fn pending_count(&self) -> usize {
-        self.pool_size().pending
+        let queued = if crate::frame_queue::frame_queue_enabled() {
+            crate::frame_queue::FrameQueue::global().pending()
+        } else {
+            0
+        };
+        self.pool_size().pending + queued
     }
 }
 
@@ -766,6 +774,16 @@ where
                 metrics::counter!("n42_ingest_batches_total", "outcome" => "native_gate")
                     .increment(1);
                 stats.deferred.fetch_add(num_txs as u64, Ordering::Relaxed);
+                // A block that refers to its frames can be built by a leader
+                // whose queue had room for this one. Keep the frame for that
+                // block even though it is not queued here: a node that cannot
+                // put the block together stops importing, its queue never
+                // drains, and the gate never opens again.
+                if crate::frame_queue::frame_queue_enabled()
+                    && n42_tx_types::frame_ref_blocks_enabled()
+                {
+                    admit_native_frame(&pool, stats, native, frame, true).await;
+                }
                 write_ack(
                     &mut stream,
                     0,
@@ -778,7 +796,7 @@ where
                 .await?;
                 continue;
             }
-            let accepted = admit_native_frame(&pool, stats, native, frame).await;
+            let accepted = admit_native_frame(&pool, stats, native, frame, false).await;
             if credit_probe_enabled {
                 leased_credit_remaining = leased_credit_remaining.saturating_sub(num_txs);
             }
@@ -1090,11 +1108,24 @@ async fn read_native_frame(
 /// Authenticates one native frame and hands its transactions to the pool.
 /// Returns the number the pool accepted; a frame that fails authentication
 /// is rejected whole and counted as decode errors.
+/// Roots of frames held for block rebuilding while the gate was closed. The
+/// sender offers such a frame again, and that time it is queued.
+static HELD_FRAMES: std::sync::LazyLock<std::sync::Mutex<alloy_primitives::map::B256HashSet>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Most held roots remembered; past it the oldest knowledge is dropped and
+/// those frames are simply not queued when offered again.
+const MAX_HELD_FRAMES: usize = 1 << 16;
+
+/// Authenticates a native frame and admits it. With `hold_only` the frame is
+/// kept for blocks that refer to it but is not offered to this node's builder;
+/// the caller reports it as deferred.
 async fn admit_native_frame<P>(
     pool: &P,
     stats: &IngestStats,
     native: &Arc<NativeIngest>,
     frame: NativeFrameWire,
+    hold_only: bool,
 ) -> usize
 where
     P: DirectPoolIngest,
@@ -1111,6 +1142,7 @@ where
     let auth_start = Instant::now();
     let auth_native = native.clone();
     let admitted = tokio::task::spawn_blocking(move || {
+        let mut stored = false;
         let admitted = AdmittedFrame::authenticate(
             auth_native.chain_id,
             &frame.transactions,
@@ -1124,18 +1156,23 @@ where
         // Keep the authenticated frame's exact bytes so a block built from it
         // can be sent, and put back together, by reference.
         if n42_tx_types::frame_ref_blocks_enabled() {
-            let hashes = admitted
+            let (hashes, senders) = admitted
                 .transactions()
                 .iter()
-                .map(|tx| *tx.transaction().hash())
-                .collect();
-            n42_tx_types::FrameStore::global().insert(admitted.root(), frame.transactions, hashes);
+                .map(|tx| (*tx.transaction().hash(), tx.sender()))
+                .unzip();
+            stored = n42_tx_types::FrameStore::global().insert_with_senders(
+                admitted.root(),
+                frame.transactions,
+                hashes,
+                senders,
+            );
         }
-        Ok(admitted)
+        Ok((admitted, stored))
     })
     .await;
-    let frame = match admitted {
-        Ok(Ok(frame)) => frame,
+    let (frame, stored) = match admitted {
+        Ok(Ok(admitted)) => admitted,
         Ok(Err::<_, n42_tx_types::admission::FrameAdmissionError>(error)) => {
             metrics::counter!("n42_ingest_native_frames_total", "outcome" => "rejected")
                 .increment(1);
@@ -1159,7 +1196,22 @@ where
     };
     metrics::histogram!("n42_ingest_batch_duration_ms", "phase" => "native_authenticate", "auth" => outcome)
         .record(auth_start.elapsed().as_secs_f64() * 1_000.0);
+    if hold_only {
+        if stored {
+            let mut held = HELD_FRAMES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if held.len() >= MAX_HELD_FRAMES {
+                held.clear();
+            }
+            held.insert(frame.root());
+        }
+        metrics::counter!("n42_ingest_native_frames_total", "outcome" => "held").increment(1);
+        return 0;
+    }
     metrics::counter!("n42_ingest_native_frames_total", "outcome" => outcome).increment(1);
+    let held_before = HELD_FRAMES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&frame.root());
 
     // The sender is now authenticated: record it so this node's own payload
     // building and import do not verify the signature again.
@@ -1178,11 +1230,47 @@ where
         }
     }
     let batch_size = pooled.len();
-    let accepted = pool
-        .add_prevalidated(pooled)
-        .iter()
-        .filter(|r| r.is_ok())
-        .count();
+    let accepted = if crate::frame_queue::frame_queue_enabled() {
+        // The frame waits for the builder outside the pool. One the store
+        // already held was queued when it first arrived, unless it arrived
+        // while the gate was closed.
+        if stored || held_before {
+            let now = std::time::Instant::now();
+            let queued = pooled
+                .into_iter()
+                .map(|transaction| {
+                    let sender = transaction.sender();
+                    let nonce = transaction.nonce();
+                    // The pool's sender numbering is not involved; the id
+                    // only has to tell senders apart.
+                    let sender_id = u64::from_be_bytes(
+                        sender.0[12..20]
+                            .try_into()
+                            .expect("an address has 20 bytes"),
+                    );
+                    Arc::new(ValidPoolTransaction {
+                        transaction,
+                        transaction_id: TransactionId::new(SenderId::from(sender_id), nonce),
+                        propagate: false,
+                        timestamp: now,
+                        origin: TransactionOrigin::External,
+                        authority_ids: None,
+                    })
+                })
+                .collect();
+            crate::frame_queue::FrameQueue::global().push(
+                n42_tx_types::FrameStore::global(),
+                frame.root(),
+                queued,
+            );
+        }
+        batch_size
+    } else {
+        pool.add_prevalidated(pooled)
+            .iter()
+            .filter(|r| r.is_ok())
+            .count()
+    };
     stats.accepted.fetch_add(accepted as u64, Ordering::Relaxed);
     if accepted < batch_size {
         stats
@@ -1465,6 +1553,7 @@ mod tests {
                 transactions,
                 attestations,
             },
+            false,
         )
         .await;
         assert_eq!(accepted, 4);
@@ -1500,6 +1589,7 @@ mod tests {
                 transactions,
                 attestations: Vec::new(),
             },
+            false,
         )
         .await;
         assert_eq!(accepted, 0);
@@ -1524,6 +1614,7 @@ mod tests {
                 transactions,
                 attestations,
             },
+            false,
         )
         .await;
         // Valid signatures: admitted through verification, not through the stranger.
@@ -1547,6 +1638,7 @@ mod tests {
                 transactions,
                 attestations: Vec::new(),
             },
+            false,
         )
         .await;
         assert_eq!(accepted, 0);

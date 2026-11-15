@@ -46,6 +46,6 @@ pub use protocol::{ConsensusEngine, ConsensusEvent, EngineOutput, ViewTiming};
 pub use receipt::gov5_native_receipts_root;
 pub use validator::{
     DEFAULT_MAX_HISTORICAL_EPOCHS, EpochManager, LeaderSelector, MAX_HISTORICAL_EPOCHS_LIMIT,
-    ValidatorSet,
+    ValidatorSet, leader_index, leader_tenure,
 };
 pub use vote_log::{NoopVoteLog, VoteLogWriter};

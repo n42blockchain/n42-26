@@ -48,13 +48,18 @@ use std::{
 pub type RestoredSlot = (Address, U256, U256);
 
 /// Bind the committed transactions, in order, to an execution context.
+///
+/// The key only names an entry of this process's registry; it never leaves
+/// the node. BLAKE3 is used because a full native block hashes 3 MB of
+/// transaction hashes here, twice per import (executor and root job), which
+/// took about 10 ms each with Keccak-256.
 pub fn restored_slots_key(context_key: B256, tx_hashes: impl IntoIterator<Item = B256>) -> B256 {
-    let mut preimage = Vec::with_capacity(32 * 64);
-    preimage.extend_from_slice(context_key.as_slice());
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(context_key.as_slice());
     for hash in tx_hashes {
-        preimage.extend_from_slice(hash.as_slice());
+        hasher.update(hash.as_slice());
     }
-    keccak256(&preimage)
+    B256::from(*hasher.finalize().as_bytes())
 }
 
 /// Bind restored writes to the block environment, not just parent and txs.

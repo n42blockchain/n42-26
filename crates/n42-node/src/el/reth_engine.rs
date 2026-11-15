@@ -116,18 +116,23 @@ impl ExecutionLayer for RethExecutionLayer {
 /// here so the orchestrator and the `ExecutionLayer` trait stay reth-free.
 fn to_built_block(payload: N42BuiltPayload) -> BuiltBlock {
     let block = payload.block();
-    let blob_tx_hashes = block
+    let blob_tx_hashes: Vec<_> = block
         .body()
         .transactions()
         .filter(|tx| tx.is_eip4844())
         .map(|tx| *tx.tx_hash())
         .collect();
+    let execution_data = if blob_tx_hashes.is_empty() {
+        crate::engine_types::blobless_block_to_payload(block)
+    } else {
+        <N42EngineTypes as PayloadTypes>::block_to_payload(block.clone(), None)
+    };
     BuiltBlock {
         hash: block.hash(),
         number: block.header().number,
         timestamp: block.header().timestamp,
         tx_count: block.body().transactions().count(),
-        execution_data: <N42EngineTypes as PayloadTypes>::block_to_payload(block.clone(), None),
+        execution_data,
         blob_tx_hashes,
     }
 }

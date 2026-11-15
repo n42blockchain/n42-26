@@ -236,10 +236,21 @@ where
             .node_types::<N>()
             .pool(N42PoolBuilder::default())
             .executor(N42ExecutorBuilder::default())
-            .payload(BasicPayloadServiceBuilder::new(
-                N42PayloadBuilder::new(self.consensus_state.clone())
-                    .with_eof_guard(self.header_profile == N42HeaderProfile::Gov5H2),
-            ))
+            .payload(
+                BasicPayloadServiceBuilder::new(
+                    N42PayloadBuilder::new(self.consensus_state.clone())
+                        .with_eof_guard(self.header_profile == N42HeaderProfile::Gov5H2),
+                )
+                // reth copies every account the parent block changed into a
+                // read cache for the next build, on the payload service's
+                // own task and again per job. On a full block of transfers
+                // that delays the job by tens of milliseconds and the next
+                // block touches other accounts. `N42_PAYLOAD_PRECACHE=0`
+                // turns it off.
+                .with_pre_cache_state(
+                    !std::env::var("N42_PAYLOAD_PRECACHE").is_ok_and(|v| v == "0"),
+                ),
+            )
             .network(EthereumNetworkBuilder::default())
             .consensus({
                 let mut builder =

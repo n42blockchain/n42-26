@@ -9,7 +9,7 @@
 //! their positions in it; a follower that holds those frames puts the same
 //! bytes back. A follower that misses a frame takes the block's full copy.
 
-use alloy_primitives::{B256, Bytes, map::B256HashMap};
+use alloy_primitives::{Address, B256, Bytes, map::B256HashMap};
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex, OnceLock, PoisonError},
@@ -24,6 +24,9 @@ pub struct StoredFrame {
     pub transactions: Vec<Bytes>,
     /// Hash of each transaction.
     pub hashes: Vec<B256>,
+    /// Authenticated sender of each transaction; empty when the frame was
+    /// kept without them.
+    pub senders: Vec<Address>,
 }
 
 #[derive(Default)]
@@ -89,7 +92,22 @@ impl FrameStore {
     /// order; a frame already held, or an inconsistent one, is ignored. A
     /// transaction keeps the first frame that named it.
     pub fn insert(&self, root: B256, transactions: Vec<Bytes>, hashes: Vec<B256>) -> bool {
+        self.insert_with_senders(root, transactions, hashes, Vec::new())
+    }
+
+    /// [`Self::insert`], also keeping the sender admission authenticated for
+    /// each transaction (`senders` empty, or one per transaction).
+    pub fn insert_with_senders(
+        &self,
+        root: B256,
+        transactions: Vec<Bytes>,
+        hashes: Vec<B256>,
+        senders: Vec<Address>,
+    ) -> bool {
         if transactions.len() != hashes.len() || transactions.is_empty() {
+            return false;
+        }
+        if !senders.is_empty() && senders.len() != hashes.len() {
             return false;
         }
         let mut inner = self.lock();
@@ -123,9 +141,23 @@ impl FrameStore {
                 root,
                 transactions,
                 hashes,
+                senders,
             }),
         );
         true
+    }
+
+    /// The sender admission authenticated for this transaction, if a held
+    /// frame carries it.
+    pub fn sender_of(&self, hash: &B256) -> Option<Address> {
+        let inner = self.lock();
+        let (root, position) = inner.by_transaction.get(hash)?;
+        inner
+            .frames
+            .get(root)?
+            .senders
+            .get(*position as usize)
+            .copied()
     }
 
     /// The frame with this root, if held.
@@ -196,6 +228,28 @@ mod tests {
             .map(alloy_primitives::keccak256)
             .collect();
         (crate::frame_root(&hashes), transactions, hashes)
+    }
+
+    #[test]
+    fn a_frame_kept_with_senders_answers_for_each_transaction() {
+        let store = FrameStore::new(4);
+        let hashes = vec![B256::repeat_byte(0xa1), B256::repeat_byte(0xa2)];
+        let senders = vec![Address::repeat_byte(1), Address::repeat_byte(2)];
+        let bytes = vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")];
+        assert!(!store.insert_with_senders(
+            B256::repeat_byte(0xf0),
+            bytes.clone(),
+            hashes.clone(),
+            senders[..1].to_vec(),
+        ));
+        assert!(store.insert_with_senders(B256::repeat_byte(0xf1), bytes, hashes.clone(), senders));
+        assert_eq!(store.sender_of(&hashes[1]), Some(Address::repeat_byte(2)));
+        assert_eq!(store.sender_of(&B256::repeat_byte(0xa3)), None);
+
+        // A frame kept without senders has no answer.
+        let plain = B256::repeat_byte(0xb1);
+        store.insert(B256::repeat_byte(0xf2), vec![Bytes::from_static(b"c")], vec![plain]);
+        assert_eq!(store.sender_of(&plain), None);
     }
 
     #[test]

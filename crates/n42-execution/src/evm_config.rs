@@ -153,6 +153,7 @@ impl ConfigureEvm for N42EvmConfig {
         env: &EvmEnvFor<Self>,
         parent_hash: alloy_primitives::B256,
         transactions: &[alloy_consensus::transaction::Recovered<N42TxEnvelope>],
+        open_parent: &(dyn Fn() -> Option<reth_storage_api::EvmStateProviderBox> + Sync),
     ) -> Result<Option<reth_evm::ImportBatchFinalize>, reth_evm::execute::BlockExecutionError> {
         let Some(provider) = &self.parallel_import else {
             return Ok(None);
@@ -160,9 +161,17 @@ impl ConfigureEvm for N42EvmConfig {
         let started = std::time::Instant::now();
         let _record = record_import_batch_time(started);
         crate::parallel_block::try_commit_import_batch(executor, env, transactions, &|| {
-            (provider.0)(parent_hash).ok().map(|provider| {
-                reth_revm::database::StateProviderDatabase::new(provider.into_evm_state_provider())
-            })
+            // The provider opened by hash keeps QMDB read routing, so it goes
+            // first. A parent that is in the engine tree but not yet canonical
+            // cannot be opened by hash; the caller's view covers that case.
+            (provider.0)(parent_hash)
+                .ok()
+                .map(|provider| {
+                    Box::new(provider.into_evm_state_provider())
+                        as reth_storage_api::EvmStateProviderBox
+                })
+                .or_else(open_parent)
+                .map(reth_revm::database::StateProviderDatabase::new)
         })
         .map(|graft| {
             graft.map(|graft| {
@@ -257,10 +266,21 @@ impl ConfigureEngineEvm<ExecutionData> for N42EvmConfig {
                             Ok(sender)
                         }
                         None => {
-                            metrics::counter!("n42_alt_sig_payload_sender_total", "cache" => "miss")
-                                .increment(1);
-                            tx.try_recover()
-                                .inspect(|sender| cache.insert(*alt.hash(), *sender))
+                            // The cache drops entries under load; a frame this
+                            // node admitted and still holds has the sender too.
+                            let held = n42_tx_types::frame_ref_blocks_enabled()
+                                .then(|| n42_tx_types::FrameStore::global().sender_of(alt.hash()))
+                                .flatten();
+                            if let Some(sender) = held {
+                                metrics::counter!("n42_alt_sig_payload_sender_total", "cache" => "frame")
+                                    .increment(1);
+                                Ok(sender)
+                            } else {
+                                metrics::counter!("n42_alt_sig_payload_sender_total", "cache" => "miss")
+                                    .increment(1);
+                                tx.try_recover()
+                                    .inspect(|sender| cache.insert(*alt.hash(), *sender))
+                            }
                         }
                     }
                 }

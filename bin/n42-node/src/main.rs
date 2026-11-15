@@ -1908,6 +1908,7 @@ fn main() {
             .with_validator_set_resolver(validator_set_resolver)
             .with_header_profile(header_profile);
         if let Some(bootstrap) = &qmdb_execution {
+            n42_node::payload::set_builder_qmdb_store(bootstrap.store.clone());
             n42_node = n42_node.with_gov5_qmdb_state_root_store(bootstrap.store.clone());
         }
         let qmdb_reads = std::env::var("N42_QMDB_READS").unwrap_or_else(|_| "off".to_owned())
@@ -3203,7 +3204,13 @@ fn main() {
                             tokio::time::interval(Duration::from_millis(pool_depth_poll_ms));
                         loop {
                             let size = pool_for_depth.pool_size();
-                            pool_depth_state.update_pool_depth(size.pending, size.queued);
+                            let frame_queued = if n42_node::frame_queue::frame_queue_enabled() {
+                                n42_node::frame_queue::FrameQueue::global().pending()
+                            } else {
+                                0
+                            };
+                            pool_depth_state
+                                .update_pool_depth(size.pending + frame_queued, size.queued);
                             interval.tick().await;
                         }
                     }),
@@ -3220,6 +3227,53 @@ fn main() {
                             inject_pool,
                             ingest_chain_id,
                         )),
+                    );
+                }
+
+                // Native frames queued outside the pool leave the queue as
+                // canonical blocks include their transactions.
+                if n42_node::frame_queue::frame_queue_enabled() {
+                    let mut canonical = reth_provider::CanonStateSubscriptions::subscribe_to_canonical_state(
+                        &full_node.provider,
+                    );
+                    task_executor.spawn_critical_task(
+                        "n42-frame-queue-canonical",
+                        Box::pin(async move {
+                            use tokio::sync::broadcast::error::RecvError;
+                            loop {
+                                let notification = match canonical.recv().await {
+                                    Ok(notification) => notification,
+                                    Err(RecvError::Closed) => break,
+                                    Err(RecvError::Lagged(missed)) => {
+                                        // Their transactions stay queued until
+                                        // the builder skips them or they expire.
+                                        warn!(missed, "frame queue missed canonical notifications");
+                                        continue;
+                                    }
+                                };
+                                // A reorg takes blocks off the chain: their
+                                // transactions are offered again.
+                                if let Some(reverted) = notification.reverted() {
+                                    for block in reverted.blocks_iter() {
+                                        n42_node::frame_queue::FrameQueue::global()
+                                            .revert_mined(block.header().number);
+                                    }
+                                }
+                                let committed = notification.committed();
+                                for block in committed.blocks_iter() {
+                                    let hashes: Vec<_> = block
+                                        .body()
+                                        .transactions()
+                                        .map(|tx| *tx.hash())
+                                        .collect();
+                                    n42_node::frame_queue::FrameQueue::global().mark_mined(
+                                        n42_tx_types::FrameStore::global(),
+                                        block.header().number,
+                                        &hashes,
+                                    );
+                                }
+                            }
+                        }),
                     );
                 }
 

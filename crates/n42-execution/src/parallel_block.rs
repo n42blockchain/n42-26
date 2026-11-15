@@ -7,7 +7,7 @@
 
 use crate::{
     N42EvmConfig,
-    parallel_transfer::{NotParallel, append_reverts, execute_for_build, graft_bundles},
+    parallel_transfer::{NotParallel, append_reverts, execute_for_build, graft_bundles_with},
 };
 use alloy_consensus::{Transaction, transaction::TxHashRef};
 use alloy_evm::{Evm, ToTxEnv, block::BlockExecutor, eth::EthTxResult};
@@ -136,7 +136,7 @@ where
     }
     let (_, graft) = commit_transfer_batch(executor, run, env.block_env.beneficiary, |tx| {
         (*tx.tx_hash(), alloy_consensus::TransactionEnvelope::tx_type(&***tx))
-    })?;
+    }, true)?;
     Ok(Some(graft))
 }
 
@@ -147,6 +147,43 @@ where
 pub fn commit_transfer_batch<'a, DB, E, T>(
     executor: &mut crate::restored_slots::TrackingExecutor<E>,
     run: crate::parallel_transfer::BuildRun<T>,
+    beneficiary: alloy_primitives::Address,
+    metadata: impl Fn(&T) -> (alloy_primitives::B256, N42TxType),
+    keep_cache: bool,
+) -> Result<(Vec<T>, crate::parallel_transfer::Graft), BlockExecutionError>
+where
+    DB: Database + 'a,
+    E: BlockExecutor<
+            Evm: Evm<DB = &'a mut State<DB>>,
+            Transaction = N42TxEnvelope,
+            Result = EthTxResult<revm::context::result::HaltReason, N42TxType>,
+        >,
+{
+    if !executor.receipts().is_empty() {
+        return Err(BlockExecutionError::msg(
+            "transfer batch must precede serial transactions",
+        ));
+    }
+    // Without the cache entries the state answers reads of a grafted account
+    // from the parent: the caller must run nothing after the batch that could
+    // read one (no serial transaction, no withdrawal).
+    let graft = graft_bundles_with(
+        executor.evm_mut().db_mut(),
+        run.bundles,
+        beneficiary,
+        keep_cache,
+    )
+    .map_err(BlockExecutionError::other)?;
+    finish_transfer_batch(executor, run.executed, graft, beneficiary, metadata)
+}
+
+/// The part of [`commit_transfer_batch`] after the graft: the beneficiary's
+/// credit and the transfers' receipts. For a caller that grafted the bundles
+/// itself (as they arrived from `execute_for_build_streamed`).
+pub fn finish_transfer_batch<'a, DB, E, T>(
+    executor: &mut crate::restored_slots::TrackingExecutor<E>,
+    executed: Vec<crate::parallel_transfer::BuiltTransfer<T>>,
+    graft: crate::parallel_transfer::Graft,
     beneficiary: alloy_primitives::Address,
     metadata: impl Fn(&T) -> (alloy_primitives::B256, N42TxType),
 ) -> Result<(Vec<T>, crate::parallel_transfer::Graft), BlockExecutionError>
@@ -163,8 +200,6 @@ where
             "transfer batch must precede serial transactions",
         ));
     }
-    let graft = graft_bundles(executor.evm_mut().db_mut(), run.bundles, beneficiary)
-        .map_err(BlockExecutionError::other)?;
     if !graft.beneficiary_delta.is_zero() {
         let db = executor.evm_mut().db_mut();
         let mut info = db.basic(beneficiary).map_err(BlockExecutionError::other)?;
@@ -197,8 +232,8 @@ where
     // The standard receipt builder and gas accounting still own these outputs.
     // No storage was written by the qualified transfers, but their hashes must
     // remain in the restored-slot registry key in their original block order.
-    let mut transactions = Vec::with_capacity(run.executed.len());
-    for tx in run.executed {
+    let mut transactions = Vec::with_capacity(executed.len());
+    for tx in executed {
         let (hash, tx_type) = metadata(&tx.tx);
         executor.commit_preexecuted_transfer(
             hash,

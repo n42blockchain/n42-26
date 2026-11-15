@@ -9,6 +9,31 @@ use n42_primitives::consensus::ViewNumber;
 #[derive(Debug, Clone)]
 pub struct LeaderSelector;
 
+/// Consecutive views one validator leads before the role moves on.
+///
+/// This is a rule of the chain: every validator must run with the same
+/// value, or they disagree about who may propose. The default of 1 is the
+/// rotation every existing network uses. `N42_LEADER_TENURE` raises it for
+/// the measurement route, where a leader that keeps the role can prepare its
+/// next block while the current one is being voted on; a network that adopts
+/// it has to carry the value in its genesis instead of the environment.
+pub fn leader_tenure() -> u64 {
+    static TENURE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TENURE.get_or_init(|| {
+        std::env::var("N42_LEADER_TENURE")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|tenure| *tenure > 0)
+            .unwrap_or(1)
+    })
+}
+
+/// The leader of `view` among `validators` validators when each leads
+/// `tenure` consecutive views. `validators` and `tenure` must not be zero.
+pub fn leader_index(view: ViewNumber, validators: u64, tenure: u64) -> u32 {
+    ((view / tenure) % validators) as u32
+}
+
 impl LeaderSelector {
     /// Returns the leader's validator index for the given view.
     ///
@@ -21,7 +46,7 @@ impl LeaderSelector {
             !validator_set.is_empty(),
             "leader_for_view called with empty validator set"
         );
-        (view % validator_set.len() as u64) as u32
+        leader_index(view, validator_set.len() as u64, leader_tenure())
     }
 
     /// Checks if the given validator is the leader for the given view.
@@ -33,6 +58,23 @@ impl LeaderSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tenure_keeps_the_leader_for_that_many_views_then_rotates() {
+        assert_eq!(
+            (0..8)
+                .map(|view| leader_index(view, 3, 1))
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 0, 1, 2, 0, 1]
+        );
+        assert_eq!(
+            (0..10)
+                .map(|view| leader_index(view, 3, 4))
+                .collect::<Vec<_>>(),
+            [0, 0, 0, 0, 1, 1, 1, 1, 2, 2]
+        );
+        assert_eq!(leader_index(4 * 3, 3, 4), 0);
+    }
     use alloy_primitives::Address;
     use n42_chainspec::ValidatorInfo;
     use n42_primitives::BlsSecretKey;

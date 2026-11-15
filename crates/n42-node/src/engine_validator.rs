@@ -205,6 +205,16 @@ where
             let p = &block.header;
             let n = &native.header;
             if p.parent_hash != n.parent_hash {
+                tracing::warn!(
+                    target: "n42::engine_validator",
+                    %expected_hash,
+                    %current_hash,
+                    payload_parent = %p.parent_hash,
+                    native_parent = %n.parent_hash,
+                    payload_number = p.number,
+                    native_number = n.number,
+                    "gov5 payload and remembered native header name different parents"
+                );
                 return Err(mismatch("parentHash"));
             }
             if p.beneficiary != n.beneficiary {

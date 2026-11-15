@@ -331,6 +331,37 @@ impl PayloadTypes for N42EngineTypes {
     }
 }
 
+/// [`PayloadTypes::block_to_payload`] for a block without blob transactions,
+/// from a reference: the transactions are encoded side by side straight out
+/// of the block instead of being cloned and then encoded one after another.
+/// On a full native block the clone and the serial encoding cost tens of
+/// milliseconds on the leader's path to the proposal.
+///
+/// A blob transaction contributes its versioned hashes to the sidecar, which
+/// is derived from the block's transactions; such a block must go through
+/// `block_to_payload`.
+pub fn blobless_block_to_payload(block: &SealedBlock<Block>) -> ExecutionData {
+    use alloy_eips::eip2718::Encodable2718;
+    use rayon::prelude::*;
+    let body = block.body();
+    let shell = Block {
+        header: block.header().clone(),
+        body: alloy_consensus::BlockBody {
+            transactions: Vec::new(),
+            ommers: body.ommers.clone(),
+            withdrawals: body.withdrawals.clone(),
+        },
+    };
+    let (mut payload, sidecar) =
+        ExecutionPayload::from_block_unchecked_with_extras(block.hash(), &shell, None);
+    payload.as_v1_mut().transactions = body
+        .transactions
+        .par_iter()
+        .map(|tx| tx.encoded_2718().into())
+        .collect();
+    ExecutionData { payload, sidecar }
+}
+
 impl EngineTypes for N42EngineTypes {
     type ExecutionPayloadEnvelopeV1 = ExecutionPayloadV1;
     type ExecutionPayloadEnvelopeV2 = ExecutionPayloadEnvelopeV2;
@@ -585,6 +616,18 @@ mod tests {
         assert_eq!(
             alloy_consensus::Transaction::nonce(&rebuilt.body.transactions[1]),
             1
+        );
+    }
+
+    #[test]
+    fn a_blobless_block_converts_from_a_reference_to_the_same_payload() {
+        let sealed = block(3).sealed_block().clone();
+        let by_reference = blobless_block_to_payload(&sealed);
+        let by_value = <N42EngineTypes as PayloadTypes>::block_to_payload(sealed, None);
+        assert_eq!(by_reference.payload.transactions().len(), 3);
+        assert_eq!(
+            serde_json::to_value(&by_reference).unwrap(),
+            serde_json::to_value(&by_value).unwrap()
         );
     }
 

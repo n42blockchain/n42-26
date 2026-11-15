@@ -1,4 +1,7 @@
-use super::{AsyncCommitStage, AsyncCommitState, ConsensusService, ImportOutcome, h2_v4_catchup_buffer_blocks};
+use super::{
+    AsyncCommitStage, AsyncCommitState, ConsensusService, ImportOutcome,
+    h2_v4_catchup_buffer_blocks,
+};
 use super::{LeaderBuildWaitMode, state_mgmt::max_consecutive_empty_skips};
 use crate::el::{ExecutionLayer, ExecutionPath};
 use crate::exec_cache::ExecutionOutputCache;
@@ -952,7 +955,9 @@ impl ConsensusService {
                 }
             }
         }
-        let views: Vec<_> = self.async_commit_states.iter()
+        let views: Vec<_> = self
+            .async_commit_states
+            .iter()
             .filter(|(_, state)| state.block_hash == block_hash)
             .map(|(view, _)| *view)
             .collect();
@@ -977,6 +982,23 @@ impl ConsensusService {
             state.block_hash == block_hash && state.stage == AsyncCommitStage::Committed
         });
         if !still_waiting {
+            return;
+        }
+        let eager_in_flight = self
+            .eager_imports_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&block_hash);
+        if eager_in_flight {
+            // The block is already being executed. Check again later instead
+            // of executing it a second time alongside the first.
+            counter!("n42_async_commit_execution_timeout_total", "action" => "wait_eager")
+                .increment(1);
+            let timeout_tx = self.commit_execution_timeout_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(commit_execution_ready_timeout()).await;
+                let _ = timeout_tx.send((view, block_hash)).await;
+            });
             return;
         }
         let retained = self
@@ -1064,13 +1086,14 @@ impl ConsensusService {
         };
 
         let fcu_state = ForkchoiceState {
-            head_block_hash: block_hash,
+            head_block_hash: self.finalize_head_for(block_hash),
             safe_block_hash: block_hash,
             finalized_block_hash: block_hash,
         };
 
         if self.async_finalize_fcu {
             let done_tx = self.finalize_done_tx.clone();
+            let finalized_mark = self.finalized_view_mark.clone();
             tokio::spawn(async move {
                 let fcu_start = std::time::Instant::now();
                 let finalized = match engine_handle
@@ -1092,7 +1115,18 @@ impl ConsensusService {
                         info!(target: "n42::cl::consensus_loop", view, %block_hash, status = ?result.payload_status.status, elapsed_ms, "N42_FCU: async finalize fcu");
                         // Only `Valid` is a real finalize. `Accepted` (stored,
                         // not executed) must not advance the validated head (F3).
-                        matches!(result.payload_status.status, PayloadStatusEnum::Valid)
+                        let valid =
+                            matches!(result.payload_status.status, PayloadStatusEnum::Valid);
+                        if valid {
+                            finalized_mark.fetch_max(view, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        valid
+                    }
+                    Err(e) if finalized_by_descendant(&e, view, &finalized_mark) => {
+                        counter!("n42_async_finalize_fcu_outcomes_total", "status" => "behind")
+                            .increment(1);
+                        info!(target: "n42::cl::consensus_loop", view, %block_hash, "async finalize fcu arrived after a later committed block was finalized");
+                        true
                     }
                     Err(e) => {
                         counter!("n42_async_finalize_fcu_outcomes_total", "status" => "error")
@@ -1248,7 +1282,7 @@ impl ConsensusService {
                 debug!(target: "n42::cl::consensus_loop", view, %block_hash,
                     "N42_DEFER_STATE_ROOT: block finalized with deferred state root (B256::ZERO)");
             }
-            self.pending_block_data.clear();
+            self.prune_pending_block_data_through(view);
             self.pending_executions.clear();
             self.enqueue_mobile_packet(block_hash, view, "block finalized")
                 .await;
@@ -1267,7 +1301,7 @@ impl ConsensusService {
             self.mark_async_commit_retryable(view, block_hash);
             // Case B: BlockData cached but not yet imported (deferred import path).
             info!(target: "n42::cl::consensus_loop", view, %block_hash, "queueing background import for deferred finalization");
-            self.pending_block_data.clear();
+            self.prune_pending_block_data_through(view);
             self.pending_executions.clear();
             self.enqueue_bg_import(data, block_hash, view);
         } else {
@@ -1280,7 +1314,7 @@ impl ConsensusService {
             if let Some(data) = self.pending_block_data.remove(&block_hash) {
                 // Recovered! Proceed as Case B.
                 info!(target: "n42::cl::consensus_loop", view, %block_hash, "recovered block data from leader_payload_rx, proceeding as Case B");
-                self.pending_block_data.clear();
+                self.prune_pending_block_data_through(view);
                 self.pending_executions.clear();
                 self.enqueue_bg_import(data, block_hash, view);
             } else {
@@ -1347,11 +1381,18 @@ impl ConsensusService {
         };
         let exec_cache = self.exec_output_cache.clone();
         let bad_blocks = self.bad_blocks.clone();
+        let finalized_mark = self.finalized_view_mark.clone();
         info!(target: "n42::cl::consensus_loop", view, %block_hash, "spawning background import");
         tokio::spawn(async move {
-            let (outcome, block_ts) =
-                Self::background_import(eh, exec_cache, bad_blocks, data.as_slice(), block_hash)
-                    .await;
+            let (outcome, block_ts) = Self::background_import(
+                eh,
+                exec_cache,
+                bad_blocks,
+                data.as_slice(),
+                block_hash,
+                Some((view, finalized_mark)),
+            )
+            .await;
             if done_tx
                 .send((block_hash, view, outcome, block_ts))
                 .await
@@ -1370,6 +1411,7 @@ impl ConsensusService {
         bad_blocks: super::bad_block_cache::BadBlockCache,
         data: &[u8],
         block_hash: B256,
+        finalized: Option<(u64, Arc<std::sync::atomic::AtomicU64>)>,
     ) -> (ImportOutcome, u64) {
         if bad_blocks.should_skip(block_hash, "committed_import") {
             return (ImportOutcome::Invalid, 0);
@@ -1456,7 +1498,20 @@ impl ConsensusService {
                     Ok(result)
                         if matches!(result.payload_status.status, PayloadStatusEnum::Valid) =>
                     {
+                        if let Some((view, mark)) = &finalized {
+                            mark.fetch_max(*view, std::sync::atomic::Ordering::Relaxed);
+                        }
                         info!(target: "n42::cl::consensus_loop", %block_hash, "bg import: block imported successfully");
+                        (ImportOutcome::Valid, block_timestamp)
+                    }
+                    Err(e)
+                        if finalized
+                            .as_ref()
+                            .is_some_and(|(view, mark)| finalized_by_descendant(&e, *view, mark)) =>
+                    {
+                        // The payload was accepted above; only the head move was
+                        // refused, because a later committed block is final.
+                        info!(target: "n42::cl::consensus_loop", %block_hash, "bg import: block already finalized through a later committed block");
                         (ImportOutcome::Valid, block_timestamp)
                     }
                     Ok(result)
@@ -1628,6 +1683,16 @@ impl ConsensusService {
 
         // Exhaust the empty-skip budget to force the next leader to build.
         self.consecutive_empty_skips = max_consecutive_empty_skips();
+
+        if !self.engine.is_current_leader() {
+            self.ahead_ready = None;
+            self.ahead_validated = None;
+            self.ahead_building = None;
+            self.ahead_emitting = None;
+        } else if self.take_ahead_build(new_view).await {
+            debug!(target: "n42::cl::consensus_loop", new_view, "proposing the payload built ahead for this view");
+            return;
+        }
 
         if self.engine.is_current_leader() {
             // If a background import is in flight, do NOT build here — the head_block_hash
@@ -2509,4 +2574,16 @@ impl ConsensusService {
             }
         }
     }
+}
+
+/// Whether a refused finalize of the committed block at `view` only means a
+/// later committed block was finalized first. Committed blocks form one chain,
+/// so that later block has `view`'s block as an ancestor and the execution
+/// layer reports the stale head move as a reorg below its finalized block.
+fn finalized_by_descendant(
+    error: &impl std::fmt::Display,
+    view: u64,
+    finalized_mark: &std::sync::atomic::AtomicU64,
+) -> bool {
+    finalized_mark.load(std::sync::atomic::Ordering::Relaxed) > view && error.to_string().contains("too deep reorg")
 }

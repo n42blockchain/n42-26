@@ -1,6 +1,6 @@
 use alloy_consensus::{
-    EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH, Header, TxReceipt,
-    proofs::{calculate_receipt_root, calculate_withdrawals_root},
+    EMPTY_OMMER_ROOT_HASH, EMPTY_ROOT_HASH, Header, Transaction, TxReceipt,
+    proofs::calculate_withdrawals_root,
 };
 use alloy_primitives::{B256, Bloom, Bytes, U256, keccak256};
 use arc_swap::ArcSwapOption;
@@ -353,34 +353,40 @@ where
                 ));
             }
 
-            let (ethereum_root, logs_bloom) = receipt_root_bloom.unwrap_or_else(|| {
-                let receipts = result
-                    .receipts
-                    .iter()
-                    .map(TxReceipt::with_bloom_ref)
-                    .collect::<Vec<_>>();
-                let root = calculate_receipt_root(&receipts);
-                let bloom = receipts
-                    .iter()
-                    .fold(Bloom::ZERO, |bloom, receipt| bloom | receipt.bloom_ref());
-                (root, bloom)
-            });
-            let senders = block.senders().to_vec();
-            let mut normalized = block.clone().into_block();
-            normalized.header.receipts_root = ethereum_root;
-            if normalized.header.requests_hash.is_none()
+            // The remaining checks (gas used, logs bloom, requests hash, access
+            // list hash) read only the header. The header of this profile
+            // commits to the native receipts root checked above, so the
+            // Ethereum receipt trie is not built: the inner comparison gets
+            // the header's own value, and the bloom is the one real input.
+            let logs_bloom = receipt_root_bloom.map_or_else(
+                || {
+                    result.receipts.iter().fold(Bloom::ZERO, |bloom, receipt| {
+                        bloom | receipt.with_bloom_ref().bloom_ref()
+                    })
+                },
+                |(_, bloom)| bloom,
+            );
+            let mut header = block.header().clone();
+            if header.requests_hash.is_none()
                 && self
                     .chain_spec
-                    .is_prague_active_at_timestamp(normalized.header.timestamp)
+                    .is_prague_active_at_timestamp(header.timestamp)
             {
-                normalized.header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
+                header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
             }
-            let normalized = RecoveredBlock::new_unhashed(normalized, senders);
+            let receipts_root = header.receipts_root;
+            let header_only = RecoveredBlock::new_unhashed(
+                N42Block {
+                    header,
+                    body: Default::default(),
+                },
+                Vec::new(),
+            );
             return <EthBeaconConsensus<C> as FullConsensus<N42Primitives>>::validate_block_post_execution(
                 &self.inner,
-                &normalized,
+                &header_only,
                 result,
-                Some((ethereum_root, logs_bloom)),
+                Some((receipts_root, logs_bloom)),
                 block_access_list_hash,
             );
         }
@@ -391,6 +397,10 @@ where
             receipt_root_bloom,
             block_access_list_hash,
         )
+    }
+
+    fn uses_receipt_root(&self) -> bool {
+        self.header_profile != N42HeaderProfile::Gov5H2
     }
 }
 
@@ -431,23 +441,59 @@ where
         &self,
         block: &SealedBlock<N42Block>,
     ) -> Result<(), ConsensusError> {
-        if self.header_profile == N42HeaderProfile::Gov5H2 {
-            let mut normalized = block.clone().into_block();
-            normalized.header = self
-                .normalize_header(block.header())
-                .map_err(ConsensusError::other)?;
-            if validate_gov5_replay_v2_header(block.header()).is_ok() {
-                normalized.body.withdrawals = None;
-            } else {
-                let body = normalized.body.clone();
-                normalize_gov5_rewards(&mut normalized.header, &body)
-                    .map_err(ConsensusError::other)?;
-            }
+        self.validate_block_pre_execution_with_tx_root(block, None)
+    }
+
+    fn validate_block_pre_execution_with_tx_root(
+        &self,
+        block: &SealedBlock<N42Block>,
+        transaction_root: Option<B256>,
+    ) -> Result<(), ConsensusError> {
+        if self.header_profile != N42HeaderProfile::Gov5H2 {
             return self
                 .inner
-                .validate_block_pre_execution(&normalized.seal_slow());
+                .validate_block_pre_execution_with_tx_root(block, transaction_root);
         }
-        self.inner.validate_block_pre_execution(block)
+        let mut header = self
+            .normalize_header(block.header())
+            .map_err(ConsensusError::other)?;
+        let body = block.body();
+        // Normalization leaves the transactions alone, so the root of this
+        // body is the root of the normalized block.
+        let transaction_root = transaction_root
+            .unwrap_or_else(|| reth_primitives_traits::BlockBody::calculate_tx_root(body));
+        // Besides the root, the inner check reads the transactions only for
+        // the blob gas sum and, from Osaka on, the block size. A block with
+        // neither is checked on a copy without its transactions.
+        let needs_transactions = self
+            .chain_spec
+            .is_osaka_active_at_timestamp(header.timestamp)
+            || body
+                .transactions
+                .iter()
+                .any(|transaction| transaction.blob_gas_used().is_some());
+        let mut normalized_body = if needs_transactions {
+            body.clone()
+        } else {
+            alloy_consensus::BlockBody {
+                transactions: Vec::new(),
+                ommers: body.ommers.clone(),
+                withdrawals: body.withdrawals.clone(),
+            }
+        };
+        if validate_gov5_replay_v2_header(block.header()).is_ok() {
+            normalized_body.withdrawals = None;
+        } else {
+            normalize_gov5_rewards(&mut header, &normalized_body).map_err(ConsensusError::other)?;
+        }
+        let normalized = N42Block {
+            header,
+            body: normalized_body,
+        };
+        self.inner.validate_block_pre_execution_with_tx_root(
+            &normalized.seal_slow(),
+            Some(transaction_root),
+        )
     }
 }
 
@@ -820,6 +866,137 @@ mod tests {
         assert!(matches!(
             gov5.validate_block_post_execution(&forged, &result, None, None),
             Err(ConsensusError::BodyReceiptRootDiff(_))
+        ));
+    }
+
+    /// The Gov5 profile builds no receipt trie: the logs bloom and the gas
+    /// used are still compared with the header.
+    #[test]
+    fn gov5_post_execution_checks_bloom_and_gas_without_a_receipt_trie() {
+        let chain_spec = reth_chainspec::MAINNET.clone();
+        let standard = N42Consensus::new(chain_spec.clone());
+        let gov5 = N42Consensus::new(chain_spec).with_header_profile(N42HeaderProfile::Gov5H2);
+        assert!(standard.uses_receipt_root());
+        assert!(!gov5.uses_receipt_root());
+
+        let log = alloy_primitives::Log::new_unchecked(
+            alloy_primitives::Address::repeat_byte(0x11),
+            vec![B256::repeat_byte(0x22)],
+            Bytes::new(),
+        );
+        let receipt = EthereumReceipt {
+            tx_type: n42_tx_types::N42TxType::Eth(TxType::Legacy),
+            success: true,
+            cumulative_gas_used: 30_000,
+            logs: vec![log],
+        };
+        let logs_bloom = *receipt.with_bloom_ref().bloom_ref();
+        assert_ne!(logs_bloom, Bloom::ZERO);
+        let header = Header {
+            number: 13_500_000,
+            gas_used: 30_000,
+            receipts_root: gov5_native_receipts_root(std::slice::from_ref(&receipt)),
+            logs_bloom,
+            ..Default::default()
+        };
+        let block_with = |header: Header| {
+            RecoveredBlock::new_unhashed(
+                N42Block {
+                    header,
+                    body: Default::default(),
+                },
+                Vec::new(),
+            )
+        };
+        let result = BlockExecutionResult {
+            receipts: vec![receipt],
+            gas_used: 30_000,
+            ..Default::default()
+        };
+
+        gov5.validate_block_post_execution(&block_with(header.clone()), &result, None, None)
+            .unwrap();
+        assert!(matches!(
+            gov5.validate_block_post_execution(
+                &block_with(Header {
+                    logs_bloom: Bloom::ZERO,
+                    ..header.clone()
+                }),
+                &result,
+                None,
+                None
+            ),
+            Err(ConsensusError::BodyBloomLogDiff(_))
+        ));
+        assert!(matches!(
+            gov5.validate_block_post_execution(
+                &block_with(Header {
+                    gas_used: 29_999,
+                    ..header
+                }),
+                &result,
+                None,
+                None
+            ),
+            Err(ConsensusError::BlockGasUsed { .. })
+        ));
+    }
+
+    /// The pre-execution check takes a supplied transactions root, derives it
+    /// from the real body when none is supplied, and compares either with the
+    /// header, although the inner rules run on a copy without transactions.
+    #[test]
+    fn gov5_pre_execution_binds_the_transactions_root_to_the_header() {
+        use alloy_consensus::{SignableTransaction, TxLegacy, proofs::calculate_transaction_root};
+
+        let gov5 = N42Consensus::new(reth_chainspec::MAINNET.clone())
+            .with_header_profile(N42HeaderProfile::Gov5H2);
+        let signed = TxLegacy {
+            gas_limit: 21_000,
+            ..Default::default()
+        }
+        .into_signed(alloy_primitives::Signature::new(
+            U256::from(1),
+            U256::from(2),
+            false,
+        ));
+        let transactions = vec![n42_tx_types::N42TxEnvelope::from(
+            alloy_consensus::EthereumTxEnvelope::<alloy_consensus::TxEip4844>::Legacy(signed),
+        )];
+        let root = calculate_transaction_root(&transactions);
+        assert_ne!(root, EMPTY_ROOT_HASH);
+        let valid_extra = [b"N42H".as_slice(), &[0_u8; 8], &[0_u8; 96]].concat();
+        let block_with = |transactions_root: B256| {
+            N42Block {
+                header: Header {
+                    ommers_hash: B256::ZERO,
+                    difficulty: U256::ZERO,
+                    extra_data: valid_extra.clone().into(),
+                    number: 13_500_000,
+                    transactions_root,
+                    ..Default::default()
+                },
+                body: alloy_consensus::BlockBody {
+                    transactions: transactions.clone(),
+                    ommers: Vec::new(),
+                    withdrawals: None,
+                },
+            }
+            .seal_slow()
+        };
+
+        let block = block_with(root);
+        gov5.validate_block_pre_execution(&block).unwrap();
+        gov5.validate_block_pre_execution_with_tx_root(&block, Some(root))
+            .unwrap();
+        assert!(matches!(
+            gov5.validate_block_pre_execution_with_tx_root(&block, Some(EMPTY_ROOT_HASH)),
+            Err(ConsensusError::BodyTransactionRootDiff(_))
+        ));
+        // The header claims the root of an empty body; the real body decides.
+        assert!(matches!(
+            gov5.validate_block_pre_execution(&block_with(EMPTY_ROOT_HASH)),
+            Err(ConsensusError::BodyTransactionRootDiff(_))
         ));
     }
 

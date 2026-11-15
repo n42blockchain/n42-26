@@ -527,6 +527,9 @@ pub(super) struct PayloadBuildContext {
 pub(super) struct PayloadBuildReady {
     context: PayloadBuildContext,
     block_hash: B256,
+    /// Not a proposal release: the leader's own execution layer has accepted
+    /// the block, so a child can be built on it (`N42_BUILD_ON_SEAL`).
+    own_block_validated: bool,
 }
 
 /// Serializable proxy for `(BlockExecutionOutput<Receipt>, Vec<Address>)`.
@@ -744,7 +747,11 @@ mod compact_execution_codec_tests {
                 .map(|i| Address::with_last_byte(i as u8))
                 .collect(),
             transactions_root: Some(B256::repeat_byte(9)),
-            restored_slots: Some(vec![(Address::with_last_byte(7), U256::from(1), U256::from(2))]),
+            restored_slots: Some(vec![(
+                Address::with_last_byte(7),
+                U256::from(1),
+                U256::from(2),
+            )]),
         }
     }
 
@@ -965,6 +972,34 @@ enum ImportOutcome {
 type ImportDone = (B256, u64, ImportOutcome, u64);
 type SidecarDiffWork = (u64, B256, n42_execution::state_diff::StateDiff);
 type SharedBlockData = Arc<Vec<u8>>;
+
+/// Removes a hash from the in-flight eager import set when the import task
+/// ends, whatever its outcome.
+struct EagerImportInFlight {
+    set: Arc<std::sync::Mutex<HashSet<B256>>>,
+    hash: B256,
+}
+
+impl EagerImportInFlight {
+    fn enter(set: &Arc<std::sync::Mutex<HashSet<B256>>>, hash: B256) -> Self {
+        set.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(hash);
+        Self {
+            set: Arc::clone(set),
+            hash,
+        }
+    }
+}
+
+impl Drop for EagerImportInFlight {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.hash);
+    }
+}
 type StateDiffReady = (B256, n42_execution::state_diff::StateDiff);
 type CommitExecutionTimeout = (u64, B256);
 type EagerImportDone = (
@@ -1206,6 +1241,11 @@ pub struct ConsensusService {
     /// Tuple: (view, block_hash, commit_qc, finalized).
     finalize_done_rx: mpsc::Receiver<FinalizeDone>,
     finalize_done_tx: mpsc::Sender<FinalizeDone>,
+    /// Highest view whose committed block the execution layer has finalized.
+    /// Finalize tasks finish out of order; one that arrives after a later
+    /// committed block was finalized is refused as a reorg and reads this to
+    /// tell that case from a real failure.
+    finalized_view_mark: Arc<std::sync::atomic::AtomicU64>,
     blob_store: Option<Arc<dyn BlobStorePort>>,
     /// Compact-block execution-output cache behind the [`ExecutionOutputCache`]
     /// port. `None` ⇒ compact-block inject/take are no-ops (tests / EL-less).
@@ -1236,6 +1276,25 @@ pub struct ConsensusService {
     /// Set when build is triggered by eager import (before consensus commit).
     /// Cleared on ViewChanged or when finalize confirms the block.
     speculative_build_hash: Option<B256>,
+    /// A payload this leader built for the view after the current one, held
+    /// until that view starts and the LockedQC names its parent.
+    ahead_ready: Option<PayloadBuildReady>,
+    /// An own block of a later view that the execution layer has accepted;
+    /// its child is built once its view is the current one, so the leader
+    /// never runs more than one block ahead of consensus.
+    ahead_validated: Option<PayloadBuildReady>,
+    /// `(tip, parent)` of the newest own block the execution layer accepted
+    /// ahead of its commit. A finalize of `parent` keeps `tip` as head.
+    ahead_tip: Option<(B256, B256)>,
+    /// The build in flight for a view that has not started yet. Kept apart
+    /// from `building_on_parent`, which guards the current view's build until
+    /// its proposal is released.
+    ahead_building: Option<PayloadBuildContext>,
+    /// An own block built ahead that the execution layer has accepted and
+    /// whose proposal is still being prepared. `ahead_building` has moved on
+    /// to that block's child by then, so this is what keeps the block's own
+    /// view from starting a second build on the same parent.
+    ahead_emitting: Option<PayloadBuildContext>,
     /// View and parent hash for which a payload build task is currently running.
     /// Prevents duplicate builds based on the same parent, which produce different
     /// blocks at the same height and overwhelm reth with conflicting `new_payload` calls
@@ -1314,6 +1373,10 @@ pub struct ConsensusService {
     /// `new_payload(Valid)` verdict. Non-Valid attempts never advance it, so an
     /// out-of-order child cannot suppress the missing parents needed for catch-up.
     eager_import_block_guard: Arc<std::sync::atomic::AtomicU64>,
+    /// Hashes whose follower eager import is still executing. The
+    /// execution-ready deadline must not start a second import of a block
+    /// that is already being executed: both would run the same block at once.
+    eager_imports_in_flight: Arc<std::sync::Mutex<HashSet<B256>>>,
     /// Fast propose mode: skip slot boundary alignment, build immediately after
     /// ViewChanged/BlockCommitted. Consensus voting naturally paces block production.
     /// Enabled by `N42_FAST_PROPOSE=1`. Default: false (grid-aligned slots).
@@ -2243,6 +2306,25 @@ impl ConsensusService {
         true
     }
 
+    /// Drops cached proposal data up to and including `view`, keeping blocks
+    /// of later views. A leader that builds ahead delivers the next block
+    /// before this member finalizes the current one; wiping the whole cache
+    /// then throws that block away and the member has to wait for a second
+    /// full copy before it can vote.
+    fn prune_pending_block_data_through(&mut self, view: u64) {
+        if self.pending_block_data.is_empty() {
+            return;
+        }
+        let later: HashSet<B256> = self
+            .recent_block_data
+            .iter()
+            .filter(|entry| entry.view > view)
+            .map(|entry| entry.block_hash)
+            .collect();
+        self.pending_block_data
+            .retain(|hash, _| later.contains(hash));
+    }
+
     fn remember_recent_block_data(
         &mut self,
         hash: B256,
@@ -2569,6 +2651,23 @@ impl ConsensusService {
         if owns_guard {
             self.building_on_parent = None;
         }
+        if self.ahead_building == Some(ready.context) {
+            self.ahead_building = None;
+        }
+        if self.ahead_emitting == Some(ready.context) {
+            self.ahead_emitting = None;
+        }
+
+        // Built ahead for the next view: consensus takes it when that view
+        // starts, if the LockedQC then names the block it was built on.
+        if execution_bridge::build_on_seal_enabled()
+            && ready.context.view == self.engine.current_view() + 1
+        {
+            debug!(target: "n42::cl::orchestrator", built_view = ready.context.view,
+                block_hash = %ready.block_hash, "holding a payload built ahead of its view");
+            self.ahead_ready = Some(ready);
+            return false;
+        }
 
         if current_context != Some(ready.context) {
             warn!(
@@ -2616,9 +2715,86 @@ impl ConsensusService {
         true
     }
 
+    /// Starts the build of the next view's block on an own block the
+    /// execution layer has just accepted, when this validator also leads the
+    /// next view. Only the build starts early: the block is proposed in its
+    /// own view, justified by the QC of its parent, like any other.
+    async fn build_ahead_on(&mut self, validated: PayloadBuildReady) {
+        if !execution_bridge::build_on_seal_enabled() {
+            return;
+        }
+        let current_view = self.engine.current_view();
+        if validated.context.view >= current_view {
+            self.ahead_emitting = Some(validated.context);
+            // From here on a finalize of this block's parent leaves the
+            // block as the execution layer's head. Recorded before the child
+            // build starts: the parent's finalize may already be on its way.
+            self.ahead_tip = Some((validated.block_hash, validated.context.parent_hash));
+        }
+        if validated.context.view > current_view {
+            // One block ahead at most: wait for this block's own view.
+            self.ahead_validated = Some(validated);
+            return;
+        }
+        let next_view = validated.context.view + 1;
+        if validated.context.view < current_view || !self.engine.is_leader_for_view(next_view) {
+            return;
+        }
+        counter!("n42_build_ahead_started_total").increment(1);
+        self.do_trigger_payload_build_on(
+            Some(PayloadBuildContext {
+                view: next_view,
+                parent_hash: validated.block_hash,
+            }),
+            None,
+        )
+        .await;
+    }
+
+    /// On entering `new_view` as leader: hands consensus the payload built
+    /// ahead for it, if it still fits, and starts the next one. Returns
+    /// whether a proposal was released, so the caller starts no other build.
+    pub(super) async fn take_ahead_build(&mut self, new_view: u64) -> bool {
+        let released = match self.ahead_ready.take() {
+            Some(ready) if self.required_payload_build_context() == Some(ready.context) => {
+                counter!("n42_build_ahead_used_total").increment(1);
+                self.handle_payload_build_ready(ready)
+            }
+            Some(ready) => {
+                counter!("n42_build_ahead_discarded_total").increment(1);
+                debug!(target: "n42::cl::orchestrator", new_view, built_view = ready.context.view,
+                    block_hash = %ready.block_hash, "payload built ahead no longer fits the view");
+                false
+            }
+            None => false,
+        };
+        if let Some(validated) = self.ahead_validated.take()
+            && validated.context.view == new_view
+        {
+            self.build_ahead_on(validated).await;
+        }
+        released
+    }
+
+    /// The head to announce when `committed` is finalized: the uncommitted
+    /// own block a child is being built on, when it is `committed`'s child,
+    /// so the execution layer is not moved off the block under construction.
+    pub(super) fn finalize_head_for(&self, committed: B256) -> B256 {
+        match self.ahead_tip {
+            Some((tip, parent)) if parent == committed => tip,
+            _ => committed,
+        }
+    }
+
     /// Clears only the guard owned by the task that completed. An older
     /// resolve task may finish after a new-view build has already started.
     fn handle_payload_build_complete(&mut self, completed: PayloadBuildContext) -> bool {
+        if self.ahead_building == Some(completed) {
+            self.ahead_building = None;
+        }
+        if self.ahead_emitting == Some(completed) {
+            self.ahead_emitting = None;
+        }
         if self.building_on_parent != Some(completed) {
             debug!(target: "n42::cl::orchestrator", ?completed,
                 active = ?self.building_on_parent,
@@ -2689,7 +2865,7 @@ impl ConsensusService {
             return self.engine.current_leader_index();
         }
         let validator_count = self.engine.validator_count().max(1) as u64;
-        (view % validator_count) as u32
+        n42_consensus::leader_index(view, validator_count, n42_consensus::leader_tenure())
     }
 
     fn timeout_diag_entry(&mut self, view: u64) -> &mut TimeoutViewDiag {
@@ -2970,6 +3146,7 @@ impl ConsensusService {
             import_done_tx,
             finalize_done_rx,
             finalize_done_tx,
+            finalized_view_mark: Default::default(),
             blob_store: None,
             exec_output_cache: None,
             bg_import_in_flight: false,
@@ -2982,6 +3159,11 @@ impl ConsensusService {
             state_diff_ready_tx,
             state_diff_ready_rx,
             speculative_build_hash: None,
+            ahead_ready: None,
+            ahead_validated: None,
+            ahead_tip: None,
+            ahead_building: None,
+            ahead_emitting: None,
             building_on_parent: None,
             build_triggered_at: None,
             build_complete_tx,
@@ -3006,6 +3188,7 @@ impl ConsensusService {
             timeout_view_diags: BTreeMap::new(),
             commit_to_build_recorded_parent: None,
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            eager_imports_in_flight: Arc::default(),
             fast_propose: std::env::var("N42_FAST_PROPOSE")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
@@ -3226,6 +3409,7 @@ impl ConsensusService {
             import_done_tx,
             finalize_done_rx,
             finalize_done_tx,
+            finalized_view_mark: Default::default(),
             blob_store: None,
             exec_output_cache: None,
             bg_import_in_flight: false,
@@ -3238,6 +3422,11 @@ impl ConsensusService {
             state_diff_ready_tx,
             state_diff_ready_rx,
             speculative_build_hash: None,
+            ahead_ready: None,
+            ahead_validated: None,
+            ahead_tip: None,
+            ahead_building: None,
+            ahead_emitting: None,
             building_on_parent: None,
             build_triggered_at: None,
             build_complete_tx,
@@ -3262,6 +3451,7 @@ impl ConsensusService {
             timeout_view_diags: BTreeMap::new(),
             commit_to_build_recorded_parent: None,
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            eager_imports_in_flight: Arc::default(),
             fast_propose,
             async_finalize_fcu,
             defer_state_root: false,
@@ -3706,7 +3896,11 @@ impl ConsensusService {
                     }
                 } => {
                     if let Some(ready) = payload_ready {
-                        self.handle_payload_build_ready(ready);
+                        if ready.own_block_validated {
+                            self.build_ahead_on(ready).await;
+                        } else {
+                            self.handle_payload_build_ready(ready);
+                        }
                     }
                 }
 
@@ -5844,6 +6038,7 @@ mod tests {
             !orch.handle_payload_build_ready(PayloadBuildReady {
                 context: stale_context,
                 block_hash: child,
+                own_block_validated: false,
             }),
             "a payload from a sibling parent must not enter consensus"
         );
@@ -5865,6 +6060,7 @@ mod tests {
         assert!(orch.handle_payload_build_ready(PayloadBuildReady {
             context: locked_context,
             block_hash: child,
+            own_block_validated: false,
         }));
 
         let proposal = match orch.output_rx.try_recv().expect("proposal output") {
@@ -6607,6 +6803,7 @@ mod tests {
                 parent_hash: B256::repeat_byte(0xEE),
             },
             block_hash: test_hash,
+            own_block_validated: false,
         };
         block_ready_tx.send(ready).await.unwrap();
 

@@ -7226,6 +7226,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-engine",
  "bincode",
+ "blake3",
  "eyre",
  "metrics",
  "n42-chainspec",

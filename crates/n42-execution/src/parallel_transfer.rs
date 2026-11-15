@@ -84,6 +84,15 @@ pub struct Phases {
     pub collect_ms: u64,
     /// Pre- and post-execution changes and the bundle.
     pub finish_ms: u64,
+    /// Of `groups_ms`: opening the parent's state, summed over the batches.
+    pub open_ms_sum: u64,
+    /// Of `groups_ms`: the transfers themselves (reads included), summed
+    /// over the batches.
+    pub run_ms_sum: u64,
+    /// Of `groups_ms`: each batch's transition merge and bundle take, summed.
+    pub batch_merge_ms_sum: u64,
+    /// The longest batch, wall time.
+    pub batch_ms_max: u64,
     /// How many groups there were.
     pub groups: usize,
     /// How many batches of groups ran (the build's [`execute_for_build`]
@@ -413,6 +422,23 @@ pub struct Graft {
     pub committed: usize,
 }
 
+impl Graft {
+    /// Adds what a later [`graft_bundles_with`] call on the same state left.
+    pub fn absorb<E>(&mut self, later: Graft, beneficiary: Address) -> Result<(), MergeError<E>> {
+        self.beneficiary_delta = self
+            .beneficiary_delta
+            .checked_add(later.beneficiary_delta)
+            .ok_or(MergeError::Arithmetic(beneficiary))?;
+        if self.beneficiary_original.is_none() {
+            self.beneficiary_original = later.beneficiary_original;
+        }
+        self.reverts.extend(later.reverts);
+        self.accounts += later.accounts;
+        self.committed += later.committed;
+        Ok(())
+    }
+}
+
 /// Grafts the batches' bundles onto the block's state directly: each account
 /// goes into the state's cache and bundle as its batch left it (the batch's
 /// original is the parent's, which is what the block's state holds for an
@@ -575,6 +601,9 @@ fn graft_bundles_inner<DB: Database>(
     state.bundle_state.state.reserve(total);
     graft.reverts.reserve(total);
     let mut slow: revm::state::EvmState = Default::default();
+    // With an empty cache that the graft does not fill, no account can be in
+    // it: the lookup per account is skipped.
+    let cache_was_empty = state.cache.accounts.is_empty();
     for bundle in bundles {
         let BundleState {
             state: accounts,
@@ -608,17 +637,12 @@ fn graft_bundles_inner<DB: Database>(
                 repeated.insert(address);
                 continue;
             }
-            if state.bundle_state.state.contains_key(&address) {
+            if let Some(existing) = state.bundle_state.state.get_mut(&address) {
                 // An earlier bundle put it in (or an earlier merge did, in
                 // which case the cache holds the block's view too): added to
                 // what is there, in both places.
                 repeated.insert(address);
-                if let Some(info) = state
-                    .bundle_state
-                    .state
-                    .get_mut(&address)
-                    .and_then(|a| a.info.as_mut())
-                {
+                if let Some(info) = existing.info.as_mut() {
                     apply_delta(
                         info,
                         new_balance,
@@ -645,7 +669,10 @@ fn graft_bundles_inner<DB: Database>(
                 }
                 continue;
             }
-            if let Some(cached) = state.cache.accounts.get(&address) {
+            if let Some(cached) = (!cache_was_empty || keep_cache)
+                .then(|| state.cache.accounts.get(&address))
+                .flatten()
+            {
                 // The block's state has its own view of this account; a
                 // delta through the ordinary path.
                 repeated.insert(address);
@@ -696,7 +723,7 @@ fn graft_bundles_inner<DB: Database>(
         }
         let mut reverts = reverts;
         for (address, revert) in std::mem::take(&mut *reverts).into_iter().flatten() {
-            if !repeated.contains(&address) {
+            if repeated.is_empty() || !repeated.contains(&address) {
                 graft.reverts.push((address, revert));
             }
         }
@@ -795,6 +822,42 @@ where
     G: Database + std::fmt::Debug + Send,
     G::Error: std::fmt::Display + Send + Sync + 'static,
 {
+    execute_for_build_inner(evm_env, keys, convert, open, None)
+}
+
+/// [`execute_for_build`] with each batch's bundle handed to `sink` from the
+/// batch's own thread the moment the batch ends, instead of being returned in
+/// [`BuildRun::bundles`] (which stays empty). The caller can graft the
+/// bundles while later batches still run. Bundles arrive in no particular
+/// order; a failed run may have handed some out already, so the caller must
+/// discard the state it grafted them into.
+pub fn execute_for_build_streamed<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    sink: &(dyn Fn(BundleState) + Sync),
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    execute_for_build_inner(evm_env, keys, convert, open, Some(sink))
+}
+
+fn execute_for_build_inner<T, G>(
+    evm_env: &reth_evm::EvmEnv,
+    keys: &[(Address, Address)],
+    convert: &(dyn Fn(usize) -> (T, TxEnv) + Sync),
+    open: &(dyn Fn() -> Option<G> + Sync),
+    sink: Option<&(dyn Fn(BundleState) + Sync)>,
+) -> Result<BuildRun<T>, NotParallel>
+where
+    T: Send + Sync,
+    G: Database + std::fmt::Debug + Send,
+    G::Error: std::fmt::Display + Send + Sync + 'static,
+{
     let beneficiary = evm_env.block_env.beneficiary;
     let mut phases = Phases::default();
     let at = std::time::Instant::now();
@@ -817,16 +880,25 @@ where
         .map(|_| std::sync::OnceLock::new())
         .collect();
     let slots_ref = &slots;
+    let micros = |at: std::time::Instant| at.elapsed().as_micros() as u64;
+    let open_us = std::sync::atomic::AtomicU64::new(0);
+    let run_us = std::sync::atomic::AtomicU64::new(0);
+    let batch_merge_us = std::sync::atomic::AtomicU64::new(0);
+    let batch_max_us = std::sync::atomic::AtomicU64::new(0);
+    let relaxed = std::sync::atomic::Ordering::Relaxed;
     let results: Vec<Result<(Vec<usize>, BundleState), NotParallel>> = pool.install(|| {
         use rayon::prelude::*;
         batches
             .par_iter()
             .map(|members| {
+                let batch_at = std::time::Instant::now();
                 let db = open().ok_or(NotParallel::NoState)?;
                 let mut state = State::builder()
                     .with_database(db)
                     .with_bundle_update()
                     .build();
+                open_us.fetch_add(micros(batch_at), relaxed);
+                let run_at = std::time::Instant::now();
                 let mut skipped = Vec::new();
                 {
                     let mut evm = N42EvmFactory::with_fast_transfers(true)
@@ -878,12 +950,28 @@ where
                         }
                     }
                 }
+                run_us.fetch_add(micros(run_at), relaxed);
+                let merge_at = std::time::Instant::now();
                 state.merge_transitions(BundleRetention::Reverts);
-                Ok((skipped, state.take_bundle()))
+                let bundle = state.take_bundle();
+                batch_merge_us.fetch_add(micros(merge_at), relaxed);
+                batch_max_us.fetch_max(micros(batch_at), relaxed);
+                let bundle = match sink {
+                    Some(sink) => {
+                        sink(bundle);
+                        BundleState::default()
+                    }
+                    None => bundle,
+                };
+                Ok((skipped, bundle))
             })
             .collect()
     });
     phases.groups_ms = at.elapsed().as_millis() as u64;
+    phases.open_ms_sum = open_us.load(relaxed) / 1000;
+    phases.run_ms_sum = run_us.load(relaxed) / 1000;
+    phases.batch_merge_ms_sum = batch_merge_us.load(relaxed) / 1000;
+    phases.batch_ms_max = batch_max_us.load(relaxed) / 1000;
 
     let at = std::time::Instant::now();
     let mut run = BuildRun {
@@ -893,7 +981,9 @@ where
     for r in results {
         let (skipped, bundle) = r?;
         run.skipped.extend(skipped);
-        run.bundles.push(bundle);
+        if sink.is_none() {
+            run.bundles.push(bundle);
+        }
     }
     // Candidate order, as the serial builder would have laid the block out
     // (each sender's transfers were run in that order, and the graft does
@@ -1229,5 +1319,123 @@ mod tests {
         assert!(matches!(graft_bundles(&mut state,
             vec![make(U256::MAX - U256::from(3)), make(U256::MAX - U256::from(3))], BENEFICIARY),
             Err(MergeError::Arithmetic(address)) if address == C));
+    }
+
+    #[test]
+    fn bundles_grafted_one_by_one_as_they_arrive_match_one_graft_of_all() {
+        // Shared recipients across senders, so several batches touch C.
+        let txs: Vec<TxEnv> = (0..40u64)
+            .map(|i| transfer(if i % 2 == 0 { A } else { C }, B, i / 2, 1))
+            .chain((0..5).map(|i| transfer(B, C, i, 0)))
+            .collect();
+        let keys: Vec<_> = txs
+            .iter()
+            .map(|t| (t.caller, *t.kind.to().unwrap()))
+            .collect();
+        let fresh = || {
+            State::builder()
+                .with_database(db())
+                .with_bundle_update()
+                .build()
+        };
+        for keep_cache in [true, false] {
+            let run = execute_for_build(&environment(), &keys, &|i| ((), txs[i].clone()), &|| {
+                Some(db())
+            })
+            .unwrap();
+            let mut whole = fresh();
+            let expected =
+                graft_bundles_with(&mut whole, run.bundles, BENEFICIARY, keep_cache).unwrap();
+
+            let arrived = std::sync::Mutex::new(Vec::new());
+            let streamed = execute_for_build_streamed(
+                &environment(),
+                &keys,
+                &|i| ((), txs[i].clone()),
+                &|| Some(db()),
+                &|bundle| arrived.lock().unwrap().push(bundle),
+            )
+            .unwrap();
+            assert!(streamed.bundles.is_empty());
+            assert_eq!(streamed.executed.len(), run.executed.len());
+            let mut parts = fresh();
+            let mut graft = Graft::default();
+            // Latest first: the order of arrival is not the batches' order.
+            for bundle in arrived.into_inner().unwrap().into_iter().rev() {
+                let part =
+                    graft_bundles_with(&mut parts, vec![bundle], BENEFICIARY, keep_cache).unwrap();
+                graft.absorb::<std::convert::Infallible>(part, BENEFICIARY).unwrap();
+            }
+            assert_eq!(parts.bundle_state.state, whole.bundle_state.state);
+            assert_eq!(parts.cache.accounts, whole.cache.accounts);
+            assert_eq!(graft.beneficiary_delta, expected.beneficiary_delta);
+            let addresses = |graft: &Graft| {
+                let mut list: Vec<_> = graft.reverts.iter().map(|(address, _)| *address).collect();
+                list.sort_unstable();
+                list
+            };
+            assert_eq!(addresses(&graft), addresses(&expected));
+        }
+    }
+
+    /// Timing only: a full block of transfers between distinct accounts
+    /// through the build path and its graft. `cargo test --profile profiling
+    /// -p n42-execution graft_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn graft_timing() {
+        const N: usize = 95_238;
+        let address = |kind: u8, i: usize| {
+            let mut bytes = [0u8; 20];
+            bytes[0] = kind;
+            bytes[12..].copy_from_slice(&(i as u64).to_be_bytes());
+            Address::from(bytes)
+        };
+        let mut parent = CacheDB::new(EmptyDB::default());
+        parent.insert_account_info(
+            BENEFICIARY,
+            AccountInfo {
+                balance: U256::from(1),
+                ..Default::default()
+            },
+        );
+        for i in 0..N {
+            parent.insert_account_info(
+                address(1, i),
+                AccountInfo {
+                    balance: U256::from(1_000_000u64),
+                    ..Default::default()
+                },
+            );
+        }
+        let txs: Vec<TxEnv> = (0..N)
+            .map(|i| transfer(address(1, i), address(2, i), 0, 1))
+            .collect();
+        let keys: Vec<_> = txs
+            .iter()
+            .map(|t| (t.caller, *t.kind.to().unwrap()))
+            .collect();
+        for keep_cache in [true, false, true, false] {
+            let at = std::time::Instant::now();
+            let run = execute_for_build(&environment(), &keys, &|i| ((), txs[i].clone()), &|| {
+                Some(parent.clone())
+            })
+            .unwrap();
+            let run_ms = at.elapsed().as_millis();
+            assert_eq!(run.executed.len(), N);
+            let mut state = State::builder()
+                .with_database(parent.clone())
+                .with_bundle_update()
+                .build();
+            let at = std::time::Instant::now();
+            let graft =
+                graft_bundles_with(&mut state, run.bundles, BENEFICIARY, keep_cache).unwrap();
+            println!(
+                "keep_cache={keep_cache} run_ms={run_ms} phases={:?} graft_ms={} accounts={}",
+                run.phases,
+                at.elapsed().as_millis(),
+                graft.accounts
+            );
+        }
     }
 }

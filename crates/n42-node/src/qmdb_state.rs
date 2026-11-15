@@ -116,37 +116,67 @@ pub fn gov5_qmdb_genesis_tree(genesis: &Genesis) -> Result<QmdbCompatTree, QmdbO
 /// `QmdbCompatTree::apply_sorted_ops`, which rejects duplicates and sorts by hashed key exactly
 /// once immediately before mutation.
 pub fn gov5_qmdb_operations(state: &BundleState) -> Vec<QmdbOperation> {
+    // Every operation hashes its key. A full native block changes about 190k
+    // accounts, which took about 25 ms on the importing thread; the order of
+    // the result is not significant (callers sort by key), so large changes
+    // are derived on the rayon pool.
+    if state.state.len() >= PARALLEL_OPERATIONS_FROM {
+        use rayon::prelude::*;
+        let accounts: Vec<_> = state.state.iter().collect();
+        return accounts
+            .par_iter()
+            .with_min_len(1024)
+            .fold(Vec::new, |mut operations, (address, account)| {
+                push_account_operations(&mut operations, address, account);
+                operations
+            })
+            .reduce(Vec::new, |mut left, mut right| {
+                left.append(&mut right);
+                left
+            });
+    }
     let mut operations = Vec::with_capacity(state.state_size);
     for (address, account) in &state.state {
-        let address = address.into_array();
-        if !account.status.is_not_modified() {
-            operations.push(QmdbOperation {
-                key: gov5_account_key(&address),
-                value: account.info.as_ref().map(|info| {
-                    encode_gov5_account_value(
-                        info.nonce,
-                        &info.balance.to_be_bytes(),
-                        &info.code_hash.0,
-                    )
-                }),
-            });
-        }
-
-        for (slot, value) in &account.storage {
-            if !account.was_destroyed() && !value.is_changed() {
-                continue;
-            }
-            let present = value.present_value();
-            operations.push(QmdbOperation {
-                key: gov5_storage_key(&address, &slot.to_be_bytes()),
-                value: (!account.was_destroyed() || account.info.is_some())
-                    .then_some(present)
-                    .filter(|present| !present.is_zero())
-                    .map(|present| present.to_be_bytes::<32>().to_vec()),
-            });
-        }
+        push_account_operations(&mut operations, address, account);
     }
     operations
+}
+
+/// Accounts from which [`gov5_qmdb_operations`] derives in parallel.
+const PARALLEL_OPERATIONS_FROM: usize = 4096;
+
+fn push_account_operations(
+    operations: &mut Vec<QmdbOperation>,
+    address: &alloy_primitives::Address,
+    account: &reth_revm::db::BundleAccount,
+) {
+    let address = address.into_array();
+    if !account.status.is_not_modified() {
+        operations.push(QmdbOperation {
+            key: gov5_account_key(&address),
+            value: account.info.as_ref().map(|info| {
+                encode_gov5_account_value(
+                    info.nonce,
+                    &info.balance.to_be_bytes(),
+                    &info.code_hash.0,
+                )
+            }),
+        });
+    }
+
+    for (slot, value) in &account.storage {
+        if !account.was_destroyed() && !value.is_changed() {
+            continue;
+        }
+        let present = value.present_value();
+        operations.push(QmdbOperation {
+            key: gov5_storage_key(&address, &slot.to_be_bytes()),
+            value: (!account.was_destroyed() || account.info.is_some())
+                .then_some(present)
+                .filter(|present| !present.is_zero())
+                .map(|present| present.to_be_bytes::<32>().to_vec()),
+        });
+    }
 }
 
 /// Convenience boundary used by a state-root job, keeping the receipt type localized to the
@@ -259,6 +289,46 @@ mod tests {
         state::AccountInfo,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn a_large_change_set_derives_the_same_operations_as_one_account_at_a_time() {
+        let mut state = BundleState::default();
+        for index in 0..(PARALLEL_OPERATIONS_FROM as u64 + 37) {
+            let address = Address::from_word(B256::from(U256::from(index + 1)));
+            let info = AccountInfo {
+                nonce: index,
+                balance: U256::from(index * 3),
+                ..Default::default()
+            };
+            let storage = (index % 5 == 0)
+                .then(|| {
+                    (
+                        U256::from(index),
+                        StorageSlot::new_changed(U256::ZERO, U256::from(index + 9)),
+                    )
+                })
+                .into_iter()
+                .collect();
+            let status = if index % 11 == 0 {
+                AccountStatus::Loaded
+            } else {
+                AccountStatus::Changed
+            };
+            state.state.insert(
+                address,
+                BundleAccount::new(None, Some(info), storage, status),
+            );
+        }
+        let mut serial = Vec::new();
+        for (address, account) in &state.state {
+            push_account_operations(&mut serial, address, account);
+        }
+        let mut parallel = gov5_qmdb_operations(&state);
+        assert!(parallel.len() > PARALLEL_OPERATIONS_FROM);
+        serial.sort_unstable_by_key(|operation| operation.key);
+        parallel.sort_unstable_by_key(|operation| operation.key);
+        assert_eq!(parallel, serial);
+    }
 
     #[test]
     fn converts_changed_account_and_storage_to_gov5_leaf_format() {

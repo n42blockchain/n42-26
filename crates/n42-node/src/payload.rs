@@ -3,14 +3,14 @@ use crate::engine_types::N42BuiltPayload;
 use crate::native_payload::default_n42_payload;
 use alloy_rpc_types_engine::PayloadAttributes as EthPayloadAttributes;
 use n42_execution::ExecutionPath;
-use n42_tx_types::{N42Primitives, N42TxEnvelope};
+use n42_tx_types::N42Primitives;
 use rayon::prelude::*;
 use reth_basic_payload_builder::{
     BuildArguments, BuildOutcome, MissingPayloadBehaviour, PayloadBuilder, PayloadConfig,
 };
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_ethereum_payload_builder::EthereumBuilderConfig;
-use reth_node_api::{FullNodeTypes, NodeTypes, TxTy};
+use reth_node_api::{FullNodeTypes, NodeTypes};
 use reth_node_builder::{
     BuilderContext, PayloadBuilderConfig, PayloadTypes, components::PayloadBuilderBuilder,
 };
@@ -408,9 +408,7 @@ impl<Types, Node, Pool> PayloadBuilderBuilder<Node, Pool, n42_execution::N42EvmC
 where
     Types: NodeTypes<ChainSpec: EthereumHardforks, Primitives = N42Primitives>,
     Node: FullNodeTypes<Types = Types>,
-    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TxTy<Node::Types>>>
-        + Unpin
-        + 'static,
+    Pool: TransactionPool<Transaction = crate::native_pool::N42PooledTransaction> + Unpin + 'static,
     Types::Payload:
         PayloadTypes<BuiltPayload = N42BuiltPayload, PayloadAttributes = EthPayloadAttributes>,
 {
@@ -450,6 +448,32 @@ static BUILDER_STATE_ROOT_REPLACED: std::sync::atomic::AtomicBool =
 /// computed only to be discarded. Must be called before the node launches.
 pub fn set_builder_state_root_replaced(replaced: bool) {
     BUILDER_STATE_ROOT_REPLACED.store(replaced, std::sync::atomic::Ordering::Relaxed);
+}
+
+static BUILDER_QMDB_STORE: std::sync::OnceLock<
+    std::sync::Arc<crate::qmdb_state_root::Gov5QmdbStateRootStore>,
+> = std::sync::OnceLock::new();
+
+/// Hands the builder the QMDB state-root store, so that it derives the root
+/// that replaces its own while the block is being assembled instead of
+/// leaving it to the normalization step afterwards. Without it, or with
+/// `N42_BUILDER_QMDB_ROOT=0`, normalization derives the root as before.
+pub fn set_builder_qmdb_store(
+    store: std::sync::Arc<crate::qmdb_state_root::Gov5QmdbStateRootStore>,
+) {
+    let _ = BUILDER_QMDB_STORE.set(store);
+}
+
+/// The store the builder derives the replacing root from, when it does.
+pub(crate) fn builder_qmdb_store()
+-> Option<&'static std::sync::Arc<crate::qmdb_state_root::Gov5QmdbStateRootStore>> {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED
+        .get_or_init(|| !std::env::var("N42_BUILDER_QMDB_ROOT").is_ok_and(|value| value == "0"));
+    if !enabled || !builder_state_root_replaced() {
+        return None;
+    }
+    BUILDER_QMDB_STORE.get()
 }
 
 /// Whether built payloads have their state root replaced before proposal.
@@ -507,7 +531,7 @@ impl<Pool, Client> PayloadBuilder
     for N42InnerPayloadBuilder<Pool, Client, n42_execution::N42EvmConfig>
 where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks> + Clone,
-    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = N42TxEnvelope>> + 'static,
+    Pool: TransactionPool<Transaction = crate::native_pool::N42PooledTransaction> + 'static,
 {
     type Attributes = EthPayloadAttributes;
     type BuiltPayload = N42BuiltPayload;
@@ -517,14 +541,42 @@ where
         args: BuildArguments<EthPayloadAttributes, N42BuiltPayload>,
     ) -> Result<BuildOutcome<N42BuiltPayload>, PayloadBuilderError> {
         // Log pool depth before building — key diagnostic for TPS bottleneck analysis.
-        let pool_pending = self.pool.pool_size().pending;
-        let pool_queued = self.pool.pool_size().queued;
+        let frame_queue =
+            crate::frame_queue::frame_queue_enabled().then(crate::frame_queue::FrameQueue::global);
+        if let Some(queue) = frame_queue {
+            // The parent's transactions leave the queue when its canonical
+            // notification is applied; offering them again would only have
+            // the builder skip them one by one.
+            let parent = args.config.parent_header.number;
+            let wait = std::time::Instant::now();
+            if !queue.wait_applied(parent, std::time::Duration::from_millis(500)) {
+                tracing::warn!(
+                    target: "n42::payload",
+                    parent,
+                    "frame queue has not applied the parent block; building anyway"
+                );
+            }
+            metrics::histogram!("n42_frame_queue_parent_wait_ms")
+                .record(wait.elapsed().as_secs_f64() * 1_000.0);
+        }
+        let pool_size = self.pool.pool_size();
+        let pool_pending = pool_size.pending + frame_queue.map_or(0, |queue| queue.pending());
+        let pool_queued = pool_size.queued;
         self.consensus_state
             .update_pool_depth(pool_pending, pool_queued);
         metrics::gauge!("n42_pool_pending_at_build").set(pool_pending as f64);
         metrics::gauge!("n42_pool_queued_at_build").set(pool_queued as f64);
 
         let build_start = std::time::Instant::now();
+        // Marks when the builder is entered; the distance from reth's
+        // "New payload job created" line is time spent before any packing.
+        tracing::info!(
+            target: "n42::payload",
+            id = %args.config.payload_id(),
+            parent = %args.config.parent_header.hash(),
+            pool_pending,
+            "N42_BUILD_ENTRY: payload builder entered"
+        );
         let result = crate::parallel_payload::build_with_parallel(
             self.evm_config.clone(),
             self.client.clone(),
@@ -543,7 +595,13 @@ where
                         pool.best_transactions_with_attributes(attributes)
                     }
                 };
-                let best = if crate::frame_order::frame_order_build_enabled() {
+                let best = if let Some(queue) = frame_queue {
+                    // Queued frames first; the pool holds only what did not
+                    // come in as a native frame.
+                    Box::new(crate::frame_queue::QueuedFrameTransactions::new(
+                        queue, ordinary,
+                    )) as Box<_>
+                } else if crate::frame_order::frame_order_build_enabled() {
                     // Frames first, in arrival order; the pool-wide order only
                     // once they are used up.
                     let lookup_pool = self.pool.clone();
@@ -607,6 +665,22 @@ where
         .increment(1);
         match &result {
             Ok(BuildOutcome::Better { payload, .. }) => {
+                if let Some(queue) = frame_queue {
+                    // Take this block's transactions out of the queue now, off
+                    // the build thread, instead of when its canonical
+                    // notification arrives: the next build on top of it then
+                    // does not wait for that notification.
+                    let number = payload.block().header().number;
+                    let hashes: Vec<_> = payload
+                        .block()
+                        .body()
+                        .transactions()
+                        .map(|tx| *tx.hash())
+                        .collect();
+                    rayon::spawn(move || {
+                        queue.mark_mined(n42_tx_types::FrameStore::global(), number, &hashes);
+                    });
+                }
                 let tx_count = payload.block().body().transactions().count();
                 let gas_used = payload.block().header().gas_used;
                 let gas_limit = payload.block().header().gas_limit;

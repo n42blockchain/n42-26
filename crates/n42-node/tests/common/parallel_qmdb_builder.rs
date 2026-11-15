@@ -168,6 +168,12 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
     let config =
         N42EvmConfig::with_evm_factory(chain.clone(), N42EvmFactory::with_fast_transfers(false));
     n42_node::payload::set_builder_state_root_replaced(native);
+    if native {
+        // An H2-v4 participant's builder derives the replacing QMDB root
+        // itself; the normalization below then hands that root back and it is
+        // compared against the independently built tree.
+        n42_node::payload::set_builder_qmdb_store(store.clone());
+    }
     let builder = N42InnerPayloadBuilder::new(
         provider.clone(),
         pool,
