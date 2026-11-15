@@ -26,8 +26,8 @@ GIT_COMMITTER_NAME="Nyxen" GIT_COMMITTER_EMAIL="40690755+MiraWells@users.noreply
 ### Reth 稳定版基线
 
 当前基线为官方 **v2.8.1**，上游 commit
-`d763342fa185e4e90ee79dc65f6a5706168b0bcb`，加七个 N42 补丁后为
-`a8490755458ed219827a21a43187f5795f3c0d2c`。版本、补丁序列与直接依赖以
+`d763342fa185e4e90ee79dc65f6a5706168b0bcb`，加八个 N42 补丁后为
+`2545c4de8e6ed05f322fbbad7a87d24613583645`。版本、补丁序列与直接依赖以
 [`reth-source.lock`](reth-source.lock) 为准；CI 检出官方源并应用 `patches/reth-*.patch`。
 
 本机原 `../reth` 是包含未提交改动的旧 checkout，不可直接作为当前构建源或覆盖修改。
