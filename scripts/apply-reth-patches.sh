@@ -6,7 +6,7 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 reth_dir=${1:-"$script_dir/../../reth"}
 patch_dir=${N42_RETH_PATCH_DIR:-"$script_dir/../patches"}
 base_revision=${N42_RETH_BASE_REVISION:-d763342fa185e4e90ee79dc65f6a5706168b0bcb}
-adapted_revision=${N42_RETH_ADAPTED_REVISION:-2545c4de8e6ed05f322fbbad7a87d24613583645}
+adapted_revision=${N42_RETH_ADAPTED_REVISION:-6cd1d01e91f07f441bae7aa5f56c6101b4858391}
 current_revision=$(git -C "$reth_dir" rev-parse HEAD 2>/dev/null || true)
 if [[ "$current_revision" != "$base_revision" && "$current_revision" != "$adapted_revision" ]]; then
     echo "Reth checkout must be exactly pinned base $base_revision or adapted revision $adapted_revision." >&2
@@ -26,6 +26,7 @@ names=(
     reth-engine-state-provider-factory
     reth-cached-execution-refusal
     reth-native-import-path
+    reth-executed-block-inbox
 )
 # Later patches may edit lines an earlier patch introduced, so a patch cannot
 # always be reversed on its own against the final tree. Reverse the whole

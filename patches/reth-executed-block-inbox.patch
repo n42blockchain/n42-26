@@ -1,0 +1,205 @@
+diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
+index eb59fe1ff..11773f68e 100644
+--- a/crates/engine/tree/src/tree/payload_validator.rs
++++ b/crates/engine/tree/src/tree/payload_validator.rs
+@@ -488,6 +488,7 @@ where
+         V: PayloadValidator<T, Block = N::Block> + Clone,
+         Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
+     {
++        let n42_validate_start = Instant::now();
+         let parent_hash = input.parent_hash();
+         let _txpool_pause = self.txpool_prewarm.as_ref().map(txpool_prewarm::Handle::pause);
+         let txpool_snapshot =
+@@ -557,6 +558,8 @@ where
+             .into())
+         };
+         drop(_enter);
++        metrics::histogram!("n42_import_stage_ms", "stage" => "pre_provider_factory")
++            .record(n42_validate_start.elapsed().as_secs_f64() * 1000.0);
+ 
+         let evm_env = debug_span!(target: "engine::tree::payload_validator", "evm_env")
+             .in_scope(|| self.evm_env_for(&input))
+@@ -619,6 +622,8 @@ where
+ 
+         let parallel_bal_execution = ensure_ok!(self.bal_path_eligible(env.decoded_bal.as_deref()));
+ 
++        metrics::histogram!("n42_import_stage_ms", "stage" => "pre_root_prepare")
++            .record(n42_validate_start.elapsed().as_secs_f64() * 1000.0);
+         // Prepare the state-root job before execution so it can provide streaming hooks.
+         let state_root_context = StateRootJobContext::new(
+             &self.runtime,
+@@ -653,6 +658,8 @@ where
+         let hint_stream = state_root_job.take_hint_stream();
+         let hashed_update_stream = state_root_job.take_hashed_update_stream();
+ 
++        metrics::histogram!("n42_import_stage_ms", "stage" => "pre_spawn_processor")
++            .record(n42_validate_start.elapsed().as_secs_f64() * 1000.0);
+         // Spawn transaction conversion and prewarming.
+         let mut handle = ensure_ok!(self.spawn_payload_processor(
+             env.clone(),
+@@ -738,6 +745,8 @@ where
+         // The receipt root task is spawned before execution and receives receipts incrementally
+         // as transactions complete, allowing parallel computation during execution.
+         let execute_block_start = Instant::now();
++        metrics::histogram!("n42_import_stage_ms", "stage" => "pre_execute")
++            .record(execute_block_start.duration_since(n42_validate_start).as_secs_f64() * 1000.0);
+         let (output, senders, receipt_root_rx, executed_bal) =
+             if let Some((output, senders)) = cached_execution {
+                 tracing::info!(
+@@ -837,14 +846,18 @@ where
+             None
+         };
+ 
+-        if let Err(e) = self.validate_post_execution(
++        let post_execution_start = Instant::now();
++        let post_execution = self.validate_post_execution(
+             &block,
+             &parent_block,
+             &output,
+             &mut ctx,
+             receipt_root_bloom,
+             built_bal,
+-        ) {
++        );
++        metrics::histogram!("n42_import_stage_ms", "stage" => "post_execution")
++            .record(post_execution_start.elapsed().as_secs_f64() * 1000.0);
++        if let Err(e) = post_execution {
+             return Err(InsertBlockError::new(block.into_sealed_block(), cached_refusal(e)).into())
+         }
+ 
+@@ -865,6 +878,8 @@ where
+             )
+         });
+ 
++        metrics::histogram!("n42_import_stage_ms", "stage" => "post_execution_total")
++            .record(post_execution_start.elapsed().as_secs_f64() * 1000.0);
+         let root_start = Instant::now();
+         let root_outcome = match state_root_job.finish(&block, output.clone(), &hashed_state) {
+             Ok(outcome) => outcome,
+@@ -877,6 +892,10 @@ where
+             }
+         };
+         let root_elapsed = root_start.elapsed();
++        metrics::histogram!("n42_import_stage_ms", "stage" => "state_root")
++            .record(root_elapsed.as_secs_f64() * 1000.0);
++        metrics::histogram!("n42_import_stage_ms", "stage" => "execute_to_root_start")
++            .record(root_start.duration_since(execute_block_start).as_secs_f64() * 1000.0);
+ 
+         info!(
+             target: "engine::tree::payload_validator",
+@@ -976,6 +995,8 @@ where
+         let executed_block = self
+             .spawn_deferred_trie_task(Arc::new(block), output, hashed_state, trie_output)
+             .with_bal(bal);
++        metrics::histogram!("n42_import_stage_ms", "stage" => "validate_total")
++            .record(n42_validate_start.elapsed().as_secs_f64() * 1000.0);
+         Ok(ValidationOutput::new(executed_block, timing_stats))
+     }
+ 
+diff --git a/crates/node/builder/src/launch/engine.rs b/crates/node/builder/src/launch/engine.rs
+index c5504312c..5e8267ed5 100644
+--- a/crates/node/builder/src/launch/engine.rs
++++ b/crates/node/builder/src/launch/engine.rs
+@@ -338,6 +338,8 @@ impl<B> EngineNodeLauncher<B> {
+             .into_built_payload_stream()
+             .fuse();
+ 
++        let mut n42_executed_blocks = crate::n42_executed::take_receiver();
++
+         let chainspec = ctx.chain_spec();
+         let provider = ctx.blockchain_db().clone();
+         let (exit, rx) = oneshot::channel();
+@@ -415,6 +417,21 @@ impl<B> EngineNodeLauncher<B> {
+                             orchestrator.handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block).into());
+                         }
+                     }
++                    Some(submission) = async {
++                        match n42_executed_blocks.as_mut() {
++                            Some(receiver) => receiver.recv().await,
++                            None => std::future::pending().await,
++                        }
++                    } => {
++                        let queued = match submission.block.downcast() {
++                            Ok(executed_block) => {
++                                orchestrator.handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(*executed_block).into());
++                                true
++                            }
++                            Err(_) => false,
++                        };
++                        let _ = submission.queued.send(queued);
++                    }
+                     shutdown_req = &mut shutdown_rx => {
+                         if let Ok(req) = shutdown_req {
+                             debug!(target: "reth::cli", "received engine shutdown request");
+diff --git a/crates/node/builder/src/lib.rs b/crates/node/builder/src/lib.rs
+index 71d13e16c..f7112efe4 100644
+--- a/crates/node/builder/src/lib.rs
++++ b/crates/node/builder/src/lib.rs
+@@ -41,6 +41,9 @@ mod txpool_prewarm;
+ mod handle;
+ pub use handle::NodeHandle;
+ 
++mod n42_executed;
++pub use n42_executed::submit_executed_block;
++
+ pub mod rpc;
+ 
+ pub mod setup;
+diff --git a/crates/node/builder/src/n42_executed.rs b/crates/node/builder/src/n42_executed.rs
+new file mode 100644
+index 000000000..83d4cec96
+--- /dev/null
++++ b/crates/node/builder/src/n42_executed.rs
+@@ -0,0 +1,52 @@
++//! Inbox for blocks an N42 block producer hands to the engine tree already executed.
++//!
++//! The engine launcher forwards each submission to the tree as an
++//! `InsertExecutedBlock` request, the path locally built payloads take. The block is
++//! type-erased here because the launcher is generic over the node's primitives.
++
++use std::{
++    any::Any,
++    sync::{Mutex, OnceLock},
++};
++use tokio::sync::{mpsc, oneshot};
++
++/// A block submitted through [`submit_executed_block`].
++pub(crate) struct ExecutedBlockSubmission {
++    /// A `BuiltPayloadExecutedBlock` of the node's primitives.
++    pub(crate) block: Box<dyn Any + Send>,
++    /// Answered once the request is queued for the tree: `false` if the block is not
++    /// of the node's primitives.
++    pub(crate) queued: oneshot::Sender<bool>,
++}
++
++struct Inbox {
++    sender: mpsc::UnboundedSender<ExecutedBlockSubmission>,
++    receiver: Mutex<Option<mpsc::UnboundedReceiver<ExecutedBlockSubmission>>>,
++}
++
++fn inbox() -> &'static Inbox {
++    static INBOX: OnceLock<Inbox> = OnceLock::new();
++    INBOX.get_or_init(|| {
++        let (sender, receiver) = mpsc::unbounded_channel();
++        Inbox { sender, receiver: Mutex::new(Some(receiver)) }
++    })
++}
++
++/// Queues `block`, a `BuiltPayloadExecutedBlock` of the node's primitives, for insertion
++/// into the engine tree without validation.
++///
++/// The returned receiver yields `true` once the insertion is queued ahead of every
++/// engine message sent afterwards, and `false` (or an error) if no engine took it. The
++/// caller vouches for the block: its execution output, hashed state and state root are
++/// not checked.
++pub fn submit_executed_block(block: Box<dyn Any + Send>) -> oneshot::Receiver<bool> {
++    let (queued, answer) = oneshot::channel();
++    // A closed channel drops `queued`, which the caller sees as an error.
++    let _ = inbox().sender.send(ExecutedBlockSubmission { block, queued });
++    answer
++}
++
++/// Takes the receiving end; the first engine launched in the process owns it.
++pub(crate) fn take_receiver() -> Option<mpsc::UnboundedReceiver<ExecutedBlockSubmission>> {
++    inbox().receiver.lock().ok().and_then(|mut receiver| receiver.take())
++}
