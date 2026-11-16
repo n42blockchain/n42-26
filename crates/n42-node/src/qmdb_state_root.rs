@@ -407,6 +407,15 @@ struct QmdbReadViewCache {
     order: VecDeque<B256>,
 }
 
+/// Frees displaced read views off the calling thread: the last owner of a
+/// view walks every node it does not share with a newer one, tens of
+/// thousands for a full block.
+fn release_read_views(views: Vec<Arc<QmdbReadView>>) {
+    if !views.is_empty() {
+        rayon::spawn(move || drop(views));
+    }
+}
+
 impl QmdbReadViewCache {
     fn get(&mut self, hash: B256) -> Option<Arc<QmdbReadView>> {
         let view = self.views.get(&hash)?.clone();
@@ -417,11 +426,17 @@ impl QmdbReadViewCache {
         Some(view)
     }
 
-    fn insert(&mut self, view: Arc<QmdbReadView>) {
+    /// Adds `view` and returns the views it displaced. Freeing one walks
+    /// every node only it still owns, so the caller releases them outside
+    /// the cache lock, see [`release_read_views`].
+    #[must_use]
+    fn insert(&mut self, view: Arc<QmdbReadView>) -> Vec<Arc<QmdbReadView>> {
+        let mut displaced = Vec::new();
         let hash = view.block_hash();
         self.logical_bytes += view.logical_bytes();
         if let Some(previous) = self.views.insert(hash, view) {
             self.logical_bytes -= previous.logical_bytes();
+            displaced.push(previous);
         } else {
             self.order.push_back(hash);
         }
@@ -434,17 +449,21 @@ impl QmdbReadViewCache {
                 && let Some(view) = self.views.remove(&hash)
             {
                 self.logical_bytes -= view.logical_bytes();
+                displaced.push(view);
             }
         }
         metrics::gauge!("n42_qmdb_read_cache_views").set(self.views.len() as f64);
         metrics::gauge!("n42_qmdb_read_cache_logical_bytes").set(self.logical_bytes as f64);
         metrics::gauge!("n42_qmdb_read_cache_over_budget_bytes")
             .set(self.logical_bytes.saturating_sub(self.byte_budget) as f64);
+        displaced
     }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Gov5QmdbStateRootError {
+    #[error("QMDB holds no prepared candidate for the requested execution")]
+    NoBoundCandidate,
     #[error("QMDB base snapshot is invalid: {0}")]
     InvalidBaseSnapshot(#[from] QmdbSnapshotError),
     #[error("QMDB base leaf form is invalid: {0}")]
@@ -893,7 +912,7 @@ impl Gov5QmdbStateRootStore {
             .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?
             .as_mut()
         {
-            cache.insert(Arc::clone(&view));
+            release_read_views(cache.insert(Arc::clone(&view)));
         }
         Ok(Some(view))
     }
@@ -1442,7 +1461,7 @@ impl Gov5QmdbStateRootStore {
                 .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?
                 .as_mut()
         {
-            cache.insert(view);
+            release_read_views(cache.insert(view));
         }
         lock_hold += publish_started.elapsed();
         drop(state);

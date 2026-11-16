@@ -47,6 +47,35 @@ pub struct QmdbStateAdapter {
     store: Arc<Gov5QmdbStateRootStore>,
     mode: QmdbReadsMode,
     counters: Arc<QmdbReadCounters>,
+    code: Arc<CodeCache>,
+}
+
+/// Contract code by hash, shared by every provider of this node.
+///
+/// Code is addressed by its hash, so an entry is valid at every block. A hit
+/// keeps the read away from the wrapped provider, whose first read waits for
+/// the parent block's in-memory overlay.
+#[derive(Default)]
+struct CodeCache {
+    entries: std::sync::RwLock<alloy_primitives::map::B256Map<reth_primitives_traits::Bytecode>>,
+}
+
+impl CodeCache {
+    /// Entries kept; later code is read from the wrapped provider each time.
+    const CAPACITY: usize = 4096;
+
+    fn get(&self, hash: &B256) -> Option<reth_primitives_traits::Bytecode> {
+        // A poisoned lock still holds whole entries: each is inserted at once.
+        let entries = self.entries.read().unwrap_or_else(|error| error.into_inner());
+        entries.get(hash).cloned()
+    }
+
+    fn insert(&self, hash: B256, code: &reth_primitives_traits::Bytecode) {
+        let mut entries = self.entries.write().unwrap_or_else(|error| error.into_inner());
+        if entries.len() < Self::CAPACITY {
+            entries.insert(hash, code.clone());
+        }
+    }
 }
 
 impl QmdbStateAdapter {
@@ -60,6 +89,7 @@ impl QmdbStateAdapter {
             store,
             mode,
             counters: Arc::new(QmdbReadCounters::default()),
+            code: Arc::default(),
         })
     }
 }
@@ -87,11 +117,19 @@ impl BlockStateAdapter for QmdbStateAdapter {
         };
         self.counters.increment(ReadEvent::PinnedProvider);
         metrics::counter!("n42_qmdb_read_providers_total", "outcome" => "pinned").increment(1);
+        // Reads are counted per thread without touching the metrics registry;
+        // the totals are published here, once per provider.
+        let reads = self.counters.snapshot();
+        metrics::counter!("n42_qmdb_state_reads_total", "kind" => "account")
+            .absolute(reads.account_reads);
+        metrics::counter!("n42_qmdb_state_reads_total", "kind" => "storage")
+            .absolute(reads.storage_reads);
         Ok(Box::new(QmdbStateProvider {
             view,
             inner,
             mode: self.mode,
             counters: self.counters.clone(),
+            code: self.code.clone(),
         }))
     }
 }
@@ -157,6 +195,7 @@ struct QmdbStateProvider {
     inner: StateProviderBox,
     mode: QmdbReadsMode,
     counters: Arc<QmdbReadCounters>,
+    code: Arc<CodeCache>,
 }
 
 impl QmdbStateProvider {
@@ -196,7 +235,6 @@ impl AccountReader for QmdbStateProvider {
             ProviderError::other(error)
         })?;
         self.counters.increment(ReadEvent::Account);
-        metrics::counter!("n42_qmdb_state_reads_total", "kind" => "account").increment(1);
         if self.mode == QmdbReadsMode::Verify {
             let database = self.inner.basic_account(address).inspect_err(|_| {
                 self.counters.increment(ReadEvent::ReadError);
@@ -228,7 +266,6 @@ impl StateProvider for QmdbStateProvider {
             ProviderError::other(error)
         })?;
         self.counters.increment(ReadEvent::Storage);
-        metrics::counter!("n42_qmdb_state_reads_total", "kind" => "storage").increment(1);
         if self.mode == QmdbReadsMode::Verify {
             let value = self.check(
                 "storage",
@@ -245,16 +282,35 @@ impl StateProvider for QmdbStateProvider {
     }
 }
 
-// QMDB replaces point reads only. Bytecode, block hashes, historical metadata
-// and the existing compatibility proof/root interfaces keep their provider.
+impl BytecodeReader for QmdbStateProvider {
+    fn bytecode_by_hash(
+        &self,
+        hash: &B256,
+    ) -> ProviderResult<Option<reth_primitives_traits::Bytecode>> {
+        // Verify mode keeps every read on the wrapped provider.
+        if self.mode != QmdbReadsMode::Verify
+            && let Some(code) = self.code.get(hash)
+        {
+            metrics::counter!("n42_qmdb_code_reads_total", "outcome" => "cached").increment(1);
+            return Ok(Some(code));
+        }
+        let code = self.inner.bytecode_by_hash(hash)?;
+        metrics::counter!("n42_qmdb_code_reads_total", "outcome" => "provider").increment(1);
+        if let Some(code) = &code {
+            self.code.insert(*hash, code);
+        }
+        Ok(code)
+    }
+}
+
+// QMDB replaces point reads only. Block hashes, historical metadata and the
+// existing compatibility proof/root interfaces keep their provider; bytecode
+// is read from it once per code hash.
 reth_storage_api::macros::delegate_impls_to_as_ref!(
     for QmdbStateProvider =>
     BlockHashReader {
         fn block_hash(&self, number: u64) -> ProviderResult<Option<B256>>;
         fn canonical_hashes_range(&self, start: u64, end: u64) -> ProviderResult<Vec<B256>>;
-    }
-    BytecodeReader {
-        fn bytecode_by_hash(&self, hash: &B256) -> ProviderResult<Option<reth_primitives_traits::Bytecode>>;
     }
     HashedPostStateProvider {
         fn hashed_post_state(&self, state: &revm::database::BundleState) -> ProviderResult<reth_trie_common::HashedPostState>;
