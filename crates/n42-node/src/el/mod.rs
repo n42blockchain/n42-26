@@ -5,6 +5,7 @@
 //! EL-seam refactor, stage 6).
 
 mod import_gate;
+mod own_block;
 mod reth_engine;
 pub use reth_engine::RethExecutionLayer;
 

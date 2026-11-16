@@ -53,6 +53,13 @@ impl ExecutionLayer for RethExecutionLayer {
             Some(gate) => Some(gate.acquire(payload.block_hash()).await),
             None => None,
         };
+        // A block this node just built goes into the engine tree as executed.
+        if super::own_block::enabled() && super::own_block::try_insert(&payload).await {
+            return Ok(PayloadStatus::new(
+                alloy_rpc_types_engine::PayloadStatusEnum::Valid,
+                Some(payload.block_hash()),
+            ));
+        }
         // consensus_loop::background_import / execution_bridge eager import.
         self.engine
             .new_payload(payload)
@@ -102,7 +109,12 @@ impl ExecutionLayer for RethExecutionLayer {
         let result = builder
             .resolve_kind(id, reth_kind)
             .await
-            .map(|r| r.map_err(|e| ElError(e.to_string())).map(to_built_block));
+            .map(|r| {
+                r.map_err(|e| ElError(e.to_string())).map(|payload| {
+                    super::own_block::remember_built(payload.block_arc());
+                    to_built_block(payload)
+                })
+            });
         // Includes waiting for the pending build and converting its completed
         // output. This is a builder boundary, not a consensus seal timestamp.
         metrics::histogram!("n42_engine_boundary_duration_ms", "phase" => "payload_resolve")

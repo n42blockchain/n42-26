@@ -156,123 +156,160 @@ where
         let standard = standard?;
         drop(standard_timer);
         let _native_timer = PayloadConversionTimer::new("native_header_bind");
-        let mut block = standard.into_block();
-        block.header.ommers_hash = B256::ZERO;
-        block.header.extra_data = original_extra;
-        // Current gov5 uses difficulty 0. Preserved replay-v2 ranges were produced while H2 used
-        // difficulty 1. Engine payloads omit the field, so reconstruct both permitted values and
-        // let the hash-authenticated block identity select exactly one without operator guessing.
-        block.header.difficulty = U256::ZERO;
-        validate_gov5_h2_header(&block.header).map_err(NewPayloadError::other)?;
-        let current = block.seal_slow();
-        let current_hash = current.hash();
-        if current.hash() == expected_hash {
-            return Ok(current);
-        }
-        // Reuse the transaction body when trying the legacy header variant.
-        let mut block = current.into_block();
-        block.header.difficulty = U256::from(1);
-        validate_gov5_h2_header(&block.header).map_err(NewPayloadError::other)?;
-        let legacy = block.seal_slow();
-        if legacy.hash() == expected_hash {
-            return Ok(legacy);
-        }
-        // Live gov5 headers on chains with rewards, a committee pool or the
-        // mobileAnchor fork carry fields alloy cannot re-encode (see
-        // `Gov5NativeHeader`). The network layer remembered the exact
-        // encoding behind `expected_hash`; bind the payload to it field by
-        // field and seal with the hash gov5 committed to.
-        if let Some(native) = remembered_gov5_native_header(&expected_hash) {
-            let mut block = legacy.into_block();
-            block.header.difficulty = native.header.difficulty;
-            validate_gov5_h2_header(&native.header).map_err(NewPayloadError::other)?;
-            let payload_rewards = block
-                .body
-                .withdrawals
-                .as_deref()
-                .map(|withdrawals| gov5_withdrawals_to_rewards(withdrawals))
-                .unwrap_or_default();
-            let payload_rewards_root = block
-                .body
-                .withdrawals
-                .is_some()
-                .then(|| gov5_native_rewards_root(&payload_rewards));
-            let mismatch = |field: &str| {
-                NewPayloadError::other(std::io::Error::other(format!(
-                    "gov5 payload {expected_hash} disagrees with its remembered native header on {field}"
-                )))
-            };
-            let p = &block.header;
-            let n = &native.header;
-            if p.parent_hash != n.parent_hash {
-                tracing::warn!(
-                    target: "n42::engine_validator",
-                    %expected_hash,
-                    %current_hash,
-                    payload_parent = %p.parent_hash,
-                    native_parent = %n.parent_hash,
-                    payload_number = p.number,
-                    native_number = n.number,
-                    "gov5 payload and remembered native header name different parents"
-                );
-                return Err(mismatch("parentHash"));
-            }
-            if p.beneficiary != n.beneficiary {
-                return Err(mismatch("miner"));
-            }
-            if p.state_root != n.state_root {
-                return Err(mismatch("stateRoot"));
-            }
-            if p.transactions_root != n.transactions_root {
-                return Err(mismatch("transactionsRoot"));
-            }
-            if p.receipts_root != n.receipts_root {
-                return Err(mismatch("receiptsRoot"));
-            }
-            if p.logs_bloom != n.logs_bloom {
-                return Err(mismatch("logsBloom"));
-            }
-            if p.number != n.number {
-                return Err(mismatch("number"));
-            }
-            if p.gas_limit != n.gas_limit {
-                return Err(mismatch("gasLimit"));
-            }
-            if p.gas_used != n.gas_used {
-                return Err(mismatch("gasUsed"));
-            }
-            if p.timestamp != n.timestamp {
-                return Err(mismatch("timestamp"));
-            }
-            if p.extra_data != n.extra_data {
-                return Err(mismatch("extraData"));
-            }
-            if p.mix_hash != n.mix_hash {
-                return Err(mismatch("mixHash"));
-            }
-            if p.base_fee_per_gas != n.base_fee_per_gas {
-                return Err(mismatch("baseFeePerGas"));
-            }
-            if payload_rewards_root != n.withdrawals_root {
-                return Err(mismatch("withdrawalsRoot (rewards)"));
-            }
-            if p.blob_gas_used.unwrap_or(0) != n.blob_gas_used.unwrap_or(0)
-                || p.excess_blob_gas.unwrap_or(0) != n.excess_blob_gas.unwrap_or(0)
-            {
-                return Err(mismatch("blob gas"));
-            }
-            if p.parent_beacon_block_root != n.parent_beacon_block_root {
-                return Err(mismatch("parentBeaconBlockRoot"));
-            }
-            block.header = native.header;
-            return Ok(SealedBlock::new_unchecked(block, expected_hash));
-        }
-        Err(PayloadError::BlockHash {
-            execution: current_hash,
-            consensus: expected_hash,
-        }
-        .into())
+        bind_gov5_h2_header(standard.into_block(), original_extra, expected_hash)
     }
+}
+
+/// Gives a block rebuilt from a payload the gov5 H2 header `expected_hash`
+/// commits to: the current header shape, the legacy difficulty, or the native
+/// header the network layer remembered for that hash. The body is untouched.
+fn bind_gov5_h2_header(
+    mut block: N42Block,
+    original_extra: Bytes,
+    expected_hash: B256,
+) -> Result<SealedBlock<N42Block>, NewPayloadError> {
+    block.header.ommers_hash = B256::ZERO;
+    block.header.extra_data = original_extra;
+    // Current gov5 uses difficulty 0. Preserved replay-v2 ranges were produced while H2 used
+    // difficulty 1. Engine payloads omit the field, so reconstruct both permitted values and
+    // let the hash-authenticated block identity select exactly one without operator guessing.
+    block.header.difficulty = U256::ZERO;
+    validate_gov5_h2_header(&block.header).map_err(NewPayloadError::other)?;
+    let current = block.seal_slow();
+    let current_hash = current.hash();
+    if current.hash() == expected_hash {
+        return Ok(current);
+    }
+    // Reuse the transaction body when trying the legacy header variant.
+    let mut block = current.into_block();
+    block.header.difficulty = U256::from(1);
+    validate_gov5_h2_header(&block.header).map_err(NewPayloadError::other)?;
+    let legacy = block.seal_slow();
+    if legacy.hash() == expected_hash {
+        return Ok(legacy);
+    }
+    // Live gov5 headers on chains with rewards, a committee pool or the
+    // mobileAnchor fork carry fields alloy cannot re-encode (see
+    // `Gov5NativeHeader`). The network layer remembered the exact
+    // encoding behind `expected_hash`; bind the payload to it field by
+    // field and seal with the hash gov5 committed to.
+    if let Some(native) = remembered_gov5_native_header(&expected_hash) {
+        let mut block = legacy.into_block();
+        block.header.difficulty = native.header.difficulty;
+        validate_gov5_h2_header(&native.header).map_err(NewPayloadError::other)?;
+        let payload_rewards = block
+            .body
+            .withdrawals
+            .as_deref()
+            .map(|withdrawals| gov5_withdrawals_to_rewards(withdrawals))
+            .unwrap_or_default();
+        let payload_rewards_root = block
+            .body
+            .withdrawals
+            .is_some()
+            .then(|| gov5_native_rewards_root(&payload_rewards));
+        let mismatch = |field: &str| {
+            NewPayloadError::other(std::io::Error::other(format!(
+                "gov5 payload {expected_hash} disagrees with its remembered native header on {field}"
+            )))
+        };
+        let p = &block.header;
+        let n = &native.header;
+        if p.parent_hash != n.parent_hash {
+            tracing::warn!(
+                target: "n42::engine_validator",
+                %expected_hash,
+                %current_hash,
+                payload_parent = %p.parent_hash,
+                native_parent = %n.parent_hash,
+                payload_number = p.number,
+                native_number = n.number,
+                "gov5 payload and remembered native header name different parents"
+            );
+            return Err(mismatch("parentHash"));
+        }
+        if p.beneficiary != n.beneficiary {
+            return Err(mismatch("miner"));
+        }
+        if p.state_root != n.state_root {
+            return Err(mismatch("stateRoot"));
+        }
+        if p.transactions_root != n.transactions_root {
+            return Err(mismatch("transactionsRoot"));
+        }
+        if p.receipts_root != n.receipts_root {
+            return Err(mismatch("receiptsRoot"));
+        }
+        if p.logs_bloom != n.logs_bloom {
+            return Err(mismatch("logsBloom"));
+        }
+        if p.number != n.number {
+            return Err(mismatch("number"));
+        }
+        if p.gas_limit != n.gas_limit {
+            return Err(mismatch("gasLimit"));
+        }
+        if p.gas_used != n.gas_used {
+            return Err(mismatch("gasUsed"));
+        }
+        if p.timestamp != n.timestamp {
+            return Err(mismatch("timestamp"));
+        }
+        if p.extra_data != n.extra_data {
+            return Err(mismatch("extraData"));
+        }
+        if p.mix_hash != n.mix_hash {
+            return Err(mismatch("mixHash"));
+        }
+        if p.base_fee_per_gas != n.base_fee_per_gas {
+            return Err(mismatch("baseFeePerGas"));
+        }
+        if payload_rewards_root != n.withdrawals_root {
+            return Err(mismatch("withdrawalsRoot (rewards)"));
+        }
+        if p.blob_gas_used.unwrap_or(0) != n.blob_gas_used.unwrap_or(0)
+            || p.excess_blob_gas.unwrap_or(0) != n.excess_blob_gas.unwrap_or(0)
+        {
+            return Err(mismatch("blob gas"));
+        }
+        if p.parent_beacon_block_root != n.parent_beacon_block_root {
+            return Err(mismatch("parentBeaconBlockRoot"));
+        }
+        block.header = native.header;
+        return Ok(SealedBlock::new_unchecked(block, expected_hash));
+    }
+    Err(PayloadError::BlockHash {
+        execution: current_hash,
+        consensus: expected_hash,
+    }
+    .into())
+}
+
+/// Rebuilds the block `payload` names around `body`, the already decoded body
+/// of the block this node built it from, without decoding the payload's
+/// transactions again.
+///
+/// `transactions_root` is the root of `body`'s transactions. The header is
+/// derived from the payload's fields with that root and must hash to the
+/// payload's block hash, so a body that is not the payload's cannot pass.
+pub fn gov5_block_from_built_body(
+    payload: &ExecutionData,
+    body: <N42Block as reth_primitives_traits::Block>::Body,
+    transactions_root: B256,
+) -> Result<SealedBlock<N42Block>, NewPayloadError> {
+    let expected_hash = payload.block_hash();
+    let original_extra = payload.payload.as_v1().extra_data.clone();
+    validate_gov5_header_extra(&original_extra).map_err(NewPayloadError::other)?;
+    let mut standard_payload = payload.clone();
+    standard_payload.payload.set_extra_data(Bytes::new());
+    let header = standard_payload
+        .payload
+        .into_block_with_sidecar_raw_with_transactions_root(
+            &standard_payload.sidecar,
+            transactions_root,
+        )?
+        .header;
+    bind_gov5_h2_header(N42Block { header, body }, original_extra, expected_hash)
 }
 
 impl<ChainSpec, Types> EngineApiValidator<Types> for N42EngineValidator<ChainSpec>
@@ -405,6 +442,34 @@ mod tests {
             ).unwrap();
             assert_eq!(sealed.hash(), expected);
             assert_eq!(sealed.body().transactions, block.body.transactions);
+        }
+    }
+
+    #[test]
+    fn built_body_rebuilds_the_payload_block_and_a_foreign_root_is_refused() {
+        let validator =
+            N42EngineValidator::new(Arc::new(ChainSpec::default()), N42HeaderProfile::Gov5H2);
+        for difficulty in [U256::ZERO, U256::from(1)] {
+            let block = transaction_block(difficulty);
+            let expected = block.header.hash_slow();
+            let payload = ExecutionData::from_block_unchecked(expected, &block);
+            let decoded = <N42EngineValidator<ChainSpec> as PayloadValidator<EthEngineTypes>>::convert_payload_to_block(
+                &validator, payload.clone(),
+            ).unwrap();
+            let rebuilt = gov5_block_from_built_body(
+                &payload,
+                block.body.clone(),
+                block.header.transactions_root,
+            )
+            .unwrap();
+            assert_eq!(rebuilt.hash(), expected);
+            assert_eq!(rebuilt.header(), decoded.header());
+            assert_eq!(rebuilt.body(), decoded.body());
+            // A root that is not the payload's body cannot reach its hash.
+            assert!(
+                gov5_block_from_built_body(&payload, block.body.clone(), B256::repeat_byte(7))
+                    .is_err()
+            );
         }
     }
 
