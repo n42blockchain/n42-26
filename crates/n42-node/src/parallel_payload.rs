@@ -87,6 +87,7 @@ where
         ..
     } = config;
     let skip_state_root = builder_config.skip_state_root;
+    let setup_start = std::time::Instant::now();
     // Direct bundle graft does not stream per-tx changes to the incremental root
     // job. Drop its hook/receiver and compute the complete root at finish.
     drop(state_root_handle.take());
@@ -113,6 +114,7 @@ where
             Box::new(evm_state_provider)
         };
     let state = StateProviderDatabase::new(evm_state_provider);
+    let setup_provider_ms = setup_start.elapsed().as_millis() as u64;
     let chain_spec = client.chain_spec();
     let is_amsterdam = chain_spec.is_amsterdam_active_at_timestamp(attributes.timestamp());
     let mut db = State::builder()
@@ -161,6 +163,8 @@ where
     let tx_gas_limit_cap = builder.evm_mut().cfg_env().tx_gas_limit_cap();
     let base_fee = builder.evm_mut().block().basefee();
 
+    let setup_env_ms = setup_start.elapsed().as_millis() as u64 - setup_provider_ms;
+    let best_start = std::time::Instant::now();
     let mut best_txs = best_txs(BestTransactionsAttributes::new(
         base_fee,
         builder
@@ -169,6 +173,7 @@ where
             .blob_gasprice()
             .map(|gasprice| gasprice as u64),
     ));
+    let setup_best_ms = best_start.elapsed().as_millis() as u64;
     let mut total_fees = U256::ZERO;
 
     // If we have a state-root task, wire a state hook that streams per-tx state diffs.
@@ -179,10 +184,13 @@ where
             .set_state_hook(Some(Box::new(task.take_state_hook())));
     }
 
+    let pre_execution_start = std::time::Instant::now();
     builder.apply_pre_execution_changes().map_err(|err| {
         warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
         PayloadBuilderError::Internal(err.into())
     })?;
+
+    let setup_pre_execution_ms = pre_execution_start.elapsed().as_millis() as u64;
 
     // initialize empty blob sidecars at first. If cancun is active then this will be populated by
     // blob sidecars if any.
@@ -231,6 +239,7 @@ where
     let mut tx_count: usize = 0;
 
     let packing_start = std::time::Instant::now();
+    let setup_ms = setup_start.elapsed().as_millis() as u64;
     let mut evm_exec_total = std::time::Duration::ZERO;
     let mut iter_total = std::time::Duration::ZERO;
     let mut consensus_total = std::time::Duration::ZERO;
@@ -739,6 +748,11 @@ where
         iter_ms = iter_total.as_millis() as u64,
         consensus_ms = consensus_total.as_millis() as u64,
         other_ms,
+        setup_ms,
+        setup_provider_ms,
+        setup_env_ms,
+        setup_best_ms,
+        setup_pre_execution_ms,
         "N42_PAYLOAD_PACK: tx packing complete"
     );
 
@@ -813,7 +827,7 @@ where
                     let restored = n42_execution::restored_slots_for(key).unwrap_or_default();
                     let operations =
                         crate::exec_cache::gov5_sorted_operations(bundle_state, &restored, prague);
-                    let root = store.prepare_candidate(parent_hash, operations);
+                    let root = store.prepare_bound_candidate(parent_hash, operations, key);
                     metrics::histogram!("n42_payload_builder_qmdb_root_ms")
                         .record(started.elapsed().as_secs_f64() * 1000.0);
                     root

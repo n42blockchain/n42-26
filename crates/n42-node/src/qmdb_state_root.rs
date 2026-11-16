@@ -216,6 +216,9 @@ struct AppliedUndo {
 /// `tree_at` still names its parent until the exact operations are admitted.
 struct PreparedCandidate {
     parent_hash: B256,
+    /// Names the parent, block environment and ordered transactions the
+    /// operations were derived from, when the builder supplied it.
+    binding: Option<B256>,
     root: B256,
     operations: Vec<QmdbOperation>,
     undo: BlockUndo,
@@ -1003,7 +1006,61 @@ impl Gov5QmdbStateRootStore {
         parent_hash: B256,
         operations: Vec<QmdbOperation>,
     ) -> Result<B256, Gov5QmdbStateRootError> {
-        self.prepare_candidate_with_limit(parent_hash, operations, PREPARED_CANDIDATE_BYTES)
+        self.prepare_candidate_with_limit(parent_hash, operations, PREPARED_CANDIDATE_BYTES, None)
+    }
+
+    /// [`Self::prepare_candidate`] for operations the caller derived from the
+    /// execution named by `binding`: its parent, block environment and
+    /// ordered transactions. An import of exactly that execution may then
+    /// commit the candidate without deriving the operations again.
+    pub fn prepare_bound_candidate(
+        &self,
+        parent_hash: B256,
+        operations: Vec<QmdbOperation>,
+        binding: B256,
+    ) -> Result<B256, Gov5QmdbStateRootError> {
+        self.prepare_candidate_with_limit(
+            parent_hash,
+            operations,
+            PREPARED_CANDIDATE_BYTES,
+            Some(binding),
+        )
+    }
+
+    /// Commit the prepared candidate if it was derived from the execution
+    /// named by `binding`. Returns `None` when no such candidate is held; the
+    /// caller then derives the operations itself.
+    pub fn commit_bound_candidate(
+        &self,
+        parent_hash: B256,
+        block_hash: B256,
+        expected_root: B256,
+        binding: B256,
+    ) -> Result<Option<B256>, Gov5QmdbStateRootError> {
+        match self.commit_operations(parent_hash, block_hash, expected_root, Err(binding)) {
+            Ok(root) => Ok(Some(root)),
+            Err(Gov5QmdbStateRootError::NoBoundCandidate) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The binding of the prepared candidate, if one stands on `parent_hash`
+    /// and produced `root`. A builder that sealed `root` into its own block
+    /// uses it to commit that block with [`Self::commit_bound_candidate`].
+    pub fn prepared_binding(
+        &self,
+        parent_hash: B256,
+        root: B256,
+    ) -> Result<Option<B256>, Gov5QmdbStateRootError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+        Ok(state
+            .prepared
+            .as_ref()
+            .filter(|prepared| prepared.parent_hash == parent_hash && prepared.root == root)
+            .and_then(|prepared| prepared.binding))
     }
 
     fn prepare_candidate_with_limit(
@@ -1011,6 +1068,7 @@ impl Gov5QmdbStateRootStore {
         parent_hash: B256,
         operations: Vec<QmdbOperation>,
         byte_limit: usize,
+        binding: Option<B256>,
     ) -> Result<B256, Gov5QmdbStateRootError> {
         let started = std::time::Instant::now();
         let mut state = self
@@ -1034,7 +1092,7 @@ impl Gov5QmdbStateRootStore {
                         + operations.iter().filter_map(|op| op.value.as_ref()).map(Vec::capacity).sum::<usize>()
                         + undo_heap_bytes(&undo) + heap_bytes;
                     if bytes <= byte_limit {
-                        state.prepared = Some(PreparedCandidate { parent_hash, root, operations, undo });
+                        state.prepared = Some(PreparedCandidate { parent_hash, binding, root, operations, undo });
                         metrics::gauge!("n42_qmdb_prepared_candidate_bytes").set(bytes as f64);
                         metrics::counter!("n42_qmdb_prepared_candidates_total", "outcome" => "retained").increment(1);
                     } else {
@@ -1076,7 +1134,18 @@ impl Gov5QmdbStateRootStore {
         expected_root: B256,
         operations: Vec<QmdbOperation>,
     ) -> Result<B256, Gov5QmdbStateRootError> {
-        let operation_count = operations.len();
+        self.commit_operations(parent_hash, block_hash, expected_root, Ok(operations))
+    }
+
+    /// `source` is the block's operations, or the binding of the prepared
+    /// candidate whose operations are to be used.
+    fn commit_operations(
+        &self,
+        parent_hash: B256,
+        block_hash: B256,
+        expected_root: B256,
+        source: Result<Vec<QmdbOperation>, B256>,
+    ) -> Result<B256, Gov5QmdbStateRootError> {
         let _commit = self
             .commit
             .lock()
@@ -1089,6 +1158,28 @@ impl Gov5QmdbStateRootStore {
         let lock_acquired = std::time::Instant::now();
         metrics::histogram!("n42_qmdb_lock_wait_ms", "operation" => "commit")
             .record(lock_acquired.duration_since(lock_started).as_secs_f64() * 1_000.0);
+        let (operations, bound) = match source {
+            Ok(operations) => (operations, false),
+            Err(binding) => {
+                // A block already known is left to the ordinary path, which
+                // compares its operations with the stored ones.
+                let known =
+                    block_hash == self.base_block_hash || state.blocks.contains_key(&block_hash);
+                match state.prepared.as_mut() {
+                    Some(prepared)
+                        if !known
+                            && prepared.parent_hash == parent_hash
+                            && prepared.binding == Some(binding) =>
+                    {
+                        // The candidate is consumed below without another
+                        // comparison, so its operations can move out here.
+                        (std::mem::take(&mut prepared.operations), true)
+                    }
+                    _ => return Err(Gov5QmdbStateRootError::NoBoundCandidate),
+                }
+            }
+        };
+        let operation_count = operations.len();
         metrics::histogram!("n42_qmdb_operations_per_block").record(operation_count as f64);
         if block_hash == self.base_block_hash {
             metrics::counter!("n42_qmdb_commit_outcomes_total", "outcome" => "cache_conflict")
@@ -1121,10 +1212,11 @@ impl Gov5QmdbStateRootStore {
         // Keep the existing candidate metric inclusive of exact delta matching
         // and coordinator setup, but exclude waiting for the read-view worker.
         let compute_started = std::time::Instant::now();
-        let prepared_matches = state.prepared.as_ref().is_some_and(|prepared| {
-            prepared.parent_hash == parent_hash
-                && same_operations(&prepared.operations, &operations)
-        });
+        let prepared_matches = bound
+            || state.prepared.as_ref().is_some_and(|prepared| {
+                prepared.parent_hash == parent_hash
+                    && same_operations(&prepared.operations, &operations)
+            });
         // A cached immutable parent needs no forest access. Its derived index
         // may be built concurrently, but remains private until the actual tree
         // root matches the header and the WAL is durable. Never use the EVM
@@ -2415,6 +2507,23 @@ where
     }
 }
 
+/// Whether an import commits the builder's operations for the same execution
+/// instead of deriving them again (`N42_QMDB_ADOPT_BUILT=1`).
+fn adopt_built_operations() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_QMDB_ADOPT_BUILT").is_ok_and(|v| v == "1"))
+}
+
+/// Records the store commit's share of the root job when dropped.
+struct CommitStageTimer(std::time::Instant);
+
+impl Drop for CommitStageTimer {
+    fn drop(&mut self) {
+        metrics::histogram!("n42_qmdb_root_job_ms", "stage" => "commit")
+            .record(self.0.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
 #[derive(Debug)]
 struct Gov5QmdbStateRootJob {
     store: Arc<Gov5QmdbStateRootStore>,
@@ -2436,10 +2545,40 @@ impl StateRootJob<N42Primitives> for Gov5QmdbStateRootJob {
         // gov5 rewrites every slot the block's journal marked dirty, including
         // one changed and restored within the block, which revm drops from
         // the bundle; the executor wrapper recorded those for this block.
-        let restored =
-            n42_execution::restored_slots_for(gov5_restored_slots_key(block, self.env_key))
-                .unwrap_or_default();
+        let key_started = std::time::Instant::now();
+        let key = gov5_restored_slots_key(block, self.env_key);
+        metrics::histogram!("n42_qmdb_root_job_ms", "stage" => "key")
+            .record(key_started.elapsed().as_secs_f64() * 1000.0);
+        // The builder derived this exact execution's operations already; the
+        // key names its parent, environment and ordered transactions.
+        if adopt_built_operations() {
+            let started = std::time::Instant::now();
+            let adopted = self.store.commit_bound_candidate(
+                block.parent_hash,
+                block.hash(),
+                block.state_root,
+                key,
+            );
+            let root = match adopted {
+                Ok(Some(root)) => Some(root),
+                Ok(None) => None,
+                Err(Gov5QmdbStateRootError::RootMismatch { got, .. }) => Some(got),
+                Err(error) => return Err(ProviderError::other(error)),
+            };
+            if let Some(root) = root {
+                metrics::histogram!("n42_qmdb_root_job_ms", "stage" => "bound_commit")
+                    .record(started.elapsed().as_secs_f64() * 1000.0);
+                return Ok(StateRootJobOutcome::new(
+                    root,
+                    Arc::new(TrieUpdates::default()),
+                ));
+            }
+        }
+        let derive_started = std::time::Instant::now();
+        let restored = n42_execution::restored_slots_for(key).unwrap_or_default();
         let mut operations = gov5_qmdb_operations_with_restored(&output.state, &restored);
+        metrics::histogram!("n42_qmdb_root_job_ms", "stage" => "derive")
+            .record(derive_started.elapsed().as_secs_f64() * 1000.0);
         if std::env::var_os("N42_QMDB_DEBUG_ROOT").is_some() {
             eprintln!(
                 "DEBUG QMDB block={} operations={}",
@@ -2475,10 +2614,15 @@ impl StateRootJob<N42Primitives> for Gov5QmdbStateRootJob {
         }
         // Sort our existing buffer before entering the store lock. The tree
         // borrows it; WAL and read-view publication retain the same operations.
+        let sort_started = std::time::Instant::now();
         rayon::slice::ParallelSliceMut::par_sort_unstable_by_key(
             operations.as_mut_slice(),
             |operation| operation.key,
         );
+        metrics::histogram!("n42_qmdb_root_job_ms", "stage" => "sort")
+            .record(sort_started.elapsed().as_secs_f64() * 1000.0);
+        let commit_started = std::time::Instant::now();
+        let _commit_time = CommitStageTimer(commit_started);
         let root = match self.store.compute_and_commit(
             block.parent_hash,
             block.hash(),
@@ -2877,6 +3021,58 @@ mod tests {
     }
 
     #[test]
+    fn bound_candidate_commits_only_for_its_own_execution() {
+        let (store, snapshot) = store();
+        let parent = store.base_block_hash();
+        let ops = vec![operation(1, 9), operation(2, 8)];
+        let root = expected_root(&snapshot, std::slice::from_ref(&ops));
+        let binding = B256::repeat_byte(0x71);
+        let hash = B256::repeat_byte(0x42);
+        assert_eq!(
+            store
+                .prepare_bound_candidate(parent, ops.clone(), binding)
+                .unwrap(),
+            root
+        );
+        // Another execution, or another parent, leaves the candidate alone.
+        assert_eq!(
+            store
+                .commit_bound_candidate(parent, hash, root, B256::repeat_byte(0x72))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .commit_bound_candidate(hash, hash, root, binding)
+                .unwrap(),
+            None
+        );
+        assert!(store.state.lock().unwrap().prepared.is_some());
+        // A header naming another root is still refused and nothing is kept.
+        assert!(matches!(
+            store.commit_bound_candidate(parent, hash, B256::ZERO, binding),
+            Err(Gov5QmdbStateRootError::RootMismatch { got, .. }) if got == root
+        ));
+        assert!(store.state.lock().unwrap().prepared.is_none());
+        assert!(!store.contains(hash).unwrap());
+        store
+            .prepare_bound_candidate(parent, ops.clone(), binding)
+            .unwrap();
+        assert_eq!(
+            store
+                .commit_bound_candidate(parent, hash, root, binding)
+                .unwrap(),
+            Some(root)
+        );
+        assert_eq!(store.root_for(hash).unwrap(), Some(root));
+        // The stored block carries the operations the candidate was built from.
+        assert_eq!(
+            store.compute_and_commit(parent, hash, root, ops).unwrap(),
+            root
+        );
+    }
+
+    #[test]
     fn prepared_candidate_adopts_only_the_complete_delta_and_checks_header_root() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         let recorder = DebuggingRecorder::new();
@@ -3063,7 +3259,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .prepare_candidate_with_limit(store.base_block_hash(), ops, 512 * 1024)
+                .prepare_candidate_with_limit(store.base_block_hash(), ops, 512 * 1024, None)
                 .unwrap(),
             expected
         );
