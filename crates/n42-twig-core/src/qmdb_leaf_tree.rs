@@ -369,7 +369,18 @@ impl QmdbLeafTree {
 
     /// Reuse the batch's precomputed leaf while tracking deferred ancestor work.
     fn set_with_leaf(&mut self, key: Hash, value: Vec<u8>, leaf: Hash, defer_leaves: bool) {
-        if let Some(old) = self.live.remove(&key) {
+        let slot = self.next_slot;
+        self.next_slot += 1;
+        // One probe of the live index both installs the new entry and yields
+        // the replaced one; the index is far larger than the cache.
+        let replaced = self.live.insert(
+            key,
+            LiveEntry {
+                slot,
+                value: value.into_boxed_slice(),
+            },
+        );
+        if let Some(old) = replaced {
             // Move the replaced value into the undo record without cloning it.
             self.record_deactivation(old.slot, key, old.value);
             self.set_bit(old.slot, false);
@@ -377,8 +388,6 @@ impl QmdbLeafTree {
         if let Some(record) = self.recording.as_mut() {
             record.appended_keys.push(key);
         }
-        let slot = self.next_slot;
-        self.next_slot += 1;
         let twig_id = (slot as usize) / TWIG_SIZE;
         let local = (slot as usize) % TWIG_SIZE;
         if local == 0 {
@@ -397,13 +406,6 @@ impl QmdbLeafTree {
         }
         open.bits[local / 8] |= 1 << (local % 8);
         self.dirty.insert(twig_id);
-        self.live.insert(
-            key,
-            LiveEntry {
-                slot,
-                value: value.into_boxed_slice(),
-            },
-        );
         if local + 1 == TWIG_SIZE {
             self.seal_open();
         }

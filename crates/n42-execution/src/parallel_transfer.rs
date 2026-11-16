@@ -637,38 +637,43 @@ fn graft_bundles_inner<DB: Database>(
                 repeated.insert(address);
                 continue;
             }
-            if let Some(existing) = state.bundle_state.state.get_mut(&address) {
-                // An earlier bundle put it in (or an earlier merge did, in
-                // which case the cache holds the block's view too): added to
-                // what is there, in both places.
-                repeated.insert(address);
-                if let Some(info) = existing.info.as_mut() {
-                    apply_delta(
-                        info,
-                        new_balance,
-                        old_balance,
-                        new_nonce,
-                        old_nonce,
-                        address,
-                    )?;
+            // One probe of the block's bundle finds an earlier entry or the
+            // place for this one: the map holds a full block's accounts.
+            let vacant = match state.bundle_state.state.entry(address) {
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    // An earlier bundle put it in (or an earlier merge did, in
+                    // which case the cache holds the block's view too): added to
+                    // what is there, in both places.
+                    repeated.insert(address);
+                    if let Some(info) = existing.into_mut().info.as_mut() {
+                        apply_delta(
+                            info,
+                            new_balance,
+                            old_balance,
+                            new_nonce,
+                            old_nonce,
+                            address,
+                        )?;
+                    }
+                    if let Some(info) = state
+                        .cache
+                        .accounts
+                        .get_mut(&address)
+                        .and_then(|a| a.account.as_mut())
+                    {
+                        apply_delta(
+                            &mut info.info,
+                            new_balance,
+                            old_balance,
+                            new_nonce,
+                            old_nonce,
+                            address,
+                        )?;
+                    }
+                    continue;
                 }
-                if let Some(info) = state
-                    .cache
-                    .accounts
-                    .get_mut(&address)
-                    .and_then(|a| a.account.as_mut())
-                {
-                    apply_delta(
-                        &mut info.info,
-                        new_balance,
-                        old_balance,
-                        new_nonce,
-                        old_nonce,
-                        address,
-                    )?;
-                }
-                continue;
-            }
+                std::collections::hash_map::Entry::Vacant(vacant) => vacant,
+            };
             if let Some(cached) = (!cache_was_empty || keep_cache)
                 .then(|| state.cache.accounts.get(&address))
                 .flatten()
@@ -718,7 +723,7 @@ fn graft_bundles_inner<DB: Database>(
                 );
             }
             state.bundle_state.state_size += account.size_hint();
-            state.bundle_state.state.insert(address, account);
+            vacant.insert(account);
             graft.accounts += 1;
         }
         let mut reverts = reverts;
