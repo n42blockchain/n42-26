@@ -932,3 +932,204 @@ flood 加 `--connections 8` 后注入为每节点约 80 万笔/秒（160 万笔 
 **验证：** `cargo clippy --all-targets -- -D warnings` 通过；`cargo test --workspace` 无失败。
 
 **后续：** 见 8.16 的排序，首项为自验证复用构块已算好的 QMDB 根。
+
+### 8.18 Y 轮：自验证复用构块的 QMDB 操作列表（2026-11-15）
+
+**设计。** 构块端 `prepare_candidate` 早已把树的应用结果留给导入端，`compute_and_commit` 命中后不再重算树。自验证里重复的是从执行输出重新推导操作列表、排序、再与候选逐条比对。新增：
+
+- `Gov5QmdbStateRootStore::prepare_bound_candidate(parent, operations, binding)`：`binding` 即已有的 restored-slots 键，覆盖父块哈希、区块环境、beacon root、withdrawals 和有序交易哈希。
+- `commit_bound_candidate(parent, block_hash, expected_root, binding)`：候选的父块与绑定键都相符时直接提交候选（操作列表从候选中移出，不再比对）；否则返回 `None`，调用方照旧推导。区块头的根不符仍报 `RootMismatch`，候选被撤销。
+- 根任务在 `N42_QMDB_ADOPT_BUILT=1` 时先走这条路。
+- 计时：`n42_qmdb_root_job_ms{stage=derive|sort|commit|bound_commit}`；`N42_PAYLOAD_PACK` 增加 `setup_*` 字段。
+
+考虑过按区块哈希绑定，但 Gov5 归一化会改变区块哈希，构块时拿不到最终哈希，所以用执行输入的键。
+
+**结果**（单机 7 验证者，H2-v4 + QMDB，2G gas，160 万笔，每节点 8 条注入连接；原始文件 `.artifacts/native-port-p0/run86*`、`run87*`；两轮均 PASS，7 节点根一致）：
+
+| 轮次 | 配置 | leader 循环中位（构块入口到下一次入口） | 根任务（每个满块） | 自验证 |
+|------|------|------|------|------|
+| run86 | run84 配置（父状态按哈希优先） | 361 ms | 推导 4 + 排序 2 + 提交 30 ms | 67 ms |
+| run87 | 加 `N42_QMDB_ADOPT_BUILT=1` | 369 ms | 约 11.5 ms | 65 ms |
+
+- run86 的循环与 run84 的 361 ms 一致，说明 8.17 的父状态视图顺序修复没有造成回退。
+- 新开关把根任务缩短约 25 ms，但自验证和整个循环没有变短，差值在噪声内。说明自验证的时长不由根任务决定。
+- leader（node1）各段中位：入口到打包 34–37 ms（全部在 `apply_pre_execution_changes`，provider、环境、取交易迭代器均为 0）、打包 142–148、finish 70（等 QMDB 候选 47）、缓存 12、到 new_payload 19–30、自验证 65。
+- leader 指标里与 QMDB 根无关的 reth 工作量：`hash-post-state` 每满块约 50 ms，状态叠加层计算约 70 ms，`overlay_wait` 合计 1.56 s，`AccountsHistory` 查询 165 万次（约 1.3 s CPU）。
+
+**后续。** Z 轮（run88）抓 leader 的 pprof，并在 reth 校验器里加了 `pre_execute / post_execution / state_root / validate_total` 分段计时，用来定位自验证剩余的约 50 ms 和构块前 35 ms 的阻塞点。
+
+### 8.19 Z 轮：自验证分段与构块前等待的第一个假设（2026-11-15）
+
+**结果**（范围同 8.18；原始文件 `.artifacts/native-port-p0/run88*`，日志 `qfWa/`；PASS，7 节点根一致）：run88 配置同 run87，脚本窗口 249,983 TPS（块 43..50，窗口不完整），leader（node1）相邻满块打包完成的间隔中位 378 ms（15 个间隔，343–434）。pprof 只落在 node0、node3 上，没有覆盖 leader。
+
+**leader 自验证分段**（`n42_import_stage_ms`，63 次导入、其中 17 个满块；按满块摊的估计值）：
+
+| 段 | 合计 | 每满块约 |
+|------|------|------|
+| `pre_execute`（入口到执行前） | 171 ms | 10 ms |
+| `await_convert`（等 payload 转区块） | 177 ms | 10 ms |
+| `post_execution` | 52 ms | 3 ms |
+| `state_root` | 605 ms | 35 ms |
+| `validate_total` | 1,327 ms | 约 70 ms |
+
+自验证没有单一的大头，是四五段各 10 ms 左右叠起来的。
+
+**构块前的 22–53 ms：假设。** `setup_pre_execution_ms` 证实等待全在 `apply_pre_execution_changes`。当时的假设是：QMDB 读适配器把字节码读取委托给 reth 内层 provider，内层 provider 的第一次读要等父块的执行叠加层（leader 的 `overlay_wait` 59 次共 1.31 s）。据此给 `QmdbStateAdapter` 加了按代码哈希的进程内缓存（`CodeCache`，上限 4,096 条；`verify` 模式不走缓存；计数 `n42_qmdb_code_reads_total`）。
+
+**新增计时。** reth 校验器 `pre_provider_factory / pre_root_prepare / pre_spawn_processor`（均为自入口起的累计值）；根任务 `n42_qmdb_root_job_ms{stage=key}`。
+
+### 8.20 AA 轮：假设不成立，这些轮次的 QMDB 读一直是关的（2026-11-15）
+
+**结果**（范围同 8.18；原始文件 `.artifacts/native-port-p0/run89*`，日志 `qfXa/`；PASS，7 节点根一致）：脚本窗口 237,639 TPS（块 42..49，窗口不完整），leader 间隔中位 382 ms（14 个间隔，339–424），构块前等待仍是 28–59 ms。字节码缓存没有任何效果。
+
+**原因。** leader 的指标里没有任何 QMDB 读计数。`chain94-fleet.py start` 的 `--qmdb-reads` 默认是 `off`，而本文档里的所有轮次都没有传它（`qfXa/run.json` 记录 `"qmdb_reads": "off"`）。也就是说：
+
+- 构块和导入的账户、存储读取一直走 reth 的叠加层 provider，QMDB 只用来算根；
+- 每个块的第一次读要等父块的执行叠加层算完，这就是构块前的等待（AA 轮 `overlay_wait` 88 次共 1.21 s）；
+- 叠加层未命中的读取落到历史索引上（8.18 记录的 `AccountsHistory` 165 万次查询），这很可能也在拖慢 145 ms 的打包。
+
+8.17 里“按哈希 provider 才有 QMDB 读路由”的说法只对开了 QMDB 读的配置成立；那个顺序修复解决的集成测试失败是真实的，但它在这些测量轮次里不改变读路径。
+
+**AA 轮的细分计时**（leader，17 个满块）：`pre_execute` 158 ms 中，建 provider 工厂 22 ms、到根任务准备 40 ms、其余约 117 ms（每满块约 7 ms）在 `spawn_payload_processor` 之后；`state_root` 628 ms 中，键 80 ms、绑定提交 203 ms、空块提交 210 ms，约 135 ms 未归属。
+
+**后续。** AB 轮（run90，`qfYa`）在 run89 配置上加 `--qmdb-reads on`：账户和存储从 QMDB 读视图取，字节码走缓存，看构块前等待、打包时长和历史索引查询是否下降。之后再决定“封块后立即在未验证的自有块上构下一块”的做法。
+
+### 8.21 AB 轮：打开 QMDB 读（2026-11-15）
+
+**结果**（范围同 8.18；原始文件 `.artifacts/native-port-p0/run90*`，日志 `qfYa/`；PASS，7 节点根一致，572 个共同块）：run90 = run89 配置 + `--qmdb-reads on`。
+
+| 轮次 | QMDB 读 | 脚本窗口 TPS | leader 间隔中位 | 构块前等待 |
+|------|------|------|------|------|
+| run89 | off | 237,639（块 42..49） | 382 ms（339–424） | 28–59 ms |
+| run90 | on | 270,981（块 43..48） | 339 ms（301–431，15 个间隔） | 0 ms |
+
+脚本窗口两轮都不完整，只作参考；循环以 leader 间隔为准，339 ms 对应约 28 万 TPS。
+
+- 构块前等待消失，`execution_overlay` 的等待次数为 0。leader 上 QMDB 账户读 191 万次，638 个 provider 全部命中读视图。
+- 打包时长没有变化（137–208 ms，中位约 143），所以 8.20 里“历史索引查询拖慢打包”的猜测不成立；`AccountsHistory` 的 161 万次 get 仍在，来源不是读路径。
+- 自验证合计不变（1,335 ms / 63 次）；绑定提交从每满块约 12 ms 升到约 22 ms（多了读视图发布）。
+- leader 每满块的 finish 约 77 ms，其中等 QMDB 候选树约 57 ms（`qmdb_candidate_compute_ms{operation=prepare}` 964 ms / 17）。
+
+**现在的循环（每满块，leader）：** 打包约 145、finish 约 77、缓存 13、到 new_payload 约 25、自验证约 70，合计约 330–340 ms。
+
+**后续，按预期收益：**
+1. 封块后立即在未验证的自有块上构下一块：QMDB 读打开后，父状态可以直接取自候选树的读视图，可重叠缓存、new_payload 和自验证约 100 ms。
+2. QMDB 候选树的 57 ms：操作列表在打包结束时才有，要么分片并行应用，要么边打包边喂。
+3. 打包本身 145 ms（19 万次 QMDB 账户读 + 9.5 万笔转账）。
+
+### 8.22 AC 轮：leader 的 pprof 与三处修改（2026-11-15）
+
+**结果**（范围同 8.18，`--qmdb-reads on`；原始文件 `.artifacts/native-port-p0/run91*`，日志 `qfZa/`；PASS，7 节点根一致）：配置同 run90，pprof 改抓 leader（node1）和 node3。脚本窗口 252,127 TPS（块 43..49，窗口不完整）；leader 间隔中位 339 ms（15 个间隔，317–383）。pprof 开着的节点会慢一些，这一轮只用来看分布。
+
+**leader pprof（3,815 个样本，10 s，只看比例）：**
+
+- 构块线程 `payload-builder` 356 个样本里，144 个在 `QmdbLeafTree::set_with_leaf`：QMDB 候选树是在这个线程上串行应用的，每个操作对活跃索引先 `remove` 再 `insert`，索引远大于缓存，主要是内存延迟。这就是 finish 里等候选树的约 57 ms。
+- 执行线程 `n42-build` 162 个样本里约 45 个在 `metrics_util` 注册表查找：`QmdbStateProvider` 每次读都调一次 `metrics::counter!`。
+- 引擎线程 168 个样本里 91 个在 `imbl` HAMT 节点的克隆与释放：读视图缓存淘汰旧视图时，在引擎线程上、持着缓存写锁逐节点释放。这解释了 8.21 里绑定提交变慢的 10 ms。
+- `cpu` 线程 147 个样本在校验器的交易迭代器（缓存命中时用不上）；`handle_built_payload` 275 个样本里 96 个在重新解码 0x50 交易、90 个在 Gov5 编码。
+
+**修改：**
+
+1. `QmdbStateProvider` 的账户、存储读不再逐次查指标注册表；读次数仍由按线程分片的 `QmdbReadCounters` 计，`n42_qmdb_state_reads_total` 在每次创建 provider 时用 `absolute` 发布。
+2. `QmdbReadViewCache::insert` 返回被淘汰的视图，由 `release_read_views` 交给 rayon 后台释放，不再占引擎线程和缓存锁。
+3. `QmdbLeafTree::set_with_leaf` 用一次 `insert` 同时写入新条目并取回旧条目（原来是 `remove` 加 `insert` 两次探测）。槽位分配、撤销记录、位图更新的顺序不变；`n42-twig-core` 70 个测试和 `n42-node` 74 个 QMDB 测试通过。
+
+**后续。** AD 轮（run92，`qgAa`）测量这三处。之后：候选树应用并行化或提前到打包期间；`handle_built_payload` 里的重复解码；校验器在缓存命中时跳过交易迭代器。
+
+### 8.23 AD 轮与打包里的串行段（2026-11-15）
+
+**结果**（范围同 8.22；原始文件 `.artifacts/native-port-p0/run92*`，日志 `qgAa/`；PASS，7 节点根一致，570 个共同块）：脚本窗口 253,280 TPS（块 42..48，窗口不完整）；leader 间隔中位 321 ms（15 个间隔，290–380），run91 是 339 ms。pprof 同样开在 leader 上。
+
+| leader 合计（17 个满块） | run91 | run92 |
+|------|------|------|
+| QMDB 候选树 `prepare` | 938 ms | 858 ms |
+| 构块 finish | 1,311 ms | 1,241 ms |
+| 绑定提交 | 382 ms | 376 ms |
+| 自验证 `validate_total` | 1,376 ms | 1,396 ms |
+
+单次探测让候选树快了约 8%；绑定提交没有变化，说明 8.22 里“淘汰旧视图拖慢绑定提交”的推测不成立（释放确实移走了，但它不在这 22 ms 里）。打包中位 145 ms 没变。
+
+**打包 145 ms 的构成**（`parallel transfer prefix executed` 日志，满块）：32 个批次各自最长 14–18 ms，但 `groups_ms` 是 37–47 ms（16 个线程跑 32 个批次，分两波）；流式 graft 在构块线程上串行，每块 54–69 ms；`commit_ms` 23–42 ms。也就是说真正的并行执行约 15 ms，其余是把 19 万个账户逐个并进一张 `BundleState` 表的串行簿记。
+
+**修改。** `graft_bundles_inner` 对区块 bundle 表改用 `entry`：一次探测既判断是否已有条目，又拿到插入位置（原来是 `get_mut` 未命中后再 `insert`）。`n42-execution` 134 个测试通过。
+
+**后续。** AE 轮：run93（`qgBa`）测单次探测的 graft；run94（`qgBb`）再加 `N42_PARALLEL_BUILD_THREADS=32`，让 32 个批次一波跑完。
+
+### 8.24 AE 轮：单次探测的 graft 与 32 个构块线程（2026-11-15）
+
+**结果**（范围同 8.22，pprof 开在 leader 上；原始文件 `.artifacts/native-port-p0/run93*`、`run94*`，日志 `qgBa/`、`qgBb/`；两轮均 PASS，7 节点根一致）：
+
+| 轮次 | 配置 | 脚本窗口 TPS（块 44..49） | leader 间隔中位 | 打包中位 | graft | 批次整体 |
+|------|------|------|------|------|------|------|
+| run92 | 8.22 的三处修改 | 253,280 | 321 ms | 145 ms | 54–69 ms | 37–47 ms |
+| run93 | 加单次探测 graft | 275,927 | 323 ms（277–392） | 137 ms | 48 ms | 40 ms |
+| run94 | 再加 32 个构块线程 | 275,504 | 322 ms（267–381） | 139 ms | 54 ms | 33 ms |
+
+- graft 每块快了约 10 ms，打包快了约 8 ms，但 leader 间隔没有变化（差值在噪声内）。
+- 32 个线程让批次整体从 40 降到 33 ms，但打包由串行 graft 决定，没有收益；默认 16 不改。
+- 脚本窗口仍不完整，只作参考。
+
+**判断。** leader 每满块：打包约 137、finish 约 73、缓存 13、到 new_payload 约 25、自验证约 70，合计约 320 ms，全部串行。继续逐项削每次只有几个百分点。下一步改结构：封块后立即在未验证的自有块上构下一块，让缓存、new_payload、自验证（约 108 ms）与下一块的打包重叠。
+
+### 8.25 leader 把自有块作为已执行块交给引擎（2026-11-15）
+
+**设计。** 比较了两条让下一块更早开始的路：
+
+- 在未进引擎树的自有块上直接构块：要绕过 FCU（引擎对未知 head 返回 Syncing）、给 `BasicPayloadJobGenerator` 补父块头、给构块端做“父块的父状态 + 父块 bundle”的叠加 provider，QMDB 只允许一个候选、叠第二个会丢掉第一个。改动面大。
+- 走 reth 已有的 `EngineApiRequest::InsertExecutedBlock`（本地构块者的常规路径）：自有块几毫秒内进引擎树，之后 FCU、构块、provider 全部沿用现有路径。选这条。
+
+8.5 节当时搁置它的三个理由现在都有了解法：引擎入口用一个进程内收件箱补上；QMDB 提交用 8.18 的绑定候选在根任务之外完成；hashed post state 用 rayon 与 QMDB 提交并行算。
+
+**实施。**
+
+- reth（待做成第九个补丁）：`crates/node/builder/src/n42_executed.rs` 提供 `submit_executed_block(Box<dyn Any + Send>)`，引擎启动循环多一个 select 分支，把提交的块转成 `InsertExecutedBlock` 入队后应答。应答之后发出的 FCU 一定排在插入之后。
+- `engine_validator.rs`：把 gov5 H2 头部绑定（当前形态、旧 difficulty、记住的原生头）抽成 `bind_gov5_h2_header`；新增 `gov5_block_from_built_body(payload, body, transactions_root)`，用 payload 的头字段加构块时已解码的 body 重建区块，不再解码 9.5 万笔交易。头必须哈希到 payload 的区块哈希，所以不是这个 payload 的 body 过不了。
+- `qmdb_state_root.rs`：`prepared_binding(parent, root)` 返回立在该父块上且根相符的候选的绑定键。
+- `el/own_block.rs`（`N42_LEADER_INSERT_EXECUTED=1`）：`resolve_payload` 记下刚构出的块；`new_payload` 遇到同父块、同高度、同交易数的 payload 时：重建区块、取出缓存的执行输出、并行做 QMDB 绑定提交和 hashed post state、提交给引擎，然后直接返回 Valid。任何一步不成立就把执行输出放回缓存，照旧走 `newPayload`。计数 `n42_own_block_insert_total{outcome}`，计时 `n42_own_block_insert_ms{stage}`。
+
+**跳过了什么。** leader 不再对自有块做头部共识校验、执行后校验（收据根、gas）和根任务比对；QMDB 根仍与头里的状态根核对。follower 投票前照旧完整校验。提案放出的条件不变。
+
+**测试。** `built_body_rebuilds_the_payload_block_and_a_foreign_root_is_refused`（两种 difficulty 下重建结果与完整解码一致；换一个交易根就被拒）；`n42-node` clippy 通过。
+
+**后续。** AF 轮：run95（`qgCa`）同一二进制不开开关，run96（`qgCb`）打开。
+
+### 8.26 AF 轮：插入路径可用，但第一版没有变快（2026-11-15）
+
+**结果**（范围同 8.22，pprof 开在 leader 上；原始文件 `.artifacts/native-port-p0/run95*`、`run96*`，日志 `qgCa/`、`qgCb/`；两轮均 PASS，7 节点根一致）：
+
+| 轮次 | `N42_LEADER_INSERT_EXECUTED` | 脚本窗口 TPS | leader 间隔中位 |
+|------|------|------|------|
+| run95 | 关 | 256,348（块 42..47） | 320 ms（297–388，14 个间隔） |
+| run96 | 开 | 261,060（块 43..48） | 331 ms（300–454，15 个间隔） |
+
+- 功能上成立：leader 的 17 个满块全部走了插入（`n42_own_block_insert_total{outcome=queued}` 17），561 个共同块 7 节点根和哈希一致。另有 15 次 `refused` 是空块（没有 QMDB 候选），照旧走 `newPayload`。
+- 没有变快：准备阶段合计 1,174 ms，每满块约 69 ms，与原来的自验证一样长。reth 的 `HashedPostState::from_bundle_state` 是串行的，19 万个账户的 keccak 加建表约 50 ms，盖过了并行的 QMDB 提交。
+
+**修改。** `own_block.rs` 自带 `hashed_post_state`：keccak 分到 rayon 线程池，再串行收进表里；测试 `parallel_hashed_post_state_matches_reth` 与 reth 的结果逐项比对。准备阶段加分段计时 `n42_own_block_insert_ms{stage=rebuild|qmdb_commit|hashed_state}`。
+
+**后续。** AG 轮（run97，`qgDa`）。
+
+### 8.27 AG/AH 轮：leader 循环 300 ms，follower 导入成为上限（2026-11-16）
+
+**结果**（范围同 8.22，`N42_LEADER_INSERT_EXECUTED=1`，pprof 开在 leader 上；原始文件 `.artifacts/native-port-p0/run97*`、`run98*`、`run99*`，日志 `qgDa/`、`qgEa/`、`qgEb/`）：
+
+| 轮次 | 收尾校验 | 脚本窗口 TPS | leader 间隔中位 |
+|------|------|------|------|
+| run97 | **失败** | 251,852（块 40..44） | 300 ms（274–373） |
+| run98 | **失败** | 263,883（块 43..47） | 301 ms（266–412） |
+| run99 | PASS，570 个共同块根一致 | 277,720（块 42..47） | 304 ms（276–384） |
+
+失败信息都是 `a committed QC has no executed block after the FCU grace period`。三轮里 leader 的 17 个满块都走了插入路径。
+
+**插入前的准备**（run97，每满块）：约 37 ms，其中重建区块约 14、QMDB 提交约 20、hashed post state 约 14（后两项并行）。对比 8.26 的 69 ms。leader 循环从 320 降到约 300 ms。
+
+**失败原因。** 不是插入路径算错：run98 结束时 node1–node6 都 finalize 到 view 65，只有 node0 停在 view 60，它的 finalize 比共识晚 2.8 s。所有轮次（包括 PASS 的 run95、run96）里 follower 的 finalize 最坏都落后 4–5 s：follower 每个满块的导入约 350 ms（run99 的 node2：`validate_total` 5,962 ms / 17），比 leader 的循环长。follower 在导入前投票，所以共识不等它们；leader 越快，积压越多，收尾校验的宽限期就不够了。
+
+**follower 导入的构成**（run99，node2，每满块）：执行到根任务开始约 263 ms（其中并行批次 107、等交易收集 70、拷贝 17、取 bundle 12），状态根约 76 ms（QMDB 提交 60）。
+
+**判断。** 现在的上限是 follower 导入，不是 leader。再缩短 leader 循环只会加大积压，不会提高可持续的吞吐。8.11 的模型（两块 = follower 链 + leader 链）里 follower 一侧重新成为大头。
+
+**后续，按顺序：**
+1. follower 导入：交易收集的 70 ms（frame-ref 块先把帧重新拼成 14 MB 的 payload 再解码，发送者在帧入库时已认证过）、并行批次 107 ms（与 leader 的 graft 同一类串行合并）、QMDB 提交 60 ms（follower 没有预先应用的候选）。
+2. 收尾校验的宽限期要么拉长，要么改成先等所有节点 finalize 到同一高度；否则 leader 越快越容易误报。
+3. 之后才轮到 leader 一侧剩下的 finish 73 ms 和封块到 new_payload 的 25 ms。
