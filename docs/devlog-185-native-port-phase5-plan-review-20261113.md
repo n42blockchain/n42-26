@@ -1133,3 +1133,152 @@ flood 加 `--connections 8` 后注入为每节点约 80 万笔/秒（160 万笔 
 1. follower 导入：交易收集的 70 ms（frame-ref 块先把帧重新拼成 14 MB 的 payload 再解码，发送者在帧入库时已认证过）、并行批次 107 ms（与 leader 的 graft 同一类串行合并）、QMDB 提交 60 ms（follower 没有预先应用的候选）。
 2. 收尾校验的宽限期要么拉长，要么改成先等所有节点 finalize 到同一高度；否则 leader 越快越容易误报。
 3. 之后才轮到 leader 一侧剩下的 finish 73 ms 和封块到 new_payload 的 25 ms。
+
+### 8.28 AI 轮：follower 侧小修，重复提交的判断是错的（2026-11-16）
+
+**结果**（范围同 8.27，另加 `N42_ALTSIG_SENDER_CACHE=4194304`；原始文件 `.artifacts/native-port-p0/run100*`、`run101*`，日志 `qgFa/`、`qgFb/`）：
+
+| 轮次 | 收尾校验 | 脚本窗口 TPS | leader 间隔中位 | follower finalize 最坏落后 |
+|------|------|------|------|------|
+| run100 | PASS，551 个共同块 | 259,221（块 42..48） | 304.5 ms | 3.6–3.9 s |
+| run101 | PASS，558 个共同块 | 265,311（块 43..49） | 285 ms | 3.8–4.2 s |
+
+两轮都过了，但 8.27 是三轮过一轮，样本太少，不能说问题已解决。follower 每满块的 `validate_total` 仍约 345 ms（run100 node2：5,905 ms / 17），没有变。
+
+**保留的三处改动：**
+- 帧库查询改读写锁、发送者缓存开到 4M 条：交易收集从约 70 ms 降到约 53 ms 每满块，发送者未命中为 0。
+- 发送者来源计数改为每个 payload 发布一次。
+- `execution_parent_and_number` 按广播内容（blake3）记住结果，共识循环不再反复整块解码。
+
+**撤掉的一处，判断错误。** 我从 pprof 看到 payload 转换既出现在 `payload-convert` 线程又出现在引擎线程，又看到 49 次 FCU 对 58 次 newPayload，据此认为 follower 把同一块提交了两次、第二次在引擎线程白算一遍交易根，于是加了按 envelope 内容复用交易根的缓存。实测满块只有 18 次推导、没有一次满块复用（43 次复用全是空块，空块内容相同），`standard_header` 总耗时反而从 1,170 ms 升到 1,433 ms（多出来的是算内容键）。转换次数本来就是每块一次，重复提交不存在。该改动已撤回。引擎线程上为什么会出现转换，还没查清。
+
+**后续：** follower 每满块 345 ms 里最大的仍是并行批次约 120 ms（串行合并结果）和状态根约 79 ms（QMDB 叶子树现算）。下一步动这两处。
+
+### 8.29 AJ 轮：导入合并不写缓存没有收益，两条腿都没过校验（2026-11-16）
+
+**结果**（范围同 8.28；原始文件 `.artifacts/native-port-p0/run102*`、`run103*`，日志 `qgGa/`、`qgGb/`）：
+
+| 轮次 | 配置 | 收尾校验 | 脚本窗口 TPS | leader 间隔中位 | follower 并行批次 | follower 状态根 |
+|------|------|------|------|------|------|------|
+| run102 | `N42_IMPORT_GRAFT_NO_CACHE=1` | **失败** | 257,628 | 330 ms | 104 ms/满块 | 98 ms |
+| run103 | 对照 | **失败** | 249,801 | 309 ms | 110 ms/满块 | 87 ms |
+
+失败信息同 8.27（已提交的块在宽限期内未执行）。到这里，开着 `N42_LEADER_INSERT_EXECUTED` 的 7 轮里 4 轮失败。
+
+**判断。** 导入时不写状态缓存只让并行批次快了约 6 ms，在噪声内，开关已撤回。此前按 pprof 采样数估算“批次几乎全是串行合并”的依据不足：采样频率我没有核实。改为直接计时：`try_commit_import_batch` 现在按阶段记录 `n42_parallel_import_batch_stage_ms`（keys、prestate、execute 及其 partition/groups/collect、graft、receipts）。
+
+**follower 每满块的构成**（run103 node2，合计 339 ms）：并行批次 110、状态根 87（其中 QMDB 提交 70）、交易收集 52、拷贝 17、取 bundle 12、执行前准备 11，其余约 50 未分项。
+
+**下一处改动：QMDB 叶子树的有序批量写入。** leader 的候选树和 follower 的提交走的是同一条 `apply_ordered_refs`，它逐个算叶子哈希，而另一条（拥有所有权的）路径早就是批量 SIMD 哈希。现在两条一致；另外在串行写入前用 8 个线程把这批键在 live 索引里读一遍，把桶带进共享缓存。加了 2 万条操作的等价性测试。AK 轮（run104、run105）验证。
+
+### 8.30 AK 轮：导入批次的分段计时，叶子树批量哈希收益很小（2026-11-16）
+
+**结果**（范围同 8.28；原始文件 `.artifacts/native-port-p0/run104*`、`run105*`，日志 `qgHa/`、`qgHb/`）：
+
+| 轮次 | 收尾校验 | 脚本窗口 TPS | leader 间隔中位 |
+|------|------|------|------|
+| run104 | **失败** | 177,488（块 32..38，窗口含一次停顿） | 305 ms |
+| run105 | PASS，545 个共同块 | 267,460（块 40..45） | 301 ms |
+
+开着 `N42_LEADER_INSERT_EXECUTED` 的 9 轮里 5 轮失败。
+
+**follower 并行批次的构成**（node2，每满块，两轮）：
+
+| 段 | run104 | run105 |
+|------|------|------|
+| 批次合计 | 127 ms | 119 ms |
+| 执行（其中各组并行执行 55 / 45） | 60 | 51 |
+| 合并 bundle（graft，串行） | 58 | 59 |
+| 回执 | 5 | 6 |
+| 取键、分组 | 6 | 6 |
+
+QMDB 提交 64 / 70 ms（8.29 为 70），叶子批量哈希加索引预读的收益在噪声内。follower 每满块仍约 350 ms。
+
+**判断。** follower 的批次和 leader 的 pack 是同一个函数（`execute_for_build`），两侧各有约 110 ms 花在“各组执行”和“串行合并 bundle”这两段上，小修动不了它。
+
+**更正。** 我一度把执行慢归因于“按连通分量分组、随机转账连成一个大分量”。这是错的：那是 `graft_bundles_inner` 里一段旧注释描述的旧实现，现在的分组早已是 `partition_by_sender`（只按发送者分组，收款方的入账可交换）。执行 45–55 ms 的真实原因还没定位；leader 上 16 线程和 32 线程无差别（8.24），说明不是线程数。
+
+**对照 n42-rs**（只读子任务的报告，未改动 n42-rs）：
+- 分组：同样是 `partition_by_sender`，n42-26 已有。
+- 合并：n42-rs 不再把各批结果并进一张表。`OutputShards` 让每批的表原样交出，只建一个按地址前缀分片的“地址 → 批次”索引；QMDB 根直接读分片视图；连续的 `BundleState` 放到封块之后、关键路径之外（`N42_MERGE_ELIDE`）。它记录的串行合并是 68–75 ms / 14.7 万账户，与这里的 58 ms / 19 万账户同量级。
+- 状态树：仍是一棵与 gov5 兼容的树，但叶子哈希、旧槽位查找、索引插入、twig 重算都在 rayon 上，只有槽位追加顺序是串行；键 → 槽位索引分 256 片。它记录的整根 34–40 ms / 20 万笔。
+- follower：区块不带执行提示；follower 用和 leader 相同的机制执行（`N42_FOLLOWER_BUILD_PATH`），并且在只做 O(1) 可包含性检查后就投票（延后执行）。
+- 口径：n42-rs 的 3.9–5M TPS 是 E=1（七个验证者密钥共用一个执行层，每台主机只执行一次），与这里七个节点各自执行不可直接比。
+
+**后续方案，按可独立验证的顺序：**
+1. QMDB 叶子树的并行批量写入（分片索引 + 并行查旧槽位 + 并行 twig 重算）。局限在 `n42-twig-core` 一个 crate，有现成实现作对照，根必须逐位相等。预期 leader 的候选树（50–57 ms）和 follower 的提交（64–70 ms）各省一半以上。
+2. 定位各组执行的 45–55 ms（按线程计时：读状态、执行、建 bundle）。
+3. 输出分片与合并省略。改动面最大（下一块的读、QMDB 根、reth 持久化都要认分片视图），放在前两项之后。
+
+### 8.31 AL 轮：叶子树 live 索引分片，两侧各省约 20 ms（2026-11-16）
+
+**设计。** `QmdbLeafTree` 的 live 索引从一张 `HashMap` 改成 256 片（`LiveIndex`）。分片由每进程随机种子与键的前 8 字节混合决定：键是发送者可以刻意构造的哈希，按键自身的位分片会被人打满一片。一个块的操作键互不相同，每个 set 的槽位由它在批次里的位置决定，所以索引的插入、删除可以按分片在 8 个线程上做（`apply_batch`，8,192 条以上才并行）；之后按顺序串行的只剩退役被替换的条目和追加叶子（`append_slot`）。叶子哈希在这之前已经成批算好。考虑过整体移植 n42-rs 的指纹索引（每键 11–21 字节）：省内存，但要连带改条目存储，这一步先不做。
+
+**验证。** `large_ordered_batches_match_the_owned_path`：四轮 2 万条的批次（替换、删除存在与不存在的键），与拥有所有权的路径和 `QmdbCompatTree` 比根、条目数、撤销记录，再撤销一块比对。
+
+**结果**（范围同 8.28；原始文件 `.artifacts/native-port-p0/run106*`、`run107*`，日志 `qgIa/`、`qgIb/`）：
+
+| 轮次 | 收尾校验 | 脚本窗口 TPS | leader 间隔中位 | follower QMDB 提交 | follower `validate_total` | leader 候选树 prepare |
+|------|------|------|------|------|------|------|
+| run106 | PASS，549 个共同块 | 271,299（块 44..50） | 300.5 ms | 51 ms | 326 ms | 34 ms |
+| run107 | PASS，558 个共同块 | 257,568（块 42..46） | 299 ms | 49 ms | 337 ms | 34 ms |
+
+对比 8.30：follower QMDB 提交 64–70 → 49–51 ms，leader 候选树 50–57 → 34 ms。leader 间隔没有跟着降，说明 finish 里这一段不在 leader 的关键路径上（它和别的工作并行）。
+
+**leader 批次的现状**（run106 的 leader 日志）：32 批、各批最长 12 ms、各组执行墙钟 33 ms（CPU 合计约 250 ms，即每笔约 2.6 µs）；边执行边合并的 graft 48 ms 是串行的，整段 run 71–74 ms 由它决定。follower 的 graft（58 ms）是执行完才做的，没有和执行重叠。
+
+**下一步：** follower 导入也边执行边合并（`N42_IMPORT_GRAFT_STREAM=1`，默认关）。批次被拒时要退回普通路径，所以合并可能动到的三样东西（空的 bundle、缓存、transition）先留底，被拒就恢复；装了状态钩子时不走这条路。AM 轮（run108 开、run109 对照）验证。
+
+### 8.32 AM 轮：follower 边执行边合并没有收益（2026-11-16）
+
+**结果**（范围同 8.28；原始文件 `.artifacts/native-port-p0/run108*`、`run109*`，日志 `qgJa/`、`qgJb/`）：
+
+| 轮次 | 配置 | 收尾校验 | 脚本窗口 TPS | leader 间隔中位 | follower 批次合计 | 其中 graft | follower `validate_total` |
+|------|------|------|------|------|------|------|------|
+| run108 | `N42_IMPORT_GRAFT_STREAM=1` | PASS，545 个共同块 | 283,631（块 43..49） | 300 ms | 111 ms | 71 ms | 354 ms |
+| run109 | 对照 | PASS，560 个共同块 | 277,360（块 43..48） | 294 ms | 102 ms | 59 ms | 345 ms |
+
+**判断。** 对照腿里执行只要 36 ms，graft 59 ms；让两者重叠后 graft 变成 71 ms（与执行线程争内存），整段由 graft 决定，没有变短。开关已撤回。结论与 n42-rs 记录的一致：这一段只能靠不合并（输出分片、合并省略）去掉，流式或分片插入都不行。
+
+**leader 一个周期的时间线**（run109，view 51，约 295 ms）：打包 129 → finish 64（等候选树 39、组装 13）→ 缓存执行结果 19（取 bundle、追加并排序 19 万条 revert）→ 到 leader_emit 约 22（区块转 payload）→ 自有块插入约 40（重建 14、QMDB 提交 21）→ 下一个构块任务创建。后三段合计约 80 ms 是纯串行的转换与拷贝。
+
+**follower 还有约 65 ms 没有计时覆盖**（`execute_to_root_start` 266 ms，已分项的收集 57、批次 102、拷贝 17、取 bundle 12、执行前 11 只有约 200）。在 reth 校验器里补了计时：`exec_setup`、`transactions`、`executor_finish`、`exec_metrics`、`execute_block_call`（含返回时释放交易向量）、`after_execute`。AN 轮（run110、run111）取数。
+
+### 8.33 AN/AO 轮：follower 执行阶段的未计时部分，后台释放交易向量（2026-11-16）
+
+**AN 轮**（只加计时；`run110*`、`run111*`，`qgKa/`、`qgKb/`；两轮 PASS）：follower 每满块 `transactions` 阶段 254–262 ms，已分项的收集 60、拷贝 20–25、批次 112–134 合计约 200–215，余 45–60 ms。其余新计时都小：`executor_finish` 4.5、`exec_metrics` 约 1、`exec_setup` 与 `after_execute` 约 0。按代码结构，余下部分落在批次成功后：收集到的交易向量和为批次再拷贝的一份在引擎线程上就地释放。
+
+**AO 轮**（reth 校验器：批次成功后 `spawn_drop((transactions, recovered))`，为此给 `execute_block` 的交易类型加 `Send + 'static` 约束；`run112*`、`run113*`，`qgLa/`、`qgLb/`）：
+
+| 轮次 | 收尾校验 | 脚本窗口 TPS | leader 间隔中位 | follower `transactions` | follower `validate_total` |
+|------|------|------|------|------|------|
+| run112 | PASS，547 个共同块 | 264,825（块 41..46） | 286 ms | 224 ms | 337 ms |
+| run113 | **失败** | 282,146（块 42..48） | 290 ms | 237 ms | 353 ms |
+
+`transactions` 阶段少了约 25–30 ms，与推断方向一致，但 `validate_total` 没有跟着降（本轮批次 122–130 ms，比 AM 轮的 102–112 高），单节点、每轮 17 个满块的数据噪声在 ±15 ms，分不清。把拷贝改成并行没做成：交易类型不是 `Sync`。
+
+**小结（8.27–8.33，开着 `N42_LEADER_INSERT_EXECUTED` 共 17 轮，7 轮收尾校验失败）。** leader 间隔 285–305 ms；follower 每满块导入 330–355 ms，始终比 leader 长。这七轮里真正有效的只有两处：叶子树分片索引（两侧各约 20 ms）和后台释放（约 25 ms，待确认）。其余（去重、锁、缓存、流式合并）要么无效要么判断错了。follower 剩下的大头是收集 55、批次里的执行 36–50 与合并 59、状态根 65–75，每一项都要结构性改动才能动。
+
+**方向。** 本文第 3 节 Stage B 第 6 条早已列出：同一台机器上的验证者共用一个执行层、只导入一次（n42-rs 的 `N42_IMPORT_ONCE`）。它直接去掉 follower 的整段导入，是 n42-rs 头条数字的前提；这里一直用 `N42_COLOCATED_VOTE` 近似。继续逐项削 follower 的收益是每轮 5% 左右，而单机七节点的上限由 follower 决定。下一阶段做 import-once，口径随之变为 E=1，报告时必须与“七节点各自执行”的数字分开标注。
+
+### 8.34 同机只导入一次，第一步：委托执行层（2026-11-16）
+
+**设计。** n42-rs 的形状是“七个验证者进程、一个执行层”。这里共识服务和 reth 在同一进程里，拆成独立的执行层进程或把七个编排器放进一个进程（8.12 估过，要重排 `main.rs` 约 800 行的装配）都太大。第一步取最小可测的形式：
+- 一个节点是执行者（owner），照常构块、执行；
+- 同机其余密钥设 `N42_EL_OWNER_RPC=127.0.0.1:<owner http 端口>`，用 `DelegatedExecutionLayer`（`crates/n42-node/src/el/delegated.rs`）代替 `RethExecutionLayer`：`new_payload` 轮询执行者的 `eth_getHeaderByHash`，块在执行者的规范链上就返回 Valid，超时（`N42_EL_OWNER_WAIT_MS`，默认 2 s）返回 Syncing；FCU 同样只问执行者；不构块。
+- 需要 `N42_COLOCATED_VOTE=1`：块要到提交后才进执行者的规范链，委托密钥若等执行结果再投票就死锁。
+
+**没做的（下一步）。** 委托密钥当 leader 时要把构块请求转给执行者；现在不支持，所以本轮把 `N42_LEADER_TENURE` 设到 1,000,000，让 node0 一直出块。委托节点仍然启动自己的 reth（停在创世），仍然解码收到的块数据。
+
+**范围。** 仅限同一运营者在同一台机器上的密钥：委托密钥是在执行者的检查上加签名，不是独立执行。结果口径是 E=1，与七节点各自执行的数字分开报告。
+
+**脚本。** `chain94-fleet.py start --execution-owner N`（记入 `run.json`）；`sample`/`verify` 在这种拓扑下只向执行者要区块，并要求每个密钥已提交的块都在执行者的链上，输出标明 “one execution layer”。轮次脚本 `run-legO.sh`、`run-qroundO.sh` 只向执行者注入。
+
+**AP 轮**（`run114*`、`run115*`，`qgMa/`、`qgMb/`；单机 7 密钥、1 个执行层，leader 固定 node0，只向 node0 注入 56 条连接）：
+
+| 轮次 | 收尾校验 | leader 满块间隔中位 | 16 个满块跨度内 TPS |
+|------|------|------|------|
+| run114 | PASS（one execution layer，771 块） | 780 ms | 约 125,000 |
+| run115 | PASS（one execution layer，766 块） | 778.5 ms | 约 110,000 |
+
+功能通，但比各自执行还慢。原因在日志里：区块按帧引用传播，委托节点没有收到帧（只向执行者注入），报 `cannot rebuild block payload; waiting for the full copy`，投票要等 14 MB 的完整副本。下一轮先让帧照旧广播到所有节点；之后让委托密钥不解码块体就能投票。另：这一轮跑的时候我同时在本机跑了 clippy 和测试，数字本身也不干净。`wall-tps.py` 在这种拓扑下报 `KeyError`，要修。
