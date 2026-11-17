@@ -12,7 +12,7 @@
 use alloy_primitives::{Address, B256, Bytes, map::B256HashMap};
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{Arc, RwLock, OnceLock, PoisonError},
 };
 
 /// One admitted frame: its root and its transactions in frame order.
@@ -41,7 +41,9 @@ struct Inner {
 
 /// A bounded store of admitted frames; the oldest frame leaves first.
 pub struct FrameStore {
-    inner: Mutex<Inner>,
+    /// Lookups share the lock; only admission and the builder's marks take it
+    /// exclusively, so import threads resolving senders do not queue.
+    inner: RwLock<Inner>,
     capacity: usize,
 }
 
@@ -66,7 +68,7 @@ impl FrameStore {
     /// A store of at most `capacity` frames (at least one).
     pub fn new(capacity: usize) -> Self {
         Self {
-            inner: Mutex::new(Inner::default()),
+            inner: RwLock::new(Inner::default()),
             capacity: capacity.max(1),
         }
     }
@@ -84,8 +86,12 @@ impl FrameStore {
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> std::sync::RwLockWriteGuard<'_, Inner> {
+        self.inner.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Inner> {
+        self.inner.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Keeps a frame. `transactions` and `hashes` must be the same length and
@@ -150,7 +156,7 @@ impl FrameStore {
     /// The sender admission authenticated for this transaction, if a held
     /// frame carries it.
     pub fn sender_of(&self, hash: &B256) -> Option<Address> {
-        let inner = self.lock();
+        let inner = self.read();
         let (root, position) = inner.by_transaction.get(hash)?;
         inner
             .frames
@@ -162,13 +168,13 @@ impl FrameStore {
 
     /// The frame with this root, if held.
     pub fn get(&self, root: &B256) -> Option<Arc<StoredFrame>> {
-        self.lock().frames.get(root).cloned()
+        self.read().frames.get(root).cloned()
     }
 
     /// For each transaction hash, the frame holding it and its position.
     /// One lock for the whole list.
     pub fn locate_all(&self, hashes: &[B256]) -> Vec<Option<(B256, u32)>> {
-        let inner = self.lock();
+        let inner = self.read();
         hashes
             .iter()
             .map(|hash| inner.by_transaction.get(hash).copied())
@@ -177,14 +183,14 @@ impl FrameStore {
 
     /// The frames with these roots, `None` for each one not held.
     pub fn get_all(&self, roots: &[B256]) -> Vec<Option<Arc<StoredFrame>>> {
-        let inner = self.lock();
+        let inner = self.read();
         roots.iter().map(|root| inner.frames.get(root).cloned()).collect()
     }
 
     /// The first `limit` frames, in arrival order, that no builder has
     /// retired yet.
     pub fn unbuilt(&self, limit: usize) -> Vec<Arc<StoredFrame>> {
-        let inner = self.lock();
+        let inner = self.read();
         inner
             .unbuilt
             .iter()
@@ -206,7 +212,7 @@ impl FrameStore {
 
     /// Number of frames held.
     pub fn len(&self) -> usize {
-        self.lock().order.len()
+        self.read().order.len()
     }
 
     /// Whether no frame is held.

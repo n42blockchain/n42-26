@@ -17,7 +17,13 @@ use reth_primitives_traits::{
 };
 use reth_storage_api::{StateProvider, StateProviderBox};
 use reth_storage_errors::{any::AnyError, provider::ProviderResult};
-use std::{borrow::Cow, sync::Arc};
+use std::{
+    borrow::Cow,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use crate::{evm_factory::N42EvmFactory, restored_slots::TrackingBlockExecutorFactory};
 
@@ -249,6 +255,14 @@ impl ConfigureEngineEvm<ExecutionData> for N42EvmConfig {
         &self,
         payload: &ExecutionData,
     ) -> Result<impl ExecutableTxIterator<Self>, Self::Error> {
+        // Published once per payload: a registry lookup per transaction costs
+        // more than the sender lookup it counts.
+        for (outcome, count) in
+            [("hit", &SENDER_HIT), ("frame", &SENDER_FRAME), ("miss", &SENDER_MISS)]
+        {
+            metrics::counter!("n42_alt_sig_payload_sender_total", "cache" => outcome)
+                .absolute(count.load(Ordering::Relaxed));
+        }
         let txs = payload.payload.transactions().clone();
         let sender_recovery_cache = self.inner.sender_recovery_cache.clone();
         let convert = move |tx: Bytes| {
@@ -261,8 +275,7 @@ impl ConfigureEngineEvm<ExecutionData> for N42EvmConfig {
                     let cache = AltSigSenderCache::global();
                     match cache.get(alt.hash()) {
                         Some(sender) => {
-                            metrics::counter!("n42_alt_sig_payload_sender_total", "cache" => "hit")
-                                .increment(1);
+                            SENDER_HIT.fetch_add(1, Ordering::Relaxed);
                             Ok(sender)
                         }
                         None => {
@@ -272,12 +285,10 @@ impl ConfigureEngineEvm<ExecutionData> for N42EvmConfig {
                                 .then(|| n42_tx_types::FrameStore::global().sender_of(alt.hash()))
                                 .flatten();
                             if let Some(sender) = held {
-                                metrics::counter!("n42_alt_sig_payload_sender_total", "cache" => "frame")
-                                    .increment(1);
+                                SENDER_FRAME.fetch_add(1, Ordering::Relaxed);
                                 Ok(sender)
                             } else {
-                                metrics::counter!("n42_alt_sig_payload_sender_total", "cache" => "miss")
-                                    .increment(1);
+                                SENDER_MISS.fetch_add(1, Ordering::Relaxed);
                                 tx.try_recover()
                                     .inspect(|sender| cache.insert(*alt.hash(), *sender))
                             }
@@ -298,6 +309,11 @@ impl ConfigureEngineEvm<ExecutionData> for N42EvmConfig {
         Ok((txs, convert))
     }
 }
+
+/// Where the senders of 0x50 payload transactions came from, since start.
+static SENDER_HIT: AtomicU64 = AtomicU64::new(0);
+static SENDER_FRAME: AtomicU64 = AtomicU64::new(0);
+static SENDER_MISS: AtomicU64 = AtomicU64::new(0);
 
 /// Records the wall time of one parallel import batch attempt when dropped,
 /// whichever way the attempt ends.
