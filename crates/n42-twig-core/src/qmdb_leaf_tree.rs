@@ -138,6 +138,160 @@ struct LiveEntry {
     value: Box<[u8]>,
 }
 
+/// What a batch operation found in the live index for its key: the entry it
+/// replaced or removed.
+type Displaced = Option<LiveEntry>;
+
+/// The live key index, in shards so that a block's operations (distinct
+/// keys) update it on several threads. The index is far larger than the
+/// cache: applied serially, each operation waits on memory for its bucket.
+#[derive(Clone)]
+struct LiveIndex {
+    shards: Box<[HashMap<Hash, LiveEntry>]>,
+    len: usize,
+    /// Picks a key's shard. Per process: keys are hashes a sender can grind,
+    /// and a shard chosen from the key's own bits could be filled on purpose.
+    seed: u64,
+}
+
+impl LiveIndex {
+    const SHARDS: usize = 256;
+    /// Batches below this are applied on the calling thread.
+    const PARALLEL_FROM: usize = 8192;
+    const THREADS: usize = 8;
+
+    fn new() -> Self {
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(0x6e34_325f_6c69_7665);
+        Self {
+            shards: (0..Self::SHARDS).map(|_| HashMap::new()).collect(),
+            len: 0,
+            seed: hasher.finish(),
+        }
+    }
+
+    fn shard_of(&self, key: &Hash) -> usize {
+        let head = u64::from_le_bytes(key[..8].try_into().expect("a key has 32 bytes"));
+        ((head ^ self.seed).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as usize
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn get(&self, key: &Hash) -> Option<&LiveEntry> {
+        self.shards[self.shard_of(key)].get(key)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&Hash, &LiveEntry)> {
+        self.shards.iter().flat_map(|shard| shard.iter())
+    }
+
+    fn insert(&mut self, key: Hash, entry: LiveEntry) -> Displaced {
+        let shard = self.shard_of(&key);
+        let displaced = self.shards[shard].insert(key, entry);
+        self.len += usize::from(displaced.is_none());
+        displaced
+    }
+
+    fn remove(&mut self, key: &Hash) -> Displaced {
+        let shard = self.shard_of(key);
+        let displaced = self.shards[shard].remove(key);
+        self.len -= usize::from(displaced.is_some());
+        displaced
+    }
+
+    /// Applies a batch of operations on distinct keys: a set installs its
+    /// value at the next slot from `first_slot`, in batch order, and a delete
+    /// removes its key. Returns what each operation displaced, by position.
+    fn apply_batch(&mut self, operations: &[QmdbOperation], first_slot: u64) -> Vec<Displaced> {
+        let mut slot = first_slot;
+        let mut displaced = Vec::with_capacity(operations.len());
+        if operations.len() < Self::PARALLEL_FROM {
+            for operation in operations {
+                displaced.push(match &operation.value {
+                    Some(value) => {
+                        let entry = LiveEntry {
+                            slot,
+                            value: value.clone().into_boxed_slice(),
+                        };
+                        slot += 1;
+                        self.insert(operation.key, entry)
+                    }
+                    None => self.remove(&operation.key),
+                });
+            }
+            return displaced;
+        }
+        // Each operation's slot is fixed by its position, so the shards can
+        // be updated in any order.
+        let mut by_shard: Vec<Vec<(u32, u64)>> = vec![Vec::new(); Self::SHARDS];
+        let expected = operations.len() / Self::SHARDS + operations.len() / (Self::SHARDS * 4);
+        for bucket in &mut by_shard {
+            bucket.reserve(expected);
+        }
+        for (position, operation) in operations.iter().enumerate() {
+            by_shard[self.shard_of(&operation.key)].push((position as u32, slot));
+            slot += u64::from(operation.value.is_some());
+        }
+        let per_thread = Self::SHARDS.div_ceil(Self::THREADS);
+        let found: Vec<Vec<(u32, LiveEntry)>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = self
+                .shards
+                .chunks_mut(per_thread)
+                .zip(by_shard.chunks(per_thread))
+                .map(|(shards, buckets)| {
+                    scope.spawn(move || {
+                        let mut found = Vec::new();
+                        for (shard, bucket) in shards.iter_mut().zip(buckets) {
+                            for &(position, slot) in bucket {
+                                let operation = &operations[position as usize];
+                                let old = match &operation.value {
+                                    Some(value) => shard.insert(
+                                        operation.key,
+                                        LiveEntry {
+                                            slot,
+                                            value: value.clone().into_boxed_slice(),
+                                        },
+                                    ),
+                                    None => shard.remove(&operation.key),
+                                };
+                                if let Some(old) = old {
+                                    found.push((position, old));
+                                }
+                            }
+                        }
+                        found
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("live index worker panicked"))
+                .collect()
+        });
+        displaced.resize_with(operations.len(), || None);
+        for (position, old) in found.into_iter().flatten() {
+            displaced[position as usize] = Some(old);
+        }
+        // A set that displaced nothing added a key; a delete that displaced
+        // something removed one.
+        for (operation, old) in operations.iter().zip(&displaced) {
+            match (operation.value.is_some(), old.is_some()) {
+                (true, false) => self.len += 1,
+                (false, true) => self.len -= 1,
+                _ => {}
+            }
+        }
+        displaced
+    }
+}
+
 /// Twig IDs are dense. One membership bit avoids a tree lookup on every slot
 /// mutation; only the first mutation queues an ID for the next root repair.
 #[derive(Clone, Default)]
@@ -242,7 +396,7 @@ pub struct QmdbLeafTree {
     /// Heaps of recently sealed twigs, oldest first, so an undo can reopen
     /// the twig a block sealed.
     retired_heaps: VecDeque<(usize, Box<[Hash; 2 * TWIG_SIZE]>)>,
-    live: HashMap<Hash, LiveEntry>,
+    live: LiveIndex,
     next_slot: u64,
     /// Cached twig roots, one per twig (sealed and open).
     twig_roots: Vec<Hash>,
@@ -278,7 +432,7 @@ impl QmdbLeafTree {
             sealed: Vec::new(),
             open: None,
             retired_heaps: VecDeque::new(),
-            live: HashMap::new(),
+            live: LiveIndex::new(),
             next_slot: 0,
             twig_roots: Vec::new(),
             upper: Vec::new(),
@@ -369,17 +523,24 @@ impl QmdbLeafTree {
 
     /// Reuse the batch's precomputed leaf while tracking deferred ancestor work.
     fn set_with_leaf(&mut self, key: Hash, value: Vec<u8>, leaf: Hash, defer_leaves: bool) {
-        let slot = self.next_slot;
-        self.next_slot += 1;
         // One probe of the live index both installs the new entry and yields
         // the replaced one; the index is far larger than the cache.
         let replaced = self.live.insert(
             key,
             LiveEntry {
-                slot,
+                slot: self.next_slot,
                 value: value.into_boxed_slice(),
             },
         );
+        self.append_slot(key, replaced, leaf, defer_leaves);
+    }
+
+    /// The structural half of a set, for a key whose live index entry
+    /// already names the next slot: retires the entry it displaced and
+    /// appends the leaf.
+    fn append_slot(&mut self, key: Hash, replaced: Displaced, leaf: Hash, defer_leaves: bool) {
+        let slot = self.next_slot;
+        self.next_slot += 1;
         if let Some(old) = replaced {
             // Move the replaced value into the undo record without cloning it.
             self.record_deactivation(old.slot, key, old.value);
@@ -524,15 +685,32 @@ impl QmdbLeafTree {
         self.apply_sorted_ops(operations.iter().cloned())
     }
 
-    fn apply_ordered_refs<'a>(
-        &mut self,
-        operations: impl IntoIterator<Item = &'a QmdbOperation>,
-    ) -> Hash {
-        for operation in operations {
-            if let Some(value) = &operation.value {
-                self.set_inner(operation.key, value.clone(), true);
-            } else {
-                self.delete(&operation.key);
+    fn apply_ordered_refs(&mut self, operations: &[QmdbOperation]) -> Hash {
+        // As in the owned path: the leaf hashes are independent of the
+        // structural writes, so they are hashed as one batch.
+        let jobs: Vec<_> = operations
+            .iter()
+            .filter_map(|operation| {
+                operation
+                    .value
+                    .as_deref()
+                    .map(|value| (&operation.key, value))
+            })
+            .collect();
+        let mut leaves = vec![NULL_HASH; jobs.len()];
+        crate::simd::hash_leaves(&jobs, &mut leaves);
+        drop(jobs);
+        // The index entries go in first, per shard and on several threads;
+        // what stays serial is the slot order: retiring displaced entries
+        // and appending leaves.
+        let displaced = self.live.apply_batch(operations, self.next_slot);
+        let mut leaves = leaves.into_iter();
+        for (operation, displaced) in operations.iter().zip(displaced) {
+            if operation.value.is_some() {
+                self.append_slot(operation.key, displaced, leaves.next().unwrap(), true);
+            } else if let Some(entry) = displaced {
+                self.record_deactivation(entry.slot, operation.key, entry.value);
+                self.set_bit(entry.slot, false);
             }
         }
         self.finish_operations()
@@ -1588,6 +1766,46 @@ mod tests {
                 assert_eq!(batch.apply_sorted_ops(ops.clone()).unwrap(), expected);
                 apply_scalar(&mut scalar, ops);
             }
+        }
+    }
+
+    #[test]
+    fn large_ordered_batches_match_the_owned_path() {
+        // Large enough for the live index to be updated on several threads.
+        let mut owned = QmdbLeafTree::new();
+        let mut borrowed = QmdbLeafTree::new();
+        let mut full = QmdbCompatTree::new();
+        for round in 0..4u8 {
+            // Later rounds replace most keys, delete live ones and ones that
+            // were never set, and add new ones.
+            let low = u64::from(round) * 300;
+            let mut ops = sets(low..20_000 + low, round + 1);
+            ops.extend(deletes(low.saturating_sub(300)..low));
+            ops.extend(deletes(40_000..40_050));
+            ops.sort_unstable_by_key(|operation| operation.key);
+            owned.start_undo_recording();
+            borrowed.start_undo_recording();
+            let expected = owned.apply_sorted_ops(ops.clone()).unwrap();
+            assert_eq!(borrowed.apply_sorted_ops_borrowed(&ops).unwrap(), expected);
+            assert_eq!(full.apply_sorted_ops(ops).unwrap(), expected);
+            assert_eq!(borrowed.len(), owned.len());
+            assert_eq!(borrowed.len(), borrowed.live_values().count());
+            assert_eq!(borrowed.stop_undo_recording(), owned.stop_undo_recording());
+        }
+        // Undo the last block on a copy and compare with replaying without it.
+        let mut before = borrowed.clone();
+        let ops = {
+            let mut ops = sets(5_000..30_000, 9);
+            ops.extend(deletes(1_200..5_000));
+            ops.sort_unstable_by_key(|operation| operation.key);
+            ops
+        };
+        let (_, undo) = borrowed.apply_sorted_ops_recorded_borrowed(&ops).unwrap();
+        borrowed.apply_undo(&undo).unwrap();
+        assert_eq!(borrowed.root(), before.root());
+        assert_eq!(borrowed.len(), before.len());
+        for (key, value) in before.live_values() {
+            assert_eq!(borrowed.get(key), Some(value));
         }
     }
 
