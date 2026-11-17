@@ -2396,12 +2396,35 @@ impl ConsensusService {
         }
     }
 
+    /// The execution parent and number of the block a serialized broadcast
+    /// carries. Finding them decodes the whole payload, tens of milliseconds
+    /// for a full block, and the consensus loop asks several times per
+    /// block: the answer is remembered per broadcast.
     fn execution_parent_and_number(data: &[u8]) -> Option<(B256, u64)> {
+        /// Identifies a broadcast by its length and the hash of its bytes,
+        /// so two broadcasts naming the same block cannot share an answer.
+        type Key = (usize, [u8; 32]);
+        const REMEMBERED: usize = 256;
+        static KNOWN: std::sync::Mutex<VecDeque<(Key, (B256, u64))>> =
+            std::sync::Mutex::new(VecDeque::new());
+        let key: Key = (data.len(), *blake3::hash(data).as_bytes());
+        if let Ok(known) = KNOWN.lock()
+            && let Some((_, found)) = known.iter().rev().find(|(candidate, _)| *candidate == key)
+        {
+            return Some(*found);
+        }
         let broadcast = bincode::deserialize::<BlockDataBroadcast>(data).ok()?;
         let payload = decompress_payload(&broadcast.payload_json).ok()?;
         let execution = decode_execution_payload_owned(payload).ok()?;
-        (execution.block_hash() == broadcast.block_hash)
-            .then(|| (execution.parent_hash(), execution.block_number()))
+        let found = (execution.block_hash() == broadcast.block_hash)
+            .then(|| (execution.parent_hash(), execution.block_number()))?;
+        if let Ok(mut known) = KNOWN.lock() {
+            if known.len() == REMEMBERED {
+                known.pop_front();
+            }
+            known.push_back((key, found));
+        }
+        Some(found)
     }
 
     fn execution_parent_and_number_from_payload(payload_json: &[u8]) -> Option<(B256, u64)> {
