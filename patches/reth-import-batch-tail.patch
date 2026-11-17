@@ -1,0 +1,91 @@
+diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
+index 11773f68e..c0100dae0 100644
+--- a/crates/engine/tree/src/tree/payload_validator.rs
++++ b/crates/engine/tree/src/tree/payload_validator.rs
+@@ -778,6 +778,9 @@ where
+                 ensure_ok!(execution_result)
+             };
+         let execution_duration = execute_block_start.elapsed();
++        // The call's whole time, including dropping what it owned on return.
++        metrics::histogram!("n42_import_stage_ms", "stage" => "execute_block_call")
++            .record(execution_duration.as_secs_f64() * 1000.0);
+         if let (Some(metrics), Some(stats)) = (&state_provider_metrics, &state_provider_stats) {
+             metrics.record_totals(stats);
+         }
+@@ -820,6 +823,12 @@ where
+             });
+ 
+         let convert_wait_start = Instant::now();
++        metrics::histogram!("n42_import_stage_ms", "stage" => "after_execute")
++            .record(
++                convert_wait_start.duration_since(execute_block_start + execution_duration)
++                    .as_secs_f64() *
++                    1000.0,
++            );
+         let block = validated_block.try_into_inner().expect("sole handle")?;
+         let block = block.with_senders(senders);
+         metrics::histogram!("n42_import_stage_ms", "stage" => "await_convert")
+@@ -1091,7 +1100,12 @@ where
+         open_parent: &(dyn Fn() -> Option<EvmStateProviderBox> + Sync),
+         env: ExecutionEnv<Evm>,
+         input: &BlockOrPayload<T>,
+-        handle: &mut PayloadHandle<impl ExecutableTxFor<Evm>, Err, N::Receipt, HaltReasonFor<Evm>>,
++        handle: &mut PayloadHandle<
++            impl ExecutableTxFor<Evm> + Send + 'static,
++            Err,
++            N::Receipt,
++            HaltReasonFor<Evm>,
++        >,
+         state_hook: Option<Box<dyn OnStateHook + 'static>>,
+     ) -> Result<
+         (BlockExecutionOutput<N::Receipt>, Vec<Address>, ReceiptRootReceiver, Option<ExecutedBal>),
+@@ -1106,6 +1120,7 @@ where
+     {
+         debug!(target: "engine::tree::payload_validator", "Executing block");
+ 
++        let n42_setup_start = Instant::now();
+         let batch_env = self.evm_config.batch_import_enabled().then(|| env.evm_env.clone());
+         let has_bal = input.has_block_access_list();
+         let mut db = debug_span!(target: "engine::tree", "build_state_db").in_scope(|| {
+@@ -1155,6 +1170,8 @@ where
+         executor.evm_mut().db_mut().set_state_hook(state_hook);
+ 
+         let execution_start = Instant::now();
++        metrics::histogram!("n42_import_stage_ms", "stage" => "exec_setup")
++            .record(execution_start.duration_since(n42_setup_start).as_secs_f64() * 1000.0);
+ 
+         // Execute all transactions and finalize
+         let mut batch_finalize = None;
+@@ -1192,6 +1209,9 @@ where
+             )? {
+                 batch_finalize = Some(finalize);
+                 let senders = recovered.iter().map(|tx| tx.signer()).collect();
++                // Freeing both copies of a full block's transactions is tens of milliseconds:
++                // not on the thread the next block waits for.
++                self.runtime.spawn_drop((transactions, recovered));
+                 // Nothing reads the receipts when no receipt root is computed.
+                 if self.consensus.uses_receipt_root() {
+                     for (index, receipt) in executor.receipts().iter().enumerate() {
+@@ -1239,6 +1259,10 @@ where
+ 
+         // Merge transitions into bundle state
+         let merge_start = Instant::now();
++        metrics::histogram!("n42_import_stage_ms", "stage" => "executor_finish")
++            .record(merge_start.duration_since(post_exec_start).as_secs_f64() * 1000.0);
++        metrics::histogram!("n42_import_stage_ms", "stage" => "transactions")
++            .record(post_exec_start.duration_since(execution_start).as_secs_f64() * 1000.0);
+         debug_span!(target: "engine::tree", "merge_transitions")
+             .in_scope(|| db.merge_transitions(BundleRetention::Reverts));
+         metrics::histogram!("n42_import_stage_ms", "stage" => "merge_transitions")
+@@ -1261,8 +1285,11 @@ where
+         let output = BlockExecutionOutput { result, state };
+ 
+         let execution_duration = execution_start.elapsed();
++        let n42_metrics_start = Instant::now();
+         self.metrics.record_block_execution(&output, execution_duration);
+         self.metrics.record_block_execution_gas_bucket(output.result.gas_used, execution_duration);
++        metrics::histogram!("n42_import_stage_ms", "stage" => "exec_metrics")
++            .record(n42_metrics_start.elapsed().as_secs_f64() * 1000.0);
+         debug!(target: "engine::tree::payload_validator", elapsed = ?execution_duration, "Executed block");
+ 
+         Ok((output, senders, result_rx, built_bal))

@@ -3,7 +3,7 @@
   "source": "https://github.com/paradigmxyz/reth",
   "upstream_tag": "v2.8.1",
   "upstream_commit": "d763342fa185e4e90ee79dc65f6a5706168b0bcb",
-  "adapted_commit": "6cd1d01e91f07f441bae7aa5f56c6101b4858391",
+  "adapted_commit": "7aee67f58fe34b4bd9eef6a5e6caa603d3a25127",
   "patch_series": [
     {
       "name": "reth-qmdb-state-reader",
@@ -40,6 +40,10 @@
     {
       "name": "reth-executed-block-inbox",
       "commit": "6cd1d01e91f07f441bae7aa5f56c6101b4858391"
+    },
+    {
+      "name": "reth-import-batch-tail",
+      "commit": "7aee67f58fe34b4bd9eef6a5e6caa603d3a25127"
     }
   ],
   "workspace_dependency_versions": {
