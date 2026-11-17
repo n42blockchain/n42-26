@@ -3281,12 +3281,23 @@ fn main() {
                 // into (ingest virtual-block-credit arming).
                 n42_node::register_consensus_service_hooks();
 
-                let el: std::sync::Arc<dyn n42_node::el::ExecutionLayer> = std::sync::Arc::new(
-                    n42_node::el::RethExecutionLayer::new(
-                        beacon_engine_handle,
-                        payload_builder_handle,
-                    ),
-                );
+                // A key that shares its machine with the execution owner asks
+                // the owner instead of executing (import once per host).
+                let el: std::sync::Arc<dyn n42_node::el::ExecutionLayer> =
+                    match n42_node::el::DelegatedExecutionLayer::configured() {
+                        Ok(Some(delegated)) => {
+                            warn!(target: "n42::cli", "N42_EL_OWNER_RPC set: this key does not execute blocks; it reports the execution owner's result");
+                            std::sync::Arc::new(delegated)
+                        }
+                        Ok(None) => std::sync::Arc::new(n42_node::el::RethExecutionLayer::new(
+                            beacon_engine_handle,
+                            payload_builder_handle,
+                        )),
+                        Err(error) => {
+                            eprintln!("ERROR: {error}");
+                            std::process::exit(1);
+                        }
+                    };
                 let participant_replay_el = Arc::clone(&el);
                 let mut orchestrator = ConsensusOrchestrator::with_execution_layer(
                     consensus_engine,
