@@ -137,6 +137,11 @@ pub fn normalize_execution_payload_for_gov5_h2(
             && block.header.slot_number.is_none()
             && block.body.withdrawals.is_none()
     }) {
+        // The leader's direct broadcast looks the proposal up in the native
+        // header registry; the pre-Shanghai profile must register it too.
+        if let Ok(block) = reconstruct_gov5_block(execution) {
+            remember_pre_shanghai_native_header(&block.header);
+        }
         return Ok(execution.clone());
     }
 
@@ -183,7 +188,18 @@ pub fn normalize_execution_payload_for_gov5_h2(
         .map_err(|error| Gov5BlockError::HeaderProfile(error.to_string()))?;
 
     let block_hash = block.header.hash_slow();
+    remember_pre_shanghai_native_header(&block.header);
     Ok(ExecutionData::from_block_unchecked(block_hash, &block))
+}
+
+// Pre-Shanghai Gov5 headers carry no gov5-only field, so the native encoding
+// equals alloy's and hashes to the same block hash.
+fn remember_pre_shanghai_native_header(header: &alloy_consensus::Header) {
+    let native = Gov5NativeHeader {
+        header: header.clone(),
+        mobile_registry_root: None,
+    };
+    remember_gov5_native_header(&native.encode());
 }
 
 // Gov5 seeds a Cancun block-zero header without mobileRegistryRoot. Its
@@ -759,6 +775,42 @@ mod tests {
         assert_eq!(&recovered.header.extra_data[..4], b"N42H");
         assert_eq!(gov5_header_view(&recovered.header).unwrap(), 19);
         assert_eq!(recovered.header.extra_data.len(), 108);
+    }
+
+    #[test]
+    fn pre_shanghai_leader_payload_is_registered_for_direct_broadcast() {
+        let block: Block<TxEnvelope> = Block {
+            header: Header {
+                number: 2,
+                gas_limit: 30_000_000,
+                timestamp: 1_794_902_942,
+                transactions_root: calculate_transaction_root::<TxEnvelope>(&[]),
+                base_fee_per_gas: Some(7),
+                ..Default::default()
+            },
+            body: BlockBody::default(),
+        };
+        let standard = ExecutionData::from_block_unchecked(block.header.hash_slow(), &block);
+        let normalized = normalize_execution_payload_for_gov5_h2(
+            &standard,
+            3,
+            B256::repeat_byte(0x31),
+            gov5_native_receipts_root(&[]),
+        )
+        .unwrap();
+        // The leader refuses to propose a block whose native header it cannot
+        // look up, so both normalization paths must register it.
+        let hash = normalized.block_hash();
+        let raw = n42_consensus::gov5_native_header_rlp(&hash).unwrap();
+        assert_eq!(keccak256(&raw[..]), hash);
+        let again = normalize_execution_payload_for_gov5_h2(
+            &normalized,
+            3,
+            B256::repeat_byte(0x31),
+            gov5_native_receipts_root(&[]),
+        )
+        .unwrap();
+        assert_eq!(again.block_hash(), hash);
     }
 
     #[test]
