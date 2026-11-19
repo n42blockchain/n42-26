@@ -19,10 +19,10 @@ index 68c1e4415..841dbde36 100644
  
  /// Consensus is a protocol that chooses canonical chain.
 diff --git a/crates/engine/tree/src/tree/mod.rs b/crates/engine/tree/src/tree/mod.rs
-index 45d8955f1..a6f66232a 100644
+index 318f47082..98d898015 100644
 --- a/crates/engine/tree/src/tree/mod.rs
 +++ b/crates/engine/tree/src/tree/mod.rs
-@@ -264,6 +264,35 @@ pub enum TreeAction {
+@@ -259,6 +259,35 @@ pub enum TreeAction {
      },
  }
  
@@ -58,7 +58,7 @@ index 45d8955f1..a6f66232a 100644
  /// The engine API tree handler implementation.
  ///
  /// This type is responsible for processing engine API requests, maintaining the canonical state and
-@@ -2914,7 +2943,17 @@ where
+@@ -2909,7 +2938,17 @@ where
          self.state.tree_state.set_canonical_head(chain_update.tip().num_hash());
  
          let tip = chain_update.tip().clone_sealed_header();
@@ -77,7 +77,7 @@ index 45d8955f1..a6f66232a 100644
  
          // reinsert any missing reorged blocks
          if let NewCanonicalChain::Reorg { new, old } = &chain_update {
-@@ -2937,7 +2976,14 @@ where
+@@ -2932,7 +2971,14 @@ where
          self.metrics.tree.canonical_chain_height.set(tip.number() as f64);
  
          // sends an event to all active listeners about the new canonical chain
@@ -94,18 +94,10 @@ index 45d8955f1..a6f66232a 100644
          // emit event
          self.emit_event(ConsensusEngineEvent::CanonicalChainCommitted(
 diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
-index 58d2c8452..eb59fe1ff 100644
+index 496d03917..632317059 100644
 --- a/crates/engine/tree/src/tree/payload_validator.rs
 +++ b/crates/engine/tree/src/tree/payload_validator.rs
-@@ -757,6 +757,7 @@ where
-                     match state_provider {
-                         Ok(state_provider) => self.execute_block(
-                             state_provider,
-+                            &|| make_state_provider(false).ok(),
-                             env,
-                             &input,
-                             &mut handle,
-@@ -809,11 +810,14 @@ where
+@@ -797,11 +797,14 @@ where
                  }
              });
  
@@ -121,7 +113,7 @@ index 58d2c8452..eb59fe1ff 100644
              let _enter = debug_span!(
                  target: "engine::tree::payload_validator",
                  "wait_receipt_root",
-@@ -829,6 +833,8 @@ where
+@@ -817,6 +820,8 @@ where
                      );
                  })
                  .ok()
@@ -130,7 +122,7 @@ index 58d2c8452..eb59fe1ff 100644
          };
  
          if let Err(e) = self.validate_post_execution(
-@@ -996,10 +1002,15 @@ where
+@@ -984,10 +989,15 @@ where
                  "convert_and_validate",
              )
              .entered();
@@ -149,7 +141,7 @@ index 58d2c8452..eb59fe1ff 100644
                  }
              };
  
-@@ -1018,7 +1029,7 @@ where
+@@ -1006,7 +1016,7 @@ where
              drop(_enter);
  
              if let Err(e) =
@@ -158,83 +150,7 @@ index 58d2c8452..eb59fe1ff 100644
              {
                  error!(target: "engine::tree::payload_validator", block = ?block.block_with_parent(), %e, "Failed to validate block");
                  return Err(InsertBlockError::consensus_error(e, block).into())
-@@ -1056,6 +1067,7 @@ where
-     fn execute_block<S, Err, T>(
-         &mut self,
-         state_provider: S,
-+        open_parent: &(dyn Fn() -> Option<EvmStateProviderBox> + Sync),
-         env: ExecutionEnv<Evm>,
-         input: &BlockOrPayload<T>,
-         handle: &mut PayloadHandle<impl ExecutableTxFor<Evm>, Err, N::Receipt, HaltReasonFor<Evm>>,
-@@ -1128,10 +1140,14 @@ where
-         let (executor, senders) = if !has_bal && batch_env.is_some() {
-             // Collect once so a declined batch attempt can continue with the
-             // same recovered transactions in the ordinary ordered path.
-+            let collect_start = Instant::now();
-             let transactions = handle
-                 .iter_transactions()
-                 .collect::<Result<Vec<_>, _>>()
-                 .map_err(BlockExecutionError::other)?;
-+            metrics::histogram!("n42_import_stage_ms", "stage" => "collect")
-+                .record(collect_start.elapsed().as_secs_f64() * 1000.0);
-+            let recover_start = Instant::now();
-             let recovered: Vec<_> = transactions
-                 .iter()
-                 .map(|tx| {
-@@ -1141,6 +1157,8 @@ where
-                     )
-                 })
-                 .collect();
-+            metrics::histogram!("n42_import_stage_ms", "stage" => "recovered_copy")
-+                .record(recover_start.elapsed().as_secs_f64() * 1000.0);
-             let pre_exec_start = Instant::now();
-             executor.apply_pre_execution_changes()?;
-             self.metrics.record_pre_execution(pre_exec_start.elapsed());
-@@ -1149,11 +1167,15 @@ where
-                 batch_env.as_ref().expect("batch environment enabled"),
-                 input.parent_hash(),
-                 &recovered,
-+                open_parent,
-             )? {
-                 batch_finalize = Some(finalize);
-                 let senders = recovered.iter().map(|tx| tx.signer()).collect();
--                for (index, receipt) in executor.receipts().iter().enumerate() {
--                    let _ = receipt_tx.send(IndexedReceipt::new(index, receipt.clone()));
-+                // Nothing reads the receipts when no receipt root is computed.
-+                if self.consensus.uses_receipt_root() {
-+                    for (index, receipt) in executor.receipts().iter().enumerate() {
-+                        let _ = receipt_tx.send(IndexedReceipt::new(index, receipt.clone()));
-+                    }
-                 }
-                 executed_tx_index.store(transaction_count, Ordering::Relaxed);
-                 (executor, senders)
-@@ -1195,8 +1217,11 @@ where
-         self.metrics.record_post_execution(post_exec_start.elapsed());
- 
-         // Merge transitions into bundle state
-+        let merge_start = Instant::now();
-         debug_span!(target: "engine::tree", "merge_transitions")
-             .in_scope(|| db.merge_transitions(BundleRetention::Reverts));
-+        metrics::histogram!("n42_import_stage_ms", "stage" => "merge_transitions")
-+            .record(merge_start.elapsed().as_secs_f64() * 1000.0);
- 
-         // The builder only exists when the block declares a BAL. The revm form is the one shared
-         // with the executed block, so it must survive here; the clone only feeds the
-@@ -1205,10 +1230,13 @@ where
-             alloy: revm_bal.clone().into_alloy_bal(),
-             revm: Arc::new(revm_bal),
-         });
-+        let bundle_start = Instant::now();
-         let mut state = db.take_bundle();
-         if let Some(finalize) = batch_finalize {
-             finalize(&mut state);
-         }
-+        metrics::histogram!("n42_import_stage_ms", "stage" => "take_bundle")
-+            .record(bundle_start.elapsed().as_secs_f64() * 1000.0);
-         let output = BlockExecutionOutput { result, state };
- 
-         let execution_duration = execution_start.elapsed();
-@@ -1325,8 +1353,13 @@ where
+@@ -1227,8 +1237,13 @@ where
          // Unbounded channel is used since tx count bounds capacity anyway.
          let (receipt_tx, receipt_rx) = crossbeam_channel::unbounded();
          let (result_tx, result_rx) = tokio::sync::oneshot::channel();
@@ -249,40 +165,6 @@ index 58d2c8452..eb59fe1ff 100644
 +        }
  
          (receipt_tx, result_rx)
-     }
-diff --git a/crates/evm/evm/src/execute.rs b/crates/evm/evm/src/execute.rs
-index d5c1a80c7..181e7f69c 100644
---- a/crates/evm/evm/src/execute.rs
-+++ b/crates/evm/evm/src/execute.rs
-@@ -627,6 +627,7 @@ where
-                 &env,
-                 block.parent_hash(),
-                 &transactions,
-+                &|| None,
-             )?
-         } else {
-             None
-diff --git a/crates/evm/evm/src/lib.rs b/crates/evm/evm/src/lib.rs
-index 175d11d4f..05f1823fe 100644
---- a/crates/evm/evm/src/lib.rs
-+++ b/crates/evm/evm/src/lib.rs
-@@ -359,12 +359,17 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
- 
-     /// Attempts chain-specific batch execution. Returning `None` must leave
-     /// `executor` unchanged so the caller can use ordinary serial execution.
-+    ///
-+    /// `open_parent` opens a further view of the state the executor reads,
-+    /// or returns `None` when the caller has none to offer. A parent that is
-+    /// in the engine tree but not canonical is only reachable through it.
-     fn try_execute_import_batch<'a, DB: Database + 'a>(
-         &self,
-         _executor: &mut BlockExecutorForEvm<'a, Self, DB>,
-         _env: &EvmEnvFor<Self>,
-         _parent_hash: B256,
-         _transactions: &[alloy_consensus::transaction::Recovered<TxTy<Self::Primitives>>],
-+        _open_parent: &(dyn Fn() -> Option<reth_storage_api::EvmStateProviderBox> + Sync),
-     ) -> Result<Option<ImportBatchFinalize>, execute::BlockExecutionError> {
-         Ok(None)
      }
 diff --git a/crates/evm/evm/src/payload_cache.rs b/crates/evm/evm/src/payload_cache.rs
 index 1a2a1c18c..a3efac303 100644

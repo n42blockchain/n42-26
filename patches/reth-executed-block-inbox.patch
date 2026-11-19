@@ -1,8 +1,8 @@
 diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
-index eb59fe1ff..11773f68e 100644
+index 632317059..b43a07dc3 100644
 --- a/crates/engine/tree/src/tree/payload_validator.rs
 +++ b/crates/engine/tree/src/tree/payload_validator.rs
-@@ -488,6 +488,7 @@ where
+@@ -476,6 +476,7 @@ where
          V: PayloadValidator<T, Block = N::Block> + Clone,
          Evm: ConfigureEngineEvm<T::ExecutionData, Primitives = N>,
      {
@@ -10,7 +10,7 @@ index eb59fe1ff..11773f68e 100644
          let parent_hash = input.parent_hash();
          let _txpool_pause = self.txpool_prewarm.as_ref().map(txpool_prewarm::Handle::pause);
          let txpool_snapshot =
-@@ -557,6 +558,8 @@ where
+@@ -545,6 +546,8 @@ where
              .into())
          };
          drop(_enter);
@@ -19,7 +19,7 @@ index eb59fe1ff..11773f68e 100644
  
          let evm_env = debug_span!(target: "engine::tree::payload_validator", "evm_env")
              .in_scope(|| self.evm_env_for(&input))
-@@ -619,6 +622,8 @@ where
+@@ -607,6 +610,8 @@ where
  
          let parallel_bal_execution = ensure_ok!(self.bal_path_eligible(env.decoded_bal.as_deref()));
  
@@ -28,7 +28,7 @@ index eb59fe1ff..11773f68e 100644
          // Prepare the state-root job before execution so it can provide streaming hooks.
          let state_root_context = StateRootJobContext::new(
              &self.runtime,
-@@ -653,6 +658,8 @@ where
+@@ -641,6 +646,8 @@ where
          let hint_stream = state_root_job.take_hint_stream();
          let hashed_update_stream = state_root_job.take_hashed_update_stream();
  
@@ -37,7 +37,7 @@ index eb59fe1ff..11773f68e 100644
          // Spawn transaction conversion and prewarming.
          let mut handle = ensure_ok!(self.spawn_payload_processor(
              env.clone(),
-@@ -738,6 +745,8 @@ where
+@@ -726,6 +733,8 @@ where
          // The receipt root task is spawned before execution and receives receipts incrementally
          // as transactions complete, allowing parallel computation during execution.
          let execute_block_start = Instant::now();
@@ -46,7 +46,7 @@ index eb59fe1ff..11773f68e 100644
          let (output, senders, receipt_root_rx, executed_bal) =
              if let Some((output, senders)) = cached_execution {
                  tracing::info!(
-@@ -837,14 +846,18 @@ where
+@@ -824,14 +833,18 @@ where
              None
          };
  
@@ -67,7 +67,7 @@ index eb59fe1ff..11773f68e 100644
              return Err(InsertBlockError::new(block.into_sealed_block(), cached_refusal(e)).into())
          }
  
-@@ -865,6 +878,8 @@ where
+@@ -852,6 +865,8 @@ where
              )
          });
  
@@ -76,7 +76,7 @@ index eb59fe1ff..11773f68e 100644
          let root_start = Instant::now();
          let root_outcome = match state_root_job.finish(&block, output.clone(), &hashed_state) {
              Ok(outcome) => outcome,
-@@ -877,6 +892,10 @@ where
+@@ -864,6 +879,10 @@ where
              }
          };
          let root_elapsed = root_start.elapsed();
@@ -87,7 +87,7 @@ index eb59fe1ff..11773f68e 100644
  
          info!(
              target: "engine::tree::payload_validator",
-@@ -976,6 +995,8 @@ where
+@@ -963,6 +982,8 @@ where
          let executed_block = self
              .spawn_deferred_trie_task(Arc::new(block), output, hashed_state, trie_output)
              .with_bal(bal);
@@ -97,10 +97,10 @@ index eb59fe1ff..11773f68e 100644
      }
  
 diff --git a/crates/node/builder/src/launch/engine.rs b/crates/node/builder/src/launch/engine.rs
-index c5504312c..5e8267ed5 100644
+index e9935c167..8faae37b4 100644
 --- a/crates/node/builder/src/launch/engine.rs
 +++ b/crates/node/builder/src/launch/engine.rs
-@@ -338,6 +338,8 @@ impl<B> EngineNodeLauncher<B> {
+@@ -343,6 +343,8 @@ impl<B> EngineNodeLauncher<B> {
              .into_built_payload_stream()
              .fuse();
  
@@ -109,7 +109,7 @@ index c5504312c..5e8267ed5 100644
          let chainspec = ctx.chain_spec();
          let provider = ctx.blockchain_db().clone();
          let (exit, rx) = oneshot::channel();
-@@ -415,6 +417,21 @@ impl<B> EngineNodeLauncher<B> {
+@@ -420,6 +422,21 @@ impl<B> EngineNodeLauncher<B> {
                              orchestrator.handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block).into());
                          }
                      }

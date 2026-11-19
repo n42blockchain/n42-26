@@ -1,0 +1,207 @@
+diff --git a/crates/engine/tree/src/tree/payload_processor/prewarm.rs b/crates/engine/tree/src/tree/payload_processor/prewarm.rs
+index 14c554d8d..efc1d33f5 100644
+--- a/crates/engine/tree/src/tree/payload_processor/prewarm.rs
++++ b/crates/engine/tree/src/tree/payload_processor/prewarm.rs
+@@ -38,9 +38,8 @@ use reth_metrics::Metrics;
+ use reth_primitives_traits::{FastInstant as Instant, NodePrimitives};
+ use reth_provider::{
+     BlockExecutionOutput, BlockNumReader, ChangeSetReader, DatabaseProviderFactory,
+-    DatabaseProviderROFactory, EvmStateProvider, EvmStateProviderBox, HistoryReader,
+-    PruneCheckpointReader, StageCheckpointReader, StateProvider, StorageChangeSetReader,
+-    StorageSettingsCache,
++    EvmStateProvider, EvmStateProviderBox, HistoryReader, PruneCheckpointReader,
++    StageCheckpointReader, StorageChangeSetReader, StorageSettingsCache,
+ };
+ use reth_storage_overlay::OverlayStateProviderFactory;
+ use reth_tasks::{Runtime, WorkerStatefulPool};
+@@ -618,9 +617,7 @@ where
+             let caches = saved_cache.cache().clone();
+             let state_provider_factory = ctx.provider.clone();
+             let build = Arc::new(move || {
+-                state_provider_factory.database_provider_ro().map(|provider| {
+-                    Box::new(provider.into_evm_state_provider()) as EvmStateProviderBox
+-                })
++                state_provider_factory.execution_state_provider()
+             });
+ 
+             pool.begin_block(build, caches, ctx.env.txpool_snapshot.clone());
+@@ -785,8 +782,8 @@ where
+     /// Creates a per-thread EVM for prewarming.
+     #[instrument(level = "debug", target = "engine::tree::payload_processor::prewarm", skip_all)]
+     fn evm_for_ctx(&self) -> PrewarmEvmState<Evm> {
+-        let mut state_provider = match self.provider.database_provider_ro() {
+-            Ok(provider) => Box::new(provider.into_evm_state_provider()) as EvmStateProviderBox,
++        let mut state_provider = match self.provider.execution_state_provider() {
++            Ok(provider) => provider,
+             Err(err) => {
+                 trace!(
+                     target: "engine::tree::payload_processor::prewarm",
+@@ -907,8 +904,8 @@ where
+                 )
+                 .entered();
+ 
+-                let inner = match self.provider.database_provider_ro() {
+-                    Ok(p) => p.into_evm_state_provider(),
++                let inner = match self.provider.execution_state_provider() {
++                    Ok(p) => p,
+                     Err(err) => {
+                         warn!(
+                             target: "engine::tree::payload_processor::prewarm",
+@@ -927,7 +924,7 @@ where
+                                     .with_txpool_snapshot(self.env.txpool_snapshot.clone()),
+                             )
+                         }
+-                        _ => Box::new(inner),
++                        _ => inner,
+                     };
+                 *provider = Some(boxed);
+             }
+diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
+index b43a07dc3..89cee27cf 100644
+--- a/crates/engine/tree/src/tree/payload_validator.rs
++++ b/crates/engine/tree/src/tree/payload_validator.rs
+@@ -155,7 +155,7 @@ use reth_primitives_traits::{
+ use reth_provider::{
+     BlockExecutionOutput, BlockReader, ChangeSetReader, DatabaseProviderFactory,
+     DatabaseProviderROFactory, EvmStateProvider, EvmStateProviderBox, HistoryReader, ProviderError,
+-    PruneCheckpointReader, StageCheckpointReader, StateProvider, StateProviderFactory, StateReader,
++    PruneCheckpointReader, StageCheckpointReader, StateProviderFactory, StateReader,
+     StorageChangeSetReader, StorageSettingsCache,
+ };
+ use reth_storage_overlay::{OverlayManager, OverlayStateProviderFactory};
+@@ -688,7 +688,7 @@ where
+         // The second parameter `instrument_state_provider` controls whether we should
+         // instrument the state provider with metrics.
+         let make_state_provider = |fill_on_miss: bool| -> ProviderResult<EvmStateProviderBox> {
+-            let provider = state_provider_factory.database_provider_ro()?.into_evm_state_provider();
++            let provider = state_provider_factory.execution_state_provider()?;
+             let provider: EvmStateProviderBox =
+                 if let Some((caches, cache_metrics)) = &execution_cache {
+                     let fill_mode = if fill_on_miss {
+diff --git a/crates/engine/tree/src/tree/txpool_prewarm/mod.rs b/crates/engine/tree/src/tree/txpool_prewarm/mod.rs
+index 45c70b4ba..31a106277 100644
+--- a/crates/engine/tree/src/tree/txpool_prewarm/mod.rs
++++ b/crates/engine/tree/src/tree/txpool_prewarm/mod.rs
+@@ -64,7 +64,7 @@ where
+         + StorageChangeSetReader
+         + StorageSettingsCache
+         + 'static,
+-    OverlayStateProviderFactory<P, N>: DatabaseProviderROFactory<Provider: StateProvider> + Send,
++    OverlayStateProviderFactory<P, N>: DatabaseProviderROFactory<Provider: StateProvider + Send + 'static> + Send,
+     Evm: ConfigureEvm<Primitives = N> + 'static,
+ {
+     /// Spawns the long-lived worker, which owns its mutable read cache and starts a fresh one for
+diff --git a/crates/engine/tree/src/tree/txpool_prewarm/worker.rs b/crates/engine/tree/src/tree/txpool_prewarm/worker.rs
+index 819efa825..19410dd39 100644
+--- a/crates/engine/tree/src/tree/txpool_prewarm/worker.rs
++++ b/crates/engine/tree/src/tree/txpool_prewarm/worker.rs
+@@ -78,7 +78,7 @@ where
+         + StorageChangeSetReader
+         + StorageSettingsCache
+         + 'static,
+-    OverlayStateProviderFactory<P, N>: DatabaseProviderROFactory<Provider: StateProvider> + Send,
++    OverlayStateProviderFactory<P, N>: DatabaseProviderROFactory<Provider: StateProvider + Send + 'static> + Send,
+     Evm: ConfigureEvm<Primitives = N>,
+ {
+     pub(super) fn new(
+@@ -191,7 +191,7 @@ where
+             return BatchEnd::GoAgain
+         }
+ 
+-        let state_provider = match job.state_provider_factory.database_provider_ro() {
++        let state_provider = match job.state_provider_factory.execution_state_provider() {
+             Ok(provider) => provider,
+             Err(err) => {
+                 trace!(
+@@ -205,7 +205,7 @@ where
+         };
+         let db = self
+             .cache
+-            .as_db_mut(StateProviderDatabase::new(state_provider.into_evm_state_provider()));
++            .as_db_mut(StateProviderDatabase::new(state_provider));
+         let mut evm_env =
+             job.evm_env.clone().with_nonce_check_disabled().with_balance_check_disabled();
+         if job.results.is_none() {
+diff --git a/crates/storage/storage-api/src/n42_state.rs b/crates/storage/storage-api/src/n42_state.rs
+index e6736d5a8..9610e9e14 100644
+--- a/crates/storage/storage-api/src/n42_state.rs
++++ b/crates/storage/storage-api/src/n42_state.rs
+@@ -4,9 +4,10 @@
+ //! selection or the engine's unpersisted overlay. Registration is explicit;
+ //! ordinary Reth processes keep their existing behavior.
+ 
+-use crate::StateProviderBox;
++use crate::{EvmStateProviderBox, StateProvider, StateProviderBox};
+ use alloy_primitives::B256;
+ use reth_storage_errors::provider::ProviderResult;
++use alloc::boxed::Box;
+ use std::sync::{Arc, OnceLock};
+ 
+ /// A chain-specific provider adapter. It must preserve block identity and the
+@@ -31,3 +32,15 @@ pub fn wrap(hash: B256, inner: StateProviderBox) -> ProviderResult<StateProvider
+         None => Ok(inner),
+     }
+ }
++
++/// The provider block execution reads the state at `hash` through: `inner` as it is when no
++/// adapter is installed, adapted like [`wrap`] otherwise.
++pub fn execution_provider<P>(hash: B256, inner: P) -> ProviderResult<EvmStateProviderBox>
++where
++    P: StateProvider + Send + 'static,
++{
++    if ADAPTER.get().is_none() {
++        return Ok(Box::new(inner.into_evm_state_provider()))
++    }
++    Ok(Box::new(wrap(hash, Box::new(inner))?.into_evm_state_provider()))
++}
+diff --git a/crates/storage/storage-overlay/src/builder.rs b/crates/storage/storage-overlay/src/builder.rs
+index a0442dbbe..ba69409d7 100644
+--- a/crates/storage/storage-overlay/src/builder.rs
++++ b/crates/storage/storage-overlay/src/builder.rs
+@@ -219,6 +219,11 @@ impl<N: NodePrimitives> OverlayBuilder<N> {
+         }
+     }
+ 
++    /// The block whose state this builder resolves.
++    pub(crate) const fn parent_hash(&self) -> B256 {
++        self.parent_hash
++    }
++
+     /// Skips managed overlay construction when the sparse trie was reused and the DB tip is
+     /// already covered by its anchor-to-parent range.
+     pub(crate) const fn with_skip_overlay_for_reused_sparse_trie(
+diff --git a/crates/storage/storage-overlay/src/provider.rs b/crates/storage/storage-overlay/src/provider.rs
+index 43d6f2f6d..9978a8bfc 100644
+--- a/crates/storage/storage-overlay/src/provider.rs
++++ b/crates/storage/storage-overlay/src/provider.rs
+@@ -15,7 +15,8 @@ use reth_primitives_traits::{
+ use reth_prune_types::PruneSegment;
+ use reth_storage_api::{
+     AccountReader, BlockHashReader, BlockNumReader, BytecodeReader, ChangeSetReader, DBProvider,
+-    DatabaseProviderFactory, DatabaseProviderROFactory, DbTxProvider, HashedPostStateProvider,
++    DatabaseProviderFactory, DatabaseProviderROFactory, DbTxProvider, EvmStateProviderBox,
++    HashedPostStateProvider,
+     HistoryInfo, HistoryReader, PruneCheckpointReader, StageCheckpointReader, StateProofProvider,
+     StateProvider, StateRootProvider, StorageChangeSetReader, StorageRootProvider,
+     StorageSettingsCache,
+@@ -114,6 +115,20 @@ impl<F, N: NodePrimitives> OverlayStateProviderFactory<F, N> {
+         self.known_storage_roots = Arc::new(known_storage_roots);
+         self
+     }
++
++    /// Creates the provider block execution reads the parent state through.
++    ///
++    /// This is [`DatabaseProviderROFactory::database_provider_ro`] unless an N42 state adapter is
++    /// installed, which then serves the account and storage reads at the parent's hash.
++    pub fn execution_state_provider(&self) -> ProviderResult<EvmStateProviderBox>
++    where
++        Self: DatabaseProviderROFactory<Provider: StateProvider + Send + 'static>,
++    {
++        reth_storage_api::n42_state::execution_provider(
++            self.overlay_builder.parent_hash(),
++            self.database_provider_ro()?,
++        )
++    }
+ }
+ 
+ impl<F, N> DatabaseProviderROFactory for OverlayStateProviderFactory<F, N>

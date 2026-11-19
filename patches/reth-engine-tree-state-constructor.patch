@@ -1,0 +1,14 @@
+diff --git a/crates/engine/tree/src/tree/mod.rs b/crates/engine/tree/src/tree/mod.rs
+index 98d898015..847ff2de6 100644
+--- a/crates/engine/tree/src/tree/mod.rs
++++ b/crates/engine/tree/src/tree/mod.rs
+@@ -117,7 +117,8 @@ pub struct EngineApiTreeState<N: NodePrimitives> {
+ }
+ 
+ impl<N: NodePrimitives> EngineApiTreeState<N> {
+-    fn new(
++    /// Creates the Engine API tree state rooted at the canonical block.
++    pub fn new(
+         block_buffer_limit: u32,
+         max_invalid_header_cache_length: u32,
+         invalid_header_hit_eviction_threshold: u8,

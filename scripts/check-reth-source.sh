@@ -17,11 +17,13 @@ lock = json.loads(Path(sys.argv[1]).read_text())
 print(lock["upstream_commit"])
 print(lock["adapted_commit"])
 print(len(lock["patch_series"]))
+print(lock["upstream_tag"])
 PY
 )
 base_revision=${revisions[0]}
 adapted_revision=${revisions[1]}
 expected_patch_count=${revisions[2]}
+upstream_tag=${revisions[3]}
 head=$(git -C "$reth_dir" rev-parse HEAD 2>/dev/null) || {
     echo "Reth source is not a Git checkout: $reth_dir" >&2
     exit 1
@@ -41,4 +43,4 @@ fi
 # The applier owns the patch order. In check-only mode it reverses the whole
 # series against the tracked working tree and never modifies the source.
 N42_RETH_CHECK_ONLY=1 bash "$script_dir/apply-reth-patches.sh" "$reth_dir"
-echo "Reth source matches the v2.8.1 N42 patch lock."
+echo "Reth source matches the $upstream_tag N42 patch lock."

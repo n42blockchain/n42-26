@@ -1,8 +1,8 @@
 diff --git a/crates/engine/tree/src/tree/mod.rs b/crates/engine/tree/src/tree/mod.rs
-index 826554a92..45d8955f1 100644
+index 750b4962c..318f47082 100644
 --- a/crates/engine/tree/src/tree/mod.rs
 +++ b/crates/engine/tree/src/tree/mod.rs
-@@ -3345,7 +3345,13 @@ where
+@@ -3340,7 +3340,13 @@ where
  
          // keep track of the invalid header unless the consensus impl considers it transient
          let is_transient = match &validation_err {
@@ -18,10 +18,10 @@ index 826554a92..45d8955f1 100644
          };
          if is_transient {
 diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
-index 1552f6522..58d2c8452 100644
+index 802bb957d..496d03917 100644
 --- a/crates/engine/tree/src/tree/payload_validator.rs
 +++ b/crates/engine/tree/src/tree/payload_validator.rs
-@@ -529,20 +529,6 @@ where
+@@ -517,20 +517,6 @@ where
              };
          }
  
@@ -42,7 +42,7 @@ index 1552f6522..58d2c8452 100644
          // If the gas limit is multiple times higher than the parent's, be cautious and block on
          // pre-execution checks of the block.
          if input.gas_limit() >
-@@ -618,6 +604,18 @@ where
+@@ -606,6 +592,18 @@ where
              )
          };
          let is_cache_hit = cached_execution.is_some();
@@ -61,7 +61,7 @@ index 1552f6522..58d2c8452 100644
  
          let parallel_bal_execution = ensure_ok!(self.bal_path_eligible(env.decoded_bal.as_deref()));
  
-@@ -833,17 +831,16 @@ where
+@@ -821,17 +819,16 @@ where
                  .ok()
          };
  
@@ -89,7 +89,7 @@ index 1552f6522..58d2c8452 100644
  
          let mut hashed_state_validate_result = debug_span!(
              target: "engine::tree::payload_validator",
-@@ -863,10 +860,16 @@ where
+@@ -851,10 +848,16 @@ where
          });
  
          let root_start = Instant::now();
@@ -110,20 +110,20 @@ index 1552f6522..58d2c8452 100644
          let root_elapsed = root_start.elapsed();
  
          info!(
-@@ -907,7 +910,11 @@ where
+@@ -895,7 +898,11 @@ where
              if err.is_validation_error() {
                  self.on_invalid_block(&parent_block, &block, &output, None, ctx.state_mut());
              }
 -            return Err(InsertBlockError::new(block.into_sealed_block(), err).into())
 +            return Err(InsertBlockError::new(
 +                block.into_sealed_block(),
-+                cached_refusal(err.into()),
++                cached_refusal(err),
 +            )
 +            .into())
          }
  
          self.metrics.block_validation.record_state_root(&trie_output, root_elapsed.as_secs_f64());
-@@ -928,10 +935,12 @@ where
+@@ -916,10 +923,12 @@ where
              let block_state_root = block.header().state_root();
              return Err(InsertBlockError::new(
                  block.into_sealed_block(),

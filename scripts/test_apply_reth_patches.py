@@ -7,12 +7,17 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("apply-reth-patches.sh").resolve()
 PATCH_NAMES = (
+    "reth-qmdb-state-reader",
     "reth-n42-perf",
     "reth-payload-transactions-root",
-    "reth-qmdb-state-reader",
-    "reth-import-batch",
     "reth-gov5-cached-state-root",
     "reth-engine-state-provider-factory",
+    "reth-cached-execution-refusal",
+    "reth-native-import-path",
+    "reth-executed-block-inbox",
+    "reth-engine-tree-state-constructor",
+    "reth-engine-execution-state-adapter",
+    "reth-receipt-root-task-guard",
 )
 
 
@@ -63,7 +68,9 @@ class ApplyRethPatchesTest(unittest.TestCase):
         self.assertTrue(all("// n42 patch" in body for body in self.contents().values()))
         second = self.invoke()
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(second.stdout.count("already applied"), len(PATCH_NAMES))
+        # A fully patched checkout is recognised as a whole series, not patch by patch.
+        self.assertIn("already carries the full N42 patch series", second.stdout)
+        self.assertTrue(all(body.count("// n42 patch") == 1 for body in self.contents().values()))
 
     def test_dependent_patch_series_is_preflighted_and_applied_in_order(self):
         path = self.paths[PATCH_NAMES[0]]

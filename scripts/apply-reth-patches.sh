@@ -5,29 +5,31 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 reth_dir=${1:-"$script_dir/../../reth"}
 patch_dir=${N42_RETH_PATCH_DIR:-"$script_dir/../patches"}
-base_revision=${N42_RETH_BASE_REVISION:-d763342fa185e4e90ee79dc65f6a5706168b0bcb}
-adapted_revision=${N42_RETH_ADAPTED_REVISION:-7aee67f58fe34b4bd9eef6a5e6caa603d3a25127}
+base_revision=${N42_RETH_BASE_REVISION:-b9abbcc1b982755baa9021e6874e2e58936ca65f}
+adapted_revision=${N42_RETH_ADAPTED_REVISION:-20bc910983b45d53f5f5d287dca92f226d5c5622}
 current_revision=$(git -C "$reth_dir" rev-parse HEAD 2>/dev/null || true)
 if [[ "$current_revision" != "$base_revision" && "$current_revision" != "$adapted_revision" ]]; then
     echo "Reth checkout must be exactly pinned base $base_revision or adapted revision $adapted_revision." >&2
     exit 1
 fi
 
-# Keep dependency order: the performance patch creates payload_cache.rs, which
-# the transaction-root patch extends. Preflight applies pending patches to a
-# temporary index so related patches are validated as one sequence before the
-# working tree changes.
+# Commit order of the adapted branch: each patch is the diff of one commit
+# against its parent, so later patches depend on earlier ones (the performance
+# patch creates payload_cache.rs, which the transaction-root patch extends).
+# Preflight applies pending patches to a temporary index so related patches
+# are validated as one sequence before the working tree changes.
 names=(
+    reth-qmdb-state-reader
     reth-n42-perf
     reth-payload-transactions-root
-    reth-qmdb-state-reader
-    reth-import-batch
     reth-gov5-cached-state-root
     reth-engine-state-provider-factory
     reth-cached-execution-refusal
     reth-native-import-path
     reth-executed-block-inbox
-    reth-import-batch-tail
+    reth-engine-tree-state-constructor
+    reth-engine-execution-state-adapter
+    reth-receipt-root-task-guard
 )
 # Later patches may edit lines an earlier patch introduced, so a patch cannot
 # always be reversed on its own against the final tree. Reverse the whole
