@@ -1,109 +1,59 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! A plain value transfer applied without the interpreter.
+//! The plain value transfer as an evm2 transaction handler.
 //!
-//! Adapted from n42-rs `fast_transfer.rs` at 466c1839791afadba7f1dd4d48c5518440dcafba.
-//! Retains N42-26 custom precompiles and adds local environment eligibility checks.
+//! Lifted from n42-rs `crates/n42/engine-types/src/fast_handler.rs` (with the
+//! EIP-7708 log helper of its `direct_transfer.rs`).
 //!
-//! The upstream fleet used 163,000 transfers per block and measured about
-//! 1.4 us of REVM work per transfer (not a local performance claim): a journal, a frame, a
-//! call into an account with no code, the journal's finalisation. The state
-//! transition of such a transfer is three balance changes and a nonce, and
-//! this module applies exactly that -- with revm's own arithmetic, in revm's
-//! own order, producing the accounts revm's journal would hand back and the
-//! result its handler would build -- and only when it can prove revm would
-//! succeed and charge exactly the base cost. Anything else, and every
-//! transaction on a fork this module has not been checked against, goes to
-//! the interpreter unchanged. Every node executes every transaction either
-//! way; nothing is skipped, and the post-state is the same to the byte.
+//! evm2 already completes a call to an account without code without running
+//! the interpreter (`Evm::execute_call_message`), so what is left to save is the
+//! first frame around it: the code load, the message, two state checkpoints and
+//! the dispatch. This handler wraps the stock Ethereum handlers for types 0, 1 and
+//! 2 (0x50 executes as 2): the stock `prepare` validates the transaction, bumps
+//! the nonce and charges the upfront fee exactly as before; then, for a
+//! transaction that qualifies, the value moves through evm2's own
+//! `State::transfer` and the stock settlement (`settle_initial_frame_gas`, the
+//! default hooks' `settle_transaction`) refunds the sender and pays the
+//! beneficiary. Anything that does not qualify goes to the stock `execute`.
 //!
-//! What qualifies: a call (legacy, EIP-2930 or EIP-1559) with no calldata, no
-//! access list, no blob and no authorisation, from an account without code,
-//! to an account without code that is not a precompile, with the nonce, the
-//! balance and the fees revm's pre-execution checks demand, on Cancun, Prague or
-//! Osaka. The sender, the recipient and the block's beneficiary must be three
-//! distinct accounts, the recipient must not be left empty (EIP-161) and the
-//! beneficiary must already exist and not be empty, so that no account's
-//! existence changes in a way this module would have to model.
+//! What qualifies: a call with no input and no access list, on Cancun, Prague,
+//! Osaka or Amsterdam (EIP-2780's intrinsic, EIP-8037's new-account state gas and
+//! EIP-7708's transfer log are applied as the stock path applies them), with no
+//! inspector, to an account without code that is not a precompile, where the
+//! sender, the recipient and the beneficiary are three accounts, the recipient
+//! is not left empty by a zero-value call (EIP-161), and the sender can pay the
+//! value after the upfront charge.
+//!
+//! Every write goes through the EVM's own state, so the transaction's change
+//! stream — and with it the block's bundle, the touched accounts and the
+//! restored-slot record — is what the stock handler produces.
 //!
 //! `N42_FAST_TRANSFER=1` turns it on; it is off by default so that a fleet
-//! can measure it against the interpreter on the same binary.
+//! can measure it against the stock handlers on the same binary.
 
-#[cfg(test)]
-use crate::evm_factory::N42EvmFactory;
-use alloy_evm::{Database, EthEvm, Evm, EvmEnv, eth::EthEvmContext, precompiles::PrecompilesMap};
-use alloy_primitives::{Address, Bytes, U256};
-use revm::{
-    Inspector,
-    context::{BlockEnv, CfgEnv, TxEnv},
-    context_interface::{
-        Block as _, Cfg as _, Transaction as _,
-        result::{
-            EVMError, ExecutionResult, HaltReason, Output, ResultAndState, ResultGas, SuccessReason,
-        },
-    },
-    primitives::{TxKind, hardfork::SpecId},
-    state::{Account, EvmState, TransactionId},
+use alloy_consensus::{TxEip1559, TxEip2930, TxLegacy};
+use alloy_primitives::{Address, Bytes, TxKind, U256};
+use evm2::{
+    ethereum::{self, TxEnvelope},
+    handler::{DefaultTxHandlerHooks, GasSettlement, TxHandlerHooks},
+    interpreter::{GasTracker, InstrStop, MessageResultExt},
+    registry::{handler, HandlerResult, TxRegistry, TxRequest},
+    Evm, EvmTypes, SpecId, TxResult,
 };
 
-/// The gas of a call with no calldata: the whole cost of a qualifying transfer.
-const TRANSFER_GAS: u64 = 21_000;
-
-/// How many transfers have taken this path in this process.
+/// Transfers this handler completed, since start.
 static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Transactions it handed to the stock `execute`, since start.
+static DELEGATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Transfers reported by completed or dropped EVM instances in this process.
+/// Transfers the handler completed, since start.
 pub fn hits() -> u64 {
     HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Why transfers were sent to the interpreter instead, by reason, so a
-/// fleet that shows no hits says which check refused them.
-static REJECTED: [std::sync::atomic::AtomicU64; 12] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 12];
-
-/// The refusals so far, by reason: shape, fork, configuration, limits, fees,
-/// parties, sender, balance, recipient, beneficiary, arithmetic, inspecting.
-pub fn rejected() -> [u64; 12] {
-    std::array::from_fn(|i| REJECTED[i].load(std::sync::atomic::Ordering::Relaxed))
-}
-
-// Count locally while executing; publish once when the EVM is finished or dropped.
-// A global atomic increment per transfer would contend across execution lanes.
-#[derive(Default)]
-struct TransferStats {
-    hits: u64,
-    rejected: [u64; 12],
-}
-
-impl Drop for TransferStats {
-    fn drop(&mut self) {
-        if self.hits != 0 {
-            HITS.fetch_add(self.hits, std::sync::atomic::Ordering::Relaxed);
-            metrics::counter!("n42_fast_transfer_total").increment(self.hits);
-        }
-        for (reason, count) in self.rejected.iter().copied().enumerate() {
-            if count != 0 {
-                REJECTED[reason].fetch_add(count, std::sync::atomic::Ordering::Relaxed);
-                const REASONS: [&str; 12] = [
-                    "shape",
-                    "fork",
-                    "configuration",
-                    "limits",
-                    "fees",
-                    "parties",
-                    "sender",
-                    "balance",
-                    "recipient",
-                    "beneficiary",
-                    "arithmetic",
-                    "inspecting",
-                ];
-                metrics::counter!("n42_fast_transfer_fallback_total", "reason" => REASONS[reason])
-                    .increment(count);
-            }
-        }
-    }
+/// Transactions the handler gave to the stock `execute`, since start.
+pub fn delegated() -> u64 {
+    DELEGATED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether `N42_FAST_TRANSFER=1` is set.
@@ -116,943 +66,869 @@ pub fn enabled() -> bool {
     })
 }
 
-fn environment_refusal<DB: Database, I: Inspector<EthEvmContext<DB>>>(
-    inner: &EthEvm<DB, I, PrecompilesMap>,
-) -> Option<usize> {
-    let cfg = inner.cfg_env();
-    let block = inner.block();
-    // Cancun through Osaka. Cancun has no EIP-7623 floor; Prague adds it.
-    // Amsterdam transfer logs/state gas are not represented by this path.
-    let spec = cfg.spec();
-    if !spec.is_enabled_in(SpecId::CANCUN) || spec.is_enabled_in(SpecId::AMSTERDAM) {
-        return Some(1);
-    }
-    // Every check revm makes before executing, as revm makes it; a
-    // configuration that relaxes any of them is not modelled here.
-    if cfg.is_nonce_check_disabled()
-        || cfg.is_balance_check_disabled()
-        || cfg.is_eip3607_disabled()
-        || cfg.is_fee_charge_disabled()
-        || cfg.is_base_fee_check_disabled()
-        || cfg.is_priority_fee_check_disabled()
-        || cfg.is_block_gas_limit_disabled()
-        || cfg.is_eip7623_disabled()
-        || cfg.is_amsterdam_eip8037_enabled()
-        || cfg.is_amsterdam_eip2780_enabled()
-        || cfg.gas_params() != &revm::context_interface::cfg::GasParams::new_spec(*spec)
-        || block.prevrandao().is_none()
-        || block.blob_excess_gas_and_price().is_none()
-    {
-        return Some(2);
-    }
-    None
+#[cfg(test)]
+std::thread_local! {
+    /// Transfers the handler completed on this thread: the tests run beside
+    /// each other, and the process-wide counter is all of theirs.
+    static TAKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// [`EthEvm`] with the transfer path in front of the interpreter.
-pub struct N42Evm<DB: Database, I> {
-    inner: EthEvm<DB, I, PrecompilesMap>,
-    /// An inspector is watching: every transaction goes through the
-    /// interpreter, which is what the inspector expects to see.
-    inspecting: bool,
-    fast: bool,
-    environment_refusal: Option<usize>,
-    stats: TransferStats,
+/// Whether the handler is registered on `spec`: Cancun, Prague, Osaka and
+/// Amsterdam (the EIP-2780 intrinsic, the EIP-8037 new-account state gas and
+/// the EIP-7708 transfer log are modelled). n42-rs registers it from Prague;
+/// Cancun is this chain's default fork and the one the revm-era fast transfer
+/// started at, and the handler reads nothing Prague added.
+pub fn covers(spec: SpecId) -> bool {
+    spec.enables(SpecId::CANCUN) && SpecId::AMSTERDAM.enables(spec)
 }
 
-impl<DB: Database, I> std::fmt::Debug for N42Evm<DB, I> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("N42Evm")
-            .field("inspecting", &self.inspecting)
-            .field("fast", &self.fast)
-            .finish_non_exhaustive()
+/// Whether `version`'s Amsterdam transfer rules are all on or all off: the
+/// fast paths model EIP-2780, EIP-8037 and EIP-7708 together and nothing in
+/// between.
+pub fn amsterdam_features_consistent(version: &evm2::Version) -> bool {
+    use evm2::EvmFeatures;
+    let eip2780 = version.feature(EvmFeatures::EIP2780);
+    eip2780 == version.feature(EvmFeatures::EIP8037) && eip2780 == version.feature(EvmFeatures::EIP7708)
+}
+
+/// `base` (the stock registry for `spec`) with types 0, 1 and 2 handled by
+/// this module when [`covers`] says so; `base` unchanged otherwise.
+pub fn registry<T: EvmTypes<Tx = TxEnvelope>>(spec: SpecId, base: TxRegistry<T, TxResult<T>>) -> TxRegistry<T, TxResult<T>> {
+    if !covers(spec) {
+        return base;
     }
+    // A registry is made with each EVM: the counts so far are published here
+    // rather than once per transfer.
+    metrics::counter!("n42_fast_transfer_total").absolute(hits());
+    metrics::counter!("n42_fast_transfer_fallback_total", "reason" => "delegated")
+        .absolute(delegated());
+    base.with_handler(
+        0,
+        TxEnvelope::as_legacy,
+        handler(
+            |req: &mut TxRequest<'_, '_, T, TxLegacy>| {
+                let tx = req.tx.inner();
+                let shape = Shape::of(req.tx.signer(), U256::from(tx.gas_price), tx.gas_limit, tx.to, &tx.input, tx.value, true);
+                Ok((ethereum::legacy::prepare_with_hooks::<T, DefaultTxHandlerHooks>(req)?, shape))
+            },
+            |req: TxRequest<'_, '_, T, TxLegacy>, (prepared, shape)| match transfer(req.host, req.envelope, &shape)? {
+                Some(result) => Ok(result),
+                None => ethereum::legacy::execute_prepared::<T, DefaultTxHandlerHooks>(req, prepared),
+            },
+        ),
+    )
+    .with_handler(
+        1,
+        TxEnvelope::as_eip2930,
+        handler(
+            |req: &mut TxRequest<'_, '_, T, TxEip2930>| {
+                let tx = req.tx.inner();
+                let shape = Shape::of(
+                    req.tx.signer(),
+                    U256::from(tx.gas_price),
+                    tx.gas_limit,
+                    tx.to,
+                    &tx.input,
+                    tx.value,
+                    tx.access_list.is_empty(),
+                );
+                Ok((ethereum::eip2930::prepare_with_hooks::<T, DefaultTxHandlerHooks>(req)?, shape))
+            },
+            |req: TxRequest<'_, '_, T, TxEip2930>, (prepared, shape)| match transfer(req.host, req.envelope, &shape)? {
+                Some(result) => Ok(result),
+                None => ethereum::eip2930::execute_prepared::<T, DefaultTxHandlerHooks>(req, prepared),
+            },
+        ),
+    )
+    .with_handler(
+        2,
+        TxEnvelope::as_eip1559,
+        handler(
+            |req: &mut TxRequest<'_, '_, T, TxEip1559>| {
+                let tx = req.tx.inner();
+                let gas_price = ethereum::effective_gas_price(
+                    U256::from(tx.max_fee_per_gas),
+                    U256::from(tx.max_priority_fee_per_gas),
+                    req.host.block().basefee,
+                );
+                let shape =
+                    Shape::of(req.tx.signer(), gas_price, tx.gas_limit, tx.to, &tx.input, tx.value, tx.access_list.is_empty());
+                Ok((ethereum::eip1559::prepare_with_hooks::<T, DefaultTxHandlerHooks>(req)?, shape))
+            },
+            |req: TxRequest<'_, '_, T, TxEip1559>, (prepared, shape)| match transfer(req.host, req.envelope, &shape)? {
+                Some(result) => Ok(result),
+                None => ethereum::eip1559::execute_prepared::<T, DefaultTxHandlerHooks>(req, prepared),
+            },
+        ),
+    )
 }
 
-impl<DB: Database, I: Inspector<EthEvmContext<DB>>> N42Evm<DB, I> {
-    pub(crate) fn new(inner: EthEvm<DB, I, PrecompilesMap>, inspecting: bool, fast: bool) -> Self {
-        let environment_refusal = if fast {
-            environment_refusal(&inner)
-        } else {
-            None
+/// What the qualification and the settlement read of a transaction, taken
+/// before the stock `prepare` consumes the request.
+#[derive(Debug, Clone, Copy)]
+struct Shape {
+    caller: Address,
+    gas_price: U256,
+    gas_limit: u64,
+    /// The recipient of a call with no input and no access list; `None`
+    /// for anything else.
+    to: Option<Address>,
+    value: U256,
+}
+
+impl Shape {
+    fn of(caller: Address, gas_price: U256, gas_limit: u64, to: TxKind, input: &Bytes, value: U256, no_access_list: bool) -> Self {
+        let to = match to {
+            TxKind::Call(to) if input.is_empty() && no_access_list => Some(to),
+            _ => None,
         };
-        Self {
-            stats: TransferStats::default(),
-            environment_refusal,
-            inner,
-            inspecting,
-            fast,
-        }
+        Self { caller, gas_price, gas_limit, to, value }
     }
+}
 
-    /// Transfers executed by this EVM before it is finished.
-    pub const fn fast_transfer_hits(&self) -> u64 {
-        self.stats.hits
-    }
-
-    fn refused<T, E>(&mut self, reason: usize) -> Result<Option<T>, E> {
-        self.stats.rejected[reason] += 1;
+/// The transfer after the stock `prepare`, or `None` (nothing written) when
+/// the transaction does not qualify and the stock `execute` must run it.
+fn transfer<T: EvmTypes>(host: &mut Evm<'_, T>, envelope: &T::Tx, shape: &Shape) -> HandlerResult<Option<TxResult<T>>> {
+    let delegate = || {
+        DELEGATED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(None)
+    };
+    let Some(to) = shape.to else { return delegate() };
+    let caller = shape.caller;
+    let beneficiary = host.block().beneficiary;
+    if !covers(host.spec_id())
+        || !amsterdam_features_consistent(host.version())
+        || host.inspector().is_some()
+        || to == caller
+        || to == beneficiary
+        || caller == beneficiary
+        || host.precompiles().contains(&to)
+    {
+        return delegate();
     }
-
-    /// The transfer's result and post-state, if the transaction qualifies and
-    /// revm would succeed on it; `None` sends it to the interpreter. A database
-    /// error is the same error the interpreter would have hit loading the
-    /// account.
-    pub(crate) fn transfer(&mut self, tx: &TxEnv) -> Result<Option<ResultAndState>, DB::Error> {
-        // The transaction's shape.
-        let TxKind::Call(to) = tx.kind else {
-            return self.refused(0);
+    let recipient_empty = {
+        let state = host.state_mut();
+        let (recipient_empty, recipient_codeless) = {
+            let recipient = state.account(&to)?;
+            (recipient.get().is_none_or(evm2::AccountInfo::is_empty), recipient.is_empty_code_hash())
         };
-        if !tx.data.is_empty()
-            || tx.tx_type > 2
-            || !tx.access_list.0.is_empty()
-            || !tx.authorization_list.is_empty()
-            || !tx.blob_hashes.is_empty()
-            || tx.gas_limit < TRANSFER_GAS
-            || (tx.tx_type != 0 && tx.chain_id.is_none())
-        {
-            return self.refused(0);
+        if !recipient_codeless || (shape.value.is_zero() && recipient_empty) {
+            return delegate();
         }
-        let cfg = self.inner.cfg_env();
-        let block = self.inner.block();
-        if let Some(reason) = self.environment_refusal {
-            return self.refused(reason);
+        if state.account(&caller)?.balance() < shape.value {
+            return delegate();
         }
-        if tx.chain_id.is_some_and(|id| id != cfg.chain_id())
-            || tx.gas_limit > cfg.tx_gas_limit_cap()
-            || tx.gas_limit > block.gas_limit()
-        {
-            return self.refused(3);
+        recipient_empty
+    };
+    // The intrinsic gas of a call with no input and no access list, as the
+    // stock `prepare` computed it (no hooks: no adjustment, no state gas;
+    // EIP-2780's decomposed base on Amsterdam).
+    let (intrinsic, floor_gas) =
+        ethereum::intrinsic_and_floor_gas(host.version(), caller, TxKind::Call(to), &Bytes::new(), 0, 0, shape.value);
+    let (execution_gas_limit, reservoir) = ethereum::initial_gas_and_reservoir(host.version(), shape.gas_limit, intrinsic, 0);
+    let mut tx_gas = GasTracker::new_with_execution_gas_and_reservoir(execution_gas_limit, reservoir);
+    // EIP-2780's runtime phase (`prepare_initial_frame`): a value to an empty
+    // recipient pays EIP-8037's new-account state gas, reservoir first. When
+    // it does not fit the stock path makes the out-of-gas halt; nothing has
+    // been written yet.
+    let mut charged_state_gas = 0;
+    if host.version().feature(evm2::EvmFeatures::EIP2780) && !shape.value.is_zero() && recipient_empty {
+        let charge = host.version().gas_params.new_account_state_gas();
+        if tx_gas.spend_state(charge).is_err() {
+            return delegate();
         }
-        let basefee = block.basefee() as u128;
-        if tx.gas_price < basefee || tx.gas_priority_fee.is_some_and(|tip| tip > tx.gas_price) {
-            return self.refused(4);
-        }
-        let caller = tx.caller;
-        let floor_gas = if cfg.spec().is_enabled_in(SpecId::PRAGUE) {
-            TRANSFER_GAS
-        } else {
-            0
-        };
-        let beneficiary = block.beneficiary();
-        if to == caller || to == beneficiary || caller == beneficiary {
-            return self.refused(5);
-        }
-        // Use the actual map: this client has 0x0302 and callers can install
-        // additional precompiles at arbitrary addresses through components_mut.
-        if self.inner.precompiles().get(&to).is_some() {
-            return self.refused(5);
-        }
-
-        // The accounts, loaded the way the journal would load them: through
-        // the same database, so its cache holds them as the pre-state.
-        let value = tx.value;
-        let db = self.inner.db_mut();
-        let Some(sender) = db.basic(caller)? else {
-            return self.refused(6);
-        };
-        if !sender.is_code_hash_empty_or_zero()
-            || sender.nonce != tx.nonce
-            || sender.nonce == u64::MAX
-        {
-            return self.refused(6);
-        }
-        let Ok(max_spending) = tx.max_balance_spending() else {
-            return self.refused(7);
-        };
-        if max_spending > sender.balance {
-            return self.refused(7);
-        }
-        let recipient = db.basic(to)?;
-        match &recipient {
-            Some(info) if !info.is_code_hash_empty_or_zero() => return self.refused(8),
-            // An account that stays empty after being touched is deleted
-            // (EIP-161); the interpreter models that, this does not.
-            Some(info) if value.is_zero() && info.is_empty() => return self.refused(8),
-            None if value.is_zero() => return self.refused(8),
-            _ => {}
-        }
-        let Some(coinbase) = db.basic(beneficiary)? else {
-            return self.refused(9);
-        };
-        if coinbase.is_empty() {
-            return self.refused(9);
-        }
-
-        // revm's arithmetic: the caller pays gas_limit at the effective price
-        // and the value, then gets the unused gas back at the same price; the
-        // beneficiary receives the used gas at the price above the base fee.
-        let effective_price = tx.effective_gas_price(basefee);
-        let Some(gas_cost) = effective_price.checked_mul(TRANSFER_GAS as u128) else {
-            return self.refused(10);
-        };
-        let Some(sender_balance) = sender
-            .balance
-            .checked_sub(value)
-            .and_then(|b| b.checked_sub(U256::from(gas_cost)))
-        else {
-            return self.refused(10);
-        };
-        let Some(recipient_balance) = recipient
-            .as_ref()
-            .map_or(U256::ZERO, |r| r.balance)
-            .checked_add(value)
-        else {
-            return self.refused(10);
-        };
-        let tip = effective_price.saturating_sub(basefee);
-        let Some(reward) = tip.checked_mul(TRANSFER_GAS as u128) else {
-            return self.refused(10);
-        };
-        let Some(coinbase_balance) = coinbase.balance.checked_add(U256::from(reward)) else {
-            return self.refused(10);
-        };
-
-        // The accounts as the journal would return them: touched, with the
-        // pre-state kept as the original, and a recipient that did not exist
-        // marked as loaded that way.
-        // Three accounts, sized once: growing from empty reallocated twice per
-        // transaction, 326,000 allocations a full block on both the builder and
-        // the follower.
-        let mut state: EvmState = EvmState::with_capacity_and_hasher(4, Default::default());
-        let mut sender_account = Account::from(sender);
-        sender_account.info.balance = sender_balance;
-        sender_account.info.nonce += 1;
-        sender_account.mark_touch();
-        state.insert(caller, sender_account);
-        let mut recipient_account = match recipient {
-            Some(info) => Account::from(info),
-            None => Account::new_not_existing(TransactionId::ZERO),
-        };
-        recipient_account.info.balance = recipient_balance;
-        recipient_account.mark_touch();
-        state.insert(to, recipient_account);
-        let mut coinbase_account = Account::from(coinbase);
-        coinbase_account.info.balance = coinbase_balance;
-        coinbase_account.mark_touch();
-        state.insert(beneficiary, coinbase_account);
-
-        // The result revm's handler builds for a call into an account without
-        // code: it stops, spends the base cost, refunds nothing, and the
-        // EIP-7623 floor for no calldata is the base cost too on Prague+;
-        // Cancun's result must retain a zero floor even though used gas agrees.
-        let result = ExecutionResult::Success {
-            reason: SuccessReason::Stop,
-            gas: ResultGas::new_with_state_gas(TRANSFER_GAS, 0, floor_gas, 0),
-            logs: Vec::new(),
-            output: Output::Call(Bytes::new()),
-        };
-        Ok(Some(ResultAndState::new(result, state)))
+        charged_state_gas = charge;
     }
+    if !host.state_mut().transfer(&caller, &to, &shape.value)? {
+        // Unreachable: the balance was checked above.
+        return delegate();
+    }
+    // EIP-7708: the transfer's log, as `execute_call_message` emits it.
+    if host.version().feature(evm2::EvmFeatures::EIP7708)
+        && host.logs_observed()
+        && let Some(log) = eip7708_transfer_log(caller, to, shape.value)
+    {
+        host.log(log);
+    }
+    // What `execute_call_message` returns for an account without code: the
+    // frame starts with what the runtime phase left.
+    let mut result = MessageResultExt {
+        stop: InstrStop::Stop,
+        gas: GasTracker::new_with_execution_gas_and_reservoir(tx_gas.remaining(), tx_gas.reservoir()),
+        ..MessageResultExt::default()
+    };
+    ethereum::settle_initial_frame_gas(&mut tx_gas, &mut result, charged_state_gas);
+    let settled = <DefaultTxHandlerHooks as TxHandlerHooks<T>>::settle_transaction(
+        host,
+        envelope,
+        GasSettlement {
+            caller,
+            gas_price: shape.gas_price,
+            gas_limit: shape.gas_limit,
+            floor_gas,
+            initial_state_gas: 0,
+            state_refund: 0,
+            result,
+        },
+    )?;
+    HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    TAKEN.with(|taken| taken.set(taken.get() + 1));
+    Ok(Some(settled))
 }
 
-impl<DB, I> Evm for N42Evm<DB, I>
-where
-    DB: Database,
-    I: Inspector<EthEvmContext<DB>>,
-{
-    type DB = DB;
-    type Tx = TxEnv;
-    type Error = EVMError<DB::Error>;
-    type HaltReason = HaltReason;
-    type Spec = SpecId;
-    type BlockEnv = BlockEnv;
-    type Precompiles = PrecompilesMap;
-    type Inspector = I;
-
-    fn block(&self) -> &BlockEnv {
-        self.inner.block()
+/// EIP-7708's log for `value` moved from `from` to `to` (evm2's
+/// `eip7708_transfer_log`): none for a zero value or a self-transfer.
+pub fn eip7708_transfer_log(from: Address, to: Address, value: U256) -> Option<alloy_primitives::Log> {
+    if value.is_zero() || from == to {
+        return None;
     }
-
-    fn cfg_env(&self) -> &CfgEnv<SpecId> {
-        self.inner.cfg_env()
-    }
-
-    fn chain_id(&self) -> u64 {
-        self.inner.chain_id()
-    }
-
-    fn transact_raw(&mut self, tx: TxEnv) -> Result<ResultAndState, Self::Error> {
-        // EVMs can be interleaved or execute on a different thread from construction.
-        crate::precompile_random::set_block_randomness(
-            self.inner.block().prevrandao.unwrap_or_default(),
-        );
-        if self.fast && self.inspecting {
-            self.stats.rejected[11] += 1;
-        }
-        if self.fast
-            && !self.inspecting
-            && let Some(done) = self.transfer(&tx).map_err(EVMError::Database)?
-        {
-            self.stats.hits += 1;
-            return Ok(done);
-        }
-        self.inner.transact_raw(tx)
-    }
-
-    fn transact_system_call(
-        &mut self,
-        caller: Address,
-        contract: Address,
-        data: Bytes,
-    ) -> Result<ResultAndState, Self::Error> {
-        crate::precompile_random::set_block_randomness(
-            self.inner.block().prevrandao.unwrap_or_default(),
-        );
-        self.inner.transact_system_call(caller, contract, data)
-    }
-
-    fn finish(self) -> (DB, EvmEnv<SpecId, BlockEnv>) {
-        self.inner.finish()
-    }
-
-    fn set_inspector_enabled(&mut self, enabled: bool) {
-        self.inspecting = enabled;
-        self.inner.set_inspector_enabled(enabled);
-    }
-
-    fn components(&self) -> (&DB, &I, &PrecompilesMap) {
-        self.inner.components()
-    }
-
-    fn components_mut(&mut self) -> (&mut DB, &mut I, &mut PrecompilesMap) {
-        self.inner.components_mut()
-    }
+    let topics = vec![
+        evm2::constants::EIP7708_TRANSFER_TOPIC,
+        alloy_primitives::B256::left_padding_from(from.as_slice()),
+        alloy_primitives::B256::left_padding_from(to.as_slice()),
+    ];
+    Some(alloy_primitives::Log {
+        address: evm2::evm::SYSTEM_ADDRESS,
+        data: alloy_primitives::LogData::new_unchecked(topics, Bytes::copy_from_slice(&value.to_be_bytes::<32>())),
+    })
 }
+
 
 #[cfg(test)]
 mod tests {
-    //! The transfer path against the interpreter: same result, same accounts.
+    //! The handler against the stock handlers: the same result, the same
+    //! change stream, the same block.
     use super::*;
-    use alloy_evm::EvmFactory;
-    use alloy_primitives::{B256, TxKind, address};
-    use revm::{
-        Database as _, DatabaseCommit,
-        database::{CacheDB, EmptyDB},
-        state::AccountInfo,
+    use crate::{N42EvmConfig, N42EvmFactory};
+    use alloy_consensus::{BlockBody, Header};
+    use alloy_eips::eip2930::{AccessList, AccessListItem};
+    use alloy_primitives::{B256, Signature};
+    use evm2::{
+        bytecode::Bytecode,
+        evm::{AccountInfo, CacheDB, EmptyDB},
     };
+    use reth_chainspec::{ChainSpec, ChainSpecBuilder};
+    use reth_evm::{ConfigureEvm, EvmEnv as _, EvmEnvFor};
+    use reth_primitives_traits::Recovered;
+    use std::sync::Arc;
 
-    const SENDER: Address = address!("0x1000000000000000000000000000000000000001");
-    const RECIPIENT: Address = address!("0x2000000000000000000000000000000000000002");
-    const EXISTING: Address = address!("0x3000000000000000000000000000000000000003");
-    const COINBASE: Address = address!("0x4000000000000000000000000000000000000004");
-    const BASEFEE: u64 = 1_000;
+    const FUND: u64 = 1_000_000_000_000_000_000;
+    const BENEFICIARY: u64 = 0xbe;
+    const CONTRACT: u64 = 0xc0de;
+    const FRESH: u64 = 0xf00d;
+    const BASEFEE: u64 = 7;
 
-    fn env() -> EvmEnv {
-        let mut cfg = CfgEnv::new_with_spec(SpecId::OSAKA);
-        cfg.chain_id = 1;
-        let block = BlockEnv {
-            beneficiary: COINBASE,
-            basefee: BASEFEE,
-            gas_limit: 30_000_000,
-            ..Default::default()
-        };
-        EvmEnv::new(cfg, block)
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Fork {
+        Shanghai,
+        Cancun,
+        Prague,
+        Osaka,
+        Amsterdam,
     }
 
-    fn db() -> CacheDB<EmptyDB> {
+    fn addr(i: u64) -> Address {
+        Address::left_padding_from(&(0x1_0000 + i).to_be_bytes())
+    }
+
+    fn chain(fork: Fork) -> Arc<ChainSpec> {
+        let builder = ChainSpecBuilder::mainnet();
+        Arc::new(
+            match fork {
+                Fork::Shanghai => builder.shanghai_activated(),
+                Fork::Cancun => builder.cancun_activated(),
+                Fork::Prague => builder.prague_activated(),
+                Fork::Osaka => builder.osaka_activated(),
+                Fork::Amsterdam => builder.amsterdam_activated(),
+            }
+            .build(),
+        )
+    }
+
+    fn config(fork: Fork, fast: bool) -> N42EvmConfig {
+        N42EvmConfig::with_evm_factory(chain(fork), N42EvmFactory::with_fast_transfers(fast))
+    }
+
+    fn parent() -> CacheDB<EmptyDB> {
         let mut db = CacheDB::new(EmptyDB::default());
+        for i in 1..=8 {
+            db.insert_account_info(&addr(i), AccountInfo::empty().with_balance(U256::from(FUND)));
+        }
+        // A poor sender: the fee, not the value.
         db.insert_account_info(
-            SENDER,
-            AccountInfo {
-                balance: U256::from(10u128.pow(20)),
-                nonce: 7,
-                ..Default::default()
-            },
+            &addr(9),
+            AccountInfo::empty().with_balance(U256::from(21_000u64 * 100)),
         );
         db.insert_account_info(
-            EXISTING,
-            AccountInfo {
-                balance: U256::from(5),
-                nonce: 3,
-                ..Default::default()
-            },
+            &addr(BENEFICIARY),
+            AccountInfo::empty().with_balance(U256::from(1u64)),
         );
+        // PUSH1 1 PUSH1 0 SSTORE STOP: writes storage when called.
+        let code = Bytes::from_static(&[0x60, 0x01, 0x60, 0x00, 0x55, 0x00]);
         db.insert_account_info(
-            COINBASE,
-            AccountInfo {
-                balance: U256::from(1),
-                ..Default::default()
-            },
+            &addr(CONTRACT),
+            AccountInfo::new(
+                U256::ZERO,
+                1,
+                alloy_primitives::keccak256(&code),
+                Some(Bytecode::new_raw(code)),
+            ),
         );
         db
     }
 
-    fn tx(to: Address, value: u128, tx_type: u8, gas_price: u128, tip: Option<u128>) -> TxEnv {
-        TxEnv {
-            tx_type,
-            caller: SENDER,
-            gas_limit: 50_000,
-            gas_price,
-            gas_priority_fee: tip,
-            kind: TxKind::Call(to),
-            value: U256::from(value),
-            data: Bytes::new(),
-            nonce: 7,
-            chain_id: Some(1),
+    fn header() -> Header {
+        Header {
+            number: 5,
+            timestamp: 1_000,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(BASEFEE),
+            beneficiary: addr(BENEFICIARY),
+            mix_hash: B256::repeat_byte(0x67),
+            excess_blob_gas: Some(0),
+            blob_gas_used: Some(0),
+            parent_beacon_block_root: Some(B256::ZERO),
             ..Default::default()
         }
     }
 
-    #[test]
-    fn randomness_is_bound_to_the_executing_evm_not_the_last_constructed_one() {
-        let first_random = B256::repeat_byte(0xA1);
-        let second_random = B256::repeat_byte(0xB2);
-        let target = Address::from(crate::precompile_random::RANDOMNESS_ADDRESS);
-        for fast in [false, true] {
-            let factory = N42EvmFactory::with_fast_transfers(fast);
-            let mut first_env = env();
-            first_env.block_env.prevrandao = Some(first_random);
-            let mut second_env = env();
-            second_env.block_env.prevrandao = Some(second_random);
-            let mut first = factory.create_evm(db(), first_env);
-            let _second = factory.create_evm(db(), second_env);
-            let out = first
-                .transact_raw(tx(target, 0, 0, BASEFEE as u128, None))
-                .unwrap();
-            assert!(out.result.is_success());
-            assert_eq!(
-                out.result.output().unwrap().as_ref(),
-                alloy_primitives::keccak256(first_random).as_slice()
-            );
-        }
+    fn env(config: &N42EvmConfig) -> EvmEnvFor<N42EvmConfig> {
+        config.evm_env(&header()).expect("env")
     }
 
-    #[test]
-    fn absent_randomness_cannot_inherit_a_previous_blocks_value() {
-        let mut environment = env();
-        environment.block_env.prevrandao = None;
-        let factory = N42EvmFactory::with_fast_transfers(false);
-        let mut evm = factory.create_evm(db(), environment);
-        crate::precompile_random::set_block_randomness(B256::repeat_byte(0xCC));
-        // The system-call path also rebinds the executing environment.
-        let out = evm
-            .transact_system_call(
-                SENDER,
-                Address::from(crate::precompile_random::RANDOMNESS_ADDRESS),
-                Bytes::new(),
-            )
-            .unwrap();
-        assert_eq!(
-            out.result.output().unwrap().as_ref(),
-            alloy_primitives::keccak256(B256::ZERO).as_slice()
-        );
-    }
+    type Tx = Recovered<TxEnvelope>;
+    type Env = EvmEnvFor<N42EvmConfig>;
+    type Relax = fn(Env) -> Env;
 
-    /// Runs `tx` on both paths from the same pre-state; returns (fast, slow),
-    /// each as the result and the committed accounts of the three parties.
-    fn both(tx: TxEnv) -> Vec<(ResultAndState, Vec<Option<AccountInfo>>)> {
-        [true, false]
-            .into_iter()
-            .map(|fast| {
-                let mut evm = N42EvmFactory::with_fast_transfers(fast).create_evm(db(), env());
-                let out = evm
-                    .transact_raw(tx.clone())
-                    .expect("the transaction executes");
-                let (mut db, _) = evm.finish();
-                db.commit(out.state.clone());
-                let infos = [SENDER, RECIPIENT, EXISTING, COINBASE]
-                    .into_iter()
-                    .map(|a| {
-                        db.basic(a)
-                            .expect("cache")
-                            .map(|i| AccountInfo { code: None, ..i })
-                    })
-                    .collect();
-                (out, infos)
-            })
-            .collect()
-    }
-
-    fn assert_same(tx: TxEnv, expect_fast: bool) {
-        let runs = both(tx.clone());
-        let (fast, slow) = (&runs[0], &runs[1]);
-        assert_eq!(fast.0.result, slow.0.result, "result");
-        assert_eq!(fast.1, slow.1, "committed accounts");
-        // The accounts the path hands back: only the touched ones, and for
-        // those the same info and the same existence flag as the journal's.
-        for (address, account) in &fast.0.state {
-            let theirs = slow
-                .0
-                .state
-                .get(address)
-                .expect("the interpreter loaded it too");
-            assert_eq!(account.info, theirs.info, "info of {address}");
-            assert_eq!(
-                account.is_touched(),
-                theirs.is_touched(),
-                "touched {address}"
-            );
-            assert_eq!(
-                account.is_loaded_as_not_existing(),
-                theirs.is_loaded_as_not_existing(),
-                "not-existing flag {address}"
-            );
-        }
-        let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(db(), env());
-        assert_eq!(
-            evm.transfer(&tx).expect("no database error").is_some(),
-            expect_fast,
-            "the path taken"
-        );
-    }
-
-    /// The two paths through revm's `State`, the layer the node persists
-    /// from: the bundle (accounts, their statuses, the reverts) must be the
-    /// same, or the block written to the database is not.
-    fn bundles(tx: TxEnv) -> Vec<revm::database::BundleState> {
-        use revm::database::{State, states::bundle_state::BundleRetention};
-        [true, false]
-            .into_iter()
-            .map(|fast| {
-                let mut state = State::builder()
-                    .with_database(db())
-                    .with_bundle_update()
-                    .build();
-                {
-                    let mut evm =
-                        N42EvmFactory::with_fast_transfers(fast).create_evm(&mut state, env());
-                    let out = evm
-                        .transact_raw(tx.clone())
-                        .expect("the transaction executes");
-                    evm.db_mut().commit(out.state);
-                }
-                state.merge_transitions(BundleRetention::Reverts);
-                state.take_bundle()
-            })
-            .collect()
-    }
-
-    fn assert_same_bundle(tx: TxEnv) {
-        let b = bundles(tx);
-        let (fast, slow) = (&b[0], &b[1]);
-        assert_eq!(fast.state.len(), slow.state.len(), "accounts in the bundle");
-        for (address, account) in &slow.state {
-            let ours = fast.state.get(address).expect("account in our bundle");
-            assert_eq!(ours.info, account.info, "info {address}");
-            assert_eq!(
-                ours.original_info, account.original_info,
-                "original info {address}"
-            );
-            assert_eq!(ours.status, account.status, "status {address}");
-            assert_eq!(ours.storage, account.storage, "storage {address}");
-        }
-        assert_eq!(fast.reverts, slow.reverts, "reverts");
-        assert_eq!(fast.contracts.len(), slow.contracts.len(), "contracts");
-    }
-
-    #[test]
-    fn bundle_of_a_transfer_to_a_new_account() {
-        assert_same_bundle(tx(RECIPIENT, 12_345, 2, 5_000, Some(300)));
-    }
-
-    #[test]
-    fn bundle_of_a_transfer_to_an_existing_account() {
-        assert_same_bundle(tx(EXISTING, 1, 2, 5_000, Some(300)));
-    }
-
-    #[test]
-    fn bundle_of_two_transfers_in_one_block() {
-        use revm::database::{State, states::bundle_state::BundleRetention};
-        let b: Vec<revm::database::BundleState> = [true, false]
-            .into_iter()
-            .map(|fast| {
-                let mut state = State::builder()
-                    .with_database(db())
-                    .with_bundle_update()
-                    .build();
-                {
-                    let mut evm =
-                        N42EvmFactory::with_fast_transfers(fast).create_evm(&mut state, env());
-                    for (nonce, to) in [(7u64, RECIPIENT), (8u64, RECIPIENT)] {
-                        let mut t = tx(to, 5, 2, 5_000, Some(300));
-                        t.nonce = nonce;
-                        let out = evm.transact_raw(t).expect("executes");
-                        evm.db_mut().commit(out.state);
-                    }
-                }
-                state.merge_transitions(BundleRetention::Reverts);
-                state.take_bundle()
-            })
-            .collect();
-        assert_eq!(b[0].state.len(), b[1].state.len());
-        for (address, account) in &b[1].state {
-            let ours = &b[0].state[address];
-            assert_eq!(
-                (&ours.info, &ours.original_info, ours.status),
-                (&account.info, &account.original_info, account.status),
-                "{address}"
-            );
-        }
-        assert_eq!(b[0].reverts, b[1].reverts, "reverts");
-    }
-
-    #[test]
-    fn eip1559_transfer_to_a_new_account() {
-        assert_same(tx(RECIPIENT, 12_345, 2, 5_000, Some(300)), true);
-    }
-
-    #[test]
-    fn eip1559_transfer_to_an_existing_account() {
-        assert_same(tx(EXISTING, 1, 2, 5_000, Some(300)), true);
-    }
-
-    #[test]
-    fn tip_capped_by_the_max_fee() {
-        assert_same(tx(EXISTING, 1, 2, 1_100, Some(300)), true);
-    }
-
-    #[test]
-    fn legacy_transfer() {
-        assert_same(tx(EXISTING, 99, 0, 2_000, None), true);
-    }
-
-    #[test]
-    fn zero_value_to_a_new_account_goes_to_the_interpreter() {
-        assert_same(tx(RECIPIENT, 0, 2, 5_000, Some(300)), false);
-    }
-
-    #[test]
-    fn a_transfer_to_self_goes_to_the_interpreter() {
-        assert_same(tx(SENDER, 1, 2, 5_000, Some(300)), false);
-    }
-
-    #[test]
-    fn a_wrong_nonce_goes_to_the_interpreter() {
-        let mut t = tx(EXISTING, 1, 2, 5_000, Some(300));
-        t.nonce = 8;
-        let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(db(), env());
-        assert!(evm.transact_raw(t).is_err(), "the interpreter rejects it");
-    }
-
-    fn compare_case(database: CacheDB<EmptyDB>, environment: EvmEnv, tx: TxEnv, hit: bool) {
-        use revm::database::{State, states::bundle_state::BundleRetention};
-        let run = |enabled| {
-            let mut state = State::builder()
-                .with_database(database.clone())
-                .with_bundle_update()
-                .build();
-            let (result, hits) = {
-                let mut evm = N42EvmFactory::with_fast_transfers(enabled)
-                    .create_evm(&mut state, environment.clone());
-                let result = evm.transact_raw(tx.clone()).map(|out| {
-                    let result = out.result;
-                    evm.db_mut().commit(out.state);
-                    result
-                });
-                (result, evm.fast_transfer_hits())
-            };
-            state.merge_transitions(BundleRetention::Reverts);
-            (result, state.take_bundle(), hits)
+    fn eip1559(from: u64, nonce: u64, to: Address, value: u64, gas_limit: u64, input: Bytes) -> Tx {
+        let tx = TxEip1559 {
+            chain_id: 1,
+            nonce,
+            gas_limit,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 3,
+            to: TxKind::Call(to),
+            value: U256::from(value),
+            input,
+            ..Default::default()
         };
-        let (fast, fast_bundle, hits) = run(true);
-        let (slow, slow_bundle, slow_hits) = run(false);
-        assert_eq!(hits, u64::from(hit), "incorrect path for {tx:?}");
-        assert_eq!(slow_hits, 0);
-        assert_eq!(fast, slow, "result or validation error differs for {tx:?}");
-        assert_eq!(
-            fast_bundle, slow_bundle,
-            "persisted bundle differs for {tx:?}"
-        );
+        Recovered::new_unchecked(TxEnvelope::Eip1559(tx), addr(from))
     }
 
-    #[test]
-    fn supported_forks_and_transaction_types_match_complete_bundles() {
-        for spec in [SpecId::CANCUN, SpecId::PRAGUE, SpecId::OSAKA] {
-            let mut environment = env();
-            environment.cfg_env.set_spec_and_mainnet_gas_params(spec);
-            for tx_type in 0..=2 {
-                for to in [RECIPIENT, EXISTING] {
-                    for value in [0, 1, 12_345] {
-                        let tip = (tx_type == 2).then_some(300);
-                        compare_case(
-                            db(),
-                            environment.clone(),
-                            tx(to, value, tx_type, 5_000, tip),
-                            to != RECIPIENT || value != 0,
-                        );
-                    }
-                }
+    fn transfer(from: u64, to: Address, value: u64) -> Tx {
+        eip1559(from, 0, to, value, 21_000, Bytes::new())
+    }
+
+    /// [`transfer`] with `change` applied to the transaction.
+    fn changed(from: u64, change: impl FnOnce(&mut TxEip1559)) -> Tx {
+        let mut tx = transfer(from, addr(2), 1);
+        let TxEnvelope::Eip1559(inner) = tx.inner_mut() else {
+            unreachable!()
+        };
+        change(inner);
+        tx
+    }
+
+    fn legacy(from: u64, to: Address, value: u64, gas_price: u128) -> Tx {
+        let tx = TxLegacy {
+            chain_id: Some(1),
+            nonce: 0,
+            gas_price,
+            gas_limit: 21_000,
+            to: TxKind::Call(to),
+            value: U256::from(value),
+            input: Bytes::new(),
+        };
+        Recovered::new_unchecked(TxEnvelope::Legacy(tx), addr(from))
+    }
+
+    fn eip2930(from: u64, to: Address, value: u64, access_list: AccessList) -> Tx {
+        let tx = TxEip2930 {
+            chain_id: 1,
+            nonce: 0,
+            gas_price: 50,
+            gas_limit: 40_000,
+            to: TxKind::Call(to),
+            value: U256::from(value),
+            access_list,
+            input: Bytes::new(),
+        };
+        Recovered::new_unchecked(TxEnvelope::Eip2930(tx), addr(from))
+    }
+
+    /// The transaction's outcome on one EVM over `db`: the result (or the
+    /// error), the change stream, each account's changes in address order,
+    /// as text, and whether the handler completed it.
+    fn outcome_in(
+        config: &N42EvmConfig,
+        db: CacheDB<EmptyDB>,
+        env: EvmEnvFor<N42EvmConfig>,
+        tx: &Tx,
+    ) -> ((String, Vec<String>), bool) {
+        let before = TAKEN.with(std::cell::Cell::get);
+        let mut evm = config.evm_with_env(db, env);
+        let outcome = match reth_evm::Evm::transact(&mut evm, tx) {
+            Ok(out) => {
+                let mut changes: Vec<String> = out
+                    .pending_state
+                    .changes()
+                    .account_changes()
+                    .map(|c| format!("{c:?}"))
+                    .collect();
+                changes.sort();
+                (format!("{:?}", out.result), changes)
+            }
+            Err(err) => (format!("error: {err}"), Vec::new()),
+        };
+        (outcome, TAKEN.with(std::cell::Cell::get) > before)
+    }
+
+    fn outcome(fork: Fork, fast: bool, tx: &Tx) -> ((String, Vec<String>), bool) {
+        let config = config(fork, fast);
+        let env = env(&config);
+        outcome_in(&config, parent(), env, tx)
+    }
+
+    /// Each transaction on the stock handlers and on the fast one: the same
+    /// result (gas, refund, status, output, logs) or the same error, and the
+    /// same change stream (balances, nonces, touched and created accounts);
+    /// `fast` says whether the handler takes it rather than handing it on.
+    fn check(forks: &[Fork], cases: &[(&str, Tx, bool)]) {
+        for fork in forks {
+            for (name, tx, fast) in cases {
+                let (stock, stock_taken) = outcome(*fork, false, tx);
+                let (ours, taken) = outcome(*fork, true, tx);
+                assert_eq!(ours, stock, "{name} ({fork:?})");
+                assert!(!stock_taken);
+                assert_eq!(taken, *fast, "the path of {name} ({fork:?})");
             }
         }
     }
 
-    #[test]
-    fn malformed_transactions_preserve_interpreter_errors() {
-        let good = tx(EXISTING, 1, 2, 5_000, Some(300));
-        let mut cases = Vec::new();
-        for nonce in [6, 8, u64::MAX] {
-            cases.push(TxEnv {
-                nonce,
-                ..good.clone()
-            });
-        }
-        for chain_id in [None, Some(2)] {
-            cases.push(TxEnv {
-                chain_id,
-                ..good.clone()
-            });
-        }
-        for gas_limit in [20_999, 30_000_001, u64::MAX] {
-            cases.push(TxEnv {
-                gas_limit,
-                ..good.clone()
-            });
-        }
-        cases.push(TxEnv {
-            gas_price: 999,
-            ..good.clone()
-        });
-        cases.push(TxEnv {
-            gas_priority_fee: Some(5_001),
-            ..good.clone()
-        });
-        cases.push(TxEnv {
-            value: U256::MAX,
-            ..good.clone()
-        });
-        for transaction in cases {
-            compare_case(db(), env(), transaction, false);
-        }
-    }
+    const BEFORE_AMSTERDAM: [Fork; 3] = [Fork::Cancun, Fork::Prague, Fork::Osaka];
 
     #[test]
-    fn environment_overrides_and_missing_header_fields_fall_back() {
-        let good = tx(EXISTING, 1, 2, 5_000, Some(300));
-        let mut cases = Vec::new();
-        let mut missing_randomness = env();
-        missing_randomness.block_env.prevrandao = None;
-        cases.push(missing_randomness);
-        let mut missing_blob_price = env();
-        missing_blob_price.block_env.blob_excess_gas_and_price = None;
-        cases.push(missing_blob_price);
-        let mut wrong_gas_schedule = env();
-        wrong_gas_schedule.cfg_env.gas_params =
-            revm::context_interface::cfg::GasParams::new_spec(SpecId::FRONTIER);
-        cases.push(wrong_gas_schedule);
-        let mut no_nonce_check = env();
-        no_nonce_check.cfg_env.disable_nonce_check = true;
-        cases.push(no_nonce_check);
-        let mut experimental_state_gas = env();
-        experimental_state_gas.cfg_env.enable_amsterdam_eip8037 = true;
-        cases.push(experimental_state_gas);
-        let mut experimental_intrinsic_gas = env();
-        experimental_intrinsic_gas.cfg_env.enable_amsterdam_eip2780 = true;
-        cases.push(experimental_intrinsic_gas);
-        for spec in [SpecId::SHANGHAI, SpecId::AMSTERDAM] {
-            let mut environment = env();
-            environment.cfg_env.set_spec_and_mainnet_gas_params(spec);
-            cases.push(environment);
-        }
-        for environment in cases {
-            compare_case(db(), environment, good.clone(), false);
-        }
-    }
-
-    #[test]
-    fn account_edge_cases_fall_back_without_changing_results() {
-        let good = tx(EXISTING, 1, 2, 5_000, Some(300));
-        for (address, info) in [
-            (
-                SENDER,
-                AccountInfo {
-                    nonce: 7,
-                    balance: U256::from(1),
-                    ..Default::default()
-                },
-            ),
-            (
-                SENDER,
-                AccountInfo {
-                    nonce: u64::MAX,
-                    balance: U256::MAX,
-                    ..Default::default()
-                },
-            ),
-            (
-                EXISTING,
-                AccountInfo {
-                    balance: U256::MAX,
-                    ..Default::default()
-                },
-            ),
-            (COINBASE, AccountInfo::default()),
-            (
-                COINBASE,
-                AccountInfo {
-                    balance: U256::MAX,
-                    ..Default::default()
-                },
-            ),
-        ] {
-            let mut database = db();
-            database.insert_account_info(address, info);
-            compare_case(database, env(), good.clone(), false);
-        }
-        for to in [SENDER, COINBASE] {
-            compare_case(db(), env(), tx(to, 1, 2, 5_000, Some(300)), false);
-        }
-        let mut environment = env();
-        environment.block_env.beneficiary = SENDER;
-        compare_case(db(), environment, good, false);
-    }
-
-    #[test]
-    fn n42_randomness_precompile_is_preserved_even_with_empty_calldata() {
-        let to = Address::from(crate::precompile_random::RANDOMNESS_ADDRESS);
-        let mut environment = env();
-        let randomness = alloy_primitives::B256::repeat_byte(0x67);
-        environment.block_env.prevrandao = Some(randomness);
-        let transaction = tx(to, 1, 2, 5_000, Some(300));
-        compare_case(db(), environment.clone(), transaction.clone(), false);
-        let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(db(), environment);
-        let result = evm.transact_raw(transaction).unwrap();
-        assert_eq!(
-            result.result.output().unwrap().as_ref(),
-            alloy_primitives::keccak256(randomness).as_slice()
-        );
-        assert_eq!(evm.fast_transfer_hits(), 0);
-    }
-
-    #[test]
-    fn dynamically_installed_high_address_precompile_is_never_treated_as_eoa() {
-        use revm::precompile::{PrecompileFn, PrecompileId};
-        let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm(db(), env());
-        evm.precompiles_mut().apply_precompile(&RECIPIENT, |_| {
-            Some(
+    fn qualifying_transfers_equal_the_stock_handler() {
+        check(
+            &BEFORE_AMSTERDAM,
+            &[
+                ("1559 to an existing account", transfer(1, addr(2), 100), true),
+                ("1559 creating its recipient", transfer(1, addr(FRESH), 100), true),
                 (
-                    PrecompileId::custom("test-high-address"),
-                    crate::precompile_random::revm_precompile_fn as PrecompileFn,
-                )
-                    .into(),
-            )
-        });
-        let result = evm
-            .transact_raw(tx(RECIPIENT, 1, 2, 5_000, Some(300)))
-            .unwrap();
-        assert_eq!(evm.fast_transfer_hits(), 0);
-        assert_eq!(result.result.output().unwrap().len(), 32);
+                    "1559 over the intrinsic gas",
+                    eip1559(1, 0, addr(2), 100, 30_000, Bytes::new()),
+                    true,
+                ),
+                (
+                    "1559 with its tip capped by the fee cap",
+                    changed(1, |tx| tx.max_fee_per_gas = 8),
+                    true,
+                ),
+                ("legacy", legacy(2, addr(3), 7, 50), true),
+                (
+                    "2930 with an empty access list",
+                    eip2930(3, addr(4), 9, AccessList::default()),
+                    true,
+                ),
+                ("zero value to an existing account", transfer(4, addr(5), 0), true),
+                (
+                    "legacy at the base fee: a zero tip to the beneficiary",
+                    legacy(2, addr(3), 7, BASEFEE as u128),
+                    true,
+                ),
+            ],
+        );
     }
 
     #[test]
-    fn inspector_creation_and_toggling_keep_interpreter_observable() {
-        use revm::inspector::NoOpInspector;
-        let mut evm = N42EvmFactory::with_fast_transfers(true).create_evm_with_inspector(
-            db(),
-            env(),
-            NoOpInspector,
+    fn everything_else_is_handed_to_the_stock_handler_unchanged() {
+        let access_list = AccessList(vec![AccessListItem {
+            address: addr(6),
+            storage_keys: vec![B256::ZERO],
+        }]);
+        let randomness = Address::from(crate::precompile_random::RANDOMNESS_ADDRESS);
+        check(
+            &BEFORE_AMSTERDAM,
+            &[
+                ("zero value to an empty account", transfer(1, addr(FRESH), 0), false),
+                (
+                    "to a contract",
+                    eip1559(1, 0, addr(CONTRACT), 1, 100_000, Bytes::new()),
+                    false,
+                ),
+                (
+                    "to a precompile",
+                    eip1559(1, 0, Address::with_last_byte(4), 1, 30_000, Bytes::new()),
+                    false,
+                ),
+                (
+                    "to the randomness precompile",
+                    eip1559(1, 0, randomness, 1, 30_000, Bytes::new()),
+                    false,
+                ),
+                ("to itself", transfer(2, addr(2), 5), false),
+                ("to the beneficiary", transfer(3, addr(BENEFICIARY), 5), false),
+                (
+                    "with input",
+                    eip1559(4, 0, addr(5), 1, 30_000, Bytes::from_static(&[1, 2])),
+                    false,
+                ),
+                ("2930 with an access list", eip2930(5, addr(6), 1, access_list), false),
+                ("value the sender lacks after the fee", transfer(9, addr(2), 1), false),
+            ],
         );
-        let transaction = tx(EXISTING, 1, 2, 5_000, Some(300));
-        assert!(
-            evm.transact_raw(transaction.clone())
-                .unwrap()
-                .result
-                .is_success()
-        );
-        assert_eq!(evm.fast_transfer_hits(), 0);
-        evm.set_inspector_enabled(false);
-        assert!(
-            evm.transact_raw(transaction.clone())
-                .unwrap()
-                .result
-                .is_success()
-        );
-        assert_eq!(evm.fast_transfer_hits(), 1);
-        evm.set_inspector_enabled(true);
-        assert!(evm.transact_raw(transaction).unwrap().result.is_success());
-        assert_eq!(evm.fast_transfer_hits(), 1);
     }
 
     #[test]
-    fn mixed_fast_and_contract_transactions_preserve_storage_and_reverts() {
-        use revm::{
-            bytecode::Bytecode,
-            database::{State, states::bundle_state::BundleRetention},
-        };
-        let contract = address!("5000000000000000000000000000000000000005");
-        // SSTORE(0, 1), STOP. Both paths must use the interpreter for this account.
-        let code = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x01, 0x60, 0x00, 0x55, 0x00]));
-        let mut database = db();
-        database.insert_account_info(
-            contract,
-            AccountInfo {
-                code_hash: code.hash_slow(),
-                code: Some(code),
-                ..Default::default()
-            },
-        );
-        let run = |enabled| {
-            let mut state = State::builder()
-                .with_database(database.clone())
-                .with_bundle_update()
-                .build();
-            let (results, hits) = {
-                let mut evm =
-                    N42EvmFactory::with_fast_transfers(enabled).create_evm(&mut state, env());
-                let mut results = Vec::new();
-                for (offset, to) in [RECIPIENT, contract, EXISTING, contract, RECIPIENT]
-                    .into_iter()
-                    .enumerate()
-                {
-                    let mut transaction = tx(to, 1, 2, 5_000, Some(300));
-                    transaction.nonce += offset as u64;
-                    let out = evm.transact_raw(transaction).unwrap();
-                    assert!(out.result.is_success());
-                    results.push(out.result);
-                    evm.db_mut().commit(out.state);
+    fn invalid_transactions_keep_the_stock_errors() {
+        let cases = [
+            ("a nonce ahead", changed(6, |tx| tx.nonce = 3)),
+            ("a nonce at its maximum", changed(6, |tx| tx.nonce = u64::MAX)),
+            ("another chain", changed(6, |tx| tx.chain_id = 2)),
+            ("an intrinsic gas too low", changed(7, |tx| tx.gas_limit = 20_999)),
+            ("a gas limit over the block's", changed(7, |tx| tx.gas_limit = 30_000_001)),
+            ("a gas limit of u64::MAX", changed(7, |tx| tx.gas_limit = u64::MAX)),
+            ("a fee cap under the base fee", changed(7, |tx| tx.max_fee_per_gas = 6)),
+            (
+                "a priority fee over the fee cap",
+                changed(7, |tx| tx.max_priority_fee_per_gas = 101),
+            ),
+            ("a value of U256::MAX", changed(7, |tx| tx.value = U256::MAX)),
+            ("a sender without funds", transfer(FRESH, addr(2), 1)),
+        ];
+        for fork in BEFORE_AMSTERDAM {
+            for (name, tx) in &cases {
+                let (stock, _) = outcome(fork, false, tx);
+                let (ours, taken) = outcome(fork, true, tx);
+                assert!(stock.0.starts_with("error: "), "{name}: {}", stock.0);
+                assert_eq!(ours, stock, "{name} ({fork:?})");
+                assert!(!taken, "{name} ({fork:?})");
+            }
+        }
+    }
+
+    /// Accounts and environments at their edges: whichever path takes the
+    /// transaction, the outcome is the stock one.
+    #[test]
+    fn account_and_environment_edges_equal_the_stock_handler() {
+        let tx = transfer(1, addr(2), 1);
+        let at_basefee = legacy(1, addr(2), 1, BASEFEE as u128);
+        let rich = AccountInfo::empty().with_balance(U256::MAX);
+        let mut sender_at_last_nonce = AccountInfo::empty().with_balance(U256::from(FUND));
+        sender_at_last_nonce.nonce = u64::MAX - 1;
+        let accounts: [(&str, Address, Option<AccountInfo>, &Tx); 5] = [
+            ("a recipient at the largest balance", addr(2), Some(rich.clone()), &tx),
+            ("a beneficiary at the largest balance", addr(BENEFICIARY), Some(rich), &tx),
+            ("an empty beneficiary paid a tip", addr(BENEFICIARY), Some(AccountInfo::empty()), &tx),
+            (
+                "an empty beneficiary paid no tip",
+                addr(BENEFICIARY),
+                Some(AccountInfo::empty()),
+                &at_basefee,
+            ),
+            ("a sender one nonce from the end", addr(1), Some(sender_at_last_nonce), &tx),
+        ];
+        for fork in BEFORE_AMSTERDAM {
+            for (name, address, info, tx) in &accounts {
+                let run = |fast| {
+                    let config = config(fork, fast);
+                    let mut db = parent();
+                    if let Some(info) = info {
+                        db.insert_account_info(address, info.clone());
+                    }
+                    let env = env(&config);
+                    outcome_in(&config, db, env, tx).0
+                };
+                assert_eq!(run(true), run(false), "{name} ({fork:?})");
+            }
+            let relaxed: [(&str, Relax); 2] = [
+                ("no nonce check", |env| env.with_nonce_check_disabled()),
+                ("no balance check", |env| env.with_balance_check_disabled()),
+            ];
+            for (name, relax) in relaxed {
+                for tx in [&tx, &changed(6, |tx| tx.nonce = 3), &transfer(9, addr(2), 1)] {
+                    let run = |fast| {
+                        let config = config(fork, fast);
+                        let env = relax(env(&config));
+                        outcome_in(&config, parent(), env, tx).0
+                    };
+                    assert_eq!(run(true), run(false), "{name} ({fork:?})");
                 }
-                (results, evm.fast_transfer_hits())
+            }
+            // The sender is the beneficiary.
+            let run = |fast| {
+                let config = config(fork, fast);
+                let mut db = parent();
+                db.insert_account_info(
+                    &addr(BENEFICIARY),
+                    AccountInfo::empty().with_balance(U256::from(FUND)),
+                );
+                let env = env(&config);
+                outcome_in(&config, db, env, &transfer(BENEFICIARY, addr(2), 1))
             };
-            state.merge_transitions(BundleRetention::Reverts);
-            (results, state.take_bundle(), hits)
-        };
-        let (fast_results, fast_bundle, hits) = run(true);
-        let (slow_results, slow_bundle, slow_hits) = run(false);
-        assert_eq!(hits, 3);
-        assert_eq!(slow_hits, 0);
-        assert_eq!(fast_results, slow_results);
-        assert_eq!(fast_bundle, slow_bundle);
-        assert!(!fast_bundle.state[&contract].storage.is_empty());
+            let (ours, taken) = run(true);
+            assert_eq!(ours, run(false).0, "the beneficiary sends ({fork:?})");
+            assert!(!taken);
+        }
+    }
+
+    #[test]
+    fn the_handler_covers_cancun_to_amsterdam() {
+        assert!(covers(SpecId::CANCUN));
+        assert!(covers(SpecId::PRAGUE));
+        assert!(covers(SpecId::OSAKA));
+        assert!(covers(SpecId::AMSTERDAM));
+        assert!(!covers(SpecId::SHANGHAI));
+        let mut partial = evm2::Version::new(SpecId::AMSTERDAM);
+        assert!(amsterdam_features_consistent(&partial));
+        partial.features.remove(evm2::EvmFeatures::EIP7708);
+        assert!(
+            !amsterdam_features_consistent(&partial),
+            "only some of the Amsterdam transfer rules"
+        );
+        assert!(amsterdam_features_consistent(&evm2::Version::new(SpecId::OSAKA)));
+        // Not registered before Cancun: the stock handler runs the transfer.
+        check(
+            &[Fork::Shanghai],
+            &[("1559 to an existing account", transfer(1, addr(2), 100), false)],
+        );
+    }
+
+    #[test]
+    fn qualifying_transfers_equal_the_stock_amsterdam_handler() {
+        let config = config(Fork::Amsterdam, false);
+        assert_eq!(env(&config).spec_id(), SpecId::AMSTERDAM);
+        let creating = eip1559(1, 0, addr(FRESH), 100, 210_000, Bytes::new());
+        check(
+            &[Fork::Amsterdam],
+            &[
+                ("1559 to an existing account", transfer(1, addr(2), 100), true),
+                ("1559 creating its recipient (EIP-8037)", creating.clone(), true),
+                (
+                    "1559 creating its recipient, the charge to the gas limit",
+                    eip1559(1, 0, addr(FRESH), 100, 204_600, Bytes::new()),
+                    true,
+                ),
+                (
+                    "1559 over the intrinsic gas",
+                    eip1559(1, 0, addr(2), 100, 30_000, Bytes::new()),
+                    true,
+                ),
+                ("legacy", legacy(2, addr(3), 7, 50), true),
+                (
+                    "2930 with an empty access list",
+                    eip2930(3, addr(4), 9, AccessList::default()),
+                    true,
+                ),
+                ("zero value to an existing account (15,000)", transfer(4, addr(5), 0), true),
+                (
+                    "zero value at its 15,000 intrinsic",
+                    eip1559(4, 0, addr(5), 0, 15_000, Bytes::new()),
+                    true,
+                ),
+            ],
+        );
+        // The stock outcome carries what Prague's does not.
+        let ((result, _), _) = outcome(Fork::Amsterdam, false, &creating);
+        assert!(
+            result.contains("state_gas_spent: 183600")
+                && result.contains("total_gas_spent: 204600"),
+            "{result}"
+        );
+        assert!(result.contains("ddf252ad"), "the EIP-7708 log: {result}");
+    }
+
+    #[test]
+    fn everything_else_is_handed_to_the_stock_amsterdam_handler_unchanged() {
+        let access_list = AccessList(vec![AccessListItem {
+            address: addr(6),
+            storage_keys: vec![B256::ZERO],
+        }]);
+        check(
+            &[Fork::Amsterdam],
+            &[
+                (
+                    "creating its recipient at 21,000 (a runtime out-of-gas halt)",
+                    transfer(1, addr(FRESH), 100),
+                    false,
+                ),
+                (
+                    "creating its recipient one gas short",
+                    eip1559(1, 0, addr(FRESH), 100, 204_599, Bytes::new()),
+                    false,
+                ),
+                ("zero value to an empty account", transfer(1, addr(FRESH), 0), false),
+                (
+                    "to a contract",
+                    eip1559(1, 0, addr(CONTRACT), 1, 200_000, Bytes::new()),
+                    false,
+                ),
+                (
+                    "to a precompile",
+                    eip1559(1, 0, Address::with_last_byte(4), 1, 30_000, Bytes::new()),
+                    false,
+                ),
+                ("to itself", transfer(2, addr(2), 5), false),
+                ("to the beneficiary", transfer(3, addr(BENEFICIARY), 5), false),
+                (
+                    "with input",
+                    eip1559(4, 0, addr(5), 1, 30_000, Bytes::from_static(&[1, 2])),
+                    false,
+                ),
+                ("2930 with an access list", eip2930(5, addr(6), 1, access_list), false),
+                ("value the sender lacks after the fee", transfer(9, addr(2), 1), false),
+                ("a nonce ahead", eip1559(6, 3, addr(2), 1, 21_000, Bytes::new()), false),
+                (
+                    "an intrinsic gas too low",
+                    eip1559(7, 0, addr(2), 1, 20_000, Bytes::new()),
+                    false,
+                ),
+                (
+                    "zero value under its intrinsic",
+                    eip1559(7, 0, addr(2), 0, 14_999, Bytes::new()),
+                    false,
+                ),
+            ],
+        );
     }
 
     #[derive(Debug, thiserror::Error)]
     #[error("injected state read failure")]
     struct ReadFailure;
 
-    impl revm::database_interface::DBErrorMarker for ReadFailure {}
-
     #[derive(Debug)]
     struct FailingDatabase;
 
-    impl revm::Database for FailingDatabase {
+    impl evm2::evm::Database for FailingDatabase {
         type Error = ReadFailure;
-        fn basic(&mut self, _: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        fn get_account(&mut self, _: &Address) -> Result<Option<AccountInfo>, Self::Error> {
             Err(ReadFailure)
         }
-        fn code_by_hash(
-            &mut self,
-            _: alloy_primitives::B256,
-        ) -> Result<revm::bytecode::Bytecode, Self::Error> {
+        fn get_code_by_hash(&mut self, _: &B256) -> Result<Bytecode, Self::Error> {
             Err(ReadFailure)
         }
-        fn storage(&mut self, _: Address, _: U256) -> Result<U256, Self::Error> {
+        fn get_storage(&mut self, _: &Address, _: &U256) -> Result<U256, Self::Error> {
             Err(ReadFailure)
         }
-        fn block_hash(&mut self, _: u64) -> Result<alloy_primitives::B256, Self::Error> {
+        fn get_block_hash(&mut self, _: &U256) -> Result<B256, Self::Error> {
             Err(ReadFailure)
         }
     }
 
     #[test]
     fn read_errors_are_propagated_instead_of_treated_as_missing_accounts() {
-        for enabled in [false, true] {
-            let mut evm =
-                N42EvmFactory::with_fast_transfers(enabled).create_evm(FailingDatabase, env());
-            assert!(matches!(
-                evm.transact_raw(tx(EXISTING, 1, 2, 5_000, Some(300))),
-                Err(EVMError::Database(ReadFailure))
-            ));
-            assert_eq!(evm.fast_transfer_hits(), 0);
+        let run = |fast| {
+            let config = config(Fork::Prague, fast);
+            let mut evm = config.evm_with_env(FailingDatabase, env(&config));
+            let error = reth_evm::Evm::transact(&mut evm, &transfer(1, addr(2), 1))
+                .map(|_| ())
+                .expect_err("the read fails");
+            format!("{error}")
+        };
+        let before = TAKEN.with(std::cell::Cell::get);
+        let ours = run(true);
+        assert!(ours.contains("injected state read failure"), "{ours}");
+        assert_eq!(ours, run(false));
+        assert_eq!(TAKEN.with(std::cell::Cell::get), before);
+    }
+
+    /// One block of transfers and contract calls through the block executor
+    /// on both registries: the same receipts, gas and bundle — statuses,
+    /// reverts, the touched and unchanged account, the contract's storage —
+    /// and the same restored-slot record.
+    #[test]
+    fn a_mixed_block_equals_the_stock_block() {
+        use alloy_consensus::transaction::TxHashRef;
+        use n42_tx_types::{Block, N42TxEnvelope};
+        use reth_ethereum_primitives::{Transaction, TransactionSigned};
+        use reth_evm::execute::{BasicBlockExecutor, Executor};
+        use reth_primitives_traits::RecoveredBlock;
+
+        let targets = [
+            (addr(FRESH), 5u64),
+            (addr(CONTRACT), 1),
+            (addr(2), 1),
+            (addr(CONTRACT), 0),
+            (addr(FRESH), 5),
+            // Touched and left as it was.
+            (addr(3), 0),
+        ];
+        for fork in BEFORE_AMSTERDAM {
+            let run = |fast: bool| {
+                let transactions: Vec<N42TxEnvelope> = targets
+                    .iter()
+                    .enumerate()
+                    .map(|(nonce, (to, value))| {
+                        TransactionSigned::new_unhashed(
+                            Transaction::Eip1559(TxEip1559 {
+                                chain_id: 1,
+                                nonce: nonce as u64,
+                                gas_limit: 100_000,
+                                max_fee_per_gas: 100,
+                                max_priority_fee_per_gas: 3,
+                                to: TxKind::Call(*to),
+                                value: U256::from(*value),
+                                ..Default::default()
+                            }),
+                            Signature::test_signature(),
+                        )
+                        .into()
+                    })
+                    .collect();
+                let hashes: Vec<B256> = transactions.iter().map(|tx| *tx.tx_hash()).collect();
+                let senders = vec![addr(1); transactions.len()];
+                let block = RecoveredBlock::new_unhashed(
+                    Block {
+                        header: Header {
+                            // Distinct per fork: the restored-slot registry is process-wide.
+                            parent_hash: B256::repeat_byte(0xF0 + fork as u8),
+                            withdrawals_root: Some(alloy_consensus::EMPTY_ROOT_HASH),
+                            ..header()
+                        },
+                        body: BlockBody {
+                            transactions,
+                            withdrawals: Some(Default::default()),
+                            ..Default::default()
+                        },
+                    },
+                    senders,
+                );
+                let config = config(fork, fast);
+                let env_key =
+                    crate::restored_slots_env_key(&config.evm_env(block.header()).unwrap().block);
+                let before = TAKEN.with(std::cell::Cell::get);
+                let mut output = BasicBlockExecutor::new(config, parent())
+                    .execute(&block)
+                    .expect("block executes");
+                let taken = TAKEN.with(std::cell::Cell::get) - before;
+                for reverts in output.state.reverts.iter_mut() {
+                    reverts.sort_unstable_by_key(|(address, _)| *address);
+                }
+                let context = crate::restored_slots_execution_key(
+                    block.header().parent_hash,
+                    env_key,
+                    block.header().parent_beacon_block_root,
+                    Some(&[]),
+                    [],
+                );
+                let restored =
+                    crate::restored_slots_for(crate::restored_slots_key(context, hashes)).unwrap();
+                (output, restored, taken)
+            };
+            let (fast, fast_restored, taken) = run(true);
+            let (stock, stock_restored, stock_taken) = run(false);
+            assert_eq!(taken, 4, "{fork:?}");
+            assert_eq!(stock_taken, 0);
+            assert!(fast.receipts.iter().all(|receipt| receipt.success));
+            assert_eq!(fast.receipts, stock.receipts, "{fork:?}");
+            assert_eq!(fast.gas_used, stock.gas_used, "{fork:?}");
+            assert_eq!(fast.state, stock.state, "{fork:?}");
+            assert_eq!(fast_restored, stock_restored, "{fork:?}");
+            assert!(!fast.state.state[&addr(CONTRACT)].storage.is_empty());
+            let touched = &fast.state.state[&addr(3)];
+            assert_eq!(touched.info, touched.original_info);
+            assert!(!touched.status.is_not_modified());
         }
     }
 }

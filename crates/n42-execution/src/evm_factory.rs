@@ -1,19 +1,13 @@
 //! N42 custom EVM factory with randomness precompile at address `0x0302`.
 
-use alloy_evm::{
-    EvmEnv, EvmFactory,
-    eth::{EthEvmBuilder, EthEvmContext},
-    precompiles::PrecompilesMap,
-};
 use alloy_primitives::address;
-use revm::{
-    context::{BlockEnv, TxEnv},
-    context_interface::result::{EVMError, HaltReason},
-    database_interface::DBErrorMarker,
-    inspector::{Inspector, NoOpInspector},
-    precompile::{Precompile, PrecompileId, PrecompileSpecId, Precompiles},
-    primitives::hardfork::SpecId,
+use evm2::{
+    BaseEvmTypes, ExecutionConfig, Precompiles, SpecId, TxResult, Version,
+    precompiles::{Precompile, PrecompileId, PrecompileMap},
+    registry::TxRegistry,
 };
+use reth_evm_ethereum::{EvmFactory, RethEvmFactory};
+use std::borrow::Cow;
 
 use crate::precompile_random;
 
@@ -23,101 +17,130 @@ const RANDOMNESS_PRECOMPILE_ADDR: alloy_primitives::Address =
 
 /// Build precompiles for a given spec, adding the N42 randomness precompile.
 /// Cached per SpecId — leaked once, reused for all subsequent calls with the same spec.
-fn n42_precompiles(spec: SpecId) -> &'static Precompiles {
+fn n42_precompiles(spec: SpecId) -> &'static PrecompileMap {
     use std::sync::Mutex;
 
     // Bounded cache: SpecId has ~20 variants, so at most ~20 leaked entries.
-    static CACHE: Mutex<Vec<(SpecId, &'static Precompiles)>> = Mutex::new(Vec::new());
+    static CACHE: Mutex<Vec<(SpecId, &'static PrecompileMap)>> = Mutex::new(Vec::new());
 
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&(_, precompiles)) = cache.iter().find(|(s, _)| *s == spec) {
         return precompiles;
     }
 
-    let mut precompiles = Precompiles::new(PrecompileSpecId::from_spec_id(spec)).clone();
+    let mut precompiles = Precompiles::<BaseEvmTypes>::base(spec).as_map().clone();
     precompiles.extend([Precompile::new(
-        PrecompileId::custom("n42-randomness"),
         RANDOMNESS_PRECOMPILE_ADDR,
-        precompile_random::revm_precompile_fn,
+        PrecompileId::custom("n42-randomness"),
+        precompile_random::evm2_precompile_fn,
     )]);
-    let leaked: &'static Precompiles = Box::leak(Box::new(precompiles));
+    let leaked: &'static PrecompileMap = Box::leak(Box::new(precompiles));
     cache.push((spec, leaked));
     leaked
 }
 
 /// N42 EVM factory — produces EVMs with Ethereum precompiles + randomness at `0x0302`.
+///
+/// Everything else is reth's own evm2 factory, but for the SSTORE instruction,
+/// which also reports the slots a transaction wrote (see `dirty_storage`).
 #[derive(Debug, Clone, Default)]
 pub struct N42EvmFactory {
+    inner: RethEvmFactory,
     fast_transfers: bool,
 }
 
 impl N42EvmFactory {
-    /// Read the optional transfer optimization once at node configuration time.
+    /// The factory a node is configured with: the transfer fast path is on
+    /// with `N42_FAST_TRANSFER=1`.
     pub fn from_env() -> Self {
         Self::with_fast_transfers(crate::fast_transfer::enabled())
     }
 
     /// Select the same factory for execution comparisons without mutating process environment.
-    pub const fn with_fast_transfers(enabled: bool) -> Self {
+    pub fn with_fast_transfers(enabled: bool) -> Self {
         Self {
+            inner: RethEvmFactory::default(),
             fast_transfers: enabled,
+        }
+    }
+
+    /// Whether the transfer fast path was asked for.
+    pub const fn fast_transfers(&self) -> bool {
+        self.fast_transfers
+    }
+
+    /// The transaction registry N42 EVMs execute with.
+    ///
+    /// Ethereum's handlers, with the transfer fast path over types 0, 1 and
+    /// 2 when [`Self::fast_transfers`] is set (see `fast_transfer`).
+    pub fn n42_tx_registry(
+        &self,
+        spec: SpecId,
+    ) -> TxRegistry<BaseEvmTypes, TxResult<BaseEvmTypes>> {
+        let base = self.inner.tx_registry(spec);
+        if self.fast_transfers {
+            crate::fast_transfer::registry(spec, base)
+        } else {
+            base
         }
     }
 }
 
 impl EvmFactory for N42EvmFactory {
-    type Evm<DB: alloy_evm::Database, I: Inspector<EthEvmContext<DB>>> =
-        crate::fast_transfer::N42Evm<DB, I>;
-    type Context<DB: alloy_evm::Database> = EthEvmContext<DB>;
-    type Tx = TxEnv;
-    type Error<DBError: DBErrorMarker> = EVMError<DBError>;
-    type HaltReason = HaltReason;
-    type Spec = SpecId;
-    type BlockEnv = BlockEnv;
-    type Precompiles = PrecompilesMap;
+    type Types = BaseEvmTypes;
+    type SpecId = SpecId;
 
-    fn create_evm<DB: alloy_evm::Database>(
-        &self,
-        db: DB,
-        evm_env: EvmEnv,
-    ) -> Self::Evm<DB, NoOpInspector> {
-        let spec = evm_env.cfg_env.spec;
-
-        // Inject prevrandao into thread-local for the randomness precompile.
-        if let Some(prevrandao) = evm_env.block_env.prevrandao {
-            precompile_random::set_block_randomness(prevrandao);
-        }
-
-        let inner = EthEvmBuilder::new(db, evm_env)
-            .precompiles(PrecompilesMap::from_static(n42_precompiles(spec)))
-            .build();
-        crate::fast_transfer::N42Evm::new(
-            crate::dirty_storage::watch(inner, false),
-            false,
-            self.fast_transfers,
-        )
+    fn spec_id(&self, spec: SpecId) -> SpecId {
+        self.inner.spec_id(spec)
     }
 
-    fn create_evm_with_inspector<DB: alloy_evm::Database, I: Inspector<Self::Context<DB>>>(
-        &self,
-        db: DB,
-        evm_env: EvmEnv,
-        inspector: I,
-    ) -> Self::Evm<DB, I> {
-        let spec = evm_env.cfg_env.spec;
+    fn version(&self, spec: SpecId, chain_id: u64) -> Version {
+        self.inner.version(spec, chain_id)
+    }
 
-        if let Some(prevrandao) = evm_env.block_env.prevrandao {
-            precompile_random::set_block_randomness(prevrandao);
+    fn execution_config(&self, spec: SpecId, version: Version) -> ExecutionConfig<BaseEvmTypes> {
+        crate::dirty_storage::execution_config(spec, version)
+    }
+
+    fn tx_registry(&self, spec: SpecId) -> TxRegistry<BaseEvmTypes, TxResult<BaseEvmTypes>> {
+        self.n42_tx_registry(spec)
+    }
+
+    fn precompiles(&self, spec: SpecId) -> Precompiles<BaseEvmTypes> {
+        Precompiles::new(Cow::Borrowed(n42_precompiles(spec)))
+    }
+
+    fn configure_evm(&self, evm: &mut evm2::Evm<'_, BaseEvmTypes>) {
+        EvmFactory::configure_evm(&self.inner, evm);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use evm2::evm::precompile::PrecompileProvider;
+
+    #[test]
+    fn every_spec_has_its_base_precompiles_and_the_randomness_precompile() {
+        let factory = N42EvmFactory::default();
+        for spec in [
+            SpecId::FRONTIER,
+            SpecId::BERLIN,
+            SpecId::CANCUN,
+            SpecId::OSAKA,
+        ] {
+            let base = Precompiles::<BaseEvmTypes>::base(spec);
+            let n42 = factory.precompiles(spec);
+            let mut want = PrecompileProvider::<BaseEvmTypes>::addresses(&base);
+            want.push(RANDOMNESS_PRECOMPILE_ADDR);
+            want.sort_unstable();
+            let mut got = PrecompileProvider::<BaseEvmTypes>::addresses(&n42);
+            got.sort_unstable();
+            assert_eq!(got, want, "{spec:?}");
+            assert_eq!(
+                RANDOMNESS_PRECOMPILE_ADDR.as_slice(),
+                precompile_random::RANDOMNESS_ADDRESS.as_slice()
+            );
         }
-
-        let inner = EthEvmBuilder::new(db, evm_env)
-            .precompiles(PrecompilesMap::from_static(n42_precompiles(spec)))
-            .activate_inspector(inspector)
-            .build();
-        crate::fast_transfer::N42Evm::new(
-            crate::dirty_storage::watch(inner, true),
-            true,
-            self.fast_transfers,
-        )
     }
 }

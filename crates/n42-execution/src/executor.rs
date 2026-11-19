@@ -1,15 +1,31 @@
-use crate::{ExecutionPath, N42EvmConfig, state_diff::StateDiff, witness::ExecutionWitness};
-use alloy_evm::ToTxEnv;
+use crate::{N42EvmConfig, state_diff::StateDiff, witness::ExecutionWitness};
+use evm2::evm::{CacheDB, Database, Db};
 use metrics::histogram;
 use n42_tx_types::N42Primitives;
 use reth_evm::{
-    ConfigureEvm, Database,
+    ConfigureEvm,
     execute::{BlockExecutionError, BlockExecutionOutput, Executor},
 };
+use reth_execution_types::BundleSource;
 use reth_primitives_traits::{NodePrimitives, RecoveredBlock};
-use revm::database_interface::DatabaseRef;
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
+
+type Output = BlockExecutionOutput<<N42Primitives as NodePrimitives>::Receipt>;
+
+/// Executes a block over a cache of everything it reads, then folds the
+/// block's changes into that cache: the state the witness is recorded from.
+fn execute_recording<DB: Database>(
+    evm_config: &N42EvmConfig,
+    db: DB,
+    block: &RecoveredBlock<<N42Primitives as NodePrimitives>::Block>,
+) -> Result<(Output, ExecutionWitness), BlockExecutionError> {
+    let mut state = CacheDB::new(Db::new(db));
+    let output = evm_config.executor(&mut state).execute(block)?;
+    state.commit_source(&BundleSource(&output.state));
+    let witness = ExecutionWitness::from_state(&state);
+    Ok((output, witness))
+}
 
 /// Result of block execution with witness data.
 pub struct ExecutionWithWitness {
@@ -34,7 +50,7 @@ pub struct FullExecutionResult {
 }
 
 /// Executes a block and captures the execution witness.
-/// Uses `execute_with_state_closure` to access the state after execution.
+/// Executes over a cache of the block's reads to access the state after execution.
 /// Witness contains all state needed for independent re-execution.
 pub fn execute_block_with_witness<DB: Database>(
     evm_config: &N42EvmConfig,
@@ -44,12 +60,7 @@ pub fn execute_block_with_witness<DB: Database>(
     let start = Instant::now();
     debug!(target: "n42::execution", "execute_block_with_witness starting");
 
-    let executor = evm_config.executor(db);
-    let mut witness = ExecutionWitness::default();
-
-    let output = executor.execute_with_state_closure(block, |state| {
-        witness = ExecutionWitness::from_state(state);
-    })?;
+    let (output, witness) = execute_recording(evm_config, db, block)?;
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
     histogram!("n42_execution_block_ms").record(elapsed_ms as f64);
@@ -78,12 +89,7 @@ pub fn execute_block_full<DB: Database>(
     let start = Instant::now();
     debug!(target: "n42::execution", "execute_block_full starting");
 
-    let executor = evm_config.executor(db);
-    let mut witness = ExecutionWitness::default();
-
-    let output = executor.execute_with_state_closure(block, |state| {
-        witness = ExecutionWitness::from_state(state);
-    })?;
+    let (output, witness) = execute_recording(evm_config, db, block)?;
 
     let diff = StateDiff::from_bundle_state(&output.state);
 
@@ -117,119 +123,4 @@ pub fn execute_block_full<DB: Database>(
         diff,
         elapsed_ms,
     })
-}
-
-// ---------------------------------------------------------------------------
-// Parallel EVM execution (Block-STM)
-// ---------------------------------------------------------------------------
-
-/// Returns true if parallel EVM execution is enabled via `N42_PARALLEL_EVM=1`.
-///
-/// Disabled by default because under 48K-cap workloads (simple transfers),
-/// MVCC overhead exceeds sequential execution time.
-pub fn parallel_evm_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("N42_PARALLEL_EVM")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
-/// Summary of a parallel block execution run.
-#[derive(Debug, Clone)]
-pub struct ParallelExecutionSummary {
-    /// Number of transactions in the block.
-    pub tx_count: usize,
-    /// Total gas consumed across all transactions.
-    pub total_gas: u64,
-    /// Number of transactions that executed successfully.
-    pub success_count: usize,
-    /// Wall-clock execution time in milliseconds.
-    pub elapsed_ms: u64,
-}
-
-/// Executes a historical/offline block using Block-STM parallel execution.
-///
-/// Enable with `N42_PARALLEL_EVM=1`. Disabled by default because under
-/// 48K-cap workloads (simple transfers), MVCC overhead exceeds execution time.
-/// Beneficial for blocks with complex contract interactions.
-///
-/// This function provides a **standalone** parallel execution result.
-/// It does **not** produce the complete canonical output required by reth's
-/// executor and therefore must not be used as the live execution path.
-pub fn execute_block_parallel<DB: DatabaseRef + Send + Sync>(
-    evm_config: &N42EvmConfig,
-    db: &DB,
-    block: &RecoveredBlock<<N42Primitives as NodePrimitives>::Block>,
-) -> Result<ParallelExecutionSummary, BlockExecutionError>
-where
-    DB::Error: core::error::Error + Send + Sync + 'static,
-{
-    let start = Instant::now();
-    let result = (|| -> Result<(usize, u64, usize), BlockExecutionError> {
-        // 1. Derive CfgEnv + BlockEnv from the block header.
-        let evm_env = evm_config
-            .evm_env(block.header())
-            .map_err(BlockExecutionError::other)?;
-
-        // 2. Convert each recovered transaction to a revm TxEnv.
-        let txs: Vec<revm::context::TxEnv> = block
-            .transactions_recovered()
-            .map(|recovered| recovered.to_tx_env())
-            .collect();
-        let tx_count = txs.len();
-        debug!(target: "n42::execution", tx_count, "execute_block_parallel starting");
-
-        // 3. Run parallel execution.
-        let output =
-            n42_parallel_evm::parallel_execute(&txs, db, evm_env.cfg_env, evm_env.block_env)
-                .map_err(BlockExecutionError::other)?;
-
-        let total_gas = output.results.iter().map(|result| result.gas_used).sum();
-        let success_count = output
-            .results
-            .iter()
-            .filter(|result| result.success)
-            .count();
-        Ok((tx_count, total_gas, success_count))
-    })();
-    let elapsed_ms = start.elapsed().as_millis() as u64;
-    histogram!("n42_parallel_execution_block_ms").record(elapsed_ms as f64);
-    histogram!(
-        "n42_evm_path_duration_ms",
-        "path" => ExecutionPath::HISTORICAL_PEVM.label(),
-        "phase" => "standalone_block",
-    )
-    .record(start.elapsed().as_secs_f64() * 1_000.0);
-    metrics::counter!(
-        "n42_evm_path_calls_total",
-        "path" => ExecutionPath::HISTORICAL_PEVM.label(),
-        "phase" => "standalone_block",
-        "outcome" => if result.is_ok() { "ok" } else { "error" },
-    )
-    .increment(1);
-
-    match result {
-        Ok((tx_count, total_gas, success_count)) => {
-            info!(
-                target: "n42::execution",
-                tx_count,
-                total_gas,
-                success_count,
-                elapsed_ms,
-                "execute_block_parallel complete"
-            );
-            Ok(ParallelExecutionSummary {
-                tx_count,
-                total_gas,
-                success_count,
-                elapsed_ms,
-            })
-        }
-        Err(error) => {
-            warn!(target: "n42::execution", elapsed_ms, %error, "execute_block_parallel failed");
-            Err(error)
-        }
-    }
 }

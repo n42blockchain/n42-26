@@ -1,11 +1,18 @@
+pub mod batch_state;
+#[cfg(test)]
+mod block_tests;
+pub mod direct_transfer;
 mod dirty_storage;
 pub mod evm_config;
 pub mod evm_factory;
 pub mod execution_path;
-pub mod executor;
 pub mod fast_transfer;
-pub mod parallel_block;
-pub mod parallel_transfer;
+pub mod executor;
+pub mod graft_fold;
+pub mod parallel_build;
+pub mod parallel_common;
+#[cfg(test)]
+mod parallel_tests;
 pub mod precompile_random;
 pub mod read_log;
 pub mod restored_slots;
@@ -15,10 +22,7 @@ pub mod witness;
 pub use evm_config::N42EvmConfig;
 pub use evm_factory::N42EvmFactory;
 pub use execution_path::{EvmStrategy, ExecutionPath, ExecutionWorkload};
-pub use executor::{
-    ParallelExecutionSummary, execute_block_full, execute_block_parallel,
-    execute_block_with_witness, parallel_evm_enabled,
-};
+pub use executor::{execute_block_full, execute_block_with_witness};
 pub use read_log::{ReadLogDatabase, ReadLogEntry};
 pub use restored_slots::{
     RestoredSlot, TrackingBlockExecutorFactory, TrackingExecutor, record_restored_slots,

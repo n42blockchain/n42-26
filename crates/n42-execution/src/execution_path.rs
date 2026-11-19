@@ -18,7 +18,7 @@ pub enum ExecutionWorkload {
 /// How EVM transactions are scheduled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvmStrategy {
-    /// Ordinary in-order revm execution through Reth's canonical executor.
+    /// Ordinary in-order EVM execution through Reth's canonical executor.
     Sequential,
     /// PEVM-style parallel execution.
     Pevm,
@@ -44,7 +44,7 @@ impl ExecutionPath {
         strategy: EvmStrategy::Sequential,
     };
 
-    /// The production live path today: Reth's sequential revm executor.
+    /// The production live path today: Reth's sequential executor.
     pub const LIVE_SEQUENTIAL: Self = Self {
         workload: ExecutionWorkload::Live,
         strategy: EvmStrategy::Sequential,
