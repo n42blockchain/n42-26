@@ -533,10 +533,10 @@ pub(super) struct PayloadBuildReady {
 }
 
 /// Serializable proxy for `(BlockExecutionOutput<Receipt>, Vec<Address>)`.
-/// `BlockExecutionResult` from alloy-evm doesn't derive serde, so we flatten it.
+/// `BlockExecutionResult` from reth-evm doesn't derive serde, so we flatten it.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct CompactBlockExecution {
-    pub bundle_state: revm::database::states::BundleState,
+    pub bundle_state: evm2::block::bundle_state::BundleState,
     pub receipts: Vec<n42_tx_types::Receipt>,
     pub requests: alloy_eips::eip7685::Requests,
     pub gas_used: u64,
@@ -655,7 +655,7 @@ impl CompactBlockExecution {
         let Some((&COMPACT_EXECUTION_MSGPACK, body)) = bytes.split_first() else {
             return Ok(serde_json::from_slice(bytes)?);
         };
-        let wire: CompactExecutionWire<revm::database::states::BundleState> =
+        let wire: CompactExecutionWire<evm2::block::bundle_state::BundleState> =
             rmp_serde::from_slice(body)?;
         Ok(Self {
             bundle_state: wire.bundle_state,
@@ -678,7 +678,7 @@ impl CompactBlockExecution {
 mod compact_execution_codec_tests {
     use super::CompactBlockExecution;
     use alloy_primitives::{Address, B256, Bytes, Log, LogData, U256};
-    use revm::{bytecode::Bytecode, database::states::BundleState, state::AccountInfo};
+    use evm2::{block::bundle_state::BundleState, bytecode::Bytecode, evm::AccountInfo};
 
     fn sample(accounts: usize) -> CompactBlockExecution {
         let code = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xf3]));
@@ -691,7 +691,7 @@ mod compact_execution_codec_tests {
                 code_hash: if i == 0 {
                     code_hash
                 } else {
-                    revm::primitives::KECCAK_EMPTY
+                    alloy_primitives::KECCAK256_EMPTY
                 },
                 code: None,
                 ..Default::default()

@@ -85,7 +85,7 @@ pub fn decode_packet(data: &[u8]) -> Result<VerificationPacket, PacketError> {
 
 /// V2 verification packet using an ordered state read log instead of a keyed witness.
 ///
-/// Since same block + same txs → revm Database calls happen in a deterministic order,
+/// Since same block + same txs → EVM `Database` calls happen in a deterministic order,
 /// address/slot keys are dropped and only values are sent in call order.
 /// The phone replays entries by cursor on raw bytes via `StreamReplayDB`.
 ///
