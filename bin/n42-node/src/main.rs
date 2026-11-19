@@ -253,6 +253,19 @@ fn resolve_observer_genesis_hash(
     })
 }
 
+/// The parallel import of other nodes' blocks, when `N42_PARALLEL_IMPORT=1`.
+fn follower_import<P>(
+    config: n42_execution::N42EvmConfig,
+    provider: P,
+) -> Option<n42_node::el::FollowerImport>
+where
+    P: reth_provider::StateProviderFactory + Send + Sync + 'static,
+{
+    n42_node::el::FollowerImport::configured(config, move |hash| {
+        provider.state_by_block_hash(hash).ok()
+    })
+}
+
 fn resolve_header_profile(
     gov5_interop_mode: bool,
     gov5_profile_requested: bool,
@@ -2591,9 +2604,13 @@ fn main() {
                     }
 
                     let observer_el: std::sync::Arc<dyn n42_node::el::ExecutionLayer> =
-                        std::sync::Arc::new(n42_node::el::RethExecutionLayer::engine_only(
-                            beacon_engine_handle,
-                        ));
+                        std::sync::Arc::new(
+                            n42_node::el::RethExecutionLayer::engine_only(beacon_engine_handle)
+                                .with_follower_import(follower_import(
+                                    full_node.evm_config.clone(),
+                                    full_node.provider.clone(),
+                                )),
+                        );
                     let observer_head = replay_plan
                         .as_ref()
                         .map(|plan| plan.verification().last_block_hash)
@@ -3289,10 +3306,16 @@ fn main() {
                             warn!(target: "n42::cli", "N42_EL_OWNER_RPC set: this key does not execute blocks; it reports the execution owner's result");
                             std::sync::Arc::new(delegated)
                         }
-                        Ok(None) => std::sync::Arc::new(n42_node::el::RethExecutionLayer::new(
-                            beacon_engine_handle,
-                            payload_builder_handle,
-                        )),
+                        Ok(None) => std::sync::Arc::new(
+                            n42_node::el::RethExecutionLayer::new(
+                                beacon_engine_handle,
+                                payload_builder_handle,
+                            )
+                            .with_follower_import(follower_import(
+                                full_node.evm_config.clone(),
+                                full_node.provider.clone(),
+                            )),
+                        ),
                         Err(error) => {
                             eprintln!("ERROR: {error}");
                             std::process::exit(1);

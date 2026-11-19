@@ -7,7 +7,7 @@
 //! above it (`export-range-linux.go`). The datadir is opened read-only; the
 //! state of the replayed blocks is kept as an in-memory bundle overlay, the
 //! commitment as the split QMDB tree. For every block: execute, convert the
-//! bundle (plus the slots gov5 rewrites although revm dropped them) to leaf
+//! bundle (plus the slots gov5 rewrites although the bundle dropped them) to leaf
 //! operations, apply, compare the root with the header's, and report time
 //! and memory. The first divergence stops the run with both roots printed.
 
@@ -28,15 +28,13 @@ use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_evm::{ConfigureEvm, execute::Executor};
 use reth_primitives_traits::{SealedBlock, SealedHeader};
 use reth_provider::{BlockHashReader, BlockNumReader};
-use reth_revm::database::StateProviderDatabase;
+use reth_evm::database::StateProviderDatabase;
 use reth_storage_api::StateProvider;
-use revm::{
+use evm2::{
     bytecode::Bytecode,
-    database::states::BundleState,
-    database_interface::{DBErrorMarker, Database},
-    primitives::StorageKey,
-    state::AccountInfo,
+    evm::{AccountInfo, Database},
 };
+use reth_trie_common::bundle_state::BundleState;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Write};
@@ -181,50 +179,53 @@ impl<DB> std::fmt::Debug for ReplayDb<DB> {
     }
 }
 
-impl<DB: Database> Database for ReplayDb<DB>
-where
-    DB::Error: DBErrorMarker,
-{
+impl<DB: Database> Database for ReplayDb<DB> {
     type Error = DB::Error;
 
-    fn basic(
+    fn is_fatal(error: &Self::Error) -> bool {
+        DB::is_fatal(error)
+    }
+
+    fn get_account(
         &mut self,
-        address: alloy_primitives::Address,
+        address: &alloy_primitives::Address,
     ) -> Result<Option<AccountInfo>, Self::Error> {
         if let Ok(mut loaded) = self.loaded.lock() {
-            loaded.push(address);
+            loaded.push(*address);
         }
-        if let Some(account) = self.overlay.account(&address) {
+        if let Some(account) = self.overlay.account(address) {
             return Ok(account.account_info());
         }
-        self.inner.basic(address)
+        self.inner.get_account(address)
     }
 
-    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        if let Some(code) = self.overlay.contracts.get(&code_hash) {
+    fn get_code_by_hash(&mut self, code_hash: &B256) -> Result<Bytecode, Self::Error> {
+        if let Some(code) = self.overlay.contracts.get(code_hash) {
             return Ok(code.clone());
         }
-        self.inner.code_by_hash(code_hash)
+        self.inner.get_code_by_hash(code_hash)
     }
 
-    fn storage(
+    fn get_storage(
         &mut self,
-        address: alloy_primitives::Address,
-        index: StorageKey,
+        address: &alloy_primitives::Address,
+        index: &U256,
     ) -> Result<U256, Self::Error> {
-        if let Some(account) = self.overlay.account(&address)
-            && let Some(value) = account.storage_slot(index)
+        if let Some(account) = self.overlay.account(address)
+            && let Some(value) = account.storage_slot(*index)
         {
             return Ok(value);
         }
-        self.inner.storage(address, index)
+        self.inner.get_storage(address, index)
     }
 
-    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
-        if let Some(hash) = self.hashes.get(&number) {
+    fn get_block_hash(&mut self, number: &U256) -> Result<B256, Self::Error> {
+        if let Ok(number) = u64::try_from(*number)
+            && let Some(hash) = self.hashes.get(&number)
+        {
             return Ok(*hash);
         }
-        self.inner.block_hash(number)
+        self.inner.get_block_hash(number)
     }
 }
 
@@ -426,7 +427,7 @@ fn main() -> eyre::Result<()> {
         let restored = restored_slots_for(gov5_restored_slots_key(
             recovered.sealed_block(),
             n42_execution::restored_slots_env_key(
-                &evm_config.evm_env(recovered.header())?.block_env,
+                &evm_config.evm_env(recovered.header())?.block,
             ),
         ))
         .unwrap_or_default();

@@ -127,7 +127,7 @@ fn prepare(
 
 /// [`HashedPostState::from_bundle_state`] with the keccaks spread over the
 /// rayon pool: a full block changes about two accounts per transfer.
-fn hashed_post_state(bundle: &revm::database::BundleState) -> HashedPostState {
+fn hashed_post_state(bundle: &reth_trie_common::bundle_state::BundleState) -> HashedPostState {
     use rayon::prelude::*;
     let accounts: Vec<_> = bundle.state.iter().collect();
     let hashed: Vec<_> = accounts
@@ -154,7 +154,8 @@ mod tests {
     use super::*;
     use alloy_primitives::{Address, U256};
     use reth_trie_common::KeccakKeyHasher;
-    use revm::{database::BundleState, state::AccountInfo};
+    use evm2::evm::AccountInfo;
+    use reth_trie_common::bundle_state::BundleState;
 
     #[test]
     fn parallel_hashed_post_state_matches_reth() {

@@ -2519,7 +2519,9 @@ where
             Box::new(Gov5QmdbStateRootJob {
                 store: self.store.clone(),
                 chain_spec: self.chain_spec.clone(),
-                env_key: n42_execution::restored_slots_env_key(&ctx.env().evm_env.block_env),
+                env_key: n42_execution::restored_slots_env_key(reth_evm::EvmEnv::block_env(
+                    &ctx.env().evm_env,
+                )),
             }),
             None,
         ))
@@ -2562,7 +2564,7 @@ impl StateRootJob<N42Primitives> for Gov5QmdbStateRootJob {
         _hashed_state: &LazyHashedPostState,
     ) -> ProviderResult<StateRootJobOutcome> {
         // gov5 rewrites every slot the block's journal marked dirty, including
-        // one changed and restored within the block, which revm drops from
+        // one changed and restored within the block, which is dropped from
         // the bundle; the executor wrapper recorded those for this block.
         let key_started = std::time::Instant::now();
         let key = gov5_restored_slots_key(block, self.env_key);
@@ -4322,10 +4324,8 @@ mod tests {
     fn root_job_rejects_conflicting_execution_for_an_already_stored_hash() {
         use alloy_primitives::{Address, U256};
         use reth_primitives_traits::Block;
-        use revm::{
-            database::states::{AccountStatus, BundleAccount},
-            state::AccountInfo,
-        };
+        use evm2::evm::AccountInfo;
+        use reth_trie_common::bundle_state::{AccountStatus, BundleAccount};
         let (store, _) = store();
         let store = Arc::new(store);
         let mut block = n42_tx_types::Block::default();

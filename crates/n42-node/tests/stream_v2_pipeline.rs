@@ -18,10 +18,13 @@ use reth_ethereum_primitives::{Block, BlockBody, Receipt, Transaction};
 use reth_evm::execute::{BasicBlockExecutor, Executor};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_execution_types::BlockExecutionOutput;
-use reth_primitives_traits::{RecoveredBlock, crypto::secp256k1::public_key_to_address};
+use reth_primitives_traits::RecoveredBlock;
 use reth_testing_utils::generators::sign_tx_with_key_pair;
-use revm::{bytecode::Bytecode, database::CacheDB, state::AccountInfo};
-use secp256k1::{Keypair, Secp256k1, SecretKey};
+use evm2::{
+    bytecode::Bytecode,
+    evm::{AccountInfo, CacheDB, EmptyDB},
+};
+use secp256k1::{Keypair, SecretKey};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -127,21 +130,20 @@ fn encode_transfer_call(to: Address, amount: U256) -> Bytes {
 }
 
 fn test_key_pair(seed: u8) -> Keypair {
-    let secret_key = SecretKey::from_slice(&[seed; 32]).expect("test secret key should be valid");
-    let secp = Secp256k1::new();
-    Keypair::from_secret_key(&secp, &secret_key)
+    let secret_key = SecretKey::from_secret_bytes([seed; 32]).expect("test secret key should be valid");
+    Keypair::from_secret_key(&secret_key)
 }
 
 fn test_sender(seed: u8) -> (Keypair, Address) {
     let key_pair = test_key_pair(seed);
-    let sender = public_key_to_address(key_pair.public_key());
+    let sender = Address::from_raw_public_key(&key_pair.public_key().serialize_uncompressed()[1..]);
     (key_pair, sender)
 }
 
 /// Execute a block using ReadLogDatabase, then replay using StreamReplayDB,
 /// and verify that both produce identical receipts.
 fn run_pipeline_test(
-    base_db: CacheDB<revm::database::EmptyDB>,
+    base_db: CacheDB<EmptyDB>,
     header: Header,
     transactions: Vec<reth_ethereum_primitives::TransactionSigned>,
     senders: Vec<Address>,
@@ -159,7 +161,7 @@ fn run_pipeline_test(
 /// Same IDC/read-log/mobile replay pipeline as [`run_pipeline_test`], with a
 /// caller-supplied fork schedule and assertions over both real EVM outputs.
 fn run_pipeline_test_with_assertions<F>(
-    base_db: CacheDB<revm::database::EmptyDB>,
+    base_db: CacheDB<EmptyDB>,
     header: Header,
     transactions: Vec<reth_ethereum_primitives::TransactionSigned>,
     senders: Vec<Address>,
@@ -282,7 +284,7 @@ fn test_v2_pipeline_eth_transfer() {
     // Setup state
     let mut db = CacheDB::new(Default::default());
     db.insert_account_info(
-        sender,
+        &sender,
         AccountInfo {
             nonce: 0,
             balance: U256::from(10u64) * U256::from(10u64).pow(U256::from(18)), // 10 ETH
@@ -290,7 +292,7 @@ fn test_v2_pipeline_eth_transfer() {
         },
     );
     db.insert_account_info(
-        receiver,
+        &receiver,
         AccountInfo {
             nonce: 0,
             balance: U256::from(10u64).pow(U256::from(18)), // 1 ETH
@@ -345,7 +347,7 @@ fn test_v2_pipeline_erc20_transfer() {
 
     // Sender: has ETH for gas
     db.insert_account_info(
-        sender,
+        &sender,
         AccountInfo {
             nonce: 0,
             balance: U256::from(10u64) * U256::from(10u64).pow(U256::from(18)), // 10 ETH
@@ -355,21 +357,20 @@ fn test_v2_pipeline_erc20_transfer() {
 
     // ERC-20 contract: deployed with code
     db.insert_account_info(
-        contract,
+        &contract,
         AccountInfo {
             nonce: 1,
             balance: U256::ZERO,
             code_hash,
             code: Some(Bytecode::new_raw(erc20_code)),
-            account_id: None,
+            ..AccountInfo::empty()
         },
     );
 
     // Pre-populate storage: balances[sender] = 1,000,000 tokens
     let sender_balance_slot = mapping_slot(sender, 0);
     let token_amount = U256::from(1_000_000u64);
-    db.insert_account_storage(contract, sender_balance_slot, token_amount)
-        .expect("insert storage");
+    db.insert_account_storage(&contract, &sender_balance_slot, &token_amount);
 
     let chain_spec = test_chain_spec();
 
@@ -422,7 +423,7 @@ fn test_v2_pipeline_mixed_block() {
 
     // Sender A: has ETH, does ETH transfer
     db.insert_account_info(
-        sender_a,
+        &sender_a,
         AccountInfo {
             nonce: 0,
             balance: U256::from(10u64) * U256::from(10u64).pow(U256::from(18)),
@@ -432,7 +433,7 @@ fn test_v2_pipeline_mixed_block() {
 
     // Sender B: has ETH for gas + ERC-20 tokens
     db.insert_account_info(
-        sender_b,
+        &sender_b,
         AccountInfo {
             nonce: 0,
             balance: U256::from(10u64) * U256::from(10u64).pow(U256::from(18)),
@@ -442,20 +443,19 @@ fn test_v2_pipeline_mixed_block() {
 
     // ERC-20 contract
     db.insert_account_info(
-        contract,
+        &contract,
         AccountInfo {
             nonce: 1,
             balance: U256::ZERO,
             code_hash,
             code: Some(Bytecode::new_raw(erc20_code)),
-            account_id: None,
+            ..AccountInfo::empty()
         },
     );
 
     // balances[sender_b] = 1,000,000
     let sender_b_slot = mapping_slot(sender_b, 0);
-    db.insert_account_storage(contract, sender_b_slot, U256::from(1_000_000u64))
-        .expect("insert storage");
+    db.insert_account_storage(&contract, &sender_b_slot, &U256::from(1_000_000u64));
 
     let chain_spec = test_chain_spec();
 
@@ -569,10 +569,10 @@ fn selfdestruct_in_constructor_init_code() -> Bytes {
     Bytes::from(init)
 }
 
-fn funded_test_db(sender: Address) -> CacheDB<revm::database::EmptyDB> {
+fn funded_test_db(sender: Address) -> CacheDB<EmptyDB> {
     let mut db = CacheDB::new(Default::default());
     db.insert_account_info(
-        sender,
+        &sender,
         AccountInfo {
             nonce: 0,
             balance: U256::from(1_000_000_000_000_000_000u64),
@@ -582,9 +582,9 @@ fn funded_test_db(sender: Address) -> CacheDB<revm::database::EmptyDB> {
     db
 }
 
-fn insert_contract(db: &mut CacheDB<revm::database::EmptyDB>, address: Address, code: Bytes) {
+fn insert_contract(db: &mut CacheDB<EmptyDB>, address: Address, code: Bytes) {
     db.insert_account_info(
-        address,
+        &address,
         AccountInfo {
             nonce: 1,
             code_hash: keccak256(&code),
@@ -737,10 +737,8 @@ fn test_v2_selfdestruct_unread_slots_leave_no_mobile_ghost_state() {
     let runtime = write_or_selfdestruct_runtime();
     let mut db = funded_test_db(sender);
     insert_contract(&mut db, contract, runtime);
-    db.insert_account_storage(contract, U256::from(1), U256::from(0x2a))
-        .unwrap();
-    db.insert_account_storage(contract, U256::from(2), U256::from(0x99))
-        .unwrap();
+    db.insert_account_storage(&contract, &U256::from(1), &U256::from(0x2a));
+    db.insert_account_storage(&contract, &U256::from(2), &U256::from(0x99));
 
     let spec = test_chain_spec();
     let tx = signed_legacy_call(
@@ -800,8 +798,7 @@ fn test_v2_selfdestruct_cancun_same_tx_delete_vs_pre_cancun() {
     let runtime = write_or_selfdestruct_runtime();
     let mut base = funded_test_db(sender);
     insert_contract(&mut base, existing, runtime);
-    base.insert_account_storage(existing, U256::from(1), U256::from(0x2a))
-        .unwrap();
+    base.insert_account_storage(&existing, &U256::from(1), &U256::from(0x2a));
 
     for (spec, must_destroy) in [(test_chain_spec(), true), (cancun_test_chain_spec(), false)] {
         let tx = signed_legacy_call(
@@ -884,7 +881,7 @@ use reth_primitives_traits::SealedHeader;
 ///   Pass 1: execute to compute receipts_root (block builder does this)
 ///   Pass 2: execute with ReadLogDatabase using header with correct receipts_root
 fn run_full_v2_packet_test(
-    base_db: CacheDB<revm::database::EmptyDB>,
+    base_db: CacheDB<EmptyDB>,
     mut header: Header,
     transactions: Vec<reth_ethereum_primitives::TransactionSigned>,
     senders: Vec<Address>,
@@ -1075,7 +1072,7 @@ fn test_v2_full_packet_eth_transfer() {
 
     let mut db = CacheDB::new(Default::default());
     db.insert_account_info(
-        sender,
+        &sender,
         AccountInfo {
             nonce: 0,
             balance: U256::from(10u64) * U256::from(10u64).pow(U256::from(18)),
@@ -1083,7 +1080,7 @@ fn test_v2_full_packet_eth_transfer() {
         },
     );
     db.insert_account_info(
-        receiver,
+        &receiver,
         AccountInfo {
             nonce: 0,
             balance: U256::from(10u64).pow(U256::from(18)),
@@ -1134,7 +1131,7 @@ fn test_v2_full_packet_erc20_transfer() {
 
     let mut db = CacheDB::new(Default::default());
     db.insert_account_info(
-        sender,
+        &sender,
         AccountInfo {
             nonce: 0,
             balance: U256::from(10u64) * U256::from(10u64).pow(U256::from(18)),
@@ -1142,18 +1139,17 @@ fn test_v2_full_packet_erc20_transfer() {
         },
     );
     db.insert_account_info(
-        contract,
+        &contract,
         AccountInfo {
             nonce: 1,
             balance: U256::ZERO,
             code_hash,
             code: Some(Bytecode::new_raw(erc20_code)),
-            account_id: None,
+            ..AccountInfo::empty()
         },
     );
     let sender_balance_slot = mapping_slot(sender, 0);
-    db.insert_account_storage(contract, sender_balance_slot, U256::from(1_000_000u64))
-        .expect("insert storage");
+    db.insert_account_storage(&contract, &sender_balance_slot, &U256::from(1_000_000u64));
 
     let chain_spec = test_chain_spec();
 
@@ -1200,7 +1196,7 @@ fn test_v2_full_packet_mixed_block() {
 
     let mut db = CacheDB::new(Default::default());
     db.insert_account_info(
-        sender_a,
+        &sender_a,
         AccountInfo {
             nonce: 0,
             balance: U256::from(10u64) * U256::from(10u64).pow(U256::from(18)),
@@ -1208,7 +1204,7 @@ fn test_v2_full_packet_mixed_block() {
         },
     );
     db.insert_account_info(
-        sender_b,
+        &sender_b,
         AccountInfo {
             nonce: 0,
             balance: U256::from(10u64) * U256::from(10u64).pow(U256::from(18)),
@@ -1216,18 +1212,17 @@ fn test_v2_full_packet_mixed_block() {
         },
     );
     db.insert_account_info(
-        contract,
+        &contract,
         AccountInfo {
             nonce: 1,
             balance: U256::ZERO,
             code_hash,
             code: Some(Bytecode::new_raw(erc20_code)),
-            account_id: None,
+            ..AccountInfo::empty()
         },
     );
     let sender_b_slot = mapping_slot(sender_b, 0);
-    db.insert_account_storage(contract, sender_b_slot, U256::from(1_000_000u64))
-        .expect("insert storage");
+    db.insert_account_storage(&contract, &sender_b_slot, &U256::from(1_000_000u64));
 
     let chain_spec = test_chain_spec();
 
@@ -1298,9 +1293,9 @@ fn run_adversarial_erc20<F: FnOnce(&mut Vec<ReadLogEntry>)>(tamper: F) {
     let erc20_code = minimal_erc20_bytecode();
     let code_hash = keccak256(&erc20_code);
 
-    let mut db = CacheDB::new(revm::database::EmptyDB::default());
+    let mut db = CacheDB::new(EmptyDB::default());
     db.insert_account_info(
-        sender,
+        &sender,
         AccountInfo {
             nonce: 0,
             balance: U256::from(10u64) * U256::from(10u64).pow(U256::from(18)),
@@ -1308,18 +1303,17 @@ fn run_adversarial_erc20<F: FnOnce(&mut Vec<ReadLogEntry>)>(tamper: F) {
         },
     );
     db.insert_account_info(
-        contract,
+        &contract,
         AccountInfo {
             nonce: 1,
             balance: U256::ZERO,
             code_hash,
             code: Some(Bytecode::new_raw(erc20_code)),
-            account_id: None,
+            ..AccountInfo::empty()
         },
     );
     let sender_balance_slot = mapping_slot(sender, 0);
-    db.insert_account_storage(contract, sender_balance_slot, U256::from(1_000_000u64))
-        .expect("insert storage");
+    db.insert_account_storage(&contract, &sender_balance_slot, &U256::from(1_000_000u64));
 
     let chain_spec = test_chain_spec();
     let evm_config = EthEvmConfig::new(chain_spec.clone());

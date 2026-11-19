@@ -21,6 +21,10 @@ pub struct RethExecutionLayer {
     engine: ConsensusEngineHandle<N42EngineTypes>,
     payload_builder: Option<PayloadBuilderHandle<N42EngineTypes>>,
     import_gate: Option<super::import_gate::ImportGate>,
+    follower_import: Option<super::FollowerImport>,
+    /// The block this node resolved from its builder last: parent, number
+    /// and transaction count, which survive the header normalization.
+    last_built: std::sync::Mutex<Option<(alloy_primitives::B256, u64, usize)>>,
 }
 
 impl RethExecutionLayer {
@@ -33,6 +37,8 @@ impl RethExecutionLayer {
             engine,
             payload_builder: Some(payload_builder),
             import_gate: super::import_gate::ImportGate::configured(),
+            follower_import: None,
+            last_built: std::sync::Mutex::new(None),
         }
     }
 
@@ -42,7 +48,18 @@ impl RethExecutionLayer {
             engine,
             payload_builder: None,
             import_gate: super::import_gate::ImportGate::configured(),
+            follower_import: None,
+            last_built: std::sync::Mutex::new(None),
         }
+    }
+}
+
+impl RethExecutionLayer {
+    /// Executes other nodes' blocks with the parallel transfer batches
+    /// before the engine validates them (`N42_PARALLEL_IMPORT=1`).
+    pub fn with_follower_import(mut self, follower_import: Option<super::FollowerImport>) -> Self {
+        self.follower_import = follower_import;
+        self
     }
 }
 
@@ -59,6 +76,33 @@ impl ExecutionLayer for RethExecutionLayer {
                 alloy_rpc_types_engine::PayloadStatusEnum::Valid,
                 Some(payload.block_hash()),
             ));
+        }
+        // Another node's block: its transfers run in batches here, and the
+        // engine checks the output instead of executing the block.
+        let own = self.last_built.lock().is_ok_and(|built| {
+            *built
+                == Some((
+                    payload.parent_hash(),
+                    payload.block_number(),
+                    payload.payload.transactions().len(),
+                ))
+        });
+        if let Some(follower_import) = self.follower_import.as_ref().filter(|_| !own) {
+            let prepared = {
+                let (follower_import, payload) = (follower_import.clone(), payload.clone());
+                tokio::task::spawn_blocking(move || follower_import.prepare(&payload))
+                    .await
+                    .unwrap_or(false)
+            };
+            if prepared {
+                return super::follower_import::submit_prepared(payload.block_hash(), || async {
+                    self.engine
+                        .new_payload(payload.clone())
+                        .await
+                        .map_err(|e| ElError(e.to_string()))
+                })
+                .await;
+            }
         }
         // consensus_loop::background_import / execution_bridge eager import.
         self.engine
@@ -111,6 +155,14 @@ impl ExecutionLayer for RethExecutionLayer {
             .await
             .map(|r| {
                 r.map_err(|e| ElError(e.to_string())).map(|payload| {
+                    let block = payload.block();
+                    if let Ok(mut built) = self.last_built.lock() {
+                        *built = Some((
+                            block.header().parent_hash,
+                            block.header().number,
+                            block.body().transactions.len(),
+                        ));
+                    }
                     super::own_block::remember_built(payload.block_arc());
                     to_built_block(payload)
                 })

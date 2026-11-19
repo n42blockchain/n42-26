@@ -509,14 +509,10 @@ mod tests {
     use alloy_primitives::{TxKind, U256, keccak256};
     use reth_ethereum_primitives::Transaction;
     use reth_execution_types::BlockExecutionResult;
-    use reth_primitives_traits::crypto::secp256k1::public_key_to_address;
     use reth_testing_utils::generators::sign_tx_with_key_pair;
-    use revm::{
-        bytecode::Bytecode,
-        database::states::{AccountStatus, BundleAccount, BundleState},
-        state::AccountInfo,
-    };
-    use secp256k1::{Keypair, Secp256k1, SecretKey};
+    use evm2::{bytecode::Bytecode, evm::AccountInfo};
+    use reth_trie_common::bundle_state::{AccountStatus, BundleAccount, BundleState};
+    use secp256k1::{Keypair, SecretKey};
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -556,14 +552,13 @@ mod tests {
     }
 
     fn keypair() -> Keypair {
-        let secp = Secp256k1::new();
-        let secret = SecretKey::from_slice(&[0x42; 32]).unwrap();
-        Keypair::from_secret_key(&secp, &secret)
+        let secret = SecretKey::from_secret_bytes([0x42; 32]).unwrap();
+        Keypair::from_secret_key(&secret)
     }
 
     fn tx(nonce: u64, to: TxKind, input: Bytes) -> (N42TxEnvelope, Address) {
         let key = keypair();
-        let sender = public_key_to_address(key.public_key());
+        let sender = Address::from_raw_public_key(&key.public_key().serialize_uncompressed()[1..]);
         let tx = sign_tx_with_key_pair(
             key,
             Transaction::Legacy(TxLegacy {

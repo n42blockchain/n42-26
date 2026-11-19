@@ -362,7 +362,7 @@ where
         let parent_hash = recovered_block.header().parent_hash();
         let (state_provider, state_source) = parent_state_provider(provider, parent_hash)?;
 
-        let inner_db = reth_revm::database::StateProviderDatabase::new(
+        let inner_db = reth_evm::database::StateProviderDatabase::new(
             (&*state_provider).into_evm_state_provider(),
         );
         let logged_db = ReadLogDatabase::new(inner_db);

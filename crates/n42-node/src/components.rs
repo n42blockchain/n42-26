@@ -31,12 +31,6 @@ where
         if let Some(cache) = ctx.sender_recovery_cache() {
             config = config.with_sender_recovery_cache(cache.clone());
         }
-        if std::env::var("N42_PARALLEL_IMPORT").as_deref() == Ok("1") {
-            use reth_storage_api::StateProviderFactory;
-            let provider = ctx.provider().clone();
-            config = config
-                .with_parallel_import_provider(move |parent| provider.state_by_block_hash(parent));
-        }
         Ok(config)
     }
 }

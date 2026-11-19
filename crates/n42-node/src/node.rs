@@ -10,7 +10,7 @@ use crate::rpc_compat::Gov5RpcCompatLayer;
 use n42_consensus::{N42HeaderProfile, ValidatorSetResolver};
 use n42_tx_types::{N42Primitives, N42TxEnvelope};
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks, Hardforks};
-use reth_evm::{ConfigureEvm, EvmFactory, EvmFactoryFor, NextBlockEnvAttributes};
+use reth_evm::{ConfigureEvm, NextBlockEnvAttributes};
 use reth_node_api::{FullNodeComponents, NodeAddOns};
 use reth_node_builder::{
     Node, NodeAdapter,
@@ -25,7 +25,6 @@ use reth_node_builder::{
 use reth_node_ethereum::node::EthereumNetworkBuilder;
 use reth_provider::EthStorage;
 use reth_rpc_eth_types::{EthApiError, error::FromEvmError};
-use revm::context::TxEnv;
 use std::sync::Arc;
 
 /// N42 node type configuration.
@@ -151,7 +150,6 @@ where
     EB: EngineApiBuilder<N>,
     EVB: EngineValidatorBuilder<N>,
     EthApiError: FromEvmError<N::Evm>,
-    EvmFactoryFor<N::Evm>: EvmFactory<Tx = TxEnv>,
     RpcMiddleware: RethRpcMiddleware,
 {
     type Handle = RpcHandle<N, EthB::EthApi>;
@@ -182,7 +180,6 @@ where
     EB: EngineApiBuilder<N>,
     EVB: EngineValidatorBuilder<N>,
     EthApiError: FromEvmError<N::Evm>,
-    EvmFactoryFor<N::Evm>: EvmFactory<Tx = TxEnv>,
     RpcMiddleware: RethRpcMiddleware,
 {
     type EthApi = EthB::EthApi;

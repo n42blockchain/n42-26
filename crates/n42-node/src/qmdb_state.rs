@@ -17,7 +17,7 @@ use n42_twig_core::qmdb_compat::{
 use n42_tx_types::{Block, Receipt};
 use reth_execution_types::BlockExecutionOutput;
 use reth_primitives_traits::SealedBlock;
-use revm::database::states::BundleState;
+use reth_trie_common::bundle_state::BundleState;
 use std::collections::HashSet;
 
 /// Apply the additional state that Gov5 replay-v2 inserts after sealing the source block-zero
@@ -110,7 +110,12 @@ pub fn gov5_qmdb_genesis_tree(genesis: &Genesis) -> Result<QmdbCompatTree, QmdbO
 /// write changes every later slot and the root. Reth preserves the same distinction in
 /// `BundleAccount::status`: loaded accounts are reads, while every other status is dirty.
 ///
-/// A destroyed account has complete storage in the revm bundle, so every known slot is emitted:
+/// The evm2 block state commits only the accounts a transaction changed; the accounts one touched
+/// and left as they were (the existing recipient of a zero-value transfer, a beneficiary credited
+/// a zero tip) are put back into the bundle by `n42_execution::TrackingExecutor`, with a dirty
+/// status, so they get their leaf here.
+///
+/// A destroyed account has complete storage in the bundle, so every known slot is emitted:
 /// this preserves the storage wipe even when a slot's `present_value` still equals its original
 /// value. Other accounts emit only changed slots. Ordering is deliberately left to
 /// `QmdbCompatTree::apply_sorted_ops`, which rejects duplicates and sorts by hashed key exactly
@@ -148,7 +153,7 @@ const PARALLEL_OPERATIONS_FROM: usize = 4096;
 fn push_account_operations(
     operations: &mut Vec<QmdbOperation>,
     address: &alloy_primitives::Address,
-    account: &reth_revm::db::BundleAccount,
+    account: &reth_trie_common::bundle_state::BundleAccount,
 ) {
     let address = address.into_array();
     if !account.status.is_not_modified() {
@@ -210,7 +215,7 @@ pub fn gov5_restored_slots_key(block: &SealedBlock<Block>, env_key: B256) -> B25
 pub const GOV5_PRAGUE_SYSTEM_CALLER: alloy_primitives::Address =
     address!("fffffffffffffffffffffffffffffffffffffffe");
 
-/// The leaf a Prague block writes that revm's bundle cannot show: the system
+/// The leaf a Prague block writes that the bundle cannot show: the system
 /// caller of the EIP-7002/7251 end-of-block calls.
 ///
 /// gov5 executes those calls as messages from `SYSTEM_ADDRESS`
@@ -238,7 +243,7 @@ pub fn with_gov5_prague_system_caller(operations: &mut Vec<QmdbOperation>) {
 }
 
 /// [`gov5_qmdb_operations`] plus the rewrites gov5 makes for the slots the block changed and
-/// restored to their value at the block's start, which revm drops from the bundle (see
+/// restored to their value at the block's start, which the bundle drops (see
 /// `n42_execution::restored_slots`). A rewrite is a leaf with the value the slot already has;
 /// QMDB records it as a fresh slot, and the root moves exactly as gov5's does.
 ///
@@ -284,10 +289,8 @@ mod tests {
     use super::*;
     use alloy_genesis::GenesisAccount;
     use alloy_primitives::{Address, U256};
-    use revm::{
-        database::states::{AccountStatus, BundleAccount, StorageSlot},
-        state::AccountInfo,
-    };
+    use evm2::evm::AccountInfo;
+    use reth_trie_common::bundle_state::{AccountStatus, BundleAccount, StorageSlot};
     use std::collections::BTreeMap;
 
     #[test]

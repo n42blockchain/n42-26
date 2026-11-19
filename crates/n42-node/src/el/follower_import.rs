@@ -1,0 +1,256 @@
+//! Another node's block executed with the parallel transfer batches before
+//! the engine sees it (`N42_PARALLEL_IMPORT=1`).
+//!
+//! The block's leading plain transfers run in sender batches over the
+//! block's parent (`n42_execution::parallel_build::import_payload`), and the
+//! output is filed in the payload cache under the block's hash. The engine's
+//! `newPayload` then takes it as it takes a builder's output: it does not
+//! execute the block again, and it checks the output as it checks its own
+//! execution -- gas, receipts, requests and the state root against the
+//! header. Nothing here validates a block; an output the engine refuses is
+//! dropped and the block is submitted again for the engine to execute.
+//!
+//! A block the batches do not take (it opens with something other than a
+//! plain transfer, a fork they do not reproduce, a pre-execution change to
+//! one of their accounts, a parent this node does not hold) is submitted
+//! with no output, as without this module.
+
+use alloy_primitives::{Address, B256};
+use alloy_rpc_types_engine::{ExecutionData, PayloadStatus};
+use n42_execution::{N42EvmConfig, parallel_build};
+use n42_tx_types::Receipt;
+use reth_evm::database::StateProviderDatabase;
+use reth_execution_types::BlockExecutionOutput;
+use reth_storage_api::{StateProvider, StateProviderBox};
+use std::{future::Future, sync::Arc};
+
+/// What the engine takes from the payload cache.
+type CachedExecution = (BlockExecutionOutput<Receipt>, Vec<Address>);
+
+/// Opens the state a block hash names, when this node holds it.
+type OpenState = dyn Fn(B256) -> Option<StateProviderBox> + Send + Sync;
+
+/// Executes other nodes' blocks ahead of the engine.
+#[derive(Clone)]
+pub struct FollowerImport {
+    config: N42EvmConfig,
+    open: Arc<OpenState>,
+}
+
+impl std::fmt::Debug for FollowerImport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FollowerImport").finish_non_exhaustive()
+    }
+}
+
+impl FollowerImport {
+    /// The import over `config`, the engine's own EVM configuration, reading
+    /// parents through `open`.
+    pub fn new(
+        config: N42EvmConfig,
+        open: impl Fn(B256) -> Option<StateProviderBox> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            config,
+            open: Arc::new(open),
+        }
+    }
+
+    /// [`Self::new`] when `N42_PARALLEL_IMPORT=1`.
+    pub fn configured(
+        config: N42EvmConfig,
+        open: impl Fn(B256) -> Option<StateProviderBox> + Send + Sync + 'static,
+    ) -> Option<Self> {
+        std::env::var("N42_PARALLEL_IMPORT")
+            .is_ok_and(|value| value == "1")
+            .then(|| Self::new(config, open))
+    }
+
+    /// Executes `payload` and files its output for the engine. Returns
+    /// whether an output was filed. `false` leaves the payload cache as it
+    /// was: the block is the engine's to execute.
+    pub fn prepare(&self, payload: &ExecutionData) -> bool {
+        let hash = payload.block_hash();
+        // A block this node built, or one that arrived with its leader's
+        // output, already has its output filed: that one stands.
+        if let Some(held) = reth_evm::payload_cache::take_payload_execution::<CachedExecution>(&hash)
+        {
+            reth_evm::payload_cache::store_payload_execution(hash, held);
+            return false;
+        }
+        let started = std::time::Instant::now();
+        let declined = |reason: &'static str| {
+            metrics::counter!("n42_parallel_import_declined_total", "reason" => reason)
+                .increment(1);
+            false
+        };
+        if payload.payload.transactions().is_empty() {
+            return declined("empty");
+        }
+        let Ok((transactions, senders)) = self.config.recover_payload_transactions(payload) else {
+            // The engine reports what is wrong with the payload.
+            return declined("senders");
+        };
+        let parent = payload.parent_hash();
+        let Some(main) = (self.open)(parent) else {
+            return declined("parent-state");
+        };
+        let open = || {
+            Some(StateProviderDatabase::new(
+                (self.open)(parent)?.into_evm_state_provider(),
+            ))
+        };
+        let imported = parallel_build::import_payload(
+            &self.config,
+            payload,
+            &transactions,
+            &senders,
+            StateProviderDatabase::new(main.into_evm_state_provider()),
+            &open,
+        );
+        match imported {
+            Ok((output, stats)) => {
+                reth_evm::payload_cache::store_payload_execution(hash, (output, senders));
+                let batch_ms = started.elapsed().as_secs_f64() * 1_000.0;
+                metrics::counter!("n42_parallel_import_executed_total")
+                    .increment(stats.txs as u64);
+                metrics::histogram!("n42_parallel_import_batch_ms").record(batch_ms);
+                for (stage, ms) in [
+                    ("partition", stats.phases.partition_ms as f64),
+                    ("execute", stats.phases.groups_ms as f64),
+                    ("collect", stats.phases.collect_ms as f64),
+                    ("finish", stats.finish_us as f64 / 1_000.0),
+                ] {
+                    metrics::histogram!("n42_parallel_import_batch_stage_ms", "stage" => stage)
+                        .record(ms);
+                }
+                tracing::debug!(
+                    target: "n42::el",
+                    %hash,
+                    txs = stats.txs,
+                    tail = stats.tail,
+                    batches = stats.phases.batches,
+                    accounts = stats.accounts,
+                    cached = stats.cached,
+                    direct_hits = stats.phases.direct_hits,
+                    batch_ms,
+                    "parallel import executed; the engine validates the output"
+                );
+                true
+            }
+            Err(refused) => {
+                tracing::debug!(target: "n42::el", %hash, %refused, "parallel import declined; the engine executes the block");
+                declined(refused.reason())
+            }
+        }
+    }
+
+    /// Drops the output filed for `hash` when the engine did not take it.
+    pub fn discard(hash: &B256) {
+        drop(reth_evm::payload_cache::take_payload_execution::<CachedExecution>(hash));
+    }
+}
+
+/// Submits a payload whose output [`FollowerImport::prepare`] filed. An
+/// `INVALID` answer may be a verdict on that output rather than on the block
+/// (the engine does not remember the hash for a refused output), so the
+/// output is dropped and the payload submitted once more, which the engine
+/// then executes itself: that second answer is the block's.
+pub(super) async fn submit_prepared<F, E>(
+    hash: B256,
+    submit: impl Fn() -> F,
+) -> Result<PayloadStatus, E>
+where
+    F: Future<Output = Result<PayloadStatus, E>>,
+{
+    let first = submit().await;
+    // Whatever the answer, nothing of this block stays filed.
+    FollowerImport::discard(&hash);
+    match first {
+        Ok(status) if status.is_invalid() => {
+            metrics::counter!("n42_parallel_import_resubmitted_total").increment(1);
+            tracing::warn!(
+                target: "n42::el",
+                %hash,
+                %status,
+                "payload refused with the parallel import's output; submitting it for the engine to execute"
+            );
+            submit().await
+        }
+        answer => answer,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_rpc_types_engine::PayloadStatusEnum;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn invalid() -> PayloadStatus {
+        PayloadStatus::from_status(PayloadStatusEnum::Invalid {
+            validation_error: "cached execution output refused: receipts root".to_owned(),
+        })
+    }
+
+    fn valid(hash: B256) -> PayloadStatus {
+        PayloadStatus::new(PayloadStatusEnum::Valid, Some(hash))
+    }
+
+    /// A refused output ends in the engine's own answer, after exactly one
+    /// more submission, with nothing left filed.
+    #[tokio::test]
+    async fn a_refused_output_is_dropped_and_the_payload_submitted_once_more() {
+        let hash = B256::repeat_byte(0x71);
+        reth_evm::payload_cache::store_payload_execution(
+            hash,
+            (BlockExecutionOutput::<Receipt>::default(), Vec::<Address>::new()),
+        );
+        let calls = AtomicUsize::new(0);
+        let answer = submit_prepared(hash, || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok::<_, ()>(if n == 0 { invalid() } else { valid(hash) }) }
+        })
+        .await;
+        assert_eq!(answer, Ok(valid(hash)));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            reth_evm::payload_cache::take_payload_execution::<CachedExecution>(&hash).is_none()
+        );
+    }
+
+    /// A block that is invalid stays invalid: one more submission, no loop.
+    #[tokio::test]
+    async fn an_invalid_block_is_submitted_twice_and_no_more() {
+        let hash = B256::repeat_byte(0x72);
+        let calls = AtomicUsize::new(0);
+        let answer = submit_prepared(hash, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<_, ()>(invalid()) }
+        })
+        .await;
+        assert_eq!(answer, Ok(invalid()));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A valid answer, a syncing one and an engine error are the answer.
+    #[tokio::test]
+    async fn any_other_answer_is_returned_after_one_submission() {
+        let hash = B256::repeat_byte(0x73);
+        for first in [
+            Ok(valid(hash)),
+            Ok(PayloadStatus::from_status(PayloadStatusEnum::Syncing)),
+            Err(()),
+        ] {
+            let calls = AtomicUsize::new(0);
+            let answer = submit_prepared(hash, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let first = first.clone();
+                async move { first }
+            })
+            .await;
+            assert_eq!(answer, first);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+}

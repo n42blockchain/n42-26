@@ -20,7 +20,7 @@ use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_ethereum_primitives::Transaction;
 use reth_evm::execute::{BasicBlockExecutor, BlockExecutionOutput, Executor};
 use reth_primitives_traits::{
-    Block as _, SignedTransaction, crypto::secp256k1::public_key_to_address,
+    Block as _, SignedTransaction,
 };
 use reth_provider::{
     providers::BlockchainProvider, test_utils::create_test_provider_factory_with_node_types,
@@ -31,7 +31,7 @@ use reth_transaction_pool::{
     CoinbaseTipOrdering, Pool, PoolConfig, PoolTransaction, TransactionOrigin, TransactionPool,
     blobstore::InMemoryBlobStore, noop::MockTransactionValidator,
 };
-use secp256k1::{Keypair, Secp256k1, SecretKey};
+use secp256k1::{Keypair, SecretKey};
 use std::sync::Arc;
 
 fn account(tree: &mut QmdbCompatTree, address: Address, nonce: u64, balance: U256) {
@@ -47,6 +47,20 @@ pub async fn run(native: bool) -> eyre::Result<()> {
 }
 
 pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::Result<()> {
+    run_mode(native, reuse_builder_output, false).await
+}
+
+/// The native block imported as a follower imports it with
+/// `N42_PARALLEL_IMPORT=1`: executed by the parallel import over QMDB-only
+/// state, the output filed for the engine, which validates it. Before that,
+/// outputs that are deliberately wrong are refused by the engine as outputs,
+/// not as the block.
+#[allow(dead_code)]
+pub async fn run_follower() -> eyre::Result<()> {
+    run_mode(true, false, true).await
+}
+
+async fn run_mode(native: bool, reuse_builder_output: bool, follower: bool) -> eyre::Result<()> {
     assert!(
         !reuse_builder_output || native,
         "cache rekey requires the native profile"
@@ -57,14 +71,13 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
         n42_consensus::N42HeaderProfile::Ethereum
     };
     let chain = n42_chainspec::n42_dev_chainspec();
-    let secp = Secp256k1::new();
     let keys: Vec<_> = [1u8, 2]
         .into_iter()
-        .map(|n| Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[n; 32]).unwrap()))
+        .map(|n| Keypair::from_secret_key(&SecretKey::from_secret_bytes([n; 32]).unwrap()))
         .collect();
     let senders: Vec<_> = keys
         .iter()
-        .map(|key| public_key_to_address(key.public_key()))
+        .map(|key| Address::from_raw_public_key(&key.public_key().serialize_uncompressed()[1..]))
         .collect();
     let recipient = Address::repeat_byte(0x33);
     let beneficiary = Address::repeat_byte(0x44);
@@ -238,7 +251,7 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
     type Cached = (BlockExecutionOutput<n42_tx_types::Receipt>, Vec<Address>);
     let (mut cached, cached_senders) =
         reth_evm::payload_cache::take_payload_execution::<Cached>(&hash).unwrap();
-    let db = reth_revm::database::StateProviderDatabase::new(
+    let db = reth_evm::database::StateProviderDatabase::new(
         provider
             .state_by_block_hash(parent)?
             .into_evm_state_provider(),
@@ -269,60 +282,72 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
         // execution. Restore that verified output for the Engine cache-hit test.
         reth_evm::payload_cache::store_payload_execution(hash, (cached, cached_senders));
     }
-    // The ordinary import executor uses the same production parent provider;
-    // the factory's single-transaction shortcut remains disabled.
+    // The follower's parallel import of the built block, over the same
+    // production parent provider, gives the serial execution's output.
     let import_provider = provider.clone();
-    let import_config = config.with_parallel_import_provider(move |hash| {
-        assert_eq!(hash, parent, "every worker opens the exact sealed parent");
-        import_provider.state_by_block_hash(hash)
-    });
-    let updates = Arc::new(std::sync::Mutex::new(revm::state::EvmState::default()));
-    let sink = updates.clone();
-    let db = reth_revm::database::StateProviderDatabase::new(
+    let db = reth_evm::database::StateProviderDatabase::new(
         provider
             .state_by_block_hash(parent)?
             .into_evm_state_provider(),
     );
-    let mut importer = BasicBlockExecutor::new(import_config.clone(), db);
-    let import_recorder = metrics_util::debugging::DebuggingRecorder::new();
-    let result = metrics::with_local_recorder(&import_recorder, || {
-        importer.execute_one_with_state_hook(
-            payload.recovered_block(),
-            move |changes: revm::state::EvmState| {
-                sink.lock()
-                    .unwrap()
-                    .extend(changes.into_iter().filter(|(_, a)| a.is_touched()));
-            },
-        )
-    })?;
-    let mut imported = importer.into_state().take_bundle();
-    for reverts in imported.reverts.iter_mut() {
+    let (mut parallel_import, import_stats) = n42_execution::parallel_build::import_block(
+        &config,
+        payload.recovered_block(),
+        db,
+        &|| {
+            let provider = import_provider.state_by_block_hash(parent).ok()?;
+            Some(reth_evm::database::StateProviderDatabase::new(
+                provider.into_evm_state_provider(),
+            ))
+        },
+    )
+    .map_err(|refused| eyre::eyre!("parallel import refused: {refused}"))?;
+    assert_eq!((import_stats.txs, import_stats.tail), (4_096, 0));
+    for reverts in parallel_import.state.reverts.iter_mut() {
         reverts.sort_unstable_by_key(|(address, _)| *address);
     }
     assert_eq!(
-        imported, serial.state,
+        parallel_import.state, serial.state,
+        "parallel import complete bundle and rollback originals"
+    );
+    assert_eq!(
+        parallel_import.result, serial.result,
+        "parallel import receipts and gas retain sealed order"
+    );
+    // The ordinary import executor with its state hook, as the engine runs
+    // a block the parallel import refused.
+    let updates = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let sink = updates.clone();
+    let db = reth_evm::database::StateProviderDatabase::new(
+        provider
+            .state_by_block_hash(parent)?
+            .into_evm_state_provider(),
+    );
+    let mut imported = BasicBlockExecutor::new(config.clone(), db).execute_with_state_hook(
+        payload.recovered_block(),
+        move |update: reth_execution_types::StateUpdate| {
+            let mut latest = sink.lock().unwrap();
+            for account in update.accounts {
+                latest.insert(account.address, account.current);
+            }
+        },
+    )?;
+    for reverts in imported.state.reverts.iter_mut() {
+        reverts.sort_unstable_by_key(|(address, _)| *address);
+    }
+    assert_eq!(
+        imported.state, serial.state,
         "import complete bundle and rollback originals"
     );
     assert_eq!(
-        result, serial.result,
+        imported.result, serial.result,
         "import receipts and gas retain sealed order"
     );
-    assert!(
-        import_recorder
-            .snapshotter()
-            .snapshot()
-            .into_vec()
-            .iter()
-            .any(|(key, _, _, value)| {
-                key.key().name() == "n42_parallel_import_executed_total"
-                    && matches!(value, metrics_util::debugging::DebugValue::Counter(4_096))
-            })
-    );
     let updates = updates.lock().unwrap();
-    for (address, account) in &imported.state {
+    for (address, account) in &imported.state.state {
         assert_eq!(
-            updates.get(address).map(|a| &a.info),
-            account.info.as_ref(),
+            updates.get(address),
+            Some(&account.info),
             "root notification for {address}"
         );
     }
@@ -360,6 +385,7 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
     let mut engine_block = payload.block().clone().into_block();
     engine_block.header.state_root = B256::from(tree.root());
     let engine_block = engine_block.seal_slow();
+    let block_senders = payload.recovered_block().senders().to_vec();
     let execution = payload.into_execution_data();
     let roots = RethExecutionOutputCache::new(Some(store.clone()), chain.clone())
         .take_gov5_normalization(&execution)
@@ -434,6 +460,7 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
         EngineApiTreeState,
         payload_validator::{BasicEngineValidator, BlockOrPayload, TreeCtx},
     };
+    let follower_provider = provider.clone();
     tokio::task::block_in_place(|| -> eyre::Result<()> {
         let runtime = reth_tasks::Runtime::test();
         let overlay =
@@ -455,7 +482,7 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
         let mut engine = BasicEngineValidator::new(
             provider,
             Arc::new(n42_consensus::N42Consensus::new(chain.clone()).with_header_profile(profile)),
-            import_config,
+            config.clone(),
             n42_node::engine_validator::N42EngineValidator::new(chain.clone(), profile),
             tree_config,
             Box::new(reth_engine_primitives::NoopInvalidBlockHook::default()),
@@ -485,30 +512,77 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
         bad_nonce.header.transactions_root =
             alloy_consensus::proofs::calculate_transaction_root(&bad_nonce.body.transactions);
         let bad_nonce = bad_nonce.seal_slow();
-        let fallback_recorder = metrics_util::debugging::DebuggingRecorder::new();
         assert!(
-            metrics::with_local_recorder(&fallback_recorder, || {
-                engine.validate_block_with_state::<n42_node::engine_types::N42EngineTypes>(
+            engine
+                .validate_block_with_state::<n42_node::engine_types::N42EngineTypes>(
                     BlockOrPayload::Block(bad_nonce.clone().into()),
                     TreeCtx::new(&mut state, &canonical),
                 )
-            })
-            .is_err(),
-            "a signed duplicate nonce must fail ordered serial fallback"
+                .is_err(),
+            "a signed duplicate nonce must fail the import"
         );
         assert_eq!(store.root_for(bad_nonce.hash())?, None);
-        assert!(
-            !fallback_recorder
-                .snapshotter()
-                .snapshot()
-                .into_vec()
-                .iter()
-                .any(|(key, _, _, _)| { key.key().name() == "n42_parallel_import_executed_total" }),
-            "a sealed batch cannot silently omit a refused transaction"
-        );
-        let engine_recorder = metrics_util::debugging::DebuggingRecorder::new();
-        let checked = metrics::with_local_recorder(&engine_recorder, || {
-            engine.validate_block_with_state::<n42_node::engine_types::N42EngineTypes>(
+        if follower {
+            let payload = native_payload.as_ref().expect("the follower imports the wire payload");
+            let wire_hash = payload.block_hash();
+            // An output that is not the block's is refused as an output: the
+            // error is the transient one, nothing is committed, and the
+            // block is still importable afterwards.
+            let mut wrong_state = serial.clone();
+            let credited = wrong_state.state.state.get_mut(&recipient).unwrap();
+            credited.info.as_mut().unwrap().balance += U256::from(1);
+            let mut wrong_receipts = serial.clone();
+            wrong_receipts.result.receipts[0].cumulative_gas_used += 1;
+            for wrong in [wrong_state, wrong_receipts] {
+                reth_evm::payload_cache::store_payload_execution(
+                    wire_hash,
+                    (wrong, block_senders.clone()),
+                );
+                let Err(refused) = engine
+                    .validate_block_with_state::<n42_node::engine_types::N42EngineTypes>(
+                        BlockOrPayload::Payload(payload.clone()),
+                        TreeCtx::new(&mut state, &canonical),
+                    )
+                else {
+                    panic!("a wrong cached output must not validate");
+                };
+                assert!(
+                    format!("{refused:?}").contains("CachedExecutionRefused"),
+                    "the verdict is on the output, not on the block: {refused:?}"
+                );
+                assert!(
+                    reth_evm::payload_cache::take_payload_execution::<Cached>(&wire_hash).is_none(),
+                    "the refused output is consumed"
+                );
+                assert_eq!(store.root_for(wire_hash)?, None);
+            }
+            // The follower's import: QMDB-only reads of the sealed parent.
+            let reads_before = qmdb_state_reader::status(Some(parent))?.counters.account_reads;
+            let open_provider = follower_provider.clone();
+            let import = n42_node::el::FollowerImport::new(config.clone(), move |hash| {
+                open_provider.state_by_block_hash(hash).ok()
+            });
+            assert!(import.prepare(payload), "the transfer block is the batches'");
+            assert!(
+                qmdb_state_reader::status(Some(parent))?.counters.account_reads > reads_before,
+                "the parallel import read the parent from QMDB"
+            );
+            // An output already filed stands: a second pass does not run.
+            assert!(!import.prepare(payload));
+            let (filed, filed_senders) =
+                reth_evm::payload_cache::take_payload_execution::<Cached>(&wire_hash)
+                    .expect("the import's output is filed under the block's hash");
+            assert_eq!(filed_senders, block_senders);
+            let mut sorted = filed.clone();
+            for reverts in sorted.state.reverts.iter_mut() {
+                reverts.sort_unstable_by_key(|(address, _)| *address);
+            }
+            assert_eq!(sorted.state, serial.state);
+            assert_eq!(sorted.result, serial.result);
+            reth_evm::payload_cache::store_payload_execution(wire_hash, (filed, filed_senders));
+        }
+        let checked = engine
+            .validate_block_with_state::<n42_node::engine_types::N42EngineTypes>(
                 if let Some(payload) = &native_payload {
                     BlockOrPayload::Payload(payload.clone())
                 } else {
@@ -516,8 +590,14 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
                 },
                 TreeCtx::new(&mut state, &canonical),
             )
-        })
         .map_err(|e| eyre::eyre!("Engine import failed: {e:?}"))?;
+        if follower {
+            assert!(
+                reth_evm::payload_cache::take_payload_execution::<Cached>(&engine_block.hash())
+                    .is_none(),
+                "the engine took the follower's output"
+            );
+        }
         let mut engine_output = checked.executed_block.execution_outcome().clone();
         for reverts in engine_output.state.reverts.iter_mut() {
             reverts.sort_unstable_by_key(|(address, _)| *address);
@@ -533,20 +613,6 @@ pub async fn run_with_cache(native: bool, reuse_builder_output: bool) -> eyre::R
             checked.executed_block.recovered_block().hash(),
             engine_block.hash()
         );
-        if !reuse_builder_output {
-            assert!(
-                engine_recorder
-                    .snapshotter()
-                    .snapshot()
-                    .into_vec()
-                    .iter()
-                    .any(|(key, _, _, value)| {
-                        key.key().name() == "n42_parallel_import_executed_total"
-                            && matches!(value, metrics_util::debugging::DebugValue::Counter(4_096))
-                    }),
-                "Engine must execute the local parallel batch"
-            );
-        }
         assert_eq!(
             store.root_for(engine_block.hash())?,
             Some(B256::from(tree.root()))

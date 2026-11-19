@@ -283,7 +283,7 @@ fn gov5_restored_slots_key_for_payload(
     let ctx = config.context_for_payload(execution).ok()?;
     let context = n42_execution::restored_slots_execution_key(
         execution.parent_hash(),
-        n42_execution::restored_slots_env_key(&env.block_env),
+        n42_execution::restored_slots_env_key(&env.block),
         ctx.parent_beacon_block_root,
         ctx.withdrawals.as_deref(),
         [],
@@ -361,7 +361,7 @@ fn take_built_gov5_roots(hash: &B256) -> Option<(B256, B256)> {
 /// The QMDB operations of a block's state changes in the tree's canonical
 /// order. The ordering buffer is owned here, before the tree lock is taken.
 pub(crate) fn gov5_sorted_operations(
-    state: &reth_revm::db::BundleState,
+    state: &reth_trie_common::bundle_state::BundleState,
     restored: &[n42_execution::RestoredSlot],
     prague: bool,
 ) -> Vec<n42_twig_core::qmdb_compat::QmdbOperation> {
@@ -717,7 +717,8 @@ mod tests {
     #[test]
     fn compact_output_with_unbound_bytecode_or_senders_is_refused() {
         use alloy_primitives::{Bytes, keccak256};
-        use revm::{bytecode::Bytecode, database::BundleState};
+        use evm2::bytecode::Bytecode;
+        use reth_trie_common::bundle_state::BundleState;
 
         let _lock = CACHE_TEST_LOCK.lock().unwrap();
         let hash = B256::repeat_byte(0x47);
@@ -861,10 +862,8 @@ mod tests {
         use n42_twig_core::qmdb_compat::{
             QmdbCompatTree, encode_gov5_account_value, gov5_account_key,
         };
-        use revm::{
-            database::states::{AccountStatus, BundleAccount},
-            state::AccountInfo,
-        };
+        use evm2::evm::AccountInfo;
+        use reth_trie_common::bundle_state::{AccountStatus, BundleAccount};
         let _lock = CACHE_TEST_LOCK.lock().unwrap();
         let base = QmdbCompatTree::new();
         let base_hash = B256::repeat_byte(0x61);

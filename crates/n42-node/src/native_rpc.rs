@@ -11,7 +11,7 @@ use alloy_rpc_types_eth::{Log, TransactionReceipt, TransactionRequest};
 use n42_tx_types::{N42RpcReceipt, N42TxEnvelope, Receipt};
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_node_api::{FullNodeComponents, FullNodeTypes, NodeTypes, PrimitivesTy};
-use reth_node_builder::rpc::{EthApiBuilder, EthApiCtx};
+use reth_node_builder::rpc::{EthApiBuilder, EthApiCtx, RpcNodeCoreFor};
 use reth_primitives_traits::TransactionMeta;
 use reth_provider::ChainSpecProvider;
 use reth_rpc::EthApi;
@@ -86,7 +86,7 @@ pub type N42RpcConverterFor<N> = RpcConverter<
 >;
 
 /// The `eth_` API for a node with components `N`.
-pub type N42EthApiFor<N> = EthApi<N, N42RpcConverterFor<N>>;
+pub type N42EthApiFor<N> = EthApi<RpcNodeCoreFor<N>, N42RpcConverterFor<N>>;
 
 /// Builds the `eth_` API over [`N42RpcTypes`].
 #[derive(Debug, Default, Clone, Copy)]
