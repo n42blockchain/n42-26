@@ -17,7 +17,7 @@ n42-zkproof.workspace = true
 
 # Execution-domain type deps (pragmatic boundary: NO reth-node-builder / reth-evm /
 # reth-payload-* / reth-transaction-pool / reth-execution-types).
-revm.workspace = true
+evm2.workspace = true
 reth-ethereum-primitives.workspace = true
 n42-tx-types.workspace = true
 

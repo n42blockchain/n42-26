@@ -62,8 +62,8 @@ reth-transaction-pool.workspace = true
 reth-tasks.workspace = true
 reth-primitives-traits.workspace = true
 reth-evm.workspace = true
-reth-revm.workspace = true
-revm.workspace = true
+evm2.workspace = true
+reth-trie-common.workspace = true
 blake3.workspace = true
 
 alloy-consensus.workspace = true

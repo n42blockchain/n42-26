@@ -8,7 +8,6 @@ description = "N42 EVM execution layer wrapping reth EthEvmConfig"
 
 [dependencies]
 n42-chainspec.workspace = true
-n42-parallel-evm.workspace = true
 n42-tx-types.workspace = true
 
 reth-chainspec.workspace = true
@@ -17,18 +16,17 @@ reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
 reth-execution-types.workspace = true
 reth-primitives-traits.workspace = true
-reth-revm = { workspace = true, features = ["witness"] }
 reth-storage-errors.workspace = true
 reth-storage-api.workspace = true
 reth-trie-common.workspace = true
 
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
-alloy-evm.workspace = true
+alloy-eip7928.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-engine.workspace = true
-revm.workspace = true
-rayon.workspace = true
+evm2.workspace = true
+evm2-macros.workspace = true
 blake3.workspace = true
 
 serde.workspace = true
@@ -36,6 +34,7 @@ eyre.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 metrics.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
