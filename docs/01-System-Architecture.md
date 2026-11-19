@@ -219,11 +219,11 @@ Each module's end-to-end integration status: constructed in `main.rs` → events
 | Validator Reconfig RPC | ✅ Wired | always | `main.rs:515` → admin channel → orchestrator select! |
 | QMDB binary twig (`ShardedTwig`) | ✅ Wired | default (`N42_TWIG` unset/on) | `main.rs` → `with_twig()` → execution-validated, ordered `apply_diff` worker |
 | Reserve SBMT | ⚙️ Opt-in | `N42_JMT=1` | `main.rs` → `with_jmt()`; disabled when twig is selected |
-| Parallel EVM | ⚙️ Opt-in | `N42_PARALLEL_EVM=1` | `executor.rs:130` `parallel_evm_enabled()` → `execute_block_parallel` (off by default) |
+| Parallel EVM | ❌ Parked | — | `n42-parallel-evm` is REVM-only; the `N42_PARALLEL_EVM` switch was removed at the evm2 migration (devlog-186) |
 
 ### Open issues
 
-1. **Parallel EVM opt-in**：`n42-parallel-evm` 由 `N42_PARALLEL_EVM=1` 门控（`executor.rs:130` `parallel_evm_enabled`），默认走 reth 标准串行路径。Block-STM 在小块（< `N42_PARALLEL_THRESHOLD`，默认 8 tx）时回退顺序执行；devlog-28 评估 EVM 仅占 8s slot 约 5%，启用收益有限，仍是 opt-in。
+1. **Parallel EVM 已搁置**：`n42-parallel-evm` 仅支持 revm，evm2 迁移（devlog-186）时移出 workspace，`N42_PARALLEL_EVM` 开关随之删除，执行走 reth 标准串行路径。以下为搁置前的评估：Block-STM 在小块（< `N42_PARALLEL_THRESHOLD`，默认 8 tx）时回退顺序执行；devlog-28 评估 EVM 仅占 8s slot 约 5%，启用收益有限，仍是 opt-in。
 2. **Admin RPC 无鉴权**：`proposeAddValidator`/`proposeRemoveValidator` 端点无权限控制，任何 RPC 客户端可调用（除非启用 `N42_ADMIN_TOKEN`）。
 
 ## Shared state objects
@@ -275,5 +275,5 @@ Persistent recovery payload for:
 - security-sensitive mobile authorization spans `star_hub`, `mobile_bridge`, `consensus_state`, and `rpc`
 - release readiness depends heavily on cross-module invariants rather than a single enforcement layer
 - QMDB/LtHash proposal commitments and the explicit full-replay mode are not yet wired; see `follower-validation-modes.md`
-- `n42-parallel-evm` remains opt-in pending broader differential evidence
+- `n42-parallel-evm` is parked (REVM-only, excluded from the workspace since the evm2 migration)
 - admin RPC endpoints (`proposeAddValidator`/`proposeRemoveValidator`) lack authentication

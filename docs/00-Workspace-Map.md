@@ -24,7 +24,7 @@ n42-26/
 | `bin/n42-node` | binary | Primary node process and bootstrap path |
 | `bin/n42-mobile-sim` | binary | Mobile verifier simulator |
 | `bin/n42-stress` | binary | High-throughput transaction injector |
-| `bin/n42-evm-bench` | binary | EVM benchmarking utility |
+| `bin/n42-evm-bench` | binary | EVM benchmarking utility (REVM-only; parked and excluded from the workspace since the evm2 migration) |
 | `crates/n42-primitives` | library | Shared primitive types, BLS keys, consensus messages |
 | `crates/n42-chainspec` | library | Chain spec and N42 consensus config |
 | `crates/n42-consensus` | library | HotStuff-2 consensus engine and validator logic |
@@ -33,7 +33,7 @@ n42-26/
 | `crates/n42-mobile-ffi` | library | Android/iOS/C bindings for mobile verifier runtime |
 | `crates/n42-network` | library | libp2p network service and QUIC StarHub |
 | `crates/n42-node` | library | Node composition, orchestrator, RPC, persistence, rewards |
-| `crates/n42-parallel-evm` | library | Optimistic parallel EVM execution engine |
+| `crates/n42-parallel-evm` | library | Optimistic parallel EVM execution engine (REVM-only; parked and excluded from the workspace since the evm2 migration) |
 | `crates/n42-jmt` | library | Blake3-based Jellyfish Merkle Tree implementation |
 | `crates/n42-zkproof` | library | ZK proof scheduling, storage, prover abstraction |
 | `tests/e2e` | binary/test harness | Multi-scenario end-to-end test runner |
@@ -69,7 +69,7 @@ flowchart TD
 ### Execution and state
 
 - `crates/n42-execution`
-- `crates/n42-parallel-evm`
+- `crates/n42-parallel-evm` (parked, not built)
 - `crates/n42-jmt`
 
 ### Mobile verification plane

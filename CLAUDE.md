@@ -25,21 +25,26 @@ GIT_COMMITTER_NAME="Nyxen" GIT_COMMITTER_EMAIL="40690755+MiraWells@users.noreply
 
 ### Reth 稳定版基线
 
-当前基线为官方 **v2.8.1**，上游 commit
-`d763342fa185e4e90ee79dc65f6a5706168b0bcb`，加十个 N42 补丁后为
-`7aee67f58fe34b4bd9eef6a5e6caa603d3a25127`。版本、补丁序列与直接依赖以
+当前基线为官方 **v2.11.0**，上游 commit
+`b9abbcc1b982755baa9021e6874e2e58936ca65f`，加十一个 N42 补丁后为
+`20bc910983b45d53f5f5d287dca92f226d5c5622`。版本、补丁序列与直接依赖以
 [`reth-source.lock`](reth-source.lock) 为准；CI 检出官方源并应用 `patches/reth-*.patch`。
 
 本机原 `../reth` 是包含未提交改动的旧 checkout，不可直接作为当前构建源或覆盖修改。
-已适配源位于 `.artifacts/reth-upgrade-281/reth-worktree`，同目录的 `reth` 链接指向它；
-在 `.artifacts/reth-upgrade-281/` 下建 n42-26 的 git worktree，其 `../reth` 即解析到适配源，
+已适配源位于 `.artifacts/reth-upgrade-2110/reth-worktree`（分支 `n42/v2.11.0`），同目录的 `reth` 链接指向它；
+在 `.artifacts/reth-upgrade-2110/` 下建 n42-26 的 git worktree，其 `../reth` 即解析到适配源，
 无需改写 Cargo.toml。用 `bash scripts/check-reth-source.sh <reth-source>` 验证源码。
 
-直接依赖为 revm 43.0.3、alloy-evm 0.39.0、reth-primitives-traits 0.8.2、
-Alloy 2.5.0 与 alloy-primitives 1.7.3（reth v2.8.1 未移动这些版本）。不要为旧源码降低这些依赖。
-QMDB bin 状态读取、交易根缓存、导入批处理及 Engine 状态 provider 补丁均须保留；
-迁移记录见 [Reth 2.8.1 升级](docs/devlog-178-reth-281-upgrade-20261025.md)，
-上一轮见 [Reth 2.7.0 适配](docs/devlog-177-reth-27-upgrade-20261003.md)。
+EVM 为 evm2（reth v2.9.0 起取代 revm）：git `alloy-rs/evm2` rev
+`66687c18b34d3bdbb899f5eb7605070615c03475`，经 `[patch]` 指向 `DaniPopes/evm2` 同一 rev 以保证图中只有一份；
+workspace 不再依赖 revm、alloy-evm、reth-revm。reth-primitives-traits 0.8.2 等 reth-core crate 经
+`[patch.crates-io]` 取自 `paradigmxyz/reth-core` rev `275ce4cf5befeb9f1e8acd935ff2882d2d25fc61`；
+Alloy 2.5.0、alloy-primitives 1.7.3。`vendor/dependency-repairs/evm2-inspectors-0.1.0` 取代原 revm-inspectors 修复。
+不要为旧源码降低这些依赖。
+QMDB bin 状态读取、交易根缓存、缓存执行拒绝回退、原生导入路径、已执行块收件箱及 Engine 状态 provider
+补丁均须保留；原导入批处理两个补丁（`reth-import-batch`、`reth-import-batch-tail`）在 v2.11.0 不再迁移。
+迁移记录见 [Reth 2.11.0 升级（revm → evm2）](docs/devlog-186-reth-2110-evm2-upgrade-20261119.md)，
+上一轮见 [Reth 2.8.1 升级](docs/devlog-178-reth-281-upgrade-20261025.md)。
 
 ## 常用命令
 
@@ -73,7 +78,6 @@ cargo build --release -p n42-node-bin -p e2e-test
 # 其他二进制
 cargo build --release -p n42-stress       # 压力测试工具（TCP 注入，122K tx/s）
 cargo build --release -p n42-mobile-sim   # 手机模拟器
-cargo build --release -p n42-evm-bench    # EVM 基准
 
 # 本地测试网（推荐，7 节点默认）
 ./scripts/testnet.sh
@@ -102,22 +106,24 @@ E2E_SCENARIO_FILTER=5,8,12 target/release/e2e-test --binary target/release/n42-n
 | `n42-chainspec` | 链配置、ValidatorInfo、ConsensusConfig（含 deterministic_key_bytes） |
 | `n42-consensus` | HotStuff-2 状态机、验证者生命周期、reth 适配器 |
 | `n42-execution` | EVM 执行辅助、witness 生成、state diff |
-| `n42-mobile` | 手机协议、数据包、收据、本地验证（零 reth 依赖，签名走 n42-primitives 的 BLS） |
+| `n42-mobile` | 手机协议、数据包、收据、本地验证（用 reth-evm + evm2 重执行，签名走 n42-primitives 的 BLS） |
 | `n42-mobile-ffi` | Android/iOS C/JNI 绑定（staticlib + cdylib） |
 | `n42-network` | libp2p 服务、QUIC StarHub、共识/区块直连通道 |
 | `n42-node` | 编排器（ConsensusOrchestrator 3-way select! loop）、RPC、持久化、手机桥接、奖励分发 |
-| `n42-parallel-evm` | 乐观并行 EVM 执行 |
+| `n42-parallel-evm` | 乐观并行 EVM 执行（仅支持 revm；evm2 迁移时搁置，已从 workspace 排除，`bin/n42-evm-bench` 同） |
 | `n42-jmt` | Blake3 Jellyfish Merkle Tree，16 分片并行，快照 |
 | `n42-zkproof` | ZK sidecar 证明系统（SP1 zkVM 后端，trait ZkProver + MockProver） |
 
 ### 依赖关系要点
 
 - `n42-primitives` 是最底层 crate，被几乎所有 crate 依赖
-- `n42-mobile` 零 reth 依赖 — 只依赖 `alloy-primitives`、`n42-primitives`(BLS)、
-  `n42-bmt-core`、`n42-twig-core`、`lru`、`serde`、`bincode`、`thiserror`。
-  （**已不用 ed25519-dalek**；workspace 里那条死声明已删。图里的
-  ed25519-dalek 2.2.0/3.0.0 分别来自 reth 的 enr/discv5 栈与 libp2p 0.57，
-  非 n42 直接依赖。）
+- `n42-mobile` **依赖 reth 与 evm2**（手机端与节点用同一执行引擎重执行）：`reth-evm`、
+  `reth-primitives-traits`、`reth-ethereum-primitives`、`reth-chainspec`、`evm2`，以及
+  `n42-execution`、`n42-chainspec`、`n42-tx-types`、`n42-primitives`(BLS)、`n42-bmt-core`、
+  `n42-twig-core`、`alloy-primitives`/`alloy-consensus`/`alloy-eips`/`alloy-rlp`、`quinn`、`rustls`、
+  `tokio`、`zstd`、`lru`、`serde`、`bincode`、`thiserror`。它自身不直接依赖 ed25519-dalek；
+  `n42-tx-types`、`n42-node`、`n42-network`、`n42-stress` 直接依赖 ed25519-dalek 3.0（0x50 交易与认证帧）。
+- `n42-parallel-evm`、`bin/n42-evm-bench` 仅支持 revm，已从 workspace 排除（搁置）
 - `n42-zkproof-guest` 用 SP1 RISC-V 工具链构建，已从 workspace 排除
 - 所有 reth 依赖通过 `../reth` 本地 path 引入
 

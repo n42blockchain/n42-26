@@ -1,0 +1,428 @@
+# Reth 2.11.0 升级（revm → evm2）
+
+日期：2026-11-19 起。分支 `upgrade/reth-v2.11.0`（自 `feat/native-port` `1b51564`）。状态：**进行中**。
+工作区 `.artifacts/reth-upgrade-2110/`：`reth-worktree`（上游 v2.11.0 `b9abbcc1b982755baa9021e6874e2e58936ca65f`
+上的 `n42/v2.11.0` 分支）、`reth` 链接、`n42-26`（本分支）。构建产物放
+`/data/n42-build/n42-26-reth211/target`；重型构建经 `gated.sh` 取 box claim 后运行。
+
+## 要求（用户）
+
+1. 参考 `../n42-rs`（主线已在 v2.11.0），依赖库 reth 升到 2.11.0。
+2. 尽量复用，减少自己做的内容。
+3. 手机 SDK（`n42-mobile`、`n42-mobile-ffi`）一并升级到 evm2。
+
+## 版本
+
+| 项 | 升级前 | 升级后 |
+|---|---|---|
+| Reth 上游 | v2.8.1 `d763342f` | v2.11.0 `b9abbcc1` |
+| EVM | revm 43.0.3 + alloy-evm 0.39.0 + reth-revm | evm2 / evm2-inspectors / evm2-jit，git `alloy-rs/evm2@66687c18b34d3bdbb899f5eb7605070615c03475` |
+| reth-core 类 crate | crates.io 0.8.2 | `[patch.crates-io]` → `paradigmxyz/reth-core@275ce4cf5befeb9f1e8acd935ff2882d2d25fc61` |
+| alloy-trie / secp256k1 / enr / discv5 | 0.9.8 / 0.30 / 0.13 / git | 0.9.9 / 0.33 / 0.14 / 0.12 |
+
+reth-core 仍钉 evm2 旧 rev，图里会出现两份 evm2；与上游、n42-rs 相同，用
+`[patch."https://github.com/alloy-rs/evm2"]` 指向 `https://github.com/DaniPopes/evm2` 同一 rev 解决。
+
+## 调研结论（三份只读调研，2026-11-19）
+
+- reth 2.9 起没有 revm 的 `State`：块级缓存与 bundle 在 reth 执行器内部，`merge_transitions`/`take_bundle`
+  不存在，变更以 evm2 的 `PendingState`/`AccountChanges` 流给出。驱动 `State` 的代码（graft、批量导入、
+  `TrackingExecutor`）不能改名了事，n42-rs 也是重写而非翻译（其 `docs/RETH_2_9_0_UPGRADE.md`，1,755 行，
+  含接口对照表与 F3–F6 记录）。
+- 其余多为路径改名：bundle 类型 → `reth_trie_common::bundle_state`；`AccountInfo`/`Bytecode`/`CacheDB`/`SpecId`
+  → evm2；`Database` 变为 `get_account/get_code_by_hash/get_storage/get_block_hash`（`&mut self`、引用参数）。
+- n42-rs 2.9→2.11 几乎不需改 N42 代码（2.10 一处回调签名，2.11 `receipts` 字段私有 + secp256k1 0.33）。
+
+### 复用分类
+
+| 类别 | 内容 |
+|---|---|
+| 直接拿 | n42-rs `crates/n42/tx-types/src/evm.rs`（0x50 → `evm2::ethereum::TxEnvelope::Eip1559`）；twig-core、bmt-core 不依赖 EVM |
+| 小改后拿 | `engine-types/src/parallel_common.rs` |
+| 采用其设计与代码 | `n42_evm.rs`、`fast_handler.rs`、`direct_transfer.rs`、`batch_state.rs`、`graft_fold.rs`、`parallel_build.rs`（区块头换回 alloy `Header`，组装器换回 `EthBlockAssembler`，去掉 HotStuff/Glamsterdam 特有部分） |
+| n42-rs 没有，自行迁移 | 随机数预编译 0x0302、restored-slots / SSTORE 脏槽、`ReadLogDatabase`、witness、state_diff、EOF 守卫、`n42-parallel-evm` |
+
+待核对：(1) 脏槽规则——本仓库以 chain 94 块 13,561,251 为反例认为“写后改回”的槽也算脏，n42-rs
+`qmdb-reth/src/changes.rs` 的注释相反；以本仓库的反例测试为准。(2) `partition_by_sender` 在收款人也是
+发送人时本仓库合并分组，n42-rs 不合并而靠 `merge_batches` 拒绝。(3) revert 追加的存储合并语义。
+
+### 协议面
+
+- 手机 V2 流式验证按 EVM 读库顺序回放无键值流；节点打包与手机验证同步换 evm2 则自洽，新旧混用会失败
+  → 流式包需要版本号。手机包、见证、状态差异本身不含 revm 类型。
+- `CompactBlockExecution.bundle_state`（leader→follower 紧凑块，MessagePack/JSON）直接序列化
+  `revm::database::states::BundleState`；须核对 `reth_trie_common::bundle_state::BundleState` 的 serde 是否
+  逐字节一致，否则升版本。
+
+## reth 补丁（v2.11.0 上的 `n42/v2.11.0`）
+
+| 补丁 | v2.11.0 |
+|---|---|
+| reth-qmdb-state-reader | 干净 cherry-pick |
+| reth-n42-perf | `evm/src/lib.rs` 冲突：保留上游 `witness`，加入 `payload_cache` 与两个开关 |
+| reth-payload-transactions-root | 复用 2.9.0 评估时的解法（`execution_state`），干净应用 |
+| reth-gov5-cached-state-root | 复用 2.9.0 评估时的解法，干净应用 |
+| reth-engine-state-provider-factory | 干净 |
+| reth-cached-execution-refusal | 干净 |
+| reth-native-import-path | 保留 `uses_receipt_root`、`N42_CANON_NOTIFY_LATE`、payload 交易根复用；去掉 `open_parent`（随批量导入钩子） |
+| reth-executed-block-inbox | 干净 |
+| reth-import-batch、reth-import-batch-tail | **不迁移**：钩子挂在已删除的执行器上。改用 n42-rs 的做法——follower 在引擎外执行并校验，再经已执行块收件箱交给引擎 |
+
+以上尚未编译验证。
+
+## 阶段
+
+1. **能编译、结果正确（性能路径关闭）**：workspace 依赖；tx-types；`N42EvmConfig`（取自 n42-rs `n42_evm.rs`）
+   + 随机数预编译；脏槽跟踪；读日志库；witness/state_diff；`native_payload` 重新从上游 v2.11.0
+   `default_ethereum_payload` 移植；exec_cache、qmdb_*、eof_guard、mobile_packet；`n42-mobile` 验证器；
+   consensus-service 紧凑块；各 bin。`n42-parallel-evm` 的去留待定（仅 `execute_block_parallel` 开关与
+   evm-bench 使用，n42-rs 无对应物）。
+2. **性能路径**：搬 n42-rs 的 fast handler、direct transfer、batch_state、graft_fold、parallel_build、
+   parallel_common；follower 导入走收件箱。
+3. **验证与收尾**：串/并行逐字节对照、全量测试、E2E 1/3/4/5/8/12、七节点舰队、与 n42-rs/gov5 混合轮；
+   `reth-source.lock`、补丁文件、apply/check 脚本、CI 固定点、CLAUDE.md、README（仍写六个补丁）、
+   CLAUDE.md 中“n42-mobile 零 reth 依赖”的过时描述。
+
+## 进度
+
+- [x] 工作区与 v2.11.0 源；八个补丁迁移（未编译）
+- [ ] 阶段 1
+- [ ] 阶段 2
+- [ ] 阶段 3
+
+## 进度记录（2026-11-19，阶段 1 进行中）
+
+### reth 侧（`n42/v2.11.0`，8 个补丁，未推送）
+
+- `cargo check --tests`（reth-evm / engine-tree / ethereum-payload-builder / node-builder / provider /
+  storage-api / consensus）通过：`logs/reth-check2.log`，rc=0。
+- 只改了三行源码：`ethereum/payload/src/lib.rs` 的 `transactions_root` 取字段；`payload_validator.rs`
+  去掉一处无用 `into()`；`state_root_strategy/mod.rs` 的 `state_provider_factory` 改 `const fn`。
+- clippy：N42 代码无警告；`-D warnings` 整体不过是上游文件自身的警告（`rpc/src/debug.rs:1604`、
+  `config/src/config.rs:559`）。未跑任何测试，`N42_CANON_NOTIFY_LATE` 与 executed-block inbox 未做运行时验证。
+- 随批量导入钩子一起消失：`open_parent` 参数、`n42_import_stage_ms` 的 `collect` / `recovered_copy` /
+  `merge_transitions` / `take_bundle` 四个阶段（读这些阶段的看板将无数据）。
+
+### `n42-tx-types` / `n42-execution`
+
+- check / test / clippy `-D warnings` 全过：`logs/exec-final.log`，rc=0；n42-execution 110 通过，
+  n42-tx-types 35 通过、4 个原有 `#[ignore]`。
+- `execution.rs` 直接采用 n42-rs 的 `evm.rs`（0x50 交易 = EIP-1559 的 `From` 实现）。
+- `N42EvmConfig` 内包上游 `EthEvmConfig<ChainSpec, N42EvmFactory>`，环境与上下文计算委托上游；
+  `N42EvmFactory` 委托 `RethEvmFactory`，加 0x0302 随机数预编译，`n42_tx_registry` 为快速转账处理器的接入口。
+- 写后恢复槽位：每笔交易的变化取自 evm2 `TxStateChanges::account_changes()`；同一交易内写后恢复
+  仍靠替换 SSTORE 指令观察（基于 evm2 自带 `sstore_with`，gas 不变）。**注意：evm2 JIT 不走该钩子**，
+  本仓库未启用 jit 特性，若启用需另行处理。
+- 旧性能路径 `fast_transfer` / `parallel_transfer` / `parallel_block` 当时移至
+  `crates/n42-execution/legacy-revm/`，不参与编译；阶段 2 已用 n42-rs 对应实现替换，该目录随后删除。
+- `n42-parallel-evm`、`bin/n42-evm-bench` 移出 workspace 搁置（revm 专用，n42-rs 无对应实现）。
+
+### 行为差异（需在阶段 3 验证）
+
+1. evm2 的 bundle 不含"只被加载未改动"的账户；遍历 `bundle.state` 的消费者需逐一核对。
+2. 帧回滚的 SSTORE 仍记为恢复槽位（沿用旧规则，已用测试固定）。
+3. 读日志流格式不变，但 evm2 在交易内的读顺序不能假定与 revm 相同：节点与手机必须同时切换，
+   流数据包需带版本。
+4. `AccountInfo` 无 `account_id`；`CompactBlockExecution` 的线上编码因此与旧版不保证兼容，
+   新旧节点不可混跑。
+5. gas 与状态清理未见差异，但尚未在真实区块上与 revm 对拍。
+
+### 手机 SDK 与共识服务
+
+- `n42-mobile/src/verifier.rs`：`StreamReplayDB` 改为实现 `evm2::evm::Database`，V1 的 `CachedReads`
+  取自 `reth_evm::cached`；`n42-mobile-ffi` 无需改代码。
+- `n42-consensus-service`：`CompactBlockExecution.bundle_state` 改为 `evm2::block::bundle_state::BundleState`。
+- 编译验证进行中（`logs/mobile-check1.log`）。
+
+### 待办
+
+- `n42-node`、`bin/n42-node` 迁移（进行中）；阶段 2 性能路径；阶段 3 验证与
+  `reth-source.lock` / `patches/` / 脚本 / CI / `CLAUDE.md` / `README.md` 更新。
+
+## 进度记录（2026-11-19 续）：手机 SDK、共识服务、节点串行路径
+
+### 结果
+
+| 范围 | check | test | clippy `-D warnings` | 日志 |
+|---|---|---|---|---|
+| n42-mobile / n42-mobile-ffi | 通过 | 109 / 47 通过 | 干净 | `logs/mobile-test1.log` |
+| n42-consensus-service | 通过 | 仅跑了 `compact_execution_codec`（1 通过 1 忽略） | 干净 | 同上 |
+| n42-node / n42-node-bin | 通过 | lib 289 通过 11 忽略；`stream_v2_pipeline` 12、`restored_slots` 5 通过 | 干净 | `logs/node-final.log` |
+
+`stream_v2_pipeline` 覆盖节点侧读日志采集 + 手机侧回放（含三个对抗用例），两端都在 evm2 上。
+尚未跑 E2E、真实链数据回放和机群。
+
+### 阶段 1 暂时退回串行的路径（开关仍可解析，启动时告警一次）
+
+| 路径 | 开关 | 旧代码当时的暂存位置（阶段 2 后已删除） | 阶段 2 来源 |
+|---|---|---|---|
+| 并行转账出块 | `N42_PARALLEL_BUILD=1` | 原 `crates/n42-node/legacy-revm/parallel_payload.rs` | n42-rs `parallel_build` / `batch_state` / `graft_fold` / `parallel_common` |
+| 转账快速路径 | `N42EvmFactory::with_fast_transfers` | 原 `crates/n42-execution/legacy-revm/fast_transfer.rs` | n42-rs `fast_handler` / `direct_transfer` |
+| 跟随者并行导入批 | `N42_PARALLEL_IMPORT=1` | 原 `crates/n42-execution/legacy-revm/parallel_block.rs` | n42-rs `follower_import.rs` 思路 |
+
+并行出块器独有、阶段 2 前缺失的行为：构建器内的 `N42_MAX_TXS_PER_BLOCK` / `N42_BUILD_TIME_BUDGET_MS`
+限制、`N42_GRAFT_NO_CACHE` / `N42_GRAFT_STREAM` / `N42_TX_ROOT_EARLY`、H2-v4 收尾时把原生收据根写入区块头、
+构建器直接给出的 QMDB 根（现由 normalization 自行推导）。因此阶段 1 结束时 TPS 低于升级前。
+
+### 共识相关差异：被触碰但未变化的账户
+
+revm 会把被触碰但未变化的账户放进 bundle（状态 `Changed`），`gov5_qmdb_operations` 据此为其写叶子；
+evm2 的 bundle 不含这些账户。本仓库没有"未变账户不写叶子"的规则，所以不处理的话，
+零值转账收款方、零小费 beneficiary、空操作内部调用这类区块的 QMDB 根会与升级前不同。
+n42-rs 接受了这一差异（其链有对应规则），n42-26 不能照搬。
+处理：在 `TrackingExecutor` 的每块登记里增加被触碰账户列表，喂给 QMDB 操作推导与 `eof_guard`（进行中）。
+
+### 其他
+
+- 引擎导入端到端夹具依赖 `EngineApiTreeState::new` 为 `pub`（原由 import-batch 补丁顺带公开），
+  在 reth 侧补一个单独的小提交后恢复（进行中）。
+- `n42-node` 的 dev 依赖 `secp256k1` 0.30 → 0.33，`bin/n42-node` 增加 `reth-trie-common`。
+
+## 进度记录（2026-11-19 续二）：阶段 1 收尾与阶段 2a
+
+### 阶段 1 的门
+
+- 全 workspace `cargo check --all-targets`、`cargo clippy --all-targets -- -D warnings`：`logs/c3-ws-check-clippy.log`，rc=0。
+- `cargo test --workspace --no-fail-fast`：1851 通过、0 失败、34 忽略（60 个测试二进制）：`logs/c4-ws-test.log`。
+- E2E（阶段 1 的 release 二进制，以太坊配置，串行路径）：场景 1、3、4 通过（`logs/e2e-134.log`，
+  21 节点区块哈希一致）；场景 5、8 通过（`logs/e2e-58.log`）。场景 12 未跑。
+
+### 被触碰但未变化的账户
+
+规则取自 revm-database 43.0.1 的 `apply_account_state` 等源码：被触碰、存在且非空、但无变化的账户，
+revm 仍给一次 `change()` 转移，bundle 里状态为 `Changed`（无 nonce 无代码时 `InMemoryChange`），
+`info == original_info`、存储为空。evm2 只丢了这一种情形。
+实现：`TrackingExecutor` 在 `finish_*` / `into_state` 时把这些账户补进返回的 `BundleState`
+（`restored_slots.rs` 的 `touched_unchanged` / `add_touched`），所有下游（QMDB 操作推导、exec cache、
+状态根策略、回放工具、共享执行输出、`eof_guard`、`StateDiff`）无需改动。
+与 revm 的剩余差异：不补空的 `AccountRevert`（reth 对它不写任何东西，未发现 n42 读者）。
+新增 8 个测试固定：零值转账到已存在/不存在账户、零小费 beneficiary、空操作内部调用、
+回滚交易的目标、只做写后恢复的合约、被两笔交易触碰只登记一次。
+未用测试固定：区块前系统调用（EIP-4788 / EIP-2935）——按代码阅读不会产生此类账户。
+
+### QMDB-only 的引擎串行导入
+
+事实：`n42_state::wrap` 在 v2.8.1 与 v2.11.0 都只有 `BlockchainProvider::state_by_block_hash` 一个调用点，
+而引擎串行执行的状态提供者来自 overlay 工厂，绕过该钩子。v2.8.1 上 `N42_QMDB_READS=only` 且关闭并行导入时，
+缓存未命中的导入读的是 MDBX 明文状态（一直在写，见 devlog-147），所以没暴露；真正读 QMDB 的只有批量导入钩子。
+修复（reth `adac5ff764`）：新增 `n42_state::execution_provider`，在引擎构造执行读提供者的五处
+（validator 的 `make_state_provider`、三处 prewarm、txpool-prewarm worker）套用；未安装适配器时等价于原行为。
+
+### 原生配置区块串行导入失败（移植补丁引入）
+
+"无收据树缩短导入路径"补丁在 `!uses_receipt_root()` 时不启动收据根任务，而 v2.11.0 的串行执行器在发送失败时报错，
+导致原生配置区块的串行引擎导入全部失败（"receipt root task closed"）；以太坊配置不受影响，E2E 冒烟未覆盖。
+修复（reth `20bc910983`）：不使用收据根时跳过发送。恢复后的导入夹具三个变体全过。
+
+### 转账快速路径
+
+`crates/n42-execution/src/fast_transfer.rs` = n42-rs `fast_handler.rs` + `direct_transfer.rs` 的 `eip7708_transfer_log`，
+经 `N42EvmFactory::n42_tx_registry` 注册，`N42_FAST_TRANSFER=1` 开启（默认关）。
+改动：起始分叉由 Prague 改为 Cancun（本链默认分叉）；去掉 n42-rs 的批线程本地开关。
+与旧 revm 快速路径的差别：只省第一帧，不替换校验与 journal，单笔节省更小（未测量）；
+拒绝原因的分项计数没有了，只剩一个 `delegated`；计数是进程级原子量。
+9 个等价性测试（Cancun / Prague / Osaka / Amsterdam、非法交易表、账户边界、混合区块与标准执行逐项相同）。
+
+### reth 分支状态（`n42/v2.11.0`，本地，未推送）
+
+8 个移植补丁 + `f0e68aa66f`（公开 `EngineApiTreeState::new`）+ `adac5ff764` + `20bc910983`，共 11 个提交。
+
+### 待办
+
+阶段 2b：并行转账出块（整体搬 n42-rs 的 `batch_state` / `graft_fold` / `direct_transfer` / `parallel_common` /
+`parallel_build`，以当时暂存的 legacy-revm 文件为行为规范；这些文件在阶段 2b 完成后删除）、跟随者并行导入（n42-rs `follower_import` 思路 + 既有 executed-block inbox）。
+之后：原生配置的 E2E / 机群对拍、`reth-source.lock` / `patches/` / 脚本 / CI / `CLAUDE.md` / `README.md`。
+
+## 进度记录（2026-11-19 续三）：阶段 2b——并行出块与跟随者并行导入
+
+### 方案
+
+n42-rs 的代码能独立成立的整体搬，n42-26 规则不同或 n42-rs 依赖其独有基础设施的部分从旧 revm 代码移植。
+
+| 文件（`crates/n42-execution/src/`） | 行数 | 来源 |
+|---|---|---|
+| `batch_state.rs` | 519 | 整体搬自 n42-rs，约 80 行改动 |
+| `graft_fold.rs` | 631 | 整体搬，约 140 行改动 |
+| `direct_transfer.rs` | 544 | 整体搬，约 23 行改动 |
+| `parallel_common.rs` | 225 | `partition_by_sender`（并集规则）、线程池、分批移植自旧代码 |
+| `parallel_build.rs` | 1408（代码与测试各约 700） | 裁剪后搬：去掉 n42-rs 独有的线程采样、scatter slot、输出分片、延迟执行账本、late receipts、plan-ahead |
+| `crates/n42-node/src/parallel_payload.rs` | 1356 | 出块器：串行循环由 `native_payload.rs` 生成，前缀与收尾移植自旧代码，新胶水约 150 行 |
+
+真正新写约 250 行：`BatchState::touch` / `take_touched`、`graft_fold::sequential` 与带检查的合并算术、
+`TrackingExecutor::{set_pending_fold, has_pending_fold}`、`commit_run`、`batch_config`。
+
+### n42-26 固定语义
+
+- 写后恢复槽位算脏：不变（批次的交易哈希经 `commit_preexecuted_transfer` 进入恢复槽位登记）。
+- 收款方同时是发送方：沿用并集规则，不采用 n42-rs 的拒绝。
+- 批次注资账户上的串行存储 / CREATE：n42-rs 拒绝，这里在 fold 时按累加器规则重算状态与 revert（有测试）。
+- 被触碰但未变化的账户：EVM 路径与直接转账路径都上报，与串行一致。
+- 与串行逐项相同：测试比较整个 `BlockExecutionResult`、整个 `BundleState`（revert 按地址排序后）、区块与 QMDB 根。
+
+### 开关
+
+`N42_PARALLEL_BUILD`、`N42_MAX_TXS_PER_BLOCK`、`N42_BUILD_TIME_BUDGET_MS`、`N42_PARALLEL_BUILD_THREADS`、
+`N42_GRAFT_NO_CACHE`、`N42_TX_ROOT_EARLY`、H2-v4 收尾（原生收据根入头、`store_built_gov5_roots`、
+替换状态根时抑制广播执行副本）均恢复。新增 `N42_BATCH_FAST_TRANSFER`、`N42_BATCH_DIRECT_TRANSFER`（默认开）。
+**`N42_GRAFT_STREAM=1` 仅解析并告警**：新设计在收尾时一次合并，没有流式嫁接。
+
+### 与 revm 路径的行为差异
+
+1. 批次直接读父状态，不带区块前系统调用的 overlay；若系统调用改到了批次动过的账户，缓存一半拒绝，整块退回串行。
+2. 提交前的拒绝（划分、worker 打开失败、未建模变化、合并拒绝、缓存冲突）改为退回串行并计数
+   （`n42_parallel_payload_refused_total{reason}`），旧版是出块错误；收据提交后的失败仍是出块错误。
+3. 批内普通转账默认走直接路径，不经 EVM，直到该批第一笔不合格交易。
+
+### 跟随者并行导入（`N42_PARALLEL_IMPORT=1`）
+
+设计选择：不走"无校验插入已执行区块"（需要在适配层重做头、体、执行后与 QMDB 根校验），
+而走引擎已有的缓存执行路径：`RethExecutionLayer::new_payload` 中 `FollowerImport::prepare`
+恢复发送方 → `state_by_block_hash` 打开父状态 → `parallel_build::import_payload` →
+`store_payload_execution` 按区块哈希存入 → `engine.new_payload` 取用并做全部校验。
+代价：交易解码两次，引擎仍做自己的校验，节省少于无校验插入。n42-rs 的 `follower_import.rs`（约 4,700 行，
+多为 APoS 与延迟执行机制）未搬。
+
+- 缓存输出被拒：重提一次且不带缓存输出，以第二次结果为准（任何 `INVALID` 都重提，真无效区块被校验两次仍无效）。
+- 缓存是单槽，至多持有一个区块的输出；首次提交后无论结果都取回残留项。
+- `import_payload` 婉拒（空块、发送方恢复失败、父状态不可用、非纯转账开头、分叉不在 Cancun–Osaka、
+  系统调用冲突等）时不存缓存、照常提交，计入 `n42_parallel_import_declined_total{reason}`。
+- 不处理：自己出的块、已带执行输出的块（出块器输出、compact block 的 leader 输出）、委托执行层。
+- 指标：`n42_parallel_import_batch_stage_ms` 的阶段标签变为 `partition` / `execute` / `collect` / `finish`
+  （`keys`、`prestate` 消失）；并行导入的块在引擎自身指标里显示为缓存命中而非执行。
+- 测试：`crates/n42-node/tests/follower_parallel_import.rs`（4,096 笔转账的原生 H2 区块，QMDB-only 状态，
+  与串行相同）；真实 `BasicEngineValidator` 上两种故意错误的缓存输出被拒后区块仍通过。
+
+### 门
+
+- 全 workspace check：`logs/f2-final.log`；clippy `-D warnings` 与测试（1897 通过、0 失败、31 忽略）、
+  release 构建 `n42-node` / `e2e-test` / `n42-stress`：`logs/f3-final.log`，均 rc=0。
+- 两个 `legacy-revm/` 目录已删除。脚本未使用 reth v2.11.0 删除的命令行参数。
+
+### 未做
+
+- n42-rs 直接转账测试里的 0x50（ed25519）用例未搬（需要 dev 依赖）。
+- 并行出块、并行导入、快速路径均无任何节点级或机群级运行，无性能数据。
+
+## 进度记录（2026-11-19 续四）：基线固定点、补丁文件、脚本、CI 与文档
+
+只动固定点与文档，未改 Rust 源码，未跑 cargo，未提交。
+
+### 设计决策
+
+- **补丁文件**：沿用既有格式——每个适配提交一份 `git diff --abbrev=9 父 提交`，无邮件头。
+  与旧文件逐字节对照确认：旧文件即 9 位缩写的纯 diff。八个沿用补丁保留原文件名；
+  删除 `reth-import-batch.patch`、`reth-import-batch-tail.patch`；新增三份。
+- **应用顺序改为提交顺序**：旧脚本的顺序与提交顺序不同。每份补丁是对其父提交的 diff，
+  按提交顺序应用必然成立，其他顺序需逐次验证（未验证旧顺序在新系列上是否仍可用）；
+  `reth-source.lock` 的 `patch_series` 与 `apply-reth-patches.sh` 的 `names` 现在顺序一致。
+- **`reth-source.lock`**：去掉 `revm`、`alloy-evm` 两项；evm2 与 reth-core 没有 crates.io 版本号，
+  新增 `git_dependency_revisions` 记录两个 rev。`schema` 仍为 1（读它的 `check-reth-source.sh`
+  只取上游提交、适配提交、补丁数与 tag）。
+- **不改写 reth 历史**：`1eb96074a7`、`f97241fff2` 两个沿用提交的标题仍写 "Reth 2.7"，内容已是 v2.11.0 的适配，仅在此注明。
+
+### 补丁系列（v2.11.0 `b9abbcc1b982755baa9021e6874e2e58936ca65f` 之上，按应用顺序）
+
+| # | 补丁文件 | reth 提交 | 说明 |
+|---|---|---|---|
+| 1 | `reth-qmdb-state-reader` | `1eb96074a7ca0edb77b4cae76734e1a1ef289a08` | 沿用（标题仍写 Reth 2.7） |
+| 2 | `reth-n42-perf` | `f97241fff2c5817841de9f24619c0421ec75852d` | 沿用（标题仍写 Reth 2.7） |
+| 3 | `reth-payload-transactions-root` | `9ad4387b84f41c4e4bbedec4a267747b593cd778` | 沿用；现在含 reth 自身 `Cargo.lock` 的一行（`rayon`） |
+| 4 | `reth-gov5-cached-state-root` | `fe01928711602bea959b942ef66480f5df3b98b1` | 沿用 |
+| 5 | `reth-engine-state-provider-factory` | `7b58b9d49f5ee2edfd5cad3ca41fb69d283aad3c` | 沿用 |
+| 6 | `reth-cached-execution-refusal` | `2b4ba0f7719868daf57edf9a3437258dc602235f` | 沿用 |
+| 7 | `reth-native-import-path` | `1574758d1a4359ffb22a17d75f0343353d4c6648` | 沿用（去掉 `open_parent`） |
+| 8 | `reth-executed-block-inbox` | `d8d631efe031dacaa1c09ea0ddc270e6d58e44b2` | 沿用 |
+| 9 | `reth-engine-tree-state-constructor` | `f0e68aa66f18a6e7e43498aec810e78c8e4c89ae` | 新增：公开 `EngineApiTreeState::new` |
+| 10 | `reth-engine-execution-state-adapter` | `adac5ff76462fe5b4e09ddf1b73c15d574428a15` | 新增：引擎执行读提供者走状态适配器 |
+| 11 | `reth-receipt-root-task-guard` | `20bc910983b45d53f5f5d287dca92f226d5c5622` | 新增：未启动收据根任务时不发送收据 |
+
+适配提交（十一补丁后）：`20bc910983b45d53f5f5d287dca92f226d5c5622`，树 `91ca846db2135d3691804809bcdb3f386a32e214`。
+
+### 改动清单
+
+- `patches/`：重生成 8 份、删除 2 份、新增 3 份。
+- `reth-source.lock`、`scripts/apply-reth-patches.sh`（基线与适配提交、补丁名单与顺序）、
+  `scripts/check-reth-source.sh`（结束语的版本号改为读 lock 的 `upstream_tag`，不再写死）。
+- `scripts/test_apply_reth_patches.py`：补丁名单改为 11 项。该测试在本次之前已有 3 例失败
+  （名单停在六补丁时期，脚本要求十个文件）；另有一处断言与脚本现状不符——整套已应用时脚本只输出
+  一行 "already carries the full N42 patch series"，不再逐补丁输出 "already applied"，断言随之更新。
+- `.github/workflows/{e2e,nightly,coverage,execution-spec-shards}.yml`：reth 检出点改为 v2.11.0 的提交
+  （共 5 处）。四个 workflow 与 Dockerfile 都不构建 `n42-evm-bench`，无需改构建目标。
+- `Cargo.toml`：reth 依赖段的注释（原写 2.7.0 与其上游提交）。
+- `CLAUDE.md`、`README.md`、`DEVLOG.md`、`docs/00-Workspace-Map.md`、`docs/01-System-Architecture.md`、
+  `docs/03-Crate-Reference.md`、`docs/04-Product-Lines-and-Performance.md`、
+  `docs/modules/binaries-and-tests.md`、`docs/modules/data-exec-zk.md`：基线、依赖、搁置的两个 crate；
+  `n42-mobile` "零 reth 依赖"的说法改为实际情况（依赖 `reth-evm`、`reth-primitives-traits`、
+  `reth-ethereum-primitives`、`reth-chainspec`、`evm2`）。`docs/01` 里 `N42_PARALLEL_EVM` 开关的描述
+  改为已删除（源码中已无该开关）。
+- 本文件：五处把 `legacy-revm/` 写成现存路径的句子改为历史表述。
+
+### 验证
+
+| 检查 | 结果 |
+|---|---|
+| 干净 v2.11.0 检出（`git worktree add --detach … v2.11.0`）上按 CI 方式运行 `apply-reth-patches.sh` | rc=0；`git add -A && git write-tree` = `91ca846db2135d3691804809bcdb3f386a32e214`，与 `n42/v2.11.0` 的 `HEAD^{tree}` 相同（21 个文件，+580 / −98） |
+| 同一检出上再次运行 | "Reth source already carries the full N42 patch series"，rc=0 |
+| `check-reth-source.sh`（打过补丁的干净检出、`../reth-worktree`） | 均 "Reth source matches the v2.11.0 N42 patch lock."，rc=0 |
+| `python3 scripts/test_apply_reth_patches.py` | 7 通过（改动前 4 通过 3 失败） |
+| `python3 -m unittest discover -s scripts -p 'test_*.py'` | 102 通过（含 `test_reth_ci_baseline.py`：每个 workflow 的 reth 检出点等于 lock 的上游提交） |
+
+Rust 版本：reth v2.11.0 声明 `rust-version = "1.96"`，本仓库 `rust-version = "1.97"`、
+`rust-toolchain.toml` 与 CI、Dockerfile 均为 1.97.1，无冲突。
+
+### 未验证 / 遗留
+
+- CI workflow 与 Docker 镜像未实际运行。
+- `docker/n42-node/Dockerfile` 不复制 `vendor/`，而根 `Cargo.toml` 的 `[patch]` 引用
+  `vendor/dependency-repairs/` 下两个路径（升级前的 revm-inspectors 修复同样如此），
+  `execution-spec-shards.yml` 的镜像构建预计在解析依赖时失败；属既有问题，本次未改。
+- `docs/performance-records.md`、`docs/batch-transfer-fastlane-reproduction.md` 里引用 `n42-evm-bench`
+  的历史测量与复现命令未动（历史记录；命令在搁置期间不可用）。
+
+## 进度记录（2026-11-19 续五）：阶段 3 验证
+
+### E2E（最终 release 二进制，含全部阶段 2 改动）
+
+场景 1、3、4 与 5、8、12 全部通过：`.artifacts/reth-upgrade-2110/logs/e2e2-all.log`。
+E2E 使用以太坊配置与串行路径，不覆盖原生 0x50 配置和并行路径。
+
+### 机群（原生 0x50 路线，7 验证者本机机群，链 ID 941050，160 万笔 0x50 转账，`--broadcast --connections 8`）
+
+脚本：`.artifacts/native-port-p0/roundAR.sh`、`roundAS.sh`（leg 辅助脚本为 `run-*-r211.sh` 副本，旧脚本未动）。
+构建：`cargo build --profile profiling --features pprof -p n42-node-bin`，`n42-node` sha256
+`1af91dd7e3d350d9741d7c487cf32c84fdc66556ab7a3afdfe8cc3719625b71a`。原始输出：`run118.out` … `run122.out`、`run*-tps.txt`、
+`run*-metrics-node*.txt`、`run*-logs/`。TPS 均为满载窗口内的 wall-clock 值（`wall-tps.py`），不是整轮平均。
+
+| 轮次 | 拓扑 | 校验 | wall-clock TPS（窗口） | 升级前同配置 |
+|---|---|---|---|---|
+| run118 | 单执行节点（`--execution-owner 0`） | PASS，895 块，7 个密钥同链 | 296,252（块 65..80，5.03 s） | run116 364,939 / run117 368,819 |
+| run121 | 同上 | PASS，889 块 | 305,586（块 66..81，4.88 s） | 同上 |
+| run120 | 全节点导入 | PASS，577 个共同块，7 个根/哈希一致 | 240,823（块 41..48，2.96 s） | run112 264,825 / run109 277,360 |
+| run122 | 同上 | PASS，556 个共同块 | 233,852（块 42..48，2.69 s） | 同上 |
+| run119 | 全节点导入，但漏了 `--broadcast` 与 `N42_LEADER_INSERT_EXECUTED` | PASS，385 个共同块 | 不可比（窗口只有 3 个块） | — |
+
+结论：五轮正确性全部通过；并行出块、快速路径、跟随者并行导入均在真实节点上运行。
+**TPS 低于升级前**：单执行节点约低 17–19%，全节点导入约低 10–15%（各两轮，未做更多重复）。
+
+观察到的原因线索（未进一步定位）：
+
+- leader 打包 118–122 ms（升级前 104–107 ms）；finish 43–49 ms（升级前约 53 ms）。
+  run118 中 1,577,816 笔走并行批次，22,184 笔走串行快速路径；无拒绝、无退回串行。
+- 跟随者并行导入每块约 193 ms（中位），其中 `collect` 61、`finish` 61、`execute` 10、`partition` 3。
+  每节点有 16 个块因 `parent-state`（父状态按哈希不可取）被婉拒而串行执行；无重提。
+- `N42_GRAFT_STREAM=1` 在新设计里不生效（见续三）。
+- 转账快速路径只省第一帧（见续二）。
+
+### 状态
+
+- 升级功能完成：reth v2.11.0 + 11 个补丁（本地分支 `n42/v2.11.0`，HEAD `20bc910983`，未推送）；
+  n42-26 分支 `upgrade/reth-v2.11.0` 全部改动未提交。
+- 全 workspace check / clippy `-D warnings` / 测试（1897 通过）通过；补丁序列在干净 v2.11.0 上复现适配树。
+
+### 后续
+
+1. 性能回归定位：跟随者导入的 `collect` / `finish` 两段与 `parent-state` 婉拒；leader 打包多出的约 15 ms。
+2. 未做：真实链 94 数据回放对拍 QMDB 根（`n42-qmdb-replay`）；CI 工作流与 Docker 镜像实际运行
+   （`docker/n42-node/Dockerfile` 未拷贝 `vendor/`，镜像构建大概率在依赖解析处失败，升级前即如此）；
+   手机流数据包的版本号（新旧 EVM 不可混跑，目前靠同时升级保证）。
+3. 搁置的 `n42-parallel-evm` / `n42-evm-bench` 是否迁移或删除。
