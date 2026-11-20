@@ -18,6 +18,9 @@ PATCH_NAMES = (
     "reth-engine-tree-state-constructor",
     "reth-engine-execution-state-adapter",
     "reth-receipt-root-task-guard",
+    "reth-cached-execution-skip-tx-conversion",
+    "reth-pre-canonical-block-state",
+    "reth-payload-cache-recent-outputs",
 )
 
 

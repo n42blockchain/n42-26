@@ -3,7 +3,7 @@
   "source": "https://github.com/paradigmxyz/reth",
   "upstream_tag": "v2.11.0",
   "upstream_commit": "b9abbcc1b982755baa9021e6874e2e58936ca65f",
-  "adapted_commit": "20bc910983b45d53f5f5d287dca92f226d5c5622",
+  "adapted_commit": "4c1615dd276381522b0252a6fc625db4b9c68a7f",
   "patch_series": [
     {
       "name": "reth-qmdb-state-reader",
@@ -48,6 +48,18 @@
     {
       "name": "reth-receipt-root-task-guard",
       "commit": "20bc910983b45d53f5f5d287dca92f226d5c5622"
+    },
+    {
+      "name": "reth-cached-execution-skip-tx-conversion",
+      "commit": "5b4495f3fd7542839872c46afc09a68dc33fb1ca"
+    },
+    {
+      "name": "reth-pre-canonical-block-state",
+      "commit": "c71add151225cf7c3c9c95a9937e9ef914c221c3"
+    },
+    {
+      "name": "reth-payload-cache-recent-outputs",
+      "commit": "4c1615dd276381522b0252a6fc625db4b9c68a7f"
     }
   ],
   "workspace_dependency_versions": {

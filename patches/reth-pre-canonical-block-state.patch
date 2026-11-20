@@ -1,0 +1,124 @@
+diff --git a/crates/storage/provider/src/providers/blockchain_provider.rs b/crates/storage/provider/src/providers/blockchain_provider.rs
+index 6855b1d98..bdc27b429 100644
+--- a/crates/storage/provider/src/providers/blockchain_provider.rs
++++ b/crates/storage/provider/src/providers/blockchain_provider.rs
+@@ -164,6 +164,23 @@ impl<N: ProviderNodeTypes> BlockchainProvider<N> {
+         Ok(Box::new(state_provider_factory.database_provider_ro()?))
+     }
+ 
++    /// Returns the post-state of `block_hash` when the engine tree holds that block as executed,
++    /// whether or not it is canonical, and `None` otherwise.
++    ///
++    /// This is the state block validation reads a parent through: the durable state under the
++    /// in-memory chain ending at `block_hash`. [`StateProviderFactory::state_by_block_hash`]
++    /// answers for such a block only once a forkchoice update has made it canonical.
++    pub fn executed_state_by_block_hash(
++        &self,
++        block_hash: B256,
++    ) -> ProviderResult<Option<StateProviderBox>> {
++        let Some(state) = self.database.overlay_manager().block_state(block_hash) else {
++            return Ok(None)
++        };
++        let state = self.state_provider_for_state(Arc::new(state))?;
++        reth_storage_api::n42_state::wrap(block_hash, state).map(Some)
++    }
++
+     /// Returns a historical state provider using an existing database snapshot.
+     pub fn state_provider_from_database(
+         &self,
+@@ -3531,6 +3548,77 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[test]
++    fn executed_state_is_read_before_the_block_is_canonical() -> eyre::Result<()> {
++        use crate::{AccountReader, StateProvider};
++
++        let mut rng = generators::rng();
++        let factory = test_provider_factory_with_genesis()?;
++        let provider = BlockchainProvider::new(factory)?;
++        let genesis = provider.canonical_in_memory_state.get_canonical_head();
++
++        let (address, account) = random_account(1);
++        let hashed_address = keccak256(address);
++        let slot_key = B256::with_last_byte(1);
++        let slot = U256::from_be_bytes(slot_key.0);
++        let value = U256::from(42);
++
++        let mut hashed_state = HashedPostState::default();
++        hashed_state.accounts.insert(hashed_address, Some(account.clone()));
++        hashed_state
++            .storages
++            .insert(hashed_address, HashedStorage::from_iter([(keccak256(slot_key), value)]));
++
++        let mut storage = HashMap::default();
++        storage.insert(slot, (U256::ZERO, value));
++
++        let block = random_block(
++            &mut rng,
++            genesis.number + 1,
++            BlockParams { parent: Some(genesis.hash()), tx_count: Some(0), ..Default::default() },
++        )
++        .try_recover()
++        .expect("failed to seal block with senders");
++        let block_hash = block.hash();
++
++        let execution_output = BlockExecutionOutput {
++            result: BlockExecutionResult {
++                receipts: Default::default(),
++                requests: Default::default(),
++                gas_used: 0,
++                blob_gas_used: 0,
++            },
++            state: BundleState::new(
++                [(address, None, Some(account.clone().into()), storage)],
++                [[(address, Some(None), [])]],
++                [],
++            ),
++        };
++        let executed = ExecutedBlock::new(
++            Arc::new(block),
++            Arc::new(execution_output),
++            SortedTrieData::new(
++                Arc::new(hashed_state.into_sorted()),
++                Arc::new(TrieUpdates::default().into_sorted()),
++            ),
++        );
++
++        // A block nobody executed has no state here.
++        assert!(provider.executed_state_by_block_hash(block_hash)?.is_none());
++
++        // Executed and held by the tree, but not made canonical: the canonical lookup does not
++        // know the block, the executed lookup reads its post-state.
++        provider.database.overlay_manager().insert_block(executed);
++        assert!(provider.state_by_block_hash(block_hash).is_err());
++        let state =
++            provider.executed_state_by_block_hash(block_hash)?.expect("the tree holds the block");
++        assert_eq!(state.basic_account(&address)?, Some(account));
++        assert_eq!(state.storage(address, slot_key)?, Some(value));
++        assert!(provider.executed_state_by_block_hash(B256::repeat_byte(0x42))?.is_none());
++
++        Ok(())
++    }
++
+     #[test]
+     fn state_range_provider_reverts_database_advancement_past_anchor() -> eyre::Result<()> {
+         let mut rng = generators::rng();
+diff --git a/crates/storage/storage-overlay/src/manager.rs b/crates/storage/storage-overlay/src/manager.rs
+index f6fbcf9a4..fb403a3a0 100644
+--- a/crates/storage/storage-overlay/src/manager.rs
++++ b/crates/storage/storage-overlay/src/manager.rs
+@@ -135,7 +135,12 @@ impl<N: NodePrimitives> OverlayManager<N> {
+         OverlayBuilder::new(state.hash(), Some(state), self.clone())
+     }
+ 
+-    pub(crate) fn block_state(&self, parent_hash: B256) -> Option<BlockState<N>> {
++    /// Returns the in-memory chain ending at `parent_hash`, oldest block first as the innermost
++    /// parent, or `None` when the manager does not hold that block.
++    ///
++    /// The manager holds the blocks the engine tree has inserted as executed and not yet
++    /// removed after persistence.
++    pub fn block_state(&self, parent_hash: B256) -> Option<BlockState<N>> {
+         let mut blocks = self.parent_chain(parent_hash).collect::<Vec<_>>();
+         blocks.pop().map(|oldest| {
+             blocks.into_iter().rev().fold(BlockState::new(oldest), |parent, block| {

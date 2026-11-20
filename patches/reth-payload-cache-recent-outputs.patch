@@ -1,0 +1,102 @@
+diff --git a/crates/evm/evm/src/payload_cache.rs b/crates/evm/evm/src/payload_cache.rs
+index a3efac303..a6ef9369a 100644
+--- a/crates/evm/evm/src/payload_cache.rs
++++ b/crates/evm/evm/src/payload_cache.rs
+@@ -1,12 +1,17 @@
+ //! Process-local payload results shared between the payload builder and engine.
+ //!
+-//! Each slot retains only the most recent payload, matching the sequential
+-//! leader build path. Entries are keyed by the sealed block hash so stale data
+-//! cannot be consumed for a different payload.
++//! The broadcast slot and the transaction-root slot retain only the most recent
++//! payload, matching the sequential leader build path. The execution cache
++//! retains the last few: a node that executes other nodes' payloads ahead of
++//! the engine can have two of them in hand at once, and the output filed for
++//! one must not drop the output the engine is about to take for the other.
++//! Entries are keyed by the sealed block hash so stale data cannot be consumed
++//! for a different payload.
+ 
+ use alloy_primitives::B256;
+ use std::{
+     any::Any,
++    collections::VecDeque,
+     sync::{Mutex, OnceLock},
+ };
+ 
+@@ -34,7 +39,11 @@ struct CachedPayload {
+ 
+ type CacheSlot = OnceLock<Mutex<Option<CachedPayload>>>;
+ 
+-static PAYLOAD_CACHE: CacheSlot = OnceLock::new();
++/// Execution outputs retained at once. An output is large, and one that is never taken stays
++/// until this many newer ones have been stored.
++const PAYLOAD_EXECUTIONS: usize = 4;
++
++static PAYLOAD_CACHE: OnceLock<Mutex<VecDeque<CachedPayload>>> = OnceLock::new();
+ static BROADCAST_CACHE: CacheSlot = OnceLock::new();
+ static TRANSACTION_ROOT_CACHE: OnceLock<Mutex<Option<(B256, B256)>>> = OnceLock::new();
+ 
+@@ -53,14 +62,24 @@ fn take<T: 'static>(slot: &CacheSlot, block_hash: &B256) -> Option<T> {
+     None
+ }
+ 
+-/// Store the execution output for a locally built payload.
++/// Store the execution output of the payload sealed as `block_hash`, replacing an output already
++/// held for that hash. The oldest output is dropped once [`PAYLOAD_EXECUTIONS`] others are held.
+ pub fn store_payload_execution(block_hash: B256, data: impl Any + Send + Sync + 'static) {
+-    store(&PAYLOAD_CACHE, block_hash, data);
++    let cache = PAYLOAD_CACHE.get_or_init(Default::default);
++    let mut held = cache.lock().unwrap_or_else(|error| error.into_inner());
++    held.retain(|entry| entry.block_hash != block_hash);
++    if held.len() >= PAYLOAD_EXECUTIONS {
++        held.pop_front();
++    }
++    held.push_back(CachedPayload { block_hash, data: Box::new(data) });
+ }
+ 
+-/// Take the cached execution output when it belongs to `block_hash`.
++/// Take the cached execution output when one is held for `block_hash`.
+ pub fn take_payload_execution<T: 'static>(block_hash: &B256) -> Option<T> {
+-    take(&PAYLOAD_CACHE, block_hash)
++    let cache = PAYLOAD_CACHE.get_or_init(Default::default);
++    let mut held = cache.lock().unwrap_or_else(|error| error.into_inner());
++    let at = held.iter().position(|entry| &entry.block_hash == block_hash)?;
++    held.remove(at).and_then(|entry| entry.data.downcast::<T>().ok()).map(|data| *data)
+ }
+ 
+ /// Store execution data used to broadcast a compact block.
+@@ -112,3 +131,34 @@ pub fn n42_defer_state_root() -> bool {
+     static DEFER: OnceLock<bool> = OnceLock::new();
+     *DEFER.get_or_init(|| std::env::var("N42_DEFER_STATE_ROOT").is_ok_and(|value| value == "1"))
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn an_execution_output_survives_the_next_payloads() {
++        // Hashes no other test stores under: the cache is the process's.
++        let hash = |n: u8| B256::repeat_byte(0xc0 | n);
++        store_payload_execution(hash(1), 1u64);
++        store_payload_execution(hash(2), 2u64);
++        assert_eq!(take_payload_execution::<u64>(&hash(1)), Some(1));
++        assert_eq!(take_payload_execution::<u64>(&hash(1)), None, "an output is taken once");
++        assert_eq!(take_payload_execution::<u64>(&hash(2)), Some(2));
++
++        // A second output for one hash replaces the first.
++        store_payload_execution(hash(3), 3u64);
++        store_payload_execution(hash(3), 30u64);
++        assert_eq!(take_payload_execution::<u64>(&hash(3)), Some(30));
++        assert_eq!(take_payload_execution::<u64>(&hash(3)), None);
++
++        // The oldest goes once more than the bound are held.
++        for n in 0..=PAYLOAD_EXECUTIONS as u8 {
++            store_payload_execution(hash(4 + n), u64::from(n));
++        }
++        assert_eq!(take_payload_execution::<u64>(&hash(4)), None);
++        for n in 1..=PAYLOAD_EXECUTIONS as u8 {
++            assert_eq!(take_payload_execution::<u64>(&hash(4 + n)), Some(u64::from(n)));
++        }
++    }
++}
