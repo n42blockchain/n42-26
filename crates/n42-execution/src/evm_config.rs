@@ -219,45 +219,11 @@ impl N42EvmConfig {
     {
         let sender_recovery_cache = self.inner.sender_recovery_cache.clone();
         move |tx: Bytes| {
-            let tx =
-                N42TxEnvelope::decode_2718_exact(tx.as_ref()).map_err(AnyError::new)?;
-            let signer = match &tx {
-                // Ed25519 senders verified at admission are reused; anything
-                // else is verified here and remembered.
-                N42TxEnvelope::AltSig(alt) => {
-                    let cache = AltSigSenderCache::global();
-                    match cache.get(alt.hash()) {
-                        Some(sender) => {
-                            SENDER_HIT.fetch_add(1, Ordering::Relaxed);
-                            Ok(sender)
-                        }
-                        None => {
-                            // The cache drops entries under load; a frame this
-                            // node admitted and still holds has the sender too.
-                            let held = n42_tx_types::frame_ref_blocks_enabled()
-                                .then(|| n42_tx_types::FrameStore::global().sender_of(alt.hash()))
-                                .flatten();
-                            if let Some(sender) = held {
-                                SENDER_FRAME.fetch_add(1, Ordering::Relaxed);
-                                Ok(sender)
-                            } else {
-                                SENDER_MISS.fetch_add(1, Ordering::Relaxed);
-                                tx.try_recover()
-                                    .inspect(|sender| cache.insert(*alt.hash(), *sender))
-                            }
-                        }
-                    }
-                }
-                N42TxEnvelope::Eth(_) => {
-                    if let Some(cache) = &sender_recovery_cache {
-                        cache.recover(&tx)
-                    } else {
-                        tx.try_recover()
-                    }
-                }
+            let (tx, source) = recover_payload_transaction(sender_recovery_cache.as_ref(), &tx)?;
+            if let Some(source) = source {
+                source.counter().fetch_add(1, Ordering::Relaxed);
             }
-            .map_err(AnyError::new)?;
-            Ok::<_, AnyError>(tx.with_signer(signer))
+            Ok(tx)
         }
     }
 
@@ -269,15 +235,100 @@ impl N42EvmConfig {
         payload: &ExecutionData,
     ) -> Result<(Vec<N42TxEnvelope>, Vec<alloy_primitives::Address>), AnyError> {
         use rayon::prelude::*;
-        let convert = self.payload_transaction_converter();
-        let recovered: Vec<_> = payload
-            .payload
-            .transactions()
-            .par_iter()
-            .map(|tx| convert(tx.clone()))
-            .collect::<Result<_, _>>()?;
-        Ok(recovered.into_iter().map(Recovered::into_parts).unzip())
+        let cache = self.inner.sender_recovery_cache.as_ref();
+        let raw = payload.payload.transactions();
+        // Decoded from the payload's own bytes: a clone of each would count
+        // a reference on a buffer the transactions may all share, from every
+        // worker at once. Each lands in its own place of the result, and the
+        // senders' sources are counted once for the payload, not once per
+        // transaction on counters every worker writes.
+        let recovered: Vec<_> =
+            raw.par_iter().map(|tx| recover_payload_transaction(cache, tx)).collect();
+        let (mut transactions, mut senders) =
+            (Vec::with_capacity(raw.len()), Vec::with_capacity(raw.len()));
+        let mut sources = [0u64; 3];
+        for recovered in recovered {
+            let (tx, source) = recovered?;
+            if let Some(source) = source {
+                sources[source as usize] += 1;
+            }
+            let (tx, sender) = tx.into_parts();
+            transactions.push(tx);
+            senders.push(sender);
+        }
+        for (source, count) in
+            [SenderSource::Hit, SenderSource::Frame, SenderSource::Miss].into_iter().zip(sources)
+        {
+            if count > 0 {
+                source.counter().fetch_add(count, Ordering::Relaxed);
+            }
+        }
+        Ok((transactions, senders))
     }
+}
+
+/// Where a 0x50 transaction's sender came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SenderSource {
+    /// The admission cache.
+    Hit = 0,
+    /// A frame this node holds.
+    Frame = 1,
+    /// Verified here.
+    Miss = 2,
+}
+
+impl SenderSource {
+    fn counter(self) -> &'static AtomicU64 {
+        match self {
+            Self::Hit => &SENDER_HIT,
+            Self::Frame => &SENDER_FRAME,
+            Self::Miss => &SENDER_MISS,
+        }
+    }
+}
+
+/// One payload transaction decoded from its bytes with its sender, and where
+/// a 0x50 transaction's sender came from.
+fn recover_payload_transaction(
+    sender_recovery_cache: Option<&SenderRecoveryCache>,
+    tx: &[u8],
+) -> Result<(Recovered<N42TxEnvelope>, Option<SenderSource>), AnyError> {
+    let tx = N42TxEnvelope::decode_2718_exact(tx).map_err(AnyError::new)?;
+    let (signer, source) = match &tx {
+        // Ed25519 senders verified at admission are reused; anything
+        // else is verified here and remembered.
+        N42TxEnvelope::AltSig(alt) => {
+            let cache = AltSigSenderCache::global();
+            match cache.get(alt.hash()) {
+                Some(sender) => (Ok(sender), Some(SenderSource::Hit)),
+                None => {
+                    // The cache drops entries under load; a frame this
+                    // node admitted and still holds has the sender too.
+                    let held = n42_tx_types::frame_ref_blocks_enabled()
+                        .then(|| n42_tx_types::FrameStore::global().sender_of(alt.hash()))
+                        .flatten();
+                    if let Some(sender) = held {
+                        (Ok(sender), Some(SenderSource::Frame))
+                    } else {
+                        (
+                            tx.try_recover().inspect(|sender| cache.insert(*alt.hash(), *sender)),
+                            Some(SenderSource::Miss),
+                        )
+                    }
+                }
+            }
+        }
+        N42TxEnvelope::Eth(_) => (
+            match sender_recovery_cache {
+                Some(cache) => cache.recover(&tx),
+                None => tx.try_recover(),
+            },
+            None,
+        ),
+    };
+    let signer = signer.map_err(AnyError::new)?;
+    Ok((tx.with_signer(signer), source))
 }
 
 /// Where the senders of 0x50 payload transactions came from, since start.
@@ -303,6 +354,78 @@ mod tests {
             },
         };
         ExecutionData::from_block_unchecked(B256::ZERO, &block)
+    }
+
+    /// A full block's payload recovery, timed: `N42_BENCH_TXS` 0x50
+    /// transfers (95,238 by default) whose senders the admission cache holds,
+    /// once as slices of one buffer and once as a buffer each.
+    ///
+    /// `N42_ALTSIG_SENDER_CACHE=4194304 cargo test --release -p n42-execution --lib payload_recovery_of_a_full_block -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing run, not a check"]
+    fn payload_recovery_of_a_full_block() {
+        use alloy_eips::eip2718::Encodable2718;
+        use alloy_primitives::{Address, Bytes};
+        let count: u64 =
+            std::env::var("N42_BENCH_TXS").ok().and_then(|v| v.parse().ok()).unwrap_or(95_238);
+        let cache = AltSigSenderCache::global();
+        let mut buffer = Vec::new();
+        let mut bounds = Vec::new();
+        for i in 0..count {
+            let mut seed = [0x42u8; 32];
+            seed[..8].copy_from_slice(&i.to_be_bytes());
+            let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+            let tx = n42_tx_types::TxAltSig {
+                    chain_id: N42_CHAIN_ID,
+                    nonce: 0,
+                    max_priority_fee_per_gas: 1,
+                    max_fee_per_gas: 100,
+                    gas_limit: 21_000,
+                    to: Address::left_padding_from(&(0x100_0000 + i).to_be_bytes()),
+                    value: U256::from(1_000u64),
+                    input: Bytes::new(),
+                    access_list: Default::default(),
+                    alg_type: n42_tx_types::ALG_ED25519,
+                    pubkey: Bytes::copy_from_slice(key.verifying_key().as_bytes()),
+            }
+            .sign_ed25519(&key);
+            cache.insert(*tx.hash(), tx.tx().sender());
+            let start = buffer.len();
+            N42TxEnvelope::AltSig(tx).encode_2718(&mut buffer);
+            bounds.push(start..buffer.len());
+        }
+        let buffer = Bytes::from(buffer);
+        let shared: Vec<Bytes> = bounds.iter().map(|range| buffer.slice(range.clone())).collect();
+        let apart: Vec<Bytes> = shared.iter().map(|tx| Bytes::copy_from_slice(tx)).collect();
+        let config = N42EvmConfig::new(n42_dev_chainspec());
+        for (name, transactions) in [("one buffer", shared), ("a buffer each", apart)] {
+            let mut input = payload(Vec::new());
+            input.payload.as_v1_mut().transactions = transactions;
+            let mut times = Vec::new();
+            for _ in 0..14 {
+                let at = std::time::Instant::now();
+                let (txs, senders) = config.recover_payload_transactions(&input).expect("recovered");
+                times.push(at.elapsed().as_secs_f64() * 1e3);
+                assert_eq!((txs.len() as u64, senders.len() as u64), (count, count));
+                assert_eq!(senders[1], txs[1].as_alt_sig().expect("0x50").tx().sender());
+            }
+            times.drain(..2);
+            times.sort_by(f64::total_cmp);
+            println!(
+                "PAYLOAD_RECOVERY {name}: txs={count} threads={} median_ms={:.1} min_ms={:.1} max_ms={:.1}",
+                rayon::current_num_threads(),
+                times[times.len() / 2],
+                times[0],
+                times[times.len() - 1],
+            );
+        }
+        // The cache is direct-mapped: a few of a block's entries displace
+        // each other and are verified again.
+        println!(
+            "PAYLOAD_RECOVERY senders: hit={} miss={}",
+            SENDER_HIT.load(Ordering::Relaxed),
+            SENDER_MISS.load(Ordering::Relaxed)
+        );
     }
 
     #[test]
