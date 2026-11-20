@@ -426,3 +426,107 @@ E2E 使用以太坊配置与串行路径，不覆盖原生 0x50 配置和并行�
    （`docker/n42-node/Dockerfile` 未拷贝 `vendor/`，镜像构建大概率在依赖解析处失败，升级前即如此）；
    手机流数据包的版本号（新旧 EVM 不可混跑，目前靠同时升级保证）。
 3. 搁置的 `n42-parallel-evm` / `n42-evm-bench` 是否迁移或删除。
+
+## 进度记录（2026-11-20）：leader 侧性能回归定位与修复
+
+升级提交已推送：`origin/upgrade/reth-v2.11.0`，六个提交（`6dd9f6f` 起）。以下改动在其之上，尚未提交。
+
+### 定位
+
+同配置下 node0 满块（95,238 笔）各阶段中位数（`qgNb/logs/node0.log` 对 `qgSb/logs/node0.log`）：
+
+| 阶段（ms） | run117（revm） | run121（evm2，修复前） |
+|---|---|---|
+| `packing_ms` | 104 | 128 |
+| `evm_exec_ms` | 96 | 118.5 |
+| `executor_finish_ms` | 4 | 53 |
+| `root_wait_ms` | 26.5 | 28.5 |
+| `N42_PAYLOAD_CACHE finish_ms` | 50 | 97.3 |
+| `N42_PAYLOAD_CACHE cache_ms` | 11.3 | 0.2 |
+
+每块净增约 60 ms。原因：批次合并做了两遍且都串行——最后一个批次结束后 `merge_batches`
+（计入 `evm_exec_ms`，日志 `collect_ms` 44–48，旧版 3），收尾时 `fold_into` 再把每个账户从中间结构移出、
+插入区块 map，并推入约 19 万条 revert 后排序。批次执行本身不慢于旧版（`groups_ms` 14–16 对 29–30）。
+
+### 修改（`crates/n42-execution/src/{graft_fold,parallel_build,parallel_common}.rs`）
+
+1. `MergedBatches` 直接采用区块 bundle 的形状（一个 `AddressMap<BundleAccount>` + 各批 revert 集 + 跨批账户小表），
+   `fold_into` 把它整体移入，只把区块自己的少量账户并进去。
+2. 逐批检查（存储、代码、销毁、每账户恰一条无存储 revert）移到批次线程（`CheckedBundle::new`）。
+   新增拒绝 `FoldRefused::Reverts`。
+3. 合并流式化：`execute_batches` 用 `pool.in_place_scope`，每个批次完成即在调用线程合并（`BatchMerger::add`）。
+4. revert 在构建线程池上拼成一个已排序集合（`parallel_common::concat_sorted`），fold 不再排序。
+
+日志行 "parallel transfer prefix executed"：`groups_ms` 现含流式合并，`collect_ms` 只剩尾部，新增 `merge_ms`。
+bundle 内容不变，等价性测试未改且通过。
+
+### 微基准（`leader_stages_of_a_full_block_of_transfers`，`#[ignore]`；95,238 笔直接转账、190,476 个账户、16 线程、release、本机，12 轮取第 2–11 轮中位数）
+
+| 阶段（ms） | 修改前 | 修改后 |
+|---|---|---|
+| `execute_batches` | 100.2 | 51.1 |
+| `commit_run` | 5.3 | 5.9 |
+| `executor.finish()` | 86.3 | 9.2 |
+
+### 机群（round AT，`roundAT.sh`，构建 sha256 前缀 `01a49a9461c41972`，原始输出 `run123.out`–`run125.out` 等）
+
+| 轮次 | 拓扑 | 校验 | wall-clock TPS（窗口） | 打包 | `executor_finish` | finish 合计 |
+|---|---|---|---|---|---|---|
+| run123 | 单执行节点 | PASS，889 块 | 404,205（块 65..82，3.96 s） | 84.5 | 11 | 57.2 |
+| run124 | 单执行节点 | PASS，879 块 | 404,397（块 66..83，3.96 s） | 86.5 | 10 | 56.5 |
+| run125 | 全节点导入 | PASS，544 个共同块 | 256,499（块 43..45，1.11 s，仅 3 块，不稳） | — | — | — |
+
+单执行节点拓扑高于升级前（364,939 / 368,819）。全节点导入仍低于升级前（264,825 / 277,360），
+且窗口过短；跟随者每节点有 16 个块因 `parent-state` 婉拒而串行执行（定位中）。
+
+### 待办
+
+- `n42-execution` 测试套件间歇失败（`restored_slots_for(..).is_some()`）：疑为进程级 512 项登记表被淘汰测试挤出，确认并修复中；
+  同时评估生产负载下登记表是否会淘汰仍在使用的条目。
+- 跟随者 `parent-state` 婉拒与 `collect` / `finish` 两段各约 61 ms。
+- 可选：剩余的串行入表（约 15–20 ms）移出关键路径。
+
+## 进度记录（2026-11-20 续）：测试竞争与跟随者父状态
+
+### `n42-execution` 测试间歇失败
+
+原因（已证实，`logs/q2-repro.log`、`logs/rsdbg/quiet8.txt`）：淘汰测试 `the_registry_is_keyed_ordered_and_bounded`
+向进程级 512 项恢复槽位登记表写入 520 项，挤掉其他测试刚写入、尚未读取的条目。
+修复：`RestoredSlotsRegistry` 改为可实例化（`new(kept)` / `record` / `get`），进程级登记表仍是同一类型、上限 512，
+`record_restored_slots` / `restored_slots_for` 行为不变；淘汰测试用自己的实例。套件连续 22 次全绿（`logs/q3-gates.log`）。
+生产评估：每块登记 1–2 个键，读取紧跟执行（亚秒级），约 4 块/秒时 512 项覆盖一分钟以上，不会淘汰在用条目。
+未做的加固：重复登记的键不前移；读取方 `unwrap_or_default()` 的未命中是静默的（只表现为根不一致），可加未命中计数。
+
+### 跟随者 `parent-state` 婉拒
+
+原因（run125 node3 日志）：`BlockchainProvider::state_by_block_hash` 只回答规范链内存块、pending 块或数据库；
+引擎已校验但尚未成为规范头的块对它不可见（引擎校验器从自己的树状态读）。导入一旦在导入闸门排队，
+`prepare(N+1)` 在 N 插入的瞬间开始，而 N 的 forkchoice 更新要 22–27 ms 后才处理；被婉拒的块串行执行更慢（385–477 ms 对 180–202 ms），
+于是 forkchoice 更新越排越后（实测落后到数秒），之后每块都被婉拒。
+
+修复（`crates/n42-node/src/el/follower_import.rs`）：`prepare` 每 1 ms 询问一次父状态，最多
+`N42_PARALLEL_IMPORT_PARENT_WAIT_MS`（默认 60，`0` 恢复单次尝试）；只按父块哈希打开状态，不可能用错父块；超时照旧婉拒。
+新增观测：`n42_parallel_import_batch_stage_ms` 的 `recover`、`parent_wait` 阶段，
+`n42_parallel_import_parent_wait_ms{outcome=ready|timeout}`。
+
+### 机群（round AU，`roundAU.sh`，原始输出 `run126.out`–`run128.out`、`run12[678]-metrics-node*.txt`）
+
+| 轮次 | 拓扑 | 校验 | wall-clock TPS（窗口） | 升级前同配置 |
+|---|---|---|---|---|
+| run126 | 全节点导入 | PASS，568 个共同块 | 290,555（块 41..47，2.28 s） | run112 264,825 / run109 277,360 |
+| run127 | 全节点导入 | PASS，563 个共同块 | 283,967（块 41..48，2.60 s） | 同上 |
+| run128 | 单执行节点 | PASS，880 块 | 385,571（块 65..82，4.15 s） | run116 364,939 / run117 368,819 |
+
+node3 的跟随者导入（run126 / run127）：`parent-state` 婉拒 12 / 3（修复前 16）；等待成功 6 / 16 次，
+中位 0.1 / 19 ms；超时 12 / 3 次。每块准备中位 151 / 144 ms：`recover` 43 / 38、`execute` 46 / 44（含流式合并）、
+`finish` 26 / 20、`collect` 6、`partition` 3–4。
+
+结论：两种拓扑均不低于升级前。单执行节点三轮为 404,205 / 404,397 / 385,571；全节点导入两轮为 290,555 / 283,967。
+窗口都只有几秒（7–18 个块），轮间波动约 5%。
+
+### 仍可做
+
+1. 父状态改从引擎树读取（与校验器同路），彻底去掉等待与超时婉拒；需要新增一个 reth 补丁。
+2. 跟随者每块仍约 340 ms（准备约 147 + 引擎处理缓存输出约 190），高于约 250 ms 的出块节奏；
+   较大的杠杆是引擎侧的 190 ms 与 `recover` 的约 40 ms。
+3. leader 剩余的串行入表（约 15–20 ms）移出关键路径。
