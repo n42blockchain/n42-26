@@ -530,3 +530,101 @@ node3 的跟随者导入（run126 / run127）：`parent-state` 婉拒 12 / 3（�
 2. 跟随者每块仍约 340 ms（准备约 147 + 引擎处理缓存输出约 190），高于约 250 ms 的出块节奏；
    较大的杠杆是引擎侧的 190 ms 与 `recover` 的约 40 ms。
 3. leader 剩余的串行入表（约 15–20 ms）移出关键路径。
+
+## 进度记录（2026-11-20 续二）：跟随者每块开销与 run129 失败
+
+已推送：`e62cd30`（流式合并）、`203cbd4`（测试隔离）、`8f783f1`（父状态有界等待）、`019a095`（文档）。以下改动在其之上，尚未提交。
+
+### 引擎侧约 190 ms 的构成（run127 node3，满块，缓存命中）
+
+`validate_total` 约 159：`await_convert` 约 72（`standard_header` 65 + `ethereum_validate` 18）、`state_root` 约 69
+（QMDB `commit` 约 45、key 约 5、derive 约 4.5、sort 约 1.6）、`pre_execute` 约 11、`post_execution` 2–3。
+最大的可避免项是交易根：`convert_payload_to_block` 里串行的 `ordered_trie_root_encoded`（`payload-convert` 线程 99 个样本中 93 个）。
+revm 版本里它与引擎内执行重叠；现在执行在 `prepare` 中完成，引擎只是干等。
+第二项：缓存命中时校验器仍启动交易迭代与预热转换（约 190 个 `cpu` 线程样本），结果从未使用。
+
+### 第一批改动（round AV 验证）
+
+1. 交易根与执行并行（`follower_import.rs`）：`prepare` 入口起 `import-tx-root` 线程，输出存入后
+   `store_payload_transactions_root`；`convert_payload_to_block` 仍对重建的头校验两个哈希，错误的根只会让区块哈希校验失败。
+   新阶段 `tx_root_wait`。
+2. 缓存命中时不转换交易（reth `5b4495f3fd`）。
+3. `recover`（`evm_config.rs`）：从 `&[u8]` 解码，不再逐笔克隆 / 释放 `Bytes`（共享引用计数）；发送方来源计数本地累计、每个 payload 发布一次。
+   `payload_recovery_of_a_full_block`（`#[ignore]`，95,238 笔真实 Ed25519 0x50 转账，14 轮中位）：共享缓冲 29.8 → 11.6 ms，各自缓冲 37.6 → 10.6 ms。
+4. 父状态从引擎树读（reth `c71add1512`：`BlockchainProvider::executed_state_by_block_hash`），有界等待保留为兜底。
+
+round AV（`roundAV.sh`，构建 `92a71646…`）：run130 全节点导入 309,697 PASS；run131 单执行节点 379,500 PASS；
+**run129 全节点导入校验失败**（"a committed QC has no executed block after the FCU grace period"，260,350，仅块 42..47）。
+已生效：准备中位 113 / 110 ms（`recover` 24、`execute` 43–46、`finish` 21–23、`tx_root_wait` 约 0）；
+引擎处理缓存命中满块约 107–113 ms（原约 190）。
+
+### run129 失败的因果（`qgVa/logs/node5.log`）
+
+1. 共识层"ExecutionReady deadline expired"对已导入的第 44 块发起后台导入，在 `prepare` 中重新执行它。
+2. `reth_evm::payload_cache` 只有一个执行输出槽；重复的 44 的输出覆盖了刚存入的 45 的输出，引擎串行执行 45（441 ms）。
+3. 导入闸门在机群里未启用，`prepare(N+1)` 在区块数据到达时就开始，此时 N 仍在引擎里执行——既非规范头也不在引擎树，
+   60 ms 等待超时后婉拒（46..59 共 14 次），每块串行 320–500 ms，高于约 250 ms 的节奏，自我强化。
+4. `new_payload(N+1..)` 先入引擎队列，FCU(N) 排在其后：FCU 延迟 502 → 2178 ms，`Finalized` 落后峰值 5.3 s，
+   超过校验脚本每节点每样本 2 s 的宽限（`committed_block` 每 50 ms 轮询 `eth_getBlockByHash`）。不是纯粹的收尾假象，也不是分叉。
+   同类失败在升级前也出现过（run102–104、run113）。
+5. 引擎树路径本身没坏，只是从未轮到：健康节点上 provider 先答，落后节点上父块尚未入树。
+
+### 第二批改动（round AW 验证）
+
+- 导入按父子顺序（`el/reth_engine.rs`、`import_gate.rs`）：配置了跟随者导入时闸门常开；一个块的导入等待本节点上父块正在进行的导入结束
+  （`ImportGate::settled`），位置在发送方恢复之后、打开父状态之前；等待结束时父块已在树里。
+  payload 只在父块导入返回后提交，引擎队列不再积压后代，FCU(N) 面对的是空闲引擎。
+- 引擎已持有的块不再执行（婉拒原因 `known`）。
+- 执行缓存保留最近 4 个输出（reth `4c1615dd27`）。
+- 父状态婉拒改为 `n42::el` 上的 WARN。新直方图 `n42_engine_import_parent_wait_ms`。
+- 测试：`follower_parallel_import` 夹具改为校验器与 provider 工厂共用 overlay manager（与节点一致），覆盖"已校验未规范"的父块读取、
+  `prepare_after`、重复导入；`import_gate` 与 reth `payload_cache` 各一个单元测试。
+
+round AW（`roundAW.sh`，构建 `1a9f1b48917dc53a`，原始输出 `run132.out`–`run135.out` 等）：
+
+| 轮次 | 拓扑 | 校验 | wall-clock TPS（窗口） |
+|---|---|---|---|
+| run132 | 全节点导入 | PASS，565 个共同块 | 269,886（块 42..59，5.93 s） |
+| run133 | 全节点导入 | PASS，557 个共同块 | 305,547（块 43..59，5.24 s） |
+| run134 | 全节点导入 | PASS，546 个共同块 | 311,811（块 44..60，5.13 s） |
+| run135 | 单执行节点 | PASS，881 块 | 398,604（块 65..82，4.01 s） |
+
+三段全节点导入中 node0 / node3 / node5 的 `parent-state` 婉拒均为 0，`known` 婉拒 0–1，父状态全部来自 provider；
+准备中位 103–138 ms。全节点导入的窗口现在覆盖全部 160 万笔（17–18 个块）。
+
+### 未解释
+
+run129 中 node5 的引擎在追平后静默约 2 s（FCU view=65 用时 1950 ms），猜测是持久化积压的 17 个满块，未验证。
+
+### 仍可做
+
+- QMDB bound candidate 用于跟随者输出（把约 50 ms 的 derive / sort / 树工作移出引擎，需要 store 里新的握手）。
+- leader 剩余的串行入表（约 15–20 ms）。
+- 引擎线程上的小项：`TreeState::remove_until` / `OverlayManager::remove_blocks`、`canon-notify` 克隆输出。
+
+## 进度记录（2026-11-20 续三）：补丁系列增至十四个
+
+`n42/v2.11.0` 在 `20bc910983` 之上新增三个提交；只动固定点与文档，未改 Rust 源码，未跑 cargo，未提交。
+
+| # | 补丁文件 | reth 提交 | 改动文件 |
+|---|---|---|---|
+| 12 | `reth-cached-execution-skip-tx-conversion` | `5b4495f3fd7542839872c46afc09a68dc33fb1ca` | `engine/tree/src/tree/payload_validator.rs` |
+| 13 | `reth-pre-canonical-block-state` | `c71add151225cf7c3c9c95a9937e9ef914c221c3` | `storage/provider/src/providers/blockchain_provider.rs`、`storage/storage-overlay/src/manager.rs` |
+| 14 | `reth-payload-cache-recent-outputs` | `4c1615dd276381522b0252a6fc625db4b9c68a7f` | `evm/evm/src/payload_cache.rs` |
+
+适配提交（十四补丁后）：`4c1615dd276381522b0252a6fc625db4b9c68a7f`，树 `d23613603928bffe602b1d3a781320579a288710`。
+
+- 三个提交改的文件前面的补丁也改过（`payload_validator.rs`、`blockchain_provider.rs`、`payload_cache.rs`），
+  但各补丁是对各自父提交的 diff，前十一份无需重生成：逐份与 `git diff --abbrev=9 父 提交` 比对，字节相同。
+- 同步：`reth-source.lock`（`adapted_commit`、`patch_series` 14 项）、`scripts/apply-reth-patches.sh`
+  （适配提交、名单）、`scripts/test_apply_reth_patches.py`（名单）、`CLAUDE.md`（十四个、适配提交）、
+  `README.md`（fourteen）、`DEVLOG.md` 索引行。CI workflow 只固定上游提交，无需改动。
+
+| 检查 | 结果 |
+|---|---|
+| 干净 v2.11.0 检出上运行 `apply-reth-patches.sh` | rc=0；树 `d23613603928bffe602b1d3a781320579a288710` = `n42/v2.11.0` 的 `HEAD^{tree}`（22 个文件，+731 / −100） |
+| 再次运行 | "Reth source already carries the full N42 patch series"，rc=0 |
+| `check-reth-source.sh`（打过补丁的干净检出、`../reth-worktree`） | 均 "Reth source matches the v2.11.0 N42 patch lock."，rc=0 |
+| `python3 scripts/test_apply_reth_patches.py` / `python3 -m unittest discover -s scripts -p 'test_*.py'` | 7 通过 / 102 通过 |
+
+未验证：CI workflow 与 Docker 镜像未实际运行。
