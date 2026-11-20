@@ -68,6 +68,9 @@ pub enum FoldRefused {
     /// The batches' changes to an account do not add up: a balance over the
     /// range or a nonce that went down.
     Arithmetic(Address),
+    /// A batch's bundle does not hold exactly one revert for each of its
+    /// accounts.
+    Reverts(Address),
 }
 
 impl std::fmt::Display for FoldRefused {
@@ -80,6 +83,7 @@ impl std::fmt::Display for FoldRefused {
             Self::TwoDebits(a) => write!(f, "two batches debited {a}"),
             Self::Stale(a) => write!(f, "the serial part read {a} at a value other than the batches' result"),
             Self::Arithmetic(a) => write!(f, "the batches' changes to {a} overflow or decrease its nonce"),
+            Self::Reverts(a) => write!(f, "a batch's reverts do not match its accounts at {a}"),
         }
     }
 }
@@ -99,24 +103,28 @@ fn refuse<T>(err: FoldRefused) -> Result<T, FoldRefused> {
     Err(err)
 }
 
-/// One account across the batches.
-#[derive(Debug)]
-struct Merged {
-    /// The parent's account, as every batch loaded it.
-    original: Option<AccountInfo>,
-    /// The account after all the batches.
-    info: AccountInfo,
-    /// Whether a batch debited it (balance down or nonce up).
-    debited: bool,
-    /// The batch's own account and revert while only one batch changed it.
-    single: Option<(BundleAccount, Option<AccountRevert>)>,
-}
-
 /// The batches' bundles merged and checked: what the cache half writes and
 /// the bundle half folds.
+///
+/// Kept in the block bundle's own shape, so that the fold moves it into the
+/// bundle instead of entering its accounts one by one a second time: a full
+/// block's 190,000 accounts through a second map and a second revert set
+/// were 45 ms of the batches' merge and 50 ms of the executor's finish.
 #[derive(Debug, Default)]
 pub struct MergedBatches {
-    accounts: AddressMap<Merged>,
+    /// Every account the batches changed, as the one batch that changed it
+    /// left it. An account several batches changed (`shared`) holds the
+    /// first one's entry with every batch's change added into its info; its
+    /// status is made at the fold.
+    state: AddressMap<BundleAccount>,
+    /// The batches' reverts, each batch's set as it came, until
+    /// [`BatchMerger::finish`] makes one set of them sorted by address. A
+    /// shared account has one per batch that changed it; the fold keeps one,
+    /// made anew.
+    reverts: Vec<Vec<(Address, AccountRevert)>>,
+    /// Accounts more than one batch changed, with whether one of them
+    /// debited it (balance down or nonce up).
+    shared: AddressMap<bool>,
 }
 
 fn debits(original: Option<&AccountInfo>, info: &AccountInfo) -> bool {
@@ -124,15 +132,17 @@ fn debits(original: Option<&AccountInfo>, info: &AccountInfo) -> bool {
     info.balance < balance || info.nonce != nonce
 }
 
-/// Merges the batches' bundles, each built against the same parent with
-/// [`crate::batch_state::BatchState`], refusing anything the fold cannot
-/// model. An account two batches changed gets every batch's change added
-/// together.
-pub fn merge_batches(batches: Vec<BundleState>) -> Result<MergedBatches, FoldRefused> {
-    let mut merged = MergedBatches {
-        accounts: AddressMap::with_capacity_and_hasher(batches.iter().map(|b| b.state.len()).sum(), Default::default()),
-    };
-    for mut bundle in batches {
+/// One batch's bundle with everything about it that the merge relies on
+/// checked: made on the batch's own thread, so that the merge, which runs on
+/// one, only enters the accounts.
+#[derive(Debug)]
+pub struct CheckedBundle(BundleState);
+
+impl CheckedBundle {
+    /// Checks `bundle`: no code deployed; every account present, without
+    /// storage changes, code or a selfdestruct; and exactly one revert for
+    /// every account, without storage.
+    pub fn new(bundle: BundleState) -> Result<Self, FoldRefused> {
         if let Some(hash) = bundle.contracts.keys().next() {
             // A batch never deploys code; name an account if one carries it.
             let holder = bundle
@@ -142,89 +152,164 @@ pub fn merge_batches(batches: Vec<BundleState>) -> Result<MergedBatches, FoldRef
                 .map_or(Address::ZERO, |(a, _)| *a);
             return refuse(FoldRefused::Code(holder));
         }
-        let mut reverts: AddressMap<AccountRevert> = std::mem::take(&mut *bundle.reverts)
-            .into_iter()
-            .flatten()
-            .collect();
-        for (address, account) in bundle.state {
+        for (address, account) in &bundle.state {
             if !account.storage.is_empty() {
-                return refuse(FoldRefused::Storage(address));
+                return refuse(FoldRefused::Storage(*address));
             }
             if account.status.was_destroyed() {
-                return refuse(FoldRefused::Destroyed(address));
+                return refuse(FoldRefused::Destroyed(*address));
             }
-            let Some(info) = account.info.clone() else { return refuse(FoldRefused::Destroyed(address)) };
+            let Some(info) = account.info.as_ref() else { return refuse(FoldRefused::Destroyed(*address)) };
             if !info.is_empty_code_hash() || account.original_info.as_ref().is_some_and(|o| !o.is_empty_code_hash()) {
-                return refuse(FoldRefused::Code(address));
+                return refuse(FoldRefused::Code(*address));
             }
-            let debited = debits(account.original_info.as_ref(), &info);
-            let revert = reverts.remove(&address);
-            match merged.accounts.entry(address) {
+        }
+        // One revert for every account and no other: what a bundle made of
+        // one block's transitions holds, and what lets the reverts stay
+        // apart from the accounts in the merge.
+        let mut reverts = 0usize;
+        for (address, revert) in bundle.reverts.iter().flatten() {
+            if !bundle.state.contains_key(address) {
+                return refuse(FoldRefused::Reverts(*address));
+            }
+            if !revert.storage.is_empty() || revert.wipe_storage {
+                return refuse(FoldRefused::Storage(*address));
+            }
+            reverts += 1;
+        }
+        if reverts != bundle.state.len() {
+            let mut seen: alloy_primitives::map::AddressHashSet = Default::default();
+            let twice = bundle.reverts.iter().flatten().find(|(address, _)| !seen.insert(*address)).map(|(a, _)| *a);
+            let address =
+                twice.or_else(|| bundle.state.keys().find(|a| !seen.contains(*a)).copied()).unwrap_or(Address::ZERO);
+            return refuse(FoldRefused::Reverts(address));
+        }
+        Ok(Self(bundle))
+    }
+}
+
+/// Merges batches' bundles one at a time, as the batches finish, so that the
+/// merge of a full block runs beside the batches still executing.
+#[derive(Debug, Default)]
+pub struct BatchMerger {
+    merged: MergedBatches,
+}
+
+impl BatchMerger {
+    /// A merger with room for `accounts` without regrowing.
+    pub fn with_capacity(accounts: usize) -> Self {
+        Self {
+            merged: MergedBatches {
+                state: AddressMap::with_capacity_and_hasher(accounts, Default::default()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Adds one batch's bundle, built against the same parent as the others
+    /// with [`crate::batch_state::BatchState`], refusing a change to an
+    /// account another batch changed too that the fold cannot model;
+    /// otherwise the account gets this batch's change added. The merger is
+    /// not to be used after a refusal.
+    pub fn add(&mut self, bundle: CheckedBundle) -> Result<(), FoldRefused> {
+        let CheckedBundle(mut bundle) = bundle;
+        let merged = &mut self.merged;
+        merged.state.reserve(bundle.state.len());
+        for (address, account) in bundle.state {
+            match merged.state.entry(address) {
                 Entry::Vacant(entry) => {
-                    entry.insert(Merged {
-                        original: account.original_info.clone(),
-                        info,
-                        debited,
-                        single: Some((account, revert)),
-                    });
+                    entry.insert(account);
                 }
                 Entry::Occupied(mut entry) => {
                     let m = entry.get_mut();
-                    if m.original != account.original_info {
+                    if m.original_info != account.original_info {
                         return refuse(FoldRefused::Originals(address));
                     }
-                    if m.debited && debited {
+                    let (Some(info), Some(held)) = (account.info.as_ref(), m.info.as_mut()) else {
+                        return refuse(FoldRefused::Destroyed(address));
+                    };
+                    let debited = debits(account.original_info.as_ref(), info);
+                    // Until now the entry was one batch's own, so whether
+                    // that batch debited the account shows in it.
+                    let shared = merged.shared.entry(address).or_insert_with(|| debits(m.original_info.as_ref(), held));
+                    if *shared && debited {
                         return refuse(FoldRefused::TwoDebits(address));
                     }
-                    let (balance, nonce) = m.original.as_ref().map_or((U256::ZERO, 0), |o| (o.balance, o.nonce));
+                    let (balance, nonce) = m.original_info.as_ref().map_or((U256::ZERO, 0), |o| (o.balance, o.nonce));
                     // `info` = original + this batch's change, added onto
                     // what the earlier batches made of it.
                     let added = if info.balance >= balance {
-                        m.info.balance.checked_add(info.balance - balance)
+                        held.balance.checked_add(info.balance - balance)
                     } else {
-                        m.info.balance.checked_sub(balance - info.balance)
+                        held.balance.checked_sub(balance - info.balance)
                     };
-                    let bumped = info.nonce.checked_sub(nonce).and_then(|by| m.info.nonce.checked_add(by));
+                    let bumped = info.nonce.checked_sub(nonce).and_then(|by| held.nonce.checked_add(by));
                     let (Some(added), Some(bumped)) = (added, bumped) else {
                         return refuse(FoldRefused::Arithmetic(address));
                     };
-                    m.info.balance = added;
-                    m.info.nonce = bumped;
-                    m.debited |= debited;
-                    m.single = None;
+                    held.balance = added;
+                    held.nonce = bumped;
+                    *shared |= debited;
                 }
             }
         }
+        merged.reverts.extend(std::mem::take(&mut *bundle.reverts).into_iter().filter(|set| !set.is_empty()));
+        Ok(())
     }
-    Ok(merged)
+
+    /// The merge of everything added, its reverts in one set sorted by
+    /// address (on the worker pool this is called on, where there are enough
+    /// of them).
+    pub fn finish(self) -> MergedBatches {
+        let mut merged = self.merged;
+        if merged.reverts.len() > 1 {
+            let sets = std::mem::take(&mut merged.reverts);
+            merged.reverts.push(crate::parallel_common::concat_sorted(sets));
+        } else if let Some(set) = merged.reverts.first_mut() {
+            crate::parallel_common::sort_reverts(set);
+        }
+        merged
+    }
+}
+
+/// Merges the batches' bundles, each built against the same parent with
+/// [`crate::batch_state::BatchState`], refusing anything the fold cannot
+/// model. An account two batches changed gets every batch's change added
+/// together.
+pub fn merge_batches(batches: Vec<BundleState>) -> Result<MergedBatches, FoldRefused> {
+    let mut merger = BatchMerger::with_capacity(batches.iter().map(|b| b.state.len()).sum());
+    for bundle in batches {
+        merger.add(CheckedBundle::new(bundle)?)?;
+    }
+    Ok(merger.finish())
 }
 
 impl MergedBatches {
     /// Accounts the batches changed.
     pub fn len(&self) -> usize {
-        self.accounts.len()
+        self.state.len()
     }
 
     /// Whether the batches changed nothing.
     pub fn is_empty(&self) -> bool {
-        self.accounts.is_empty()
+        self.state.is_empty()
     }
 
     /// An account's value after the batches, if they changed it.
     pub fn get(&self, address: &Address) -> Option<&AccountInfo> {
-        self.accounts.get(address).map(|m| &m.info)
+        self.state.get(address).and_then(|m| m.info.as_ref())
     }
 
     /// An account's parent value as the batches loaded it (`Some(None)`: the
     /// parent did not have it), if they changed it.
     pub fn original(&self, address: &Address) -> Option<Option<&AccountInfo>> {
-        self.accounts.get(address).map(|m| m.original.as_ref())
+        self.state.get(address).map(|m| m.original_info.as_ref())
     }
 
     /// Every account the batches changed at its post-batch value: what the
     /// cache half writes into the executor's overlay.
     pub fn accounts(&self) -> impl Iterator<Item = (&Address, &AccountInfo)> {
-        self.accounts.iter().map(|(address, m)| (address, &m.info))
+        self.state.iter().filter_map(|(address, m)| Some((address, m.info.as_ref()?)))
     }
 }
 
@@ -286,6 +371,45 @@ fn sequential(original: Option<AccountInfo>, serial: BundleAccount) -> (BundleAc
     (t.present_bundle_account(), t.create_revert())
 }
 
+/// The accounts the fold made anew, in place of the batches' own entries.
+#[derive(Default)]
+struct Remade {
+    /// Their reverts (`None`: the account has none).
+    reverts: AddressMap<Option<AccountRevert>>,
+    /// Accounts whose block-level transition has no revert: out of the
+    /// bundle, and the serial part's revert to the post-batch value with them.
+    unchanged: Vec<Address>,
+}
+
+impl Remade {
+    /// Enters `account` into `state` when its transition has a revert, and
+    /// returns what it adds to the bundle's size.
+    fn put(
+        &mut self,
+        state: &mut AddressMap<BundleAccount>,
+        address: Address,
+        (account, revert): (BundleAccount, Option<AccountRevert>),
+    ) -> usize {
+        let size = match &revert {
+            Some(_) => {
+                let size = account.size_hint();
+                state.insert(address, account);
+                size
+            }
+            // The accumulator leaves an account whose block-level transition
+            // has no revert out of the bundle
+            // (`apply_transitions_and_create_reverts`): one the parent did
+            // not have and the block destroyed.
+            None => {
+                self.unchanged.push(address);
+                0
+            }
+        };
+        self.reverts.insert(address, revert);
+        size
+    }
+}
+
 /// What [`fold_into`] did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FoldStats {
@@ -298,43 +422,70 @@ pub struct FoldStats {
 /// Folds the merged batches into `block`, the bundle the serial part's
 /// `finish` returned, after checking every account the two share (see the
 /// module docs). Nothing is changed when it refuses.
+///
+/// The batches' accounts are the block's but for a handful, so the block's
+/// own are entered into the batches' map, which becomes the block's, and
+/// the batches' reverts, sorted already, become the block's set.
 pub fn fold_into(block: &mut BundleState, merged: MergedBatches) -> Result<FoldStats, FoldRefused> {
     // Checks first: the block is left as it was on a refusal.
-    for (address, m) in &merged.accounts {
-        if let Some(serial) = block.state.get(address)
-            && serial.original_info.as_ref() != Some(&m.info)
+    for (address, serial) in &block.state {
+        if let Some(m) = merged.state.get(address)
+            && serial.original_info != m.info
         {
             return refuse(FoldRefused::Stale(*address));
         }
     }
-    let mut stats = FoldStats { accounts: merged.accounts.len(), overlapped: 0 };
-    let mut reverts = Vec::with_capacity(merged.accounts.len());
-    // Accounts whose block-level transition has no revert: out of the
-    // bundle, and the serial part's revert to the post-batch value with them.
-    let mut unchanged = Vec::new();
-    block.state.reserve(merged.accounts.len());
-    for (address, m) in merged.accounts {
-        let (account, revert) = match (block.state.remove(&address), m.single) {
-            (Some(serial), _) => {
-                stats.overlapped += 1;
-                block.state_size -= serial.size_hint();
-                sequential(m.original, serial)
-            }
-            (None, Some(single)) => single,
-            (None, None) => transition(m.original, m.info),
-        };
-        match revert {
-            Some(revert) => {
-                block.state_size += account.size_hint();
-                block.state.insert(address, account);
-                reverts.push((address, revert));
-            }
-            // The accumulator leaves an account whose block-level transition
-            // has no revert out of the bundle
-            // (`apply_transitions_and_create_reverts`): one the parent did
-            // not have and the block destroyed.
-            None => unchanged.push(address),
+    let MergedBatches { mut state, reverts, shared } = merged;
+    let mut reverts = reverts.into_iter().next().unwrap_or_default();
+    let mut stats = FoldStats { accounts: state.len(), overlapped: 0 };
+    // A batch account has no storage (the merge refuses one), so each
+    // counts one.
+    let mut state_size = block.state_size + state.len();
+    let mut remade = Remade::default();
+    // An account several batches changed and the serial part did not: one
+    // transition from the parent's value to the sum of their changes.
+    for address in shared.keys() {
+        if block.state.contains_key(address) {
+            continue;
         }
+        let Some(batch) = state.remove(address) else { continue };
+        state_size -= batch.size_hint();
+        let Some(info) = batch.info else { continue };
+        state_size += remade.put(&mut state, *address, transition(batch.original_info, info));
+    }
+    state.reserve(block.state.len());
+    for (address, serial) in std::mem::take(&mut block.state) {
+        match state.remove(&address) {
+            Some(batch) => {
+                stats.overlapped += 1;
+                state_size -= batch.size_hint() + serial.size_hint();
+                state_size += remade.put(&mut state, address, sequential(batch.original_info, serial));
+            }
+            None => {
+                state.insert(address, serial);
+            }
+        }
+    }
+    let Remade { reverts: mut remade, mut unchanged } = remade;
+    // A batch's revert has no storage ([`CheckedBundle::new`]), nor has one
+    // made here of a batch's original and a serial account's unless the
+    // serial part gave it some.
+    let plain = remade.values().flatten().all(|revert| revert.size_hint() == 1);
+    block.state = state;
+    block.state_size = state_size;
+    if !remade.is_empty() {
+        // The first of an account's reverts gives its place to the one made
+        // anew; the others go.
+        reverts.retain_mut(|(address, revert)| match remade.get_mut(address) {
+            None => true,
+            Some(slot) => match slot.take() {
+                Some(new) => {
+                    *revert = new;
+                    true
+                }
+                None => false,
+            },
+        });
     }
     if !unchanged.is_empty() {
         unchanged.sort_unstable();
@@ -343,7 +494,7 @@ pub fn fold_into(block: &mut BundleState, merged: MergedBatches) -> Result<FoldS
         }
         block.reverts_size = block.reverts.iter().flatten().map(|(_, revert)| revert.size_hint()).sum();
     }
-    crate::parallel_common::append_reverts(block, reverts);
+    crate::parallel_common::append_sorted_reverts(block, reverts, plain);
     Ok(stats)
 }
 

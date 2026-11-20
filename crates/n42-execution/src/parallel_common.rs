@@ -168,11 +168,13 @@ pub fn append_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRe
     // follower's critical path.
     let mut reverts = reverts;
     sort_reverts(&mut reverts);
-    append_sorted_reverts(bundle, reverts);
+    append_sorted_reverts(bundle, reverts, false);
 }
 
-/// [`append_reverts`] for a set already sorted by address.
-pub(crate) fn append_sorted_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRevert)>) {
+/// [`append_reverts`] for a set already sorted by address. `plain`: every
+/// one of them counts one in the bundle's size (none has storage), so the
+/// set is not walked again to size it.
+pub(crate) fn append_sorted_reverts(bundle: &mut BundleState, reverts: Vec<(Address, AccountRevert)>, plain: bool) {
     if reverts.is_empty() {
         return;
     }
@@ -181,6 +183,9 @@ pub(crate) fn append_sorted_reverts(bundle: &mut BundleState, reverts: Vec<(Addr
     }
     let last = bundle.reverts.len() - 1;
     let mut reverts = reverts;
+    let earlier: usize = bundle.reverts[..last].iter().flatten().map(|(_, revert)| revert.size_hint()).sum();
+    let grafted = reverts.len();
+    let mut own = 0usize;
     let merged = &mut bundle.reverts[last];
     if merged.is_empty() {
         // The block's merge had nothing of its own to revert: the graft's set
@@ -196,6 +201,7 @@ pub(crate) fn append_sorted_reverts(bundle: &mut BundleState, reverts: Vec<(Addr
             .filter(|(address, _)| reverts.binary_search_by_key(address, |(address, _)| *address).is_err())
             .collect();
         few.sort_unstable_by_key(|(address, _)| *address);
+        own = few.iter().map(|(_, revert)| revert.size_hint()).sum();
         // Merged into the graft's set from the back: every entry of it moves
         // at most once, and no second buffer of 147,000 reverts is allocated.
         let (mut i, mut k) = (reverts.len(), reverts.len() + few.len());
@@ -211,7 +217,65 @@ pub(crate) fn append_sorted_reverts(bundle: &mut BundleState, reverts: Vec<(Addr
         }
         *merged = reverts;
     }
-    bundle.reverts_size = bundle.reverts.iter().flatten().map(|(_, revert)| revert.size_hint()).sum();
+    bundle.reverts_size = if plain {
+        earlier + own + grafted
+    } else {
+        bundle.reverts.iter().flatten().map(|(_, revert)| revert.size_hint()).sum()
+    };
+}
+
+/// The sets as one, sorted by address, made on the worker pool: the sets are
+/// cut at the same addresses into as many ranges as there are workers to
+/// take them, and each range of the result is filled and sorted by one of
+/// them. (A block's 190,000 reverts are 30 MB: copied together and sorted
+/// whole they cross one thread several times over.)
+pub(crate) fn concat_sorted(mut sets: Vec<Vec<(Address, AccountRevert)>>) -> Vec<(Address, AccountRevert)> {
+    use rayon::prelude::*;
+    let total: usize = sets.iter().map(Vec::len).sum();
+    let parts = rayon::current_num_threads().clamp(1, 64);
+    if total < 4096 || parts == 1 {
+        let mut all: Vec<_> = sets.into_iter().flatten().collect();
+        sort_reverts(&mut all);
+        return all;
+    }
+    sets.par_iter_mut().for_each(|set| set.sort_unstable_by_key(|(address, _)| *address));
+    // The ranges' bounds: evenly spaced among a sample of every set.
+    let mut sample: Vec<Address> = sets
+        .iter()
+        .flat_map(|set| set.iter().step_by((set.len() / 32).max(1)).map(|(address, _)| *address))
+        .collect();
+    sample.sort_unstable();
+    let bounds: Vec<Address> = (1..parts).map(|i| sample[i * sample.len() / parts]).collect();
+    // Each set's share of each range, and the ranges' sizes.
+    let mut sizes = vec![0usize; parts];
+    let mut shares: Vec<Vec<&mut [(Address, AccountRevert)]>> =
+        (0..parts).map(|_| Vec::with_capacity(sets.len())).collect();
+    for set in &mut sets {
+        let mut rest = set.as_mut_slice();
+        for (part, share) in shares.iter_mut().enumerate() {
+            let end = bounds.get(part).map_or(rest.len(), |bound| rest.partition_point(|(address, _)| address < bound));
+            let (head, tail) = rest.split_at_mut(end);
+            sizes[part] += head.len();
+            share.push(head);
+            rest = tail;
+        }
+    }
+    let mut all: Vec<(Address, AccountRevert)> = (0..total).into_par_iter().map(|_| Default::default()).collect();
+    let mut ranges = Vec::with_capacity(parts);
+    let mut rest = all.as_mut_slice();
+    for size in sizes {
+        let (head, tail) = rest.split_at_mut(size);
+        ranges.push(head);
+        rest = tail;
+    }
+    ranges.into_par_iter().zip(shares).for_each(|(range, shares)| {
+        for (to, from) in range.iter_mut().zip(shares.into_iter().flatten()) {
+            *to = std::mem::take(from);
+        }
+        // Sorted runs, one per set: the stable sort merges them.
+        range.sort_by_key(|(address, _)| *address);
+    });
+    all
 }
 
 /// By address, on the worker pool where there are enough of them to pay for it.

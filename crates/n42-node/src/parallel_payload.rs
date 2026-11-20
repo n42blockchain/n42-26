@@ -492,6 +492,7 @@ where
                         batch_merge_ms_sum = phases.batch_merge_ms_sum,
                         batch_ms_max = phases.batch_ms_max,
                         collect_ms = phases.collect_ms,
+                        merge_ms = phases.merge_ms,
                         direct_hits = phases.direct_hits,
                         direct_delegated = phases.direct_delegated,
                         "parallel transfer prefix executed; not a consensus commit");

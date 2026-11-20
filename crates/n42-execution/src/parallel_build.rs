@@ -27,7 +27,7 @@
 use crate::{
     batch_state::{BatchState, Unsupported},
     direct_transfer::{DirectTransfers, Layered, Step},
-    graft_fold::{merge_batches, FoldRefused, MergedBatches},
+    graft_fold::{FoldRefused, MergedBatches},
     parallel_common::{batch_groups, build_pool, partition_by_sender, NotParallel},
     restored_slots::TrackingExecutor,
     N42EvmConfig,
@@ -64,7 +64,8 @@ pub struct Executed<C: ConfigureEvm> {
 pub struct Phases {
     /// Partitioning the candidates by sender and packing the batches.
     pub partition_ms: u64,
-    /// The batches' execution on the worker pool, wall time.
+    /// The batches' execution on the worker pool, wall time, with the merge
+    /// of each batch's bundle as it finished.
     pub groups_ms: u64,
     /// Of `groups_ms`: opening the parent's state, summed over the batches.
     pub open_ms_sum: u64,
@@ -75,9 +76,13 @@ pub struct Phases {
     pub batch_merge_ms_sum: u64,
     /// The longest batch, wall time.
     pub batch_ms_max: u64,
-    /// The batches' results placed in candidate order and their bundles
-    /// merged.
+    /// After the last batch: the merge's reverts made one sorted set and the
+    /// batches' results placed in candidate order.
     pub collect_ms: u64,
+    /// The batches' bundles merged, on the calling thread: each as its batch
+    /// finished (inside `groups_ms`), then the reverts' set (inside
+    /// `collect_ms`).
+    pub merge_ms: u64,
     /// How many sender groups there were.
     pub groups: usize,
     /// How many batches of groups ran.
@@ -354,7 +359,8 @@ where
 /// What one batch hands back: the candidates it skipped, its bundle, the
 /// accounts it touched and left unchanged, and its times (open, run, bundle,
 /// whole; microseconds) with the direct path's counts.
-type BatchOut = Result<(Vec<usize>, evm2::block::BundleState, Vec<(Address, AccountInfo)>, [u64; 4], (u64, u64)), Refused>;
+type BatchOut =
+    Result<(Vec<usize>, crate::graft_fold::CheckedBundle, Vec<(Address, AccountInfo)>, [u64; 4], (u64, u64)), Refused>;
 
 /// Runs the candidates' transfers in batches on the build pool, each batch on
 /// an EVM from `config` with `env` over a database `open` returns (a view of
@@ -491,40 +497,71 @@ where
         crate::direct_transfer::count(direct_hits, delegated);
         let run_us = micros(run_at);
         let merge_at = std::time::Instant::now();
-        let bundle = state.take_bundle();
+        // Checked here, on the batch's thread: the merge only enters it.
+        let bundle = crate::graft_fold::CheckedBundle::new(state.take_bundle()).map_err(Refused::Fold)?;
         let touched = state.take_touched();
         Ok((skipped, bundle, touched, [open_us, run_us, micros(merge_at), micros(batch_at)], (direct_hits, delegated)))
     };
-    let results: Vec<BatchOut> = pool.install(|| {
-        use rayon::prelude::*;
-        batches.par_iter().map(run_batch).collect()
+    // Each batch's bundle is merged here as the batch finishes, beside the
+    // batches still running: a full block's merge after the last of them was
+    // 45 ms of this thread with the pool idle.
+    let (mut skipped, mut touched) = (Vec::new(), Vec::new());
+    let (mut open_us, mut run_us, mut merge_us, mut fold_us) = (0u64, 0u64, 0u64, 0u64);
+    // Room for every sender and recipient, and for the block's own accounts
+    // the fold enters afterwards.
+    let mut merger = crate::graft_fold::BatchMerger::with_capacity(keys.len() * 2 + 64);
+    let mut failed = None;
+    let (send, results) = std::sync::mpsc::channel::<BatchOut>();
+    pool.in_place_scope(|scope| {
+        for members in &batches {
+            let (send, run_batch) = (send.clone(), &run_batch);
+            scope.spawn(move |_| {
+                // The receiver outlives the scope.
+                let _ = send.send(run_batch(members));
+            });
+        }
+        drop(send);
+        for result in results {
+            if failed.is_some() {
+                continue;
+            }
+            match result {
+                Ok((s, bundle, t, [open, run, merge, whole], (hits, delegated))) => {
+                    skipped.extend(s);
+                    touched.extend(t);
+                    open_us += open;
+                    run_us += run;
+                    merge_us += merge;
+                    phases.batch_ms_max = phases.batch_ms_max.max(whole / 1000);
+                    phases.direct_hits += hits;
+                    phases.direct_delegated += delegated;
+                    let fold_at = std::time::Instant::now();
+                    if let Err(refused) = merger.add(bundle) {
+                        failed = Some(Refused::Fold(refused));
+                    }
+                    fold_us += micros(fold_at);
+                }
+                Err(refused) => failed = Some(refused),
+            }
+        }
     });
     phases.groups_ms = at.elapsed().as_millis() as u64;
+    if let Some(refused) = failed {
+        return Err(refused);
+    }
 
     let at = std::time::Instant::now();
-    let (mut skipped, mut bundles, mut touched) = (Vec::new(), Vec::with_capacity(results.len()), Vec::new());
-    let (mut open_us, mut run_us, mut merge_us) = (0u64, 0u64, 0u64);
-    for result in results {
-        let (s, bundle, t, [open, run, merge, whole], (hits, delegated)) = result?;
-        skipped.extend(s);
-        bundles.push(bundle);
-        touched.extend(t);
-        open_us += open;
-        run_us += run;
-        merge_us += merge;
-        phases.batch_ms_max = phases.batch_ms_max.max(whole / 1000);
-        phases.direct_hits += hits;
-        phases.direct_delegated += delegated;
-    }
     phases.open_ms_sum = open_us / 1000;
     phases.run_ms_sum = run_us / 1000;
     phases.batch_merge_ms_sum = merge_us / 1000;
+    // The reverts' one sorted set, on the pool the batches have left.
+    let merged = pool.install(|| merger.finish());
+    phases.merge_ms = (fold_us + micros(at)) / 1000;
     // Candidate order, as the serial builder would have laid the block out
     // (each sender's transfers were run in that order, and the merge does
     // not care): the slots are in that order already.
     let executed: Vec<Executed<C>> = slots.into_iter().filter_map(|slot| slot.into_inner()).collect();
     skipped.sort_unstable();
-    let merged = merge_batches(bundles).map_err(Refused::Fold)?;
     phases.collect_ms = at.elapsed().as_millis() as u64;
     Ok(ParallelRun { executed, skipped, merged, touched, phases })
 }
@@ -1445,6 +1482,109 @@ mod tests {
         assert_eq!(
             overlay.get_account(&addr(2)).expect("read").map(|i| i.balance),
             run.merged.get(&addr(2)).map(|i| i.balance)
+        );
+    }
+
+    /// The parent's accounts behind an `Arc`: a batch's view costs nothing
+    /// to open, as the node's does.
+    #[derive(Clone)]
+    struct SharedDb(std::sync::Arc<alloy_primitives::map::AddressMap<AccountInfo>>);
+
+    impl evm2::evm::Database for SharedDb {
+        type Error = std::convert::Infallible;
+
+        fn get_account(&mut self, address: &Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Ok(self.0.get(address).cloned())
+        }
+
+        fn get_code_by_hash(&mut self, hash: &B256) -> Result<Bytecode, Self::Error> {
+            Ok(self.0.values().find(|i| i.code_hash == *hash).and_then(|i| i.code.clone()).unwrap_or_default())
+        }
+
+        fn get_storage(&mut self, _: &Address, _: &U256) -> Result<U256, Self::Error> {
+            Ok(U256::ZERO)
+        }
+
+        fn get_block_hash(&mut self, _: &U256) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
+    /// The leader's stages for a full block of plain transfers, timed: the
+    /// batches with their merge, the commit of the receipts and the
+    /// executor's finish with the fold. `N42_BENCH_TXS` transfers (95,238 by
+    /// default) between as many senders and recipients, `N42_BENCH_ROUNDS`
+    /// rounds (12), on the build pool (`N42_PARALLEL_BUILD_THREADS`).
+    ///
+    /// `cargo test --release -p n42-execution --lib leader_stages -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing run, not a check"]
+    fn leader_stages_of_a_full_block_of_transfers() {
+        use alloy_consensus::transaction::TxHashRef as _;
+        let var = |name: &str, default: usize| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+        let (count, rounds) = (var("N42_BENCH_TXS", 95_238) as u64, var("N42_BENCH_ROUNDS", 12));
+        const BASE: u64 = 0x100_0000;
+        let mut accounts = std::mem::take(&mut parent().cache.accounts)
+            .into_iter()
+            .filter_map(|(address, info)| Some((address, info?)))
+            .collect::<alloy_primitives::map::AddressMap<_>>();
+        for i in 0..2 * count {
+            accounts.insert(addr(BASE + i), AccountInfo::empty().with_balance(U256::from(FUND)));
+        }
+        let db = SharedDb(std::sync::Arc::new(accounts));
+        let txs: Vec<Tx> = (0..count).map(|i| transfer(BASE + i, 0, addr(BASE + count + i), 1_000)).collect();
+        let block = block_with(&txs, count * 21_000);
+        let hashes: Vec<B256> = block.body().transactions.iter().map(|tx| *tx.tx_hash()).collect();
+        let types: Vec<N42TxType> =
+            block.body().transactions.iter().map(alloy_consensus::TransactionEnvelope::tx_type).collect();
+        let c = config();
+        let env = c.evm_env(block.header()).expect("env");
+        let keys = keys(&txs);
+        let convert = |i: usize| Recovered::new_unchecked(n42_tx_types::execution::evm_tx_of(txs[i].inner()), txs[i].signer());
+        let direct = DirectTransfers::of_env(&env, crate::direct_transfer::shape_of).expect("the fork has the direct path");
+        println!(
+            "txs={count} threads={} sizes: account={} revert={} info={}",
+            build_pool().current_num_threads(),
+            size_of::<(Address, evm2::block::bundle_state::BundleAccount)>(),
+            size_of::<(Address, evm2::block::bundle_state::AccountRevert)>(),
+            size_of::<AccountInfo>(),
+        );
+        let ms = |at: std::time::Instant| at.elapsed().as_secs_f64() * 1e3;
+        let mut rows: Vec<[f64; 7]> = Vec::new();
+        for round in 0..rounds {
+            let at = std::time::Instant::now();
+            let run = execute_batches(&c, &env, &keys, &convert, &|| Some(db.clone()), Some(&direct)).expect("the batches run");
+            let run_ms = ms(at);
+            let phases = run.phases;
+            assert_eq!(run.executed.len() as u64, count);
+            let ctx = c.context_for_block(block.sealed_block()).expect("ctx");
+            let mut ex = c.block_executor_factory().create_executor(c.evm_with_env(db.clone(), env.clone()), ctx);
+            ex.apply_pre_execution_changes().expect("pre");
+            let at = std::time::Instant::now();
+            let results = run.executed.into_iter().map(|e| (hashes[e.index], types[e.index], e.result));
+            commit_run(&mut ex, results, run.merged, run.touched, CacheScope::Only(&[])).expect("the commit");
+            let commit_ms = ms(at);
+            let at = std::time::Instant::now();
+            let out = ex.finish().expect("the block finishes with the fold");
+            let finish_ms = ms(at);
+            assert!(out.state.state.len() as u64 >= 2 * count, "every sender and recipient");
+            let at = std::time::Instant::now();
+            drop(out);
+            let drop_ms = ms(at);
+            println!(
+                "round {round}: run {run_ms:.1} (partition {} batches {} collect {} merge {}) commit {commit_ms:.1} finish {finish_ms:.1} drop {drop_ms:.1}",
+                phases.partition_ms, phases.groups_ms, phases.collect_ms, phases.merge_ms
+            );
+            rows.push([run_ms, phases.partition_ms as f64, phases.groups_ms as f64, phases.collect_ms as f64, commit_ms, finish_ms, drop_ms]);
+        }
+        let median = |k: usize| {
+            let mut v: Vec<f64> = rows.iter().skip(2).map(|r| r[k]).collect();
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        println!(
+            "LEADER_STAGES median_ms run={:.1} partition={:.0} batches={:.0} collect={:.0} commit={:.1} finish={:.1} drop={:.1}",
+            median(0), median(1), median(2), median(3), median(4), median(5), median(6)
         );
     }
 }
