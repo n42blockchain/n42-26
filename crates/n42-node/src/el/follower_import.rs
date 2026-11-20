@@ -12,8 +12,9 @@
 //!
 //! A block the batches do not take (it opens with something other than a
 //! plain transfer, a fork they do not reproduce, a pre-execution change to
-//! one of their accounts, a parent this node does not hold) is submitted
-//! with no output, as without this module.
+//! one of their accounts, a parent this node does not hold after a short
+//! wait, [`parent_wait`]) is submitted with no output, as without this
+//! module.
 
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_engine::{ExecutionData, PayloadStatus};
@@ -91,10 +92,25 @@ impl FollowerImport {
             // The engine reports what is wrong with the payload.
             return declined("senders");
         };
+        let recover_ms = started.elapsed().as_secs_f64() * 1_000.0;
         let parent = payload.parent_hash();
-        let Some(main) = (self.open)(parent) else {
+        let (main, waited) = wait_for(|| (self.open)(parent), parent_wait());
+        let parent_wait_ms = waited.as_secs_f64() * 1_000.0;
+        let Some(main) = main else {
+            metrics::histogram!("n42_parallel_import_parent_wait_ms", "outcome" => "timeout")
+                .record(parent_wait_ms);
+            tracing::debug!(
+                target: "n42::el",
+                %hash,
+                number = payload.block_number(),
+                %parent,
+                parent_wait_ms,
+                "parallel import declined: the provider does not hold the parent's state; the engine executes the block"
+            );
             return declined("parent-state");
         };
+        metrics::histogram!("n42_parallel_import_parent_wait_ms", "outcome" => "ready")
+            .record(parent_wait_ms);
         let open = || {
             Some(StateProviderDatabase::new(
                 (self.open)(parent)?.into_evm_state_provider(),
@@ -116,6 +132,8 @@ impl FollowerImport {
                     .increment(stats.txs as u64);
                 metrics::histogram!("n42_parallel_import_batch_ms").record(batch_ms);
                 for (stage, ms) in [
+                    ("recover", recover_ms),
+                    ("parent_wait", parent_wait_ms),
                     ("partition", stats.phases.partition_ms as f64),
                     ("execute", stats.phases.groups_ms as f64),
                     ("collect", stats.phases.collect_ms as f64),
@@ -133,6 +151,8 @@ impl FollowerImport {
                     accounts = stats.accounts,
                     cached = stats.cached,
                     direct_hits = stats.phases.direct_hits,
+                    recover_ms,
+                    parent_wait_ms,
                     batch_ms,
                     "parallel import executed; the engine validates the output"
                 );
@@ -148,6 +168,47 @@ impl FollowerImport {
     /// Drops the output filed for `hash` when the engine did not take it.
     pub fn discard(hash: &B256) {
         drop(reth_evm::payload_cache::take_payload_execution::<CachedExecution>(hash));
+    }
+}
+
+/// How long [`FollowerImport::prepare`] waits for the parent's state
+/// (`N42_PARALLEL_IMPORT_PARENT_WAIT_MS`, 60 by default; `0` asks once).
+///
+/// The provider answers for a block once it is canonical. The engine holds
+/// a block from the moment its `newPayload` returns, but the forkchoice
+/// update that makes it canonical is sent by the consensus loop some 20 to
+/// 35 ms later when blocks follow each other closely, and the next block's
+/// import has started by then: without the wait every such block was
+/// declined and executed serially by the engine, which also kept the next
+/// forkchoice update queued behind it.
+fn parent_wait() -> std::time::Duration {
+    static WAIT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *WAIT.get_or_init(|| {
+        let ms = std::env::var("N42_PARALLEL_IMPORT_PARENT_WAIT_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(60u64)
+            .min(1_000);
+        std::time::Duration::from_millis(ms)
+    })
+}
+
+/// Asks `open` until it answers or `limit` has passed, a millisecond apart,
+/// and returns the answer with the time spent. The state is whatever the
+/// provider holds under the parent's hash: nothing else is ever read.
+fn wait_for<T>(
+    mut open: impl FnMut() -> Option<T>,
+    limit: std::time::Duration,
+) -> (Option<T>, std::time::Duration) {
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(state) = open() {
+            return (Some(state), started.elapsed());
+        }
+        if started.elapsed() >= limit {
+            return (None, started.elapsed());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
@@ -195,6 +256,36 @@ mod tests {
 
     fn valid(hash: B256) -> PayloadStatus {
         PayloadStatus::new(PayloadStatusEnum::Valid, Some(hash))
+    }
+
+    /// The parent's state is taken as soon as the provider has it, and the
+    /// wait gives up at its limit; no wait asks once.
+    #[test]
+    fn the_parent_wait_takes_the_state_when_it_appears_and_gives_up_at_the_limit() {
+        use std::time::Duration;
+        let asked = AtomicUsize::new(0);
+        let appears = || (asked.fetch_add(1, Ordering::SeqCst) >= 3).then_some(7u8);
+        let (state, _) = wait_for(appears, Duration::from_secs(5));
+        assert_eq!(state, Some(7));
+        assert_eq!(asked.load(Ordering::SeqCst), 4);
+
+        let asked = AtomicUsize::new(0);
+        let never = || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            None::<u8>
+        };
+        let (state, waited) = wait_for(never, Duration::from_millis(20));
+        assert_eq!(state, None);
+        assert!(waited >= Duration::from_millis(20));
+        assert!(asked.load(Ordering::SeqCst) >= 2);
+
+        let asked = AtomicUsize::new(0);
+        let never = || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            None::<u8>
+        };
+        assert_eq!(wait_for(never, Duration::ZERO).0, None);
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
     }
 
     /// A refused output ends in the engine's own answer, after exactly one
