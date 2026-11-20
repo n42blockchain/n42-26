@@ -122,6 +122,8 @@ async fn run_mode(native: bool, reuse_builder_output: bool, follower: bool) -> e
     let writer = factory.provider_rw()?;
     writer.insert_block(&genesis.clone().try_recover()?)?;
     writer.commit()?;
+    // The node's engine tree and its provider share one overlay manager.
+    let tree_overlay = factory.overlay_manager().clone();
     let provider = BlockchainProvider::new(factory)?;
     assert!(
         provider
@@ -463,8 +465,8 @@ async fn run_mode(native: bool, reuse_builder_output: bool, follower: bool) -> e
     let follower_provider = provider.clone();
     tokio::task::block_in_place(|| -> eyre::Result<()> {
         let runtime = reth_tasks::Runtime::test();
-        let overlay =
-            reth_storage_overlay::OverlayManager::new(runtime.state_trie_overlay_worker_pool());
+        let overlay = tree_overlay;
+        let tree_blocks = overlay.clone();
         let tree_config = reth_engine_tree::tree::TreeConfig::default();
         let mut state = EngineApiTreeState::new(
             10,
@@ -562,7 +564,35 @@ async fn run_mode(native: bool, reuse_builder_output: bool, follower: bool) -> e
             let import = n42_node::el::FollowerImport::new(config.clone(), move |hash| {
                 open_provider.state_by_block_hash(hash).ok()
             });
+            {
+                // A parent whose import is still under way has no state yet.
+                // On its own the block is left to the engine after the short
+                // wait; kept behind the parent's import it is executed here.
+                use std::sync::atomic::{AtomicBool, Ordering};
+                let imported = Arc::new(AtomicBool::new(false));
+                let (seen, late_provider) = (imported.clone(), follower_provider.clone());
+                let behind = n42_node::el::FollowerImport::new(config.clone(), move |hash| {
+                    (hash != parent || seen.load(Ordering::SeqCst))
+                        .then(|| late_provider.state_by_block_hash(hash).ok())
+                        .flatten()
+                });
+                assert!(!behind.prepare(payload), "the parent is not there yet");
+                assert!(
+                    reth_evm::payload_cache::take_payload_execution::<Cached>(&wire_hash).is_none()
+                );
+                assert!(
+                    behind.prepare_after(payload, || imported.store(true, Ordering::SeqCst)),
+                    "the parent's state is opened after its import"
+                );
+                n42_node::el::FollowerImport::discard(&wire_hash);
+                assert!(reth_evm::payload_cache::payload_transactions_root(&wire_hash).is_none());
+            }
             assert!(import.prepare(payload), "the transfer block is the batches'");
+            assert_eq!(
+                reth_evm::payload_cache::payload_transactions_root(&wire_hash),
+                Some(engine_block.header().transactions_root),
+                "the transactions' root is filed for the engine's conversion"
+            );
             assert!(
                 qmdb_state_reader::status(Some(parent))?.counters.account_reads > reads_before,
                 "the parallel import read the parent from QMDB"
@@ -617,6 +647,39 @@ async fn run_mode(native: bool, reuse_builder_output: bool, follower: bool) -> e
             store.root_for(engine_block.hash())?,
             Some(B256::from(tree.root()))
         );
+        if follower {
+            // The next block's import opens this block as its parent before
+            // any forkchoice update has made it canonical: the provider does
+            // not know it, the engine tree holds it from its validation on.
+            let hash = engine_block.hash();
+            assert!(follower_provider.executed_state_by_block_hash(hash)?.is_none());
+            // What the tree does with a block it validated.
+            tree_blocks.insert_block(checked.executed_block.clone());
+            assert!(follower_provider.state_by_block_hash(hash).is_err());
+            let validated = follower_provider
+                .executed_state_by_block_hash(hash)?
+                .expect("the engine tree holds the validated block");
+            let sender = block_senders[0];
+            let before = follower_provider
+                .state_by_block_hash(parent)?
+                .basic_account(&sender)?
+                .expect("the sender is funded");
+            let after = validated.basic_account(&sender)?.expect("the sender exists");
+            assert!(after.nonce > before.nonce, "the block's own writes are read");
+            // A second import of the block the engine now holds is not
+            // executed again and files nothing.
+            let (canonical_provider, tree_provider) =
+                (follower_provider.clone(), follower_provider.clone());
+            let again = n42_node::el::FollowerImport::new(config.clone(), move |hash| {
+                canonical_provider.state_by_block_hash(hash).ok().or_else(|| {
+                    tree_provider.executed_state_by_block_hash(hash).ok().flatten()
+                })
+            });
+            let payload = native_payload.as_ref().expect("the follower imports the wire payload");
+            assert_eq!(payload.block_hash(), hash);
+            assert!(!again.prepare(payload));
+            assert!(reth_evm::payload_cache::take_payload_execution::<Cached>(&hash).is_none());
+        }
         Ok(())
     })?;
     Ok(())

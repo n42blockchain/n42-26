@@ -13,8 +13,13 @@
 //! A block the batches do not take (it opens with something other than a
 //! plain transfer, a fork they do not reproduce, a pre-execution change to
 //! one of their accounts, a parent this node does not hold after a short
-//! wait, [`parent_wait`]) is submitted with no output, as without this
-//! module.
+//! wait, [`parent_wait`], a block the engine already holds) is submitted
+//! with no output, as without this module.
+//!
+//! A block's parent is read where the engine has it: the caller keeps a
+//! block's execution behind its parent's import
+//! ([`FollowerImport::prepare_after`]), so the parent has been validated,
+//! and is in the engine tree, by the time its state is opened.
 
 use alloy_primitives::{Address, B256};
 use alloy_rpc_types_engine::{ExecutionData, PayloadStatus};
@@ -71,6 +76,14 @@ impl FollowerImport {
     /// whether an output was filed. `false` leaves the payload cache as it
     /// was: the block is the engine's to execute.
     pub fn prepare(&self, payload: &ExecutionData) -> bool {
+        self.prepare_after(payload, || ())
+    }
+
+    /// [`Self::prepare`], running `parent_imported` before the parent's
+    /// state is opened: the caller returns from it once no import of the
+    /// parent is under way on this node. The work that does not read state
+    /// is done before it.
+    pub fn prepare_after(&self, payload: &ExecutionData, parent_imported: impl FnOnce()) -> bool {
         let hash = payload.block_hash();
         // A block this node built, or one that arrived with its leader's
         // output, already has its output filed: that one stands.
@@ -79,6 +92,45 @@ impl FollowerImport {
             reth_evm::payload_cache::store_payload_execution(hash, held);
             return false;
         }
+        // A block the engine already holds (a second import of it) is
+        // answered from the tree: executing it again would only take the
+        // cores from the next block and leave an output nobody takes.
+        if !payload.payload.transactions().is_empty() && (self.open)(hash).is_some() {
+            metrics::counter!("n42_parallel_import_declined_total", "reason" => "known")
+                .increment(1);
+            return false;
+        }
+        // The transactions' root, beside the execution: the engine's
+        // conversion of the payload otherwise derives it on one thread while
+        // nothing else of the block is left to do (65 ms of a full block's
+        // 190 in the engine). It reads the root from the cache the builder's
+        // own blocks use, and still checks the block's hash over it.
+        let root_job = (!payload.payload.transactions().is_empty())
+            .then(|| {
+                let transactions = payload.payload.transactions().clone();
+                std::thread::Builder::new()
+                    .name("import-tx-root".into())
+                    .spawn(move || alloy_consensus::proofs::ordered_trie_root_encoded(&transactions))
+                    .ok()
+            })
+            .flatten();
+        let filed = self.execute(payload, parent_imported);
+        // A block left to the engine is converted beside its execution
+        // there: the job is not waited for.
+        if filed && let Some(job) = root_job {
+            let waited = std::time::Instant::now();
+            if let Ok(root) = job.join() {
+                reth_evm::payload_cache::store_payload_transactions_root(hash, root);
+            }
+            metrics::histogram!("n42_parallel_import_batch_stage_ms", "stage" => "tx_root_wait")
+                .record(waited.elapsed().as_secs_f64() * 1_000.0);
+        }
+        filed
+    }
+
+    /// [`Self::prepare`]'s execution: whether an output was filed.
+    fn execute(&self, payload: &ExecutionData, parent_imported: impl FnOnce()) -> bool {
+        let hash = payload.block_hash();
         let started = std::time::Instant::now();
         let declined = |reason: &'static str| {
             metrics::counter!("n42_parallel_import_declined_total", "reason" => reason)
@@ -94,18 +146,19 @@ impl FollowerImport {
         };
         let recover_ms = started.elapsed().as_secs_f64() * 1_000.0;
         let parent = payload.parent_hash();
+        parent_imported();
         let (main, waited) = wait_for(|| (self.open)(parent), parent_wait());
         let parent_wait_ms = waited.as_secs_f64() * 1_000.0;
         let Some(main) = main else {
             metrics::histogram!("n42_parallel_import_parent_wait_ms", "outcome" => "timeout")
                 .record(parent_wait_ms);
-            tracing::debug!(
+            tracing::warn!(
                 target: "n42::el",
                 %hash,
                 number = payload.block_number(),
                 %parent,
                 parent_wait_ms,
-                "parallel import declined: the provider does not hold the parent's state; the engine executes the block"
+                "parallel import declined: neither the provider nor the engine tree holds the parent's state; the engine executes the block"
             );
             return declined("parent-state");
         };
@@ -165,9 +218,11 @@ impl FollowerImport {
         }
     }
 
-    /// Drops the output filed for `hash` when the engine did not take it.
+    /// Drops the output filed for `hash` when the engine did not take it,
+    /// and the transactions' root filed with it.
     pub fn discard(hash: &B256) {
         drop(reth_evm::payload_cache::take_payload_execution::<CachedExecution>(hash));
+        reth_evm::payload_cache::remove_payload_transactions_root(hash);
     }
 }
 

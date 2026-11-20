@@ -20,7 +20,7 @@ use reth_payload_primitives::{PayloadKind, PayloadTypes};
 pub struct RethExecutionLayer {
     engine: ConsensusEngineHandle<N42EngineTypes>,
     payload_builder: Option<PayloadBuilderHandle<N42EngineTypes>>,
-    import_gate: Option<super::import_gate::ImportGate>,
+    import_gate: Option<std::sync::Arc<super::import_gate::ImportGate>>,
     follower_import: Option<super::FollowerImport>,
     /// The block this node resolved from its builder last: parent, number
     /// and transaction count, which survive the header normalization.
@@ -36,7 +36,7 @@ impl RethExecutionLayer {
         Self {
             engine,
             payload_builder: Some(payload_builder),
-            import_gate: super::import_gate::ImportGate::configured(),
+            import_gate: super::import_gate::ImportGate::configured().map(std::sync::Arc::new),
             follower_import: None,
             last_built: std::sync::Mutex::new(None),
         }
@@ -47,7 +47,7 @@ impl RethExecutionLayer {
         Self {
             engine,
             payload_builder: None,
-            import_gate: super::import_gate::ImportGate::configured(),
+            import_gate: super::import_gate::ImportGate::configured().map(std::sync::Arc::new),
             follower_import: None,
             last_built: std::sync::Mutex::new(None),
         }
@@ -57,10 +57,36 @@ impl RethExecutionLayer {
 impl RethExecutionLayer {
     /// Executes other nodes' blocks with the parallel transfer batches
     /// before the engine validates them (`N42_PARALLEL_IMPORT=1`).
+    ///
+    /// Imports are then kept in order here: one at a time per block, and a
+    /// block's behind its parent's. The engine validates one block at a
+    /// time whatever is queued for it, so nothing is delayed by the order;
+    /// without it a block's execution would start before the engine has its
+    /// parent, and the forkchoice update of a block would queue behind the
+    /// payloads of its descendants.
     pub fn with_follower_import(mut self, follower_import: Option<super::FollowerImport>) -> Self {
+        if follower_import.is_some() && self.import_gate.is_none() {
+            self.import_gate = Some(Default::default());
+        }
         self.follower_import = follower_import;
         self
     }
+
+    /// Returns once no import of `parent` is under way, when imports are
+    /// kept in order.
+    async fn parent_imported(&self, parent: alloy_primitives::B256) {
+        if let Some(gate) = self.import_gate.as_ref().filter(|_| self.follower_import.is_some()) {
+            let started = std::time::Instant::now();
+            gate.settled(parent).await;
+            record_parent_import_wait(started);
+        }
+    }
+}
+
+/// How long an import stood behind its parent's.
+fn record_parent_import_wait(started: std::time::Instant) {
+    metrics::histogram!("n42_engine_import_parent_wait_ms")
+        .record(started.elapsed().as_secs_f64() * 1_000.0);
 }
 
 #[async_trait::async_trait]
@@ -70,6 +96,7 @@ impl ExecutionLayer for RethExecutionLayer {
             Some(gate) => Some(gate.acquire(payload.block_hash()).await),
             None => None,
         };
+        let parent = payload.parent_hash();
         // A block this node just built goes into the engine tree as executed.
         if super::own_block::enabled() && super::own_block::try_insert(&payload).await {
             return Ok(PayloadStatus::new(
@@ -90,9 +117,18 @@ impl ExecutionLayer for RethExecutionLayer {
         if let Some(follower_import) = self.follower_import.as_ref().filter(|_| !own) {
             let prepared = {
                 let (follower_import, payload) = (follower_import.clone(), payload.clone());
-                tokio::task::spawn_blocking(move || follower_import.prepare(&payload))
-                    .await
-                    .unwrap_or(false)
+                let gate = self.import_gate.clone();
+                tokio::task::spawn_blocking(move || {
+                    follower_import.prepare_after(&payload, || {
+                        if let Some(gate) = gate {
+                            let started = std::time::Instant::now();
+                            gate.settled_blocking(parent);
+                            record_parent_import_wait(started);
+                        }
+                    })
+                })
+                .await
+                .unwrap_or(false)
             };
             if prepared {
                 return super::follower_import::submit_prepared(payload.block_hash(), || async {
@@ -105,6 +141,7 @@ impl ExecutionLayer for RethExecutionLayer {
             }
         }
         // consensus_loop::background_import / execution_bridge eager import.
+        self.parent_imported(parent).await;
         self.engine
             .new_payload(payload)
             .await

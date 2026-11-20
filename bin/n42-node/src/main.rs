@@ -254,15 +254,29 @@ fn resolve_observer_genesis_hash(
 }
 
 /// The parallel import of other nodes' blocks, when `N42_PARALLEL_IMPORT=1`.
-fn follower_import<P>(
+/// The follower import reading a block's parent from the provider when it
+/// is canonical or persisted, and otherwise from the engine tree, which
+/// holds a block from the moment it has validated it: the state the engine's
+/// own validation of the next block reads. A hash neither knows has no
+/// state here.
+fn follower_import<N>(
     config: n42_execution::N42EvmConfig,
-    provider: P,
+    provider: reth_provider::providers::BlockchainProvider<N>,
 ) -> Option<n42_node::el::FollowerImport>
 where
-    P: reth_provider::StateProviderFactory + Send + Sync + 'static,
+    N: reth_provider::providers::ProviderNodeTypes,
 {
     n42_node::el::FollowerImport::configured(config, move |hash| {
-        provider.state_by_block_hash(hash).ok()
+        use reth_provider::StateProviderFactory as _;
+        if let Ok(state) = provider.state_by_block_hash(hash) {
+            metrics::counter!("n42_parallel_import_parent_state_total", "source" => "provider")
+                .increment(1);
+            return Some(state);
+        }
+        let state = provider.executed_state_by_block_hash(hash).ok().flatten()?;
+        metrics::counter!("n42_parallel_import_parent_state_total", "source" => "engine-tree")
+            .increment(1);
+        Some(state)
     })
 }
 
