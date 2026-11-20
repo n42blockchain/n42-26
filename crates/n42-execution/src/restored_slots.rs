@@ -125,6 +125,34 @@ pub fn restored_slots_execution_key(
 struct RestoredSlotsRegistry {
     slots: HashMap<B256, Arc<Vec<RestoredSlot>>>,
     order: VecDeque<B256>,
+    /// Blocks whose lists are kept.
+    kept: usize,
+}
+
+impl RestoredSlotsRegistry {
+    fn new(kept: usize) -> Self {
+        Self {
+            slots: HashMap::new(),
+            order: VecDeque::new(),
+            kept,
+        }
+    }
+
+    /// Files `slots` under `key`, and drops the oldest keys over the bound.
+    fn record(&mut self, key: B256, slots: Vec<RestoredSlot>) {
+        if self.slots.insert(key, Arc::new(slots)).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > self.kept {
+            if let Some(old) = self.order.pop_front() {
+                self.slots.remove(&old);
+            }
+        }
+    }
+
+    fn get(&self, key: &B256) -> Option<Arc<Vec<RestoredSlot>>> {
+        self.slots.get(key).cloned()
+    }
 }
 
 /// Blocks whose lists are kept. The root job runs right after execution;
@@ -136,21 +164,11 @@ static RESTORED_SLOTS: Mutex<Option<RestoredSlotsRegistry>> = Mutex::new(None);
 /// Files a block's restored slots under `key`; an empty list is filed too,
 /// so a look-up can tell "none" from "not executed here".
 pub fn record_restored_slots(key: B256, slots: Vec<RestoredSlot>) {
-    let mut guard = RESTORED_SLOTS
+    RESTORED_SLOTS
         .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let registry = guard.get_or_insert_with(|| RestoredSlotsRegistry {
-        slots: HashMap::new(),
-        order: VecDeque::new(),
-    });
-    if registry.slots.insert(key, Arc::new(slots)).is_none() {
-        registry.order.push_back(key);
-    }
-    while registry.order.len() > RESTORED_SLOTS_KEPT {
-        if let Some(old) = registry.order.pop_front() {
-            registry.slots.remove(&old);
-        }
-    }
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_or_insert_with(|| RestoredSlotsRegistry::new(RESTORED_SLOTS_KEPT))
+        .record(key, slots);
 }
 
 /// The restored slots filed under `key`, if the block was executed here.
@@ -158,7 +176,7 @@ pub fn restored_slots_for(key: B256) -> Option<Arc<Vec<RestoredSlot>>> {
     let guard = RESTORED_SLOTS
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    guard.as_ref()?.slots.get(&key).cloned()
+    guard.as_ref()?.get(&key)
 }
 
 /// A block executor factory whose executors record restored slots.
@@ -677,16 +695,21 @@ mod tests {
         assert_eq!(*restored_slots_for(contexts[0]).unwrap(), first);
         assert_eq!(*restored_slots_for(contexts[1]).unwrap(), second);
 
+        // The bound, on a registry of its own with the process's bound:
+        // filling the process's one would drop the lists other tests, run
+        // beside this one, have filed and not yet read.
+        let mut registry = RestoredSlotsRegistry::new(RESTORED_SLOTS_KEPT);
         let keys: Vec<B256> = (0..RESTORED_SLOTS_KEPT + 8)
             .map(|i| restored_slots_key(B256::repeat_byte(0xB0), [B256::from(U256::from(i))]))
             .collect();
         for key in &keys {
-            record_restored_slots(*key, Vec::new());
+            registry.record(*key, Vec::new());
         }
-        assert!(
-            restored_slots_for(keys[0]).is_none(),
-            "the oldest entry is evicted"
-        );
-        assert!(restored_slots_for(*keys.last().unwrap()).is_some());
+        assert!(registry.get(&keys[0]).is_none(), "the oldest entry is evicted");
+        assert!(registry.get(&keys[7]).is_none());
+        assert!(registry.get(&keys[8]).is_some(), "and no more than the bound requires");
+        assert!(registry.get(keys.last().unwrap()).is_some());
+        assert_eq!(registry.slots.len(), RESTORED_SLOTS_KEPT);
+        assert_eq!(registry.order.len(), RESTORED_SLOTS_KEPT);
     }
 }
