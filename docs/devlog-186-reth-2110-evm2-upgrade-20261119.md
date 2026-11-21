@@ -628,3 +628,223 @@ run129 中 node5 的引擎在追平后静默约 2 s（FCU view=65 用时 1950 ms
 | `python3 scripts/test_apply_reth_patches.py` / `python3 -m unittest discover -s scripts -p 'test_*.py'` | 7 通过 / 102 通过 |
 
 未验证：CI workflow 与 Docker 镜像未实际运行。
+
+## 进度记录（2026-11-20 续四）：leader 周期时间线与两处小改
+
+已推送：`ba3af32`、`5143588`、`19d7ccf`、`83f577d`。以下两处改动在其之上，尚未提交。
+
+### leader 周期（满块 95,238 笔，13 个稳定满块的中位数，起点为 "New payload job created"）
+
+来源：`qgWd/logs/node0.log`（run135，单执行节点）、`qgWc/logs/node1.log`（run134，全节点导入）。
+run135 的 pprof 时间戳未落在负载窗口内，未用于归因。
+
+| 阶段（ms） | 单执行节点 | 全节点导入 | revm 时代（run109） |
+|---|---|---|---|
+| 池遍历、候选 | 约 6 | 约 10 | |
+| 前缀合计 | 79 | 113 | |
+| – 划分 / 批次（含流式合并）/ collect / 其余 | 3 / 35 / 4 / 约 9 | 4 / 48 / 6 / 约 12 | |
+| – 提交（手续费与结果循环 + `commit_run`） | 10 | 16 | |
+| – 把已执行转账移入区块 | 18 | 约 27 | |
+| **打包完成** | **@88** | **@127** | 129 |
+| executor finish / 收据根 / assemble / 等根 / 未计 | 10 / 1 / 9 / 28 / 约 8 | 11 / 1 / 13 / 31 / 约 9 | |
+| **finish 合计** | **56** | **65** | 64 |
+| cache | 0.2 | 0.3 | 19 |
+| built → 校验启动（区块转 payload、规范化、改键、克隆） | 15 | 约 13 | 约 22 |
+| 自有块 prepare（重建 13 + QMDB 提交 16.5–18.5，与 hashed state 并行） | 32 | 约 42 | |
+| 引擎插入 | 14.4 | 16.5 | |
+| FCU → 下一 job | 1.4 | 0.1 | 13 |
+| **周期** | **211**（195–226） | **280**（248–312） | 约 295 |
+
+结论：共识不在关键路径（`N42_BUILD_ON_SEAL` 下，下一 job 在自有块插入后即开始；N 的提交在 job N+1 开始后中位 123 ms 落地）；
+阶段之间无空闲；全节点导入是同一流水线被同机六个跟随者拉长约 1.3 倍。
+
+### 两处小改
+
+1. `move_executed`（`crates/n42-node/src/parallel_payload.rs`）：候选全部执行时，95,238 × 368 字节的交易并行移入一次性预留的空间。
+   微基准 `moving_a_full_block_of_executed_candidates`（`#[ignore]`）17.8 → 7.5 ms；日志新增 `moved_ms`。
+2. 自有块插入（`crates/n42-node/src/el/own_block.rs`）：先在不含交易的 body 上推导并校验头，再与 QMDB 提交、hashed state 并行取 body。
+   新指标阶段 `body`，`rebuild` 现只指头。
+
+### 机群（round AX，`roundAX.sh`，构建 `d48726eda5c39468`，原始输出 `run136.out`–`run138.out` 等）
+
+| 轮次 | 拓扑 | 校验 | wall-clock TPS（窗口） |
+|---|---|---|---|
+| run136 | 单执行节点 | PASS，883 块 | 415,375（块 66..82，3.85 s） |
+| run137 | 单执行节点 | PASS，895 块 | 404,432（块 66..82，3.96 s） |
+| run138 | 全节点导入 | PASS，557 个共同块 | 335,479（块 42..59，4.77 s） |
+
+node0 中位数（run135 → run136 / run137）：`moved_ms` 约 18 → 3；前缀合计 77.5 → 67 / 68；`packing_ms` 87.5 → 72 / 75；
+finish 56 → 55；周期 208.9 → 192.2 / 205.7。自有块 `prepare` p90 34.4 → 26.3 / 26.7（`rebuild` 13.0 → 1.9 / 1.6，`body` 14.4 / 18.0）。
+无 "own block does not rebuild" / "QMDB candidate was not committed" 告警。
+
+### 下一步候选（未做）
+
+| 项 | 预计 | 说明 |
+|---|---|---|
+| QMDB 根任务与 executor finish 并行 | 约 10–15 ms | 改变操作推导的位置，不算小 |
+| built → 校验启动复用帧字节 | 约 5–8 ms | 不再重编码 95k 笔交易 |
+| 引擎插入时 leader 用不到的 bundle 拷贝 | 约 4–5 ms | `PayloadProcessor::on_inserted_executed_block`，需 reth 提交 |
+| 提交循环并行化 | 约 4 ms | |
+| 提前构建（build-ahead） | 打包约 72–88 ms 离开关键路径 | 见下 |
+
+**提前构建设计要点**：N 的状态变化在其打包结束时已定；N+1 的批次在 N 的 finish 与衔接期间，以 N 的 `MergedBatches`
+（已是 bundle 形状，需改为 `Arc` 共享）叠在 N 所用父 provider 之上执行；job N+1 采用其 `ParallelRun`，
+`commit_run`、executor finish、QMDB candidate、组装照旧，因此收据、恢复槽位、被触碰账户、QMDB 操作由同一段代码产生。
+仅限帧顺序构块（候选在 N 打包结束时即可确定）、本节点连任、N 为纯前缀块。
+采用条件：父哈希为 N 的封存哈希且 N 由同一执行键的执行插入；区块环境（时间戳含 leader 的 bump、beneficiary、base fee、gas limit、
+prevrandao、分叉）一致；候选列表一致；无提款或区块前系统调用改到批次账户。任一不满足即丢弃，仅损失 CPU。
+预期：单执行节点周期约 150–160 ms（TPS 约 +30–35%，估算未实测）；全节点导入下跟随者约 220 ms/块会先成为瓶颈。
+规模约 400–600 行（n42-execution、n42-node），无需 reth 改动。
+
+### run129 中 node5 引擎静默约 2 s
+
+info 级日志无法解释。已排除：重复导入（在静默开始后才提交）、backpressure（最大为 0）。
+嫌疑：finalize 从 48 跳到 64 之后的持久化完成与树 / overlay 清理，或该 FCU 的规范化本身。
+复现需 `RUST_LOG=info,engine::tree=debug,engine::persistence=debug,storage::overlay::manager=debug` 及覆盖追赶期的 pprof；
+导入按序后造成它的积压不再形成，可能不复现。
+
+## 进度记录（2026-11-20 续五）：leader 收尾与衔接的四处小改
+
+AX 轮确认上一节两处改动后（run136/137 415k/404k TPS），继续做时间线表里便宜的几项。
+
+### 设计决策
+
+- **QMDB 操作提前派生**：操作表在 `executor.finish()` 之后才完全确定（串行尾部、多批共享账户、touched-unchanged 都在 fold 时定型），
+  所以不能整体提前。能提前的是"只被一个批次改过"的账户：fold 把它们原样搬进 bundle。做法是在 `commit_run` 提交回执的同时派生这些账户的叶子，
+  另起线程排序；块尾只重算 fold 报告点名的账户（共享账户、串行部分的全部账户、touched 账户）及 restored slot、Prague system caller，再并入。
+  `prepare_bound_candidate`（29 ms）仍须等最终操作表，未动；要让它与 `executor.finish()` 并行，需要 fold 在状态半完成时把被点名账户的条目交给已启动的 root 任务
+  （把 scope 提到 finish 之前、FoldReport 带条目而非地址），属于更大的重构，未做。
+- **built → 验证启动**：测得 payload 转换 4.9 ms（并行编码），首次复制 95k 个 `Bytes` 2.4 ms（每个一次分配）、之后每次 0.9 ms、释放 0.6 ms。
+  原归一化路径复制两遍、释放两遍、再逐字节比较 14 MB。改为按值归一化：native 路径且已有交易根时把交易表取出，在无交易的壳上派生头并做
+  "执行输入不变"检查，再把同一张表放回。验证用的那份复制改为并行。复用 frame 字节未做：编码只占 4.9 ms，而按哈希在 FrameStore 里串行查 95k 次并不更快，
+  且需要先证明 frame 原始字节与规范编码逐字节相同。
+- **提交循环**：哈希 / 类型 / 小费改为并行读取，结果以惰性迭代器交给 `commit_run`，不再多搬一遍。
+- **reth**：state cache 关闭且未与 payload builder 共享时，`on_inserted_executed_block` 不再把 bundle 抄进 execution cache（此时无人读取）。
+  默认配置行为不变，需 `--engine.disable-state-cache` 才生效；代价是引擎自己执行区块（串行回退）时没有跨块缓存。
+
+### 实施细节
+
+- `n42-execution`：`MergedBatches::unshared()`、`refolded()`；`FoldReport` 与 `TrackingExecutor::report_fold()`；`commit_run_beside`。
+- `n42-node`：`qmdb_state::EarlyOperations::{derive, sorted, finish}`；`parallel_payload.rs` 中的接线，debug 构建下 `debug_assert_eq!` 与原路径逐项比较。
+- `n42-network`：`normalize_built_payload_for_gov5_h2`；`ExecutionOutputCache::rekey_gov5_built`；`execution_bridge.rs` 的 `copy_payload`。
+- reth `n42/v2.11.0`：`a8583ac87e`（条件化缓存写入 + 测试）、`e037d26ce8`（`n42_insert_executed_stage_ms`）。
+- 新指标：`n42_payload_builder_qmdb_operations_ms{source}`、`n42_leader_emit_stage_ms{stage}`、
+  `n42_engine_boundary_duration_ms{phase="payload_convert"}`、`n42_insert_executed_stage_ms{stage}`。
+
+### 测量（本机，release，190,476 账户 / 95,238 笔）
+
+- 操作表：从 bundle 整体派生 8.98 ms；提前派生 6.55 ms（与 6.2 ms 的回执提交并行）+ 排序 5.82 ms（独立线程）；块尾 0.83 ms。
+- payload 复制：首次 2.39 ms → 并行 1.09 ms。
+
+### 遇到的问题
+
+- 第一版块尾用稳定排序并入，4.4 ms；改为从尾部原地归并后 0.83 ms。
+- 第一版把排序也放在 `commit_run_beside` 里，比回执提交长约 3.5 ms，会拖长 commit；拆成独立线程。
+- `graft_fold` 新测试里原以为第二个共享账户存在，实际该夹具只产生一个共享账户，且它同时在串行部分里；
+  "共享且不在串行部分"的账户由 `parallel_build` 的 shared-recipients 用例经不变式覆盖，但夹具未直接断言其共享。
+
+### 状态与后续
+
+四项均已实现并通过门禁；待车队确认。pprof 采集错过负载是 leg 脚本的时序问题（flood 启动 3 s 后才触发），节点侧无需修改。
+
+## 进度记录（2026-11-20 续六）：AY 轮结果——撤回操作提前派生
+
+AY 轮（run139–142）全部通过，但 finish 从 55 ms 变为 62–63 ms，周期未缩短。
+
+- **撤回"QMDB 操作提前派生"（续五第一项）**：真实区块上 `n42_payload_builder_qmdb_operations_ms{source="ahead"}` 中位 11.5 ms，
+  而旧路径在同样的区块上约 5.4 ms（root 任务 p90 35.8 ms − prepare 30.4 ms）；root 任务 p90 35.8 → 42.7 ms，prepare 不变（30.4 → 30.6）。
+  原因有二：其一，车队区块每块约 10.2–10.7 万个操作，本机基准用的是 19 万账户，旧路径可省的上限本来只有约 5 ms；
+  其二，pprof 显示块尾走的是"≥4096 个待重算账户 → 整表并行重排"分支，即 flood 的收款地址散列（`index * K % spread`）在一块内有上千个重复，
+  落在不同批次即成为共享账户，全部要在块尾重算。块尾的 CPU 只有约 2 ms/块，其余是等待（排序线程与全局 rayon 池上的其他任务争用）。
+  收益上限小、需要 fold 侧为共享账户提前定型才能做对，故整项撤回：`EarlyOperations`、`FoldReport`、`commit_run_beside`、
+  `MergedBatches::{unshared, refolded}` 及其测试全部移除。
+- **保留 built → 验证启动（第二项）**：built → spawn 12.6/13.1 → 5.3/6.1/5.3 ms，built → 广播 54.5/55 → 44–46 ms。
+  `n42_leader_emit_stage_ms` 的中位数被空块淹没（99 块里 18 个满块），满块看 p90：`to_validation_spawn` 约 0.3 ms，
+  即 `handle_built_payload` 内部已不是瓶颈，剩下的 5 ms 在它之前（resolve 唤醒与 payload 转换，后者 p90 1.5 ms）。
+- **保留提交循环并行（第三项）**：`commit_ms` 12 → 10–11。
+- **reth 条件化缓存写入（第四项）保留，默认不生效**：run142 加 `--engine.disable-state-cache` 后，满块 "Block added" 14.2 ms → 0.1 ms
+  （日志单位变成 µs），built → 下一个 payload job 47.5 → 31.8 ms；但本块的 frame-ref 编码与验证完成反而晚了约 8 ms
+  （built → validated 44–46 → 54.3，下一轮构建提前开始后与之争用），周期 188.6 ms 对 190.4 / 206.6，在噪声内。
+
+## 进度记录（2026-11-20 续七）：补丁系列增至十六个
+
+`n42/v2.11.0` 在 `4c1615dd27` 之上新增两个提交；只动固定点与文档，未改 Rust 源码，未跑 cargo，未提交。
+
+| # | 补丁文件 | reth 提交 | 改动文件 |
+|---|---|---|---|
+| 15 | `reth-inserted-block-cache-skip` | `a8583ac87e61027eda77bfce626546561032b92d` | `engine/tree/src/tree/payload_processor/mod.rs` |
+| 16 | `reth-insert-executed-stage-timers` | `e037d26ce8589c907cce170ee380375d78364b25` | `engine/tree/src/tree/payload_validator.rs` |
+
+适配提交（十六补丁后）：`e037d26ce8589c907cce170ee380375d78364b25`，树 `dec72b6069aa497911f2dc86d0aee5780d5a900a`。
+
+- 前十四份补丁无需重生成：十六份文件逐份与 `git diff --abbrev=9 父 提交` 比对，字节相同。
+- 同步：`reth-source.lock`（`adapted_commit`、`patch_series` 16 项）、`scripts/apply-reth-patches.sh`
+  （适配提交、名单）、`scripts/test_apply_reth_patches.py`（名单）、`CLAUDE.md`（十六个、适配提交）、
+  `README.md`（sixteen）、`DEVLOG.md` 索引行。CI workflow 只固定上游提交，无需改动。
+
+| 检查 | 结果 |
+|---|---|
+| 干净 v2.11.0 检出上运行 `apply-reth-patches.sh` | rc=0；树 `dec72b6069aa497911f2dc86d0aee5780d5a900a` = `n42/v2.11.0` 的 `HEAD^{tree}`（23 个文件，+780 / −102） |
+| 再次运行 | "Reth source already carries the full N42 patch series"，rc=0 |
+| `check-reth-source.sh`（打过补丁的干净检出、`../reth-worktree`） | 均 "Reth source matches the v2.11.0 N42 patch lock."，rc=0 |
+| `python3 scripts/test_apply_reth_patches.py` / `python3 -m unittest discover -s scripts -p 'test_*.py'` | 7 通过 / 102 通过 |
+
+未验证：CI workflow 与 Docker 镜像未实际运行。
+
+## 进度记录（2026-11-20 续八）：round AZ 与收尾验证
+
+round AZ（`roundAZ.sh`，操作提前推导已回退；原始输出 `run143.out`–`run145.out` 等）：
+
+| 轮次 | 拓扑 | 校验 | wall-clock TPS（窗口） |
+|---|---|---|---|
+| run143 | 单执行节点 | PASS，885 块 | 442,226（仅 1,333,332 笔，块 65..78，3.02 s；窗口不完整，不与其他段直接比较） |
+| run144 | 单执行节点 | PASS，884 块 | 417,140（块 65..81，3.84 s） |
+| run145 | 全节点导入 | PASS，565 个共同块 | 363,644（块 43..59，4.40 s） |
+
+node0 满块中位数（run136 / run137 → run143 / run144）：`commit_ms` 12 → 8 / 9；`packing_ms` 72 / 75 → 69 / 71；
+finish 55.3 / 54.7 → 55.3 / 55.7；周期 192.2 / 205.7 → 187.0 / 188.5。
+
+门：workspace check、clippy `-D warnings`、测试 1901 通过 / 0 失败 / 36 忽略、release 构建、E2E 1,3,4,5,8,12 全过
+（`.artifacts/reth-upgrade-2110/logs/s2-final-gates.log`）。
+
+## 进度记录（2026-11-21）：与 n42-rs 5.69M 的对照与方案调整
+
+### n42-rs 的 5.69M 是什么
+
+来源：n42-rs `main`（`284a3a0e3`）`docs/PLAN_6M_2026_11.md` 第 5 节 2026-11-21 条目，pair FTK：5.55 / 5.69M（5.69M 是迄今最好的一段）。
+口径：fleet7 X22 轮的 window 1，即压测开始约 10 s 后的第一个 30 s 窗口（`scripts/fleet7-bench.sh` `WINDOW_SEC=30`，
+`fleet7-measure.py` 按日志计窗口内封块的交易数 / 30）。拓扑 E=1：七个验证者密钥共用一个执行层（`N42_IMPORT_ONCE`，
+文档自称 bench 拓扑），执行层可用 208 个 CPU；每块 200k 笔；压测器把每笔交易直接送到执行层本地 ingest（`F7_INGEST_ALL`），
+单网关背书（不逐笔验签）；持久化每 8 块一次，账户历史关闭。同一主机（254 逻辑 CPU）。
+它自己的其他拓扑：三节点独立执行 1.40–1.42M；七节点独立执行（E=7）对照约 68 万（一个窗口），每块约 14.7 万账户的真实形态 24–33 万（`docs/PLAN_E7_FLEET7.md` 第 1 节）。
+
+### 我们的数字与可比性
+
+| 拓扑 | n42-rs | n42-26（当前未提交构建） |
+|---|---|---|
+| 一个执行层、七个密钥 | 5.55 / 5.69M（30 s 窗口，200k 块） | 417,140（run144，单执行节点，95,238 块，约 4 s 突发窗口） |
+| 七个执行层 | E=7 约 68 万；真实形态 24–33 万 | 335,479 / 336,737 / 363,644（全节点导入，约 4.5 s 突发窗口） |
+
+窗口不同：我们一段只有 160 万笔，约 4 s 负载，不是持续 30 s；round BA（run146–148）补持续负载的 30 s / 20 s 窗口。
+
+### 差距在哪里（一个执行层拓扑，每块）
+
+| 项 | n42-rs | n42-26 | 说明 |
+|---|---|---|---|
+| 块大小 | 200k | 95k | n42-rs 自己测过：周期与块大小成正比，块大小本身不是杠杆 |
+| 封块间隔 | 约 35 ms | 约 188 ms | 每千笔周期成本 0.175 ms 对约 1.97 ms，约 11 倍 |
+| 执行 | par_exec 28.6 ms / 200k（32 线程） | 批次约 35 ms / 95k，打包合计约 70 ms | 每笔执行约 2.6 倍；n42-rs 有扁平账户表、读集预取、seeded 索引批读 |
+| 状态根 | 与执行重叠（root ops 在执行批次内编码；root 门等父块） | 执行器收尾后才开始，等根 28 ms，收尾合计 55 ms | 延迟根在 n42-rs 是头部规则变化 |
+| 封块后到下一次构块 | 4–5 ms（build on output / take sealed / 跳过自有 newPayload） | 约 60 ms（自有块准备 26、引擎插入 14、构建→校验 5 等） | 我们在自有块插入后才开始下一块 |
+| 供给 | ingest 独立 runtime，64 连接，限速 9M | native-flood 8 连接，单节点约 80 万/s | 到 1M 级以上要先扩供给与重放集 |
+
+结论：差距主要是结构性的——串行流水线（执行→根→插入→下一块）与每笔执行成本，而不是某个单项。
+
+### 调整后的方案（按杠杆排序）
+
+1. 测量对齐：持续负载 30 s 窗口（`window-tps30.py`），重放集按 TPS 放大；先于任何"接近 n42-rs"的说法。（进行中，round BA）
+2. 在父块输出上构块（build on output）：下一块在本块封块时开始，读本块的内存执行输出；自有块插入、QMDB 提交、引擎工作与下一块并行。不改链规则。预计周期 188 → 约 130–147 ms。
+3. 提前构建（build-ahead）：在本块打包结束时开始下一块的批次（仅帧顺序构块）。预计周期 → 约 max(打包, 收尾+衔接)。
+4. 每笔执行成本：参照 n42-rs 的扁平账户表、读集预取。
+5. 状态根离开封块路径：root ops 进入执行批次；延迟根与帧树交易根是头部 / 共识规则变化，需用户决定。
+6. 之后再扩大块（200k）与供给（多连接、更大重放集）。
