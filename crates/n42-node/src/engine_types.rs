@@ -631,6 +631,23 @@ mod tests {
         );
     }
 
+    /// Prints what converting a full native block to its payload costs: the
+    /// encoding of every transaction, side by side.
+    #[test]
+    #[ignore = "benchmark"]
+    fn converting_a_full_block_to_its_payload() {
+        let sealed = block(95_238).sealed_block().clone();
+        let mut times = Vec::new();
+        for _ in 0..15 {
+            let at = std::time::Instant::now();
+            let data = blobless_block_to_payload(&sealed);
+            times.push(at.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(data.payload.transactions().len(), 95_238);
+        }
+        times.sort_by(f64::total_cmp);
+        println!("PAYLOAD_CONVERT transactions=95238 median_ms={:.2}", times[times.len() / 2]);
+    }
+
     #[test]
     #[should_panic(expected = "big blocks")]
     fn big_block_data_is_not_supported() {

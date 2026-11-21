@@ -48,6 +48,13 @@ pub trait ExecutionOutputCache: Send + Sync {
         false
     }
 
+    /// [`Self::rekey_gov5_normalized`] by hash, for a caller that has already
+    /// established that the normalization preserved the EVM inputs
+    /// (`n42_network::normalize_built_payload_for_gov5_h2`).
+    fn rekey_gov5_built(&self, _original: B256, _normalized: B256) -> bool {
+        false
+    }
+
     /// Inject a received compact-block wire blob into the payload cache so the
     /// next `new_payload` hits the cache and skips EVM re-execution. Returns
     /// whether the inject succeeded.

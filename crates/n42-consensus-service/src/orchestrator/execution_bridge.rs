@@ -1609,6 +1609,27 @@ impl ConsensusService {
 
 // ── Free functions for the spawned payload build task ──
 
+/// A copy of `data`, its transactions copied side by side.
+///
+/// A transaction's bytes straight from the builder are promoted to shared
+/// storage by their first copy, one allocation each; one after another that
+/// is milliseconds of a full block, on the leader's way to its own
+/// validation. The list is taken out for the copy and put back.
+fn copy_payload(
+    data: &mut alloy_rpc_types_engine::ExecutionData,
+) -> alloy_rpc_types_engine::ExecutionData {
+    use rayon::prelude::*;
+    let transactions = std::mem::take(&mut data.payload.as_v1_mut().transactions);
+    let mut copy = data.clone();
+    copy.payload.as_v1_mut().transactions = if transactions.len() >= 4096 {
+        transactions.par_iter().with_min_len(1024).cloned().collect()
+    } else {
+        transactions.clone()
+    };
+    data.payload.as_v1_mut().transactions = transactions;
+    copy
+}
+
 /// Leader pipelined import: broadcast block data, trigger consensus, then import eagerly.
 ///
 /// The leader already executed all transactions during payload building.  Instead of calling
@@ -1654,6 +1675,7 @@ async fn handle_built_payload(
         blob_tx_hashes,
     } = built;
     let original_hash = hash;
+    let emit_started = Instant::now();
     if h2_v4_participant {
         let (gov5_state_root, gov5_receipts_root) = match exec_output_cache
             .as_ref()
@@ -1674,21 +1696,21 @@ async fn handle_built_payload(
         let transactions_root = exec_output_cache
             .as_ref()
             .and_then(|cache| cache.built_transactions_root(original_hash));
-        let normalized =
-            match n42_network::normalize_execution_payload_for_gov5_h2_with_transactions_root(
-                &execution_data,
-                current_view,
-                gov5_state_root,
-                gov5_receipts_root,
-                transactions_root,
-            ) {
-                Ok(normalized) => normalized,
-                Err(error) => {
-                    error!(target: "n42::interop::h2v4", original_hash = %hash, %error, "refusing to propose a payload that cannot be normalized to the gov5 H2 header profile");
-                    return;
-                }
-            };
-        hash = normalized.block_hash();
+        let normalize_started = Instant::now();
+        let normalized = match n42_network::normalize_built_payload_for_gov5_h2(
+            execution_data,
+            current_view,
+            gov5_state_root,
+            gov5_receipts_root,
+            transactions_root,
+        ) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                error!(target: "n42::interop::h2v4", original_hash = %hash, %error, "refusing to propose a payload that cannot be normalized to the gov5 H2 header profile");
+                return;
+            }
+        };
+        hash = normalized.payload.block_hash();
         // Native Cancun normalization changes commitments and H2 metadata,
         // but preserves the EVM inputs. Move the builder result to the new
         // hash only after the adapter checks that invariant. newPayload still
@@ -1698,11 +1720,16 @@ async fn handle_built_payload(
         {
             let reuse_enabled = std::env::var_os("N42_GOV5_REUSE_BUILDER_EXECUTION")
                 .is_none_or(|value| value != "0");
-            if !reuse_enabled || !cache.rekey_gov5_normalized(&execution_data, &normalized) {
+            if !reuse_enabled
+                || !normalized.preserves_execution_input
+                || !cache.rekey_gov5_built(original_hash, hash)
+            {
                 cache.evict(original_hash);
             }
         }
-        execution_data = normalized;
+        execution_data = normalized.payload;
+        metrics::histogram!("n42_leader_emit_stage_ms", "stage" => "normalize")
+            .record(normalize_started.elapsed().as_secs_f64() * 1000.0);
     }
     let actual_parent = execution_data.parent_hash();
     let payload_hash = execution_data.block_hash();
@@ -1735,7 +1762,10 @@ async fn handle_built_payload(
     // votes, and it overlaps ~0.5 s of leader validation with the transfer.
     let leader_validation = h2_v4_participant.then(|| {
         let el = el.clone();
-        let data = execution_data.clone();
+        let copy_started = Instant::now();
+        let data = copy_payload(&mut execution_data);
+        metrics::histogram!("n42_leader_emit_stage_ms", "stage" => "validation_copy")
+            .record(copy_started.elapsed().as_secs_f64() * 1000.0);
         let import_start = std::time::Instant::now();
         let validated_tx = build_on_seal_enabled().then(|| block_ready_tx.clone());
         let task = tokio::spawn(async move {
@@ -1760,10 +1790,14 @@ async fn handle_built_payload(
         });
         (import_start, task)
     });
+    if leader_validation.is_some() {
+        metrics::histogram!("n42_leader_emit_stage_ms", "stage" => "to_validation_spawn")
+            .record(emit_started.elapsed().as_secs_f64() * 1000.0);
+    }
     // The Gov5 copy is encoded beside serialization and the native send; it
     // is still pushed, and the proposal still released, only after both.
     let gov5_encode = h2_v4_participant.then(|| {
-        let data = execution_data.clone();
+        let data = copy_payload(&mut execution_data);
         tokio::task::spawn_blocking(move || {
             let encode_start = Instant::now();
             let encoded = n42_network::encode_gov5_block_rlp(&data);
@@ -2743,6 +2777,96 @@ mod blob_frame_tests {
         let (frames, oversized) = pack_blob_sidecar_frames(Vec::new(), 1024);
         assert!(frames.is_empty());
         assert_eq!(oversized, 0);
+    }
+}
+
+#[cfg(test)]
+mod payload_copy_tests {
+    use super::copy_payload;
+    use alloy_primitives::Bytes;
+    use alloy_rpc_types_engine::{
+        ExecutionData, ExecutionPayload, ExecutionPayloadSidecar, ExecutionPayloadV1,
+    };
+
+    /// A payload of `count` transactions as the builder hands them over: each
+    /// one's bytes in an allocation of its own that nothing shares yet.
+    fn payload(count: usize) -> ExecutionData {
+        let transactions = (0..count)
+            .map(|index| {
+                let mut raw = vec![0x50u8; 146];
+                raw[1..9].copy_from_slice(&(index as u64).to_be_bytes());
+                Bytes::from(raw)
+            })
+            .collect();
+        ExecutionData {
+            payload: ExecutionPayload::V1(ExecutionPayloadV1 {
+                parent_hash: Default::default(),
+                fee_recipient: Default::default(),
+                state_root: Default::default(),
+                receipts_root: Default::default(),
+                logs_bloom: Default::default(),
+                prev_randao: Default::default(),
+                block_number: 7,
+                gas_limit: 9,
+                gas_used: 3,
+                timestamp: 11,
+                extra_data: Bytes::from_static(b"N42H"),
+                base_fee_per_gas: Default::default(),
+                block_hash: Default::default(),
+                transactions,
+            }),
+            sidecar: ExecutionPayloadSidecar::none(),
+        }
+    }
+
+    #[test]
+    fn a_copied_payload_equals_the_one_it_was_copied_from() {
+        for count in [0, 3, 4096, 9000] {
+            let mut data = payload(count);
+            let reference = data.clone();
+            let copy = copy_payload(&mut data);
+            assert_eq!(copy.payload, reference.payload, "{count} transactions: the copy");
+            assert_eq!(data.payload, reference.payload, "{count} transactions: the source");
+        }
+    }
+
+    /// Prints what the first copies of a full native block's payload cost one
+    /// transaction after another and side by side.
+    #[test]
+    #[ignore = "benchmark"]
+    fn copying_a_full_block_payload() {
+        let ms = |at: std::time::Instant| at.elapsed().as_secs_f64() * 1e3;
+        let (mut first, mut second, mut beside, mut dropped) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..15 {
+            let data = payload(95_238);
+            let at = std::time::Instant::now();
+            let one = data.clone();
+            first.push(ms(at));
+            let at = std::time::Instant::now();
+            let two = data.clone();
+            second.push(ms(at));
+            let at = std::time::Instant::now();
+            drop(one);
+            dropped.push(ms(at));
+            drop(two);
+            let mut data = payload(95_238);
+            let at = std::time::Instant::now();
+            let copy = copy_payload(&mut data);
+            beside.push(ms(at));
+            assert_eq!(copy.payload.as_v1().transactions.len(), 95_238);
+        }
+        let median = |values: &mut Vec<f64>| {
+            values.sort_by(f64::total_cmp);
+            values[values.len() / 2]
+        };
+        println!(
+            "PAYLOAD_COPY first_copy_ms={:.2} later_copy_ms={:.2} drop_ms={:.2} side_by_side_first_copy_ms={:.2}",
+            median(&mut first),
+            median(&mut second),
+            median(&mut dropped),
+            median(&mut beside)
+        );
     }
 }
 

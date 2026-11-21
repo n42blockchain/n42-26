@@ -105,11 +105,11 @@ impl ExecutionOutputCache for RethExecutionOutputCache {
         original: &alloy_rpc_types_engine::ExecutionData,
         normalized: &alloy_rpc_types_engine::ExecutionData,
     ) -> bool {
-        if !n42_network::gov5_normalization_preserves_execution_input(original, normalized) {
-            return false;
-        }
-        let old_hash = original.block_hash();
-        let new_hash = normalized.block_hash();
+        n42_network::gov5_normalization_preserves_execution_input(original, normalized)
+            && self.rekey_gov5_built(original.block_hash(), normalized.block_hash())
+    }
+
+    fn rekey_gov5_built(&self, old_hash: B256, new_hash: B256) -> bool {
         if old_hash == new_hash {
             return true;
         }

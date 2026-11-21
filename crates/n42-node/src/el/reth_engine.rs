@@ -201,7 +201,11 @@ impl ExecutionLayer for RethExecutionLayer {
                         ));
                     }
                     super::own_block::remember_built(payload.block_arc());
-                    to_built_block(payload)
+                    let convert_started = std::time::Instant::now();
+                    let built = to_built_block(payload);
+                    metrics::histogram!("n42_engine_boundary_duration_ms", "phase" => "payload_convert")
+                        .record(convert_started.elapsed().as_secs_f64() * 1_000.0);
+                    built
                 })
             });
         // Includes waiting for the pending build and converting its completed

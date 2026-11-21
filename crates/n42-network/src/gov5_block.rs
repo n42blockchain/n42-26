@@ -225,6 +225,58 @@ fn native_cancun_genesis(parent: &Gov5NativeHeader) -> bool {
         && parent.header.parent_beacon_block_root.is_some()
 }
 
+/// A locally built payload normalized by
+/// [`normalize_built_payload_for_gov5_h2`].
+#[derive(Debug)]
+pub struct NormalizedBuiltPayload {
+    /// The normalized payload.
+    pub payload: ExecutionData,
+    /// [`gov5_normalization_preserves_execution_input`] of the payload handed
+    /// in and this one.
+    pub preserves_execution_input: bool,
+}
+
+/// [`normalize_execution_payload_for_gov5_h2_with_transactions_root`] for a
+/// payload the caller hands over, with whether the normalization preserved
+/// the execution input.
+///
+/// On the native profile with the transactions root given, only header
+/// fields change and nothing reads the transactions. They are set aside
+/// while the header is derived and the two payloads compared, and the same
+/// list is the result's: a full block's 95,000 transactions are then neither
+/// copied twice nor compared byte by byte on the leader's way to its own
+/// validation.
+pub fn normalize_built_payload_for_gov5_h2(
+    mut execution: ExecutionData,
+    view: u64,
+    state_root: B256,
+    receipts_root: B256,
+    transactions_root: Option<B256>,
+) -> Result<NormalizedBuiltPayload, Gov5BlockError> {
+    let native = n42_consensus::remembered_gov5_native_header(&execution.parent_hash())
+        .is_some_and(|parent| {
+            parent.mobile_registry_root.is_some() || native_cancun_genesis(&parent)
+        });
+    let set_aside = (native && transactions_root.is_some())
+        .then(|| std::mem::take(&mut execution.payload.as_v1_mut().transactions));
+    let mut payload = normalize_execution_payload_for_gov5_h2_with_transactions_root(
+        &execution,
+        view,
+        state_root,
+        receipts_root,
+        transactions_root,
+    )?;
+    let preserves_execution_input =
+        gov5_normalization_preserves_execution_input(&execution, &payload);
+    if let Some(transactions) = set_aside {
+        payload.payload.as_v1_mut().transactions = transactions;
+    }
+    Ok(NormalizedBuiltPayload {
+        payload,
+        preserves_execution_input,
+    })
+}
+
 /// A conservative guard for reusing the builder's execution output after Gov5
 /// changes the header hash. Only the native Cancun profile is eligible: the
 /// pre-Shanghai normalization can also change the withdrawal body.
@@ -880,6 +932,20 @@ mod tests {
             assert_eq!(normalized.sidecar.prague(), expected.sidecar.prague());
             assert!(normalized.sidecar.requests_hash().is_none());
             assert!(gov5_normalization_preserves_execution_input(&execution, &normalized));
+            // Handed over, the payload normalizes to the same one.
+            let built = normalize_built_payload_for_gov5_h2(
+                execution.clone(),
+                5,
+                state_root,
+                receipts_root,
+                root,
+            )
+            .unwrap();
+            assert!(built.preserves_execution_input);
+            assert_eq!(built.payload.payload, normalized.payload);
+            assert_eq!(built.payload.sidecar.cancun(), normalized.sidecar.cancun());
+            assert_eq!(built.payload.sidecar.prague(), normalized.sidecar.prague());
+            assert_eq!(built.payload.payload.as_v1().transactions.len(), 3);
             let decoded =
                 decode_gov5_block_rlp(&encode_gov5_block_rlp(&normalized).unwrap()).unwrap();
             assert_eq!(decoded.block_hash, normalized.block_hash());
@@ -949,6 +1015,23 @@ mod tests {
         )
         .unwrap();
         assert_ne!(normalized.block_hash(), standard_hash);
+        // Off the native profile a handed-over payload takes the same path,
+        // whatever root comes with it, and is not reusable under the new hash.
+        for root in [None, Some(block.header.transactions_root)] {
+            let built = normalize_built_payload_for_gov5_h2(
+                standard.clone(),
+                19,
+                native_state_root,
+                gov5_native_receipts_root::<alloy_consensus::TxType>(&[]),
+                root,
+            )
+            .unwrap();
+            assert_eq!(built.payload.payload, normalized.payload);
+            assert_eq!(
+                built.preserves_execution_input,
+                gov5_normalization_preserves_execution_input(&standard, &normalized)
+            );
+        }
         let encoded = encode_gov5_block_rlp(&normalized).unwrap();
         let recovered = decode_gov5_block_rlp(&encoded).unwrap();
         assert_eq!(recovered.block_hash, normalized.block_hash());
