@@ -21,6 +21,8 @@ PATCH_NAMES = (
     "reth-cached-execution-skip-tx-conversion",
     "reth-pre-canonical-block-state",
     "reth-payload-cache-recent-outputs",
+    "reth-inserted-block-cache-skip",
+    "reth-insert-executed-stage-timers",
 )
 
 

@@ -1,0 +1,77 @@
+diff --git a/crates/engine/tree/src/tree/payload_processor/mod.rs b/crates/engine/tree/src/tree/payload_processor/mod.rs
+index 44c564361..1b9eb879d 100644
+--- a/crates/engine/tree/src/tree/payload_processor/mod.rs
++++ b/crates/engine/tree/src/tree/payload_processor/mod.rs
+@@ -101,6 +101,8 @@ where
+     disable_transaction_prewarming: bool,
+     /// Whether state cache should be disable
+     disable_state_cache: bool,
++    /// Whether a payload builder is lent the execution cache.
++    share_execution_cache_with_payload_builder: bool,
+     /// Determines how to configure the evm for execution.
+     evm_config: Evm,
+     /// Whether precompile cache should be disabled.
+@@ -137,6 +139,8 @@ where
+             disable_transaction_prewarming: config.disable_prewarming(),
+             evm_config,
+             disable_state_cache: config.disable_state_cache(),
++            share_execution_cache_with_payload_builder: config
++                .share_execution_cache_with_payload_builder(),
+             precompile_cache_disabled: config.precompile_cache_disabled(),
+             precompile_cache_map,
+             cache_metrics: (!config.disable_cache_metrics())
+@@ -520,11 +524,18 @@ where
+     ///
+     /// The cache enables subsequent blocks to reuse account, storage, and bytecode data without
+     /// hitting the database, maintaining performance consistency.
++    ///
++    /// Nothing is written when nothing reads the cache: block execution does not with the state
++    /// cache disabled, and a payload builder only does when the cache is shared with it. Copying
++    /// a large block's state into it is then work on the engine's thread for no reader.
+     pub fn on_inserted_executed_block(
+         &self,
+         block_with_parent: BlockWithParent,
+         bundle_state: &BundleState,
+     ) {
++        if self.disable_state_cache && !self.share_execution_cache_with_payload_builder {
++            return
++        }
+         let cache_state_metrics = self.cache_state_metrics.clone();
+         self.execution_cache.update_with_guard(|cached| {
+             if cached.as_ref().is_some_and(|c| c.executed_block_hash() != block_with_parent.parent) {
+@@ -1030,6 +1041,35 @@ mod tests {
+         assert_eq!(cached.unwrap().executed_block_hash(), block_hash);
+     }
+ 
++    #[test]
++    fn on_inserted_executed_block_writes_only_a_cache_that_is_read() {
++        let block_hash = B256::repeat_byte(10u8);
++        let block_with_parent = BlockWithParent {
++            block: BlockNumHash { hash: block_hash, number: 1 },
++            parent: B256::repeat_byte(1u8),
++        };
++        // (state cache disabled, shared with the payload builder) -> written
++        for (disabled, shared, written) in
++            [(false, false, true), (true, false, false), (true, true, true), (false, true, true)]
++        {
++            let config = TreeConfig::default()
++                .without_state_cache(disabled)
++                .with_share_execution_cache_with_payload_builder(shared);
++            let payload_processor = PayloadProcessor::new(
++                reth_tasks::Runtime::test(),
++                EthEvmConfig::new(Arc::new(ChainSpec::default())),
++                &config,
++                PrecompileCacheMap::default(),
++            );
++            payload_processor.on_inserted_executed_block(block_with_parent, &BundleState::default());
++            assert_eq!(
++                payload_processor.execution_cache.get_cache_for(block_hash).is_some(),
++                written,
++                "state cache disabled: {disabled}, shared with the builder: {shared}"
++            );
++        }
++    }
++
+     #[test]
+     fn on_inserted_executed_block_skips_on_parent_mismatch() {
+         let payload_processor = PayloadProcessor::new(

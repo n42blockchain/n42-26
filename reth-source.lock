@@ -3,7 +3,7 @@
   "source": "https://github.com/paradigmxyz/reth",
   "upstream_tag": "v2.11.0",
   "upstream_commit": "b9abbcc1b982755baa9021e6874e2e58936ca65f",
-  "adapted_commit": "4c1615dd276381522b0252a6fc625db4b9c68a7f",
+  "adapted_commit": "e037d26ce8589c907cce170ee380375d78364b25",
   "patch_series": [
     {
       "name": "reth-qmdb-state-reader",
@@ -60,6 +60,14 @@
     {
       "name": "reth-payload-cache-recent-outputs",
       "commit": "4c1615dd276381522b0252a6fc625db4b9c68a7f"
+    },
+    {
+      "name": "reth-inserted-block-cache-skip",
+      "commit": "a8583ac87e61027eda77bfce626546561032b92d"
+    },
+    {
+      "name": "reth-insert-executed-stage-timers",
+      "commit": "e037d26ce8589c907cce170ee380375d78364b25"
     }
   ],
   "workspace_dependency_versions": {
