@@ -58,6 +58,37 @@ fn flag(name: &str) -> bool {
 
 /// The builder's parts, taken by value so that nothing of it outlives the
 /// call.
+/// Moves the executed candidates, `order` of `candidates`, into the block's
+/// transactions in that order.
+///
+/// A full block's transfers are tens of megabytes of transactions. Moved one
+/// after another into a vector that grows as it goes, they took as long as
+/// the merge of the block's execution (18 ms of a 79 ms prefix); when every
+/// candidate executed, which is the block the batches fill, they are moved
+/// side by side into room made once.
+fn move_executed<T: Send>(
+    mut candidates: Vec<std::sync::OnceLock<T>>,
+    order: &[usize],
+    transactions: &mut Vec<T>,
+) {
+    use rayon::prelude::*;
+    transactions.reserve(order.len());
+    let every_candidate = order.len() == candidates.len()
+        && order.iter().enumerate().all(|(at, &index)| at == index)
+        && candidates.iter().all(|candidate| candidate.get().is_some());
+    if every_candidate && order.len() >= 4_096 {
+        transactions.par_extend(candidates.into_par_iter().map(|candidate| {
+            candidate.into_inner().expect("every candidate was converted: checked above")
+        }));
+        return;
+    }
+    for &index in order {
+        if let Some(tx) = candidates[index].take() {
+            transactions.push(tx);
+        }
+    }
+}
+
 #[expect(clippy::type_complexity)]
 fn into_parts<'a, F, E, A, N>(
     builder: BasicBlockBuilder<'a, F, E, A, N>,
@@ -425,20 +456,45 @@ where
                     touched,
                     phases,
                 } = run;
-                let mut order = Vec::with_capacity(executed.len());
-                let mut fees = U256::ZERO;
-                let mut results = Vec::with_capacity(executed.len());
-                for executed in executed {
-                    let tx = consensus[executed.index].get().ok_or_else(|| {
-                        parallel_build::Refused::Commit("an executed transfer was not converted".to_owned())
-                    })?;
-                    let fee = tx.effective_tip_per_gas(base_fee).ok_or_else(|| {
-                        parallel_build::Refused::Commit("invalid executed transfer fee".to_owned())
-                    })?;
-                    fees += U256::from(fee) * U256::from(executed.result.tx_gas_used());
-                    results.push((*tx.tx_hash(), tx.tx_type(), executed.result));
-                    order.push(executed.index);
-                }
+                // Each transfer's hash, type and fee are read out of its
+                // transaction side by side: one after another, a full block's
+                // 95,000 scattered transactions took about 4 ms.
+                let spent: Vec<(usize, u64)> = executed
+                    .iter()
+                    .map(|executed| (executed.index, executed.result.tx_gas_used()))
+                    .collect();
+                let entries = {
+                    use rayon::prelude::*;
+                    spent
+                        .par_iter()
+                        .with_min_len(2048)
+                        .map(|&(index, gas_used)| {
+                            let tx = consensus[index].get().ok_or_else(|| {
+                                parallel_build::Refused::Commit(
+                                    "an executed transfer was not converted".to_owned(),
+                                )
+                            })?;
+                            let fee = tx.effective_tip_per_gas(base_fee).ok_or_else(|| {
+                                parallel_build::Refused::Commit(
+                                    "invalid executed transfer fee".to_owned(),
+                                )
+                            })?;
+                            Ok::<_, parallel_build::Refused>((
+                                *tx.tx_hash(),
+                                tx.tx_type(),
+                                U256::from(fee) * U256::from(gas_used),
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, parallel_build::Refused>>()?
+                };
+                let fees = entries
+                    .iter()
+                    .fold(U256::ZERO, |fees, (_, _, fee)| fees + *fee);
+                let order: Vec<usize> = spent.iter().map(|(index, _)| *index).collect();
+                let results = entries
+                    .into_iter()
+                    .zip(executed)
+                    .map(|((hash, tx_type, _), executed)| (hash, tx_type, executed.result));
                 let scope = if keeps_cache {
                     CacheScope::All
                 } else {
@@ -462,13 +518,11 @@ where
                     cumulative_tx_gas_used += committed.gas_used;
                     block_regular_gas_used += committed.regular_gas_used;
                     block_state_gas_used += committed.state_gas_used;
-                    let mut consensus = consensus;
-                    for index in order {
-                        block_transactions_rlp_length += lengths[index];
-                        if let Some(tx) = consensus[index].take() {
-                            builder.transactions.push(tx);
-                        }
-                    }
+                    block_transactions_rlp_length +=
+                        order.iter().map(|&index| lengths[index]).sum::<usize>();
+                    let moved_started = std::time::Instant::now();
+                    move_executed(consensus, &order, &mut builder.transactions);
+                    let moved_ms = moved_started.elapsed().as_millis() as u64;
                     serial_allowed = keeps_cache;
                     tx_count = accepted;
                     let tail = std::mem::take(&mut replay);
@@ -493,6 +547,7 @@ where
                         batch_ms_max = phases.batch_ms_max,
                         collect_ms = phases.collect_ms,
                         merge_ms = phases.merge_ms,
+                        moved_ms,
                         direct_hits = phases.direct_hits,
                         direct_delegated = phases.direct_delegated,
                         "parallel transfer prefix executed; not a consensus commit");
@@ -1029,6 +1084,102 @@ impl<T: PoolTransaction> BestTransactions for ReplayTransactions<T> {
 mod tests {
     use super::*;
     use crate::native_pool::N42PooledTransaction;
+
+    fn candidates_of(values: &[Option<u64>]) -> Vec<std::sync::OnceLock<[u64; 40]>> {
+        values
+            .iter()
+            .map(|value| {
+                let cell = std::sync::OnceLock::new();
+                if let Some(value) = value {
+                    let _ = cell.set([*value; 40]);
+                }
+                cell
+            })
+            .collect()
+    }
+
+    /// The executed candidates reach the block in `order`, after what the
+    /// block already holds, whether all of them executed or some did not.
+    #[test]
+    fn executed_candidates_move_into_the_block_in_order() {
+        let serial = |candidates: &[Option<u64>], order: &[usize]| {
+            let mut cells = candidates_of(candidates);
+            let mut out = vec![[7u64; 40]];
+            for &index in order {
+                if let Some(tx) = cells[index].take() {
+                    out.push(tx);
+                }
+            }
+            out
+        };
+        let moved = |candidates: &[Option<u64>], order: &[usize]| {
+            let mut out = vec![[7u64; 40]];
+            move_executed(candidates_of(candidates), order, &mut out);
+            out
+        };
+        // A full run, large enough for the side-by-side move, and a small one.
+        for n in [10_000usize, 5] {
+            let all: Vec<_> = (0..n as u64).map(Some).collect();
+            let order: Vec<usize> = (0..n).collect();
+            assert_eq!(moved(&all, &order), serial(&all, &order));
+            // Some candidates were skipped.
+            let some: Vec<usize> = (0..n).filter(|index| index % 3 != 1).collect();
+            assert_eq!(moved(&all, &some), serial(&all, &some));
+            // A candidate that was never converted is left out, as before.
+            let mut holed = all.clone();
+            holed[n / 2] = None;
+            assert_eq!(moved(&holed, &order), serial(&holed, &order));
+        }
+        assert_eq!(moved(&[], &[]), serial(&[], &[]));
+    }
+
+    /// `cargo test --release -p n42-node --lib moving_a_full_block -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing"]
+    fn moving_a_full_block_of_executed_candidates() {
+        type Tx = Recovered<N42TxEnvelope>;
+        let n = 95_238usize;
+        let one = transaction(A, TxKind::Call(B), 0, 1, Bytes::new(), 21_000).to_consensus();
+        let fresh = || -> Vec<std::sync::OnceLock<Tx>> {
+            (0..n)
+                .map(|_| {
+                    let cell = std::sync::OnceLock::new();
+                    let _ = cell.set(one.clone());
+                    cell
+                })
+                .collect()
+        };
+        let order: Vec<usize> = (0..n).collect();
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        for _ in 0..11 {
+            let mut cells = fresh();
+            let mut out: Vec<Tx> = Vec::new();
+            let at = std::time::Instant::now();
+            for &index in &order {
+                if let Some(tx) = cells[index].take() {
+                    out.push(tx);
+                }
+            }
+            before.push(at.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(out.len(), n);
+            let cells = fresh();
+            let mut out: Vec<Tx> = Vec::new();
+            let at = std::time::Instant::now();
+            move_executed(cells, &order, &mut out);
+            after.push(at.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(out.len(), n);
+        }
+        println!(
+            "MOVE_EXECUTED txs={n} bytes_each={} one_by_one_ms={:.1} side_by_side_ms={:.1}",
+            std::mem::size_of::<Tx>(),
+            median(before),
+            median(after)
+        );
+    }
     use alloy_consensus::{Header, SignableTransaction, TxLegacy};
     use alloy_primitives::{Bytes, Signature, TxKind, address};
     use n42_tx_types::Receipt;
