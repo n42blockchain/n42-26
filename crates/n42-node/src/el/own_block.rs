@@ -85,18 +85,30 @@ fn prepare(
     let rebuild_started = std::time::Instant::now();
     let transactions_root = reth_evm::payload_cache::payload_transactions_root(&hash)
         .unwrap_or(built.header().transactions_root);
-    let body = Arc::unwrap_or_clone(built).into_block().body;
-    let sealed = crate::engine_validator::gov5_block_from_built_body(payload, body, transactions_root)
-        .inspect_err(|error| {
-            tracing::warn!(target: "n42::el", %hash, %error, "own block does not rebuild from the built body");
-        })
-        .ok()?;
+    // The header first, over the built body without its transactions: it
+    // must hash to the payload's block hash before anything is committed.
+    // The transactions, which another holder of the built block may make
+    // this a copy of, are taken beside the commit below.
+    let header = crate::engine_validator::gov5_block_from_built_body(
+        payload,
+        n42_tx_types::BlockBody {
+            transactions: Vec::new(),
+            ommers: built.body().ommers.clone(),
+            withdrawals: built.body().withdrawals.clone(),
+        },
+        transactions_root,
+    )
+    .inspect_err(|error| {
+        tracing::warn!(target: "n42::el", %hash, %error, "own block does not rebuild from the built body");
+    })
+    .ok()?
+    .into_sealed_header();
     stage("rebuild", rebuild_started);
-    let (parent_hash, state_root) = (sealed.header().parent_hash, sealed.header().state_root);
+    let (parent_hash, state_root) = (header.parent_hash, header.state_root);
     let binding = store.prepared_binding(parent_hash, state_root).ok()??;
     let (output, senders) =
         reth_evm::payload_cache::take_payload_execution::<CachedExecution>(&hash)?;
-    let (committed, hashed_state) = rayon::join(
+    let (committed, (hashed_state, body)) = rayon::join(
         || {
             let started = std::time::Instant::now();
             let committed = store.commit_bound_candidate(parent_hash, hash, state_root, binding);
@@ -104,12 +116,23 @@ fn prepare(
             committed
         },
         || {
-            let started = std::time::Instant::now();
-            let hashed = hashed_post_state(&output.state);
-            stage("hashed_state", started);
-            hashed
+            rayon::join(
+                || {
+                    let started = std::time::Instant::now();
+                    let hashed = hashed_post_state(&output.state);
+                    stage("hashed_state", started);
+                    hashed
+                },
+                || {
+                    let started = std::time::Instant::now();
+                    let body = Arc::unwrap_or_clone(built).into_block().body;
+                    stage("body", started);
+                    body
+                },
+            )
         },
     );
+    let sealed = reth_primitives_traits::SealedBlock::from_sealed_parts(header, body);
     if !matches!(committed, Ok(Some(root)) if root == state_root) {
         // `newPayload` takes the block from here, with the execution it reuses.
         tracing::warn!(target: "n42::el", %hash, ?committed, "own block's QMDB candidate was not committed");

@@ -465,6 +465,23 @@ mod tests {
             assert_eq!(rebuilt.hash(), expected);
             assert_eq!(rebuilt.header(), decoded.header());
             assert_eq!(rebuilt.body(), decoded.body());
+            // The header is the same over the body without its transactions,
+            // as the leader's own-block insert derives it.
+            let header = gov5_block_from_built_body(
+                &payload,
+                n42_tx_types::BlockBody {
+                    transactions: Vec::new(),
+                    ommers: block.body.ommers.clone(),
+                    withdrawals: block.body.withdrawals.clone(),
+                },
+                block.header.transactions_root,
+            )
+            .unwrap()
+            .into_sealed_header();
+            let attached = SealedBlock::<N42Block>::from_sealed_parts(header, block.body.clone());
+            assert_eq!(attached.hash(), rebuilt.hash());
+            assert_eq!(attached.header(), rebuilt.header());
+            assert_eq!(attached.body(), rebuilt.body());
             // A root that is not the payload's body cannot reach its hash.
             assert!(
                 gov5_block_from_built_body(&payload, block.body.clone(), B256::repeat_byte(7))
