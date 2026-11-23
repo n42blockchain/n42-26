@@ -848,3 +848,372 @@ finish 55.3 / 54.7 → 55.3 / 55.7；周期 192.2 / 205.7 → 187.0 / 188.5。
 4. 每笔执行成本：参照 n42-rs 的扁平账户表、读集预取。
 5. 状态根离开封块路径：root ops 进入执行批次；延迟根与帧树交易根是头部 / 共识规则变化，需用户决定。
 6. 之后再扩大块（200k）与供给（多连接、更大重放集）。
+
+## 进度记录（2026-11-21 续一）：在自有块输出上构块（`N42_BUILD_ON_OUTPUT=1`，第 1 步）
+
+### 设计决策
+
+- 开关：`N42_BUILD_ON_OUTPUT=1`，叠加在 `N42_BUILD_ON_SEAL=1` 之上（两者都开才生效），并要求
+  `N42_LEADER_INSERT_EXECUTED=1`（自有块输出由自有块插入发布）与 H2 参与者（规范化头）。默认关。
+- 下一块 N+1 在 N 规范化后立刻开始（与 N 的自有校验同时派发），不再等 N 的 newPayload(VALID) 与 FCU。
+  reth 的 `BasicPayloadJobGenerator` 要求父块头在 provider 中，故按 n42-rs `direct_build.rs` 的做法绕过作业生成器，
+  直接调用同一个 `N42InnerPayloadBuilder::try_build`（`build_on`），由进程级注册表（`OnceLock`）持有。
+- N 的状态：n42-rs 用旧 reth 的 `MemoryOverlayStateProvider`；reth 2.11 已无此类型，
+  `state_with_block_appended` 走 storage-overlay，需要 `ExecutedBlock` 的 trie 数据与 overlay manager。
+  改为自写 `SealedParentState`：N 的 `BundleState` 覆盖在 N-1 的 provider（含 QMDB 读视图）之上；
+  账户 / 存储 / 字节码先查 bundle，`BLOCKHASH(N)` 返回 N 的规范化哈希；状态根 / 证明接口返回错误（该路径从不计算 MPT 根）。
+  N-1 尚不在 provider 时，沿注册表链式叠加（最多 4 块）。
+- 输出共享：自有块准备（`own_block::prepare`）本来就从 payload cache 取出 N 的输出并包成 `Arc` 交给引擎；
+  现在取出后立即以 `(规范化头, Arc 输出)` 发布到 `build_on_output` 注册表，零额外拷贝。准备失败时记"拒绝"，等待者立刻返回。
+- QMDB：store 只保留一个 prepared candidate，N+1 的 root job 在 `prepare_bound_candidate` 前等待 N 提交
+  （`root_for(N)` 可见，最长 2 s），保证 N 的 `commit_bound_candidate` 先消费自己的候选。
+- 帧队列：`try_build` 入口已有 `wait_applied(parent)`，N 的 `mark_mined` 在 N 构建末尾派发，N+1 选交易前已完成；无需改动。
+  非帧队列模式下池中仍有 N 的交易，按 nonce 过低跳过（与 build-on-seal 相同）。
+- restored-slot 注册表键含父哈希（N 的规范化哈希），与串行构建相同，无需改动。
+- 编排器：`PayloadBuildReady` 的 `own_block_validated: bool` 改为 `ReadyKind {Payload, OwnBlockSealed, OwnBlockValidated}`；
+  `ahead_step` 纯函数决定动作。Sealed → `build_on_output`（仅当本节点领导下一视图，即 tenure 内；其他 leader 照旧）；
+  N 的 VALID 到达时若 N+1 已在输出上构建，只发一次无属性 FCU(head=N)（与 build-on-seal 的引擎 forkchoice 序列相同，减去属性）。
+  N+1 构建结束未产出 payload 时（`take_failed_output_build`），用保存的 VALID 报告按旧路径（FCU+属性）重建。
+  视图变化 / N 未被采纳：N+1 留在 `ahead_ready`，`take_ahead_build` 按 LockedQC 上下文丢弃（已有机制）；
+  N 自身无效时 N+1 的 newPayload 不会 VALID，提案不会释放。
+
+### 实施细节
+
+- 新增 `crates/n42-node/src/build_on_output.rs`：开关、注册表（publish / refuse / forget / wait_sealed）、
+  `parent_state`、`SealedParentState`、`wait_parent_committed`、`DirectBuild` 注册与 `build`。
+- `parallel_payload.rs`：两处父状态打开改为 `build_on_output::parent_state`；QMDB root job 前 `wait_parent_committed`。
+- `payload.rs`：`N42InnerPayloadBuilder::build_on`；`build_payload_builder` 在开关开且并行构块时注册直接构建器。
+- `el/own_block.rs`：取出输出后发布；失败记拒绝；拒绝路径从 `Arc` 还原输出放回 cache。
+- `n42-consensus-service/src/el.rs`：`ExecutionLayer::build_on_sealed`（默认 `None`）；`el/reth_engine.rs` 实现（spawn_blocking，
+  设置 `last_built` 与 `own_block::remember_built`）。
+- `execution_bridge.rs`：`build_on_output_enabled`、`BuildSource {Job, SealedParent}`（结果统一走 `handle_built_payload`），
+  `build_on_output`、`announce_own_head`；`handle_built_payload` 在派发自有校验后发 `OwnBlockSealed`。
+- 指标：`n42_build_on_output_started_total`、`n42_build_on_output_total{outcome}`、`n42_build_on_output_fallback_total`、
+  `n42_build_on_output_wait_ms{stage=sealed_parent|qmdb_parent}`、`n42_build_on_output_chained_parents_total`、
+  `n42_engine_boundary_duration_ms{phase=build_on_sealed}`。
+
+### 测试
+
+- `tests/build_on_output.rs`：真实构块器、QMDB-only 读、两个连续原生 H2 块；块 1 规范化后，块 2 先在块 1 的输出上构建
+  （块 1 发布时 QMDB 候选仍未提交，构建期间再提交），再把块 1 写入 provider 串行构建；比较块哈希、bundle（含回滚原值）、
+  收据与 gas、发送者、QMDB 根与收据根、整个 ExecutionData；并断言块 2 的前状态是块 1 的后状态。
+  负例：父块既不在 provider 也未发布 → 构建失败；未知父块 → `build` 返回错误。
+- 单元测试：overlay 语义（改写 / 新建 / 销毁账户、写过与未写的槽、销毁账户的槽、BLOCKHASH、哈希区间、状态根报错）、
+  链式父块、拒绝立即结束等待、等待超时、发布唤醒等待者、时间戳须晚于父块；编排器 `ahead_step` 各分支、
+  回退只在未产出 payload 时发生。
+
+### 后续
+
+- 第 2 步（build ahead，在 N 打包结束时在 N 的 MergedBatches 上开始 N+1 的批次，仅帧顺序模式）待第 1 步上 fleet 后再做。
+
+## 进度记录（2026-11-21 续二）：run148 复盘与修正（build on output）
+
+### run148 现象与原因
+
+- 3,453 次输出构块中 3,435 次失败（"own block … was not published"），失败的父块全部是空块（tx_count=0），
+  18 个非空父块全部成功（按 run148 node0 日志逐块对照 `N42_LEADER_GOV5_ENCODE` 的 tx_count）。
+  原因：空块没有 QMDB 状态变化，`prepare_candidate` 不保留 prepared candidate，`prepared_binding` 为 None，
+  自有块准备在发布输出之前就返回，于是记为拒绝；子块立即失败并走回退。
+- stale / Syncing / no state found / not found in TreeState 只在开启输出构块的 run147、run148 出现，根因是重复构块：
+  N 的 `OwnBlockSealed` 报告启动子块构建时覆盖了 `ahead_building`，而 N 的提案尚未释放、`ahead_emitting`
+  要到 N 的 VALID 报告才设置；此间若视图切到 N 的视图（fast propose / 视图切换先于 block_ready 处理），
+  N 的视图在 N 的父块上又建了一个兄弟块，后续分叉导致上述各行。与无属性 forkchoice（announce）无关：
+  announce 只在 N 已 VALID 后把 head 设为 N，与 build-on-seal 带属性 FCU 的 head 相同。
+
+### 修正
+
+- 自有块准备先取输出再检查绑定；无绑定（空块）时发布一份输出拷贝（空块拷贝近乎为零），原输出放回 cache 供 newPayload 复用。
+- `LAST_BUILT` 只被自己的 payload 取走（`take_if`），他人块不再把它丢掉。
+- `own_block_guards`：Sealed 与 Validated 报告都在子块构建开始前设置 `ahead_emitting`（N 自身的构建上下文）；
+  `ahead_tip` 仍只在 VALID 后设置。
+- 每个自有块一行 `N42_OWN_BLOCK`（insert = inserted_executed / no_bound_candidate / qmdb_commit_refused / …，output_published），
+  每次输出构块一行 `N42_BUILD_ON_OUTPUT`（outcome、reason、txs、elapsed_ms）；输出构块失败从 ERROR 降为 WARN。
+- 新增单元测试 `a_sealed_own_block_guards_its_own_view_before_its_child_starts`。
+
+## 进度记录（2026-11-21 续三）：不执行的 key 按提交排空帧队列；run160 OOM
+
+### 现象与原因（round BE）
+
+- owner 拓扑持续加载（12M）下 TPS 仅 79-95k，块间隔约 1.25 s，`R1_collect` 约 730 ms/块。
+- 帧队列只由两处标记已上链：leader 构块后的 `mark_mined`，以及 `n42-frame-queue-canonical`
+  任务订阅本节点 reth 的 canonical 通知。`N42_EL_OWNER_RPC` 的 key（`DelegatedExecutionLayer`）
+  不执行、没有自己的 canonical 链，队列只增不减；pending 到 `N42_INGEST_HIGH_WATER`（2M）后
+  每个帧走 `hold_only`，ack 计数为 0，flood 视为拒绝并无限重发同一帧，同组后续帧不再发送；
+  follower 缺少 leader 引用的帧，只能等 9.5 MB 全量副本（约晚 560 ms）。
+
+### 设计决策
+
+- 在 `DelegatedExecutionLayer` 内闭环，不动 leader/owner 路径与 canonical 任务：
+  `new_payload` 在询问 owner 的同时于阻塞线程算出块内交易哈希（payload 中 EIP-2718 编码的
+  keccak，即 0x50 交易哈希），owner 确认后按块哈希保存（最多 64 块）；`fork_choice_updated`
+  被 owner 确认后，取其 `finalized_block_hash`（非零时；head 可能领先于提交点），把它及已保存的祖先
+  按链序 `mark_mined`，并丢弃同高或更低的兄弟块。所以只有已提交块会排空队列。
+- 备选：在 consensus-service 的提交路径加 hook 传交易哈希。需要把块数据带到提交点，改动面更大；
+  委托 EL 已同时拿到 payload 与提交 head，足够。
+- FrameStore 不额外裁剪：它按 `N42_FRAME_STORE_FRAMES` 容量 FIFO 淘汰，被引用的帧需保留到淘汰。
+- held 帧的 ack：扩展 ack（12/16 字节）的 `consumed` 字段现在报告已保存的帧大小（accepted 仍为 0），
+  客户端可据此停止重发；8 字节旧 ack 不变（native-flood 当前读 8 字节，不受影响）。
+
+### 实施细节
+
+- 新文件 `crates/n42-node/src/el/committed_frames.rs`：`ImportedBlock::of(&ExecutionData)`、
+  `CommittedFrames::{imported, committed}`；指标 `n42_frame_queue_committed_blocks_total`。
+- `el/delegated.rs`：`committed: Option<Arc<CommittedFrames>>`，仅 `frame_queue_enabled()` 时启用。
+- `ingest.rs`：`admit_native_frame(hold_only)` 在 store 持有该帧时返回帧大小，门控分支把它写进 `consumed`。
+- `frame_queue.rs` 的测试模块改为 `pub(crate)` 以复用 `tx()` 构造器。
+
+### run160（全导入 8M）
+
+- node3 在负载开始约 30 s 后（12:45:38Z，view 304）被内核全局 OOM 杀掉：
+  `Out of memory: Killed process 103333 (n42-node) anon-rss:22129648kB`，触发者是 native-flood 的分配；
+  7 个节点 RSS 各 16-22 GB，swap 用尽（136 GB 主机）。日志无 panic，最后一行是正常的 view 切换。
+  之后 window-tps.py 访问 node3 RPC 得到 Connection refused。
+
+### 测试
+
+- `committed_frames` 两个单元测试：提交 head 排空其链并丢弃兄弟块、不重复标记；payload 交易哈希与编码 keccak 一致。
+
+### 后续
+
+- fleet 上看 follower 的 `n42_frame_queue_committed_blocks_total` 是否随块增长、`held` 帧数是否不再累积、
+  `N42_FRAME_REF: cannot rebuild` 是否消失。
+- flood 若要用 held 信息，需要开启扩展 ack 并读 12 字节，`accepted==0 && consumed>0` 视为已保存。
+
+## 进度记录（2026-11-21 续四）：build on output 负载下变慢（round BG）与执行成本测量
+
+### BG：现象与原因
+
+- run165（`N42_BUILD_ON_OUTPUT=1`）前约 80 块间隔 155-170 ms，之后退化到 0.7-1.7 s；verify 只有 ~124 个 common blocks。
+- verify 不是分叉：`advanced` 是 verify 窗口（负载结束后）内推进的块数。qgBGb 的样本中 owner head、7 个 key 的
+  committed 高度与 comparison 高度一致，每 5 s 只推进 10 块（OFF 约 260 块），即空闲时每块约 500 ms。
+- node0 的 `N42_PAYLOAD_PACK` 有 232/598 次构块 `setup_provider_ms` > 100（约 500 ms），OFF 为 0。
+  卡在 `parent_state` → `state_by_block_hash(祖父块)` → QMDB `prepare_read_view` 缓存未命中 →
+  `QmdbReadView::from_tree` 全量重建（restore 109 次，p50 483 ms，合计 53.5 s）；commit 时父 view 不在缓存，
+  同样整树重建（commit p90 465 ms）。OFF 腿 restore 0 次、commit p50 0.002 ms。
+- 根因：read view 缓存按 logical bytes 计预算（512 MB，共享节点每个 view 重复计费）。状态长到每个 view
+  ~288 MB 后（`n42_qmdb_read_cache_views 1`）只剩最新一个 view。OFF 只读最新块，不受影响；build on output
+  读父块之前的块（非最新），每次 miss 并整树重建，重建结果又挤掉最新 view，互相抖动；状态越大重建越慢。
+
+### BG：修正
+
+- `QmdbReadViewCache` 增加 `min_views`：超出字节预算时仍保留最近使用的 `min_views` 个 view
+  （`enable_read_views` 为 4，即 `MIN_READ_VIEWS`；`enable_read_views_with_budget` 保持 1，旧测试语义不变；
+  新增 `enable_read_views_with_minimum`）。连续 view 只差改动节点，实际多占内存远小于 logical bytes。
+- 新测试 `read_cache_keeps_the_recent_views_past_the_byte_budget`。
+- `scripts/chain94-fleet.py` `owned_process`：进程退出中（zombie）cmdline 为空，视为已停止，
+  修 run162 stop 的 "PID … no longer belongs to this datadir" 竞态。
+
+### 执行成本（第 4 项）测量
+
+- 新基准 `crates/n42-node/src/exec_cost_bench.rs`（`#[ignore]`）：95,238 笔转账、20,000 个 sender、
+  互不相同的 recipient，QMDB read view 1000 万账户；对比内存 map；单独测读路径；可输出 pprof folded。
+- 基准结果（16 线程，与 fleet 一致）：qmdb 墙钟 41 ms（batches 31、merge 28 在 builder 线程串行），
+  batch 线程合计 run 169 ms = 1.77 us/tx；内存 map 0.84 us/tx。读一次账户 625 ns（blake3 key 97、
+  imbl 查找 479、解码 ~120），每笔 2 次读 ≈ 1.25 us，占 run 的七成。
+- fleet（run155/157/158 node0 满块中位数）：groups 35 ms，但 `batch_ms_max` 6-7 ms、run_ms_sum 140-186 ms；
+  batches 阶段的墙钟由串行 merge（32 ms）决定，而不是执行。
+- `_RJEM_MALLOC_CONF=thp:always,metadata_thp:always`：缺页 23.5k → 1.9k，batches 31 → 23 ms，
+  merge 28 → 21 ms，墙钟 41 → 32 ms；只改分配器配置，输出不变。
+
+### 后续
+
+- fleet：BG 修正后看 `n42_qmdb_read_view_build_ms{operation="restore"}` 是否为 0、`setup_provider_ms` 是否回到 0，
+  以及 verify 空闲窗口推进的块数是否回到 OFF 水平。
+- 执行成本：merge 串行是 batches 墙钟的主因（按地址分片的输出，n42-rs 第 3 节）；THP 需 fleet A/B 并关注 RSS。
+
+## 进度记录（2026-11-21 续）：持续负载测量（round BA–BI）
+
+口径：`.artifacts/native-port-p0/window-tps30.py`，按 node0 日志 "view committed" 的墙钟时间，窗口从第一个含交易块提交后 10 s 起、长 30 s（另报 5 s 起 20 s）。
+机群目录改放 `/data/n42-build/fleets/`（`/home` 空间不足）。
+
+为得到有效的持续负载，依次解决了：
+
+1. native-flood 被拒 500 次即丢帧，一帧是 1000 个发送者的同一 nonce，丢帧留下 nonce 空洞 → 新增 `--max-attempts`（0 = 不丢）。
+2. 同组后续 nonce 先于被拒帧被接收，空洞占满接收上限后死锁 → 每组同一时刻只有一帧在途，被拒帧未接收前不发该组后续帧。
+3. 单执行节点拓扑的跟随者不执行，帧队列从不清空，到上限后只存不入队，压测器反复重发、后续帧不再送达，跟随者等完整副本，投票 ~730 ms
+   → 委托执行层在最终确认块上标记已上链（`el/committed_frames.rs`）；被存而未入队的帧在扩展回执里报 `consumed`。
+4. reth 引擎反压：持久化（启动脚本设为立即持久化）积压超过默认阈值后引擎停顿 1.2–2.2 s，run161 中 14 次合计 21.8 s
+   → 机群加 `--engine.persistence-backpressure-threshold=1024`（不改持久化阈值）。
+5. "在父块输出上构块"读祖父块状态时 QMDB 读视图缓存只剩一个视图（按逻辑大小计费，约 288 MB/视图，预算 512 MB），每次约 500 ms 重建
+   → 至少保留最近 4 个视图（`qmdb_state_root.rs` `MIN_READ_VIEWS`）。
+6. 全节点导入 800 万笔时七个节点各 16–22 GB，主机内存耗尽，node3 被 OOM 杀掉（run160）。
+
+结果（单执行节点，20M 笔，30 s 窗口被负载完整覆盖；原始输出 `run169.out`、`run171.out` 及 `-tps.txt`）：
+
+| 轮次 | 配置 | 30 s 窗口 | 20 s 窗口 | 满块平均间隔 |
+|---|---|---|---|---|
+| run171 | 开关关 | 415,873 | 409,523 | 229 ms |
+| run169 | `N42_BUILD_ON_OUTPUT=1` | 431,746 | 438,095 | 210 ms |
+| run170 | 开关关 + jemalloc `thp:always` | 107,936（校验失败） | 152,381 | 882 ms |
+
+16M 笔两段（run167 / run168，开关关）：30 s 窗口 395,085 / 392,021（窗口末 1–2 s 负载已尽，下限），20 s 窗口 404,762 / 414,285。
+
+- 透明大页在本地基准里批次 31 → 23 ms，在机群上崩溃式变慢且校验失败，不采用。
+- 负载结束后约 18 s 仍有一次 13–27 s 的提交停顿（引擎反压）：负载后空块约 25 ms 一块，快于持久化，积压超过阈值。不在测量窗口内，但说明持久化吞吐低于空块出块速率，持续运行时是隐患。
+- 与 n42-rs 同口径对照：431,746 对 5.69M，约 13 倍。
+
+## 进度记录（2026-11-21 续五）：build on output 周期拆解（run169）与串行 merge
+
+### run169 node0 的周期（满块，208 个）
+
+- 构块本身（BUILD_ENTRY → payload built）中位 ~139 ms（pack 83、finish 56，其中 root_wait ~30）。
+- 平均间隔 224 ms（中位 201）多出的 ~75 ms 来自两类块：
+  - 129/208（62%）"等 view"：子块在上一块构完后 101 ms（中位）才开始，正好在 `view changed` 之后。
+    `ahead_step` 规定最多领先一块（`ready.context.view > current_view` → `Hold`）：块 V+1 在 view V 内已封装，
+    但它的子块 V+2 要等 view V+1 开始，即等块 V 提交（proposal@~200 ms + R1 ~100 ms + R2 ~20 ms）。
+  - 79/208（38%）不等 view：上一块构完 2.5 ms 后即触发，但到 BUILD_ENTRY 还有 ~24 ms
+    （父块发布 + `wait_applied`；`n42_frame_queue_parent_wait_ms` 合计 2.17 s，约 10 ms/满块）。
+- 结论：~63 ms 是一块领先上限造成的等待，~10-24 ms 是父块发布与帧队列等待。
+
+### 本轮小改动
+
+- `payload.rs`：构块完成后的 `mark_mined` 改在独立线程 `frame-mined` 上运行（原 `rayon::spawn`
+  在全局池上排在 root 工作之后，子块在 `wait_applied` 等它）；线程起不来时退回 rayon。
+- `N42_BUILD_ENTRY` 日志加 `frame_queue_parent_wait_ms`；`build_on_output::build` 加 debug 行记录父块发布等待。
+
+### 设计：两块领先（未实现）
+
+- `ahead_step`：OwnBlockSealed 且开启 build on output 时允许 `view == current_view + 1` 的块直接
+  `BuildOnOutput`（子块 view = current+2）；validated 仍保持一块领先。
+- `ahead_ready`、`ahead_sealed`、`ahead_validated`、`ahead_emitting`、`output_build`、`ahead_tip`
+  由单槽改为按 view 的小列表；`take_ahead_build(new_view)` 只放出 view 相同的、保留更晚的；
+  validated 的子块若已在 ahead_ready/emitting/output 中则只 AnnounceHead，不再 Build；
+  `finalize_head_for` 沿 (tip, parent) 链取最远的 tip。提案仍只在自己的 view 内、以父块 QC 为据。
+- 预期：62% 的块省 ~75 ms，平均间隔 ~224 → ~177 ms（约 +25% TPS），前提是块在 view 开始时已就绪后
+  提交 ~30 ms（run169 中这类块 total=30 ms）。风险在 orchestrator 守卫（重复构块、EL head 回退），需单测覆盖。
+
+### 设计：并行 merge（未实现）
+
+- `BatchMerger::add` 串行把 ~190k 个 `(Address, BundleAccount)`（~250 B）插入一个 `AddressMap`，
+  `fold_into` 把它整体移入 `block.state`。按地址分片并行合并后仍需合成一个 hashbrown map，
+  合成本身就是同样的 190k 次插入；树形归约的关键路径之和也约等于总量。真正去掉它需要分片的 bundle
+  （n42-rs 第 3 节），即改 evm2/reth 的 `BundleState.state` 形状，按要求停在设计。
+- 可做的局部：后台线程预先插入并 `clear()` 一个同容量 map，消除缺页（基准中 THP 实验显示约 25%，
+  merge 28 → 21 ms）；输出完全不变。THP 本身已在 fleet 被否决（run170）。
+
+## 进度记录（2026-11-21 续六）：两块领先与预缺页 merge 表（round BK，均默认关闭）
+
+### 1. 两块领先：`N42_BUILD_AHEAD_DEPTH=2`
+
+- 开关：`N42_BUILD_AHEAD_DEPTH=2`，仅在 `N42_BUILD_ON_SEAL=1` 且 `N42_BUILD_ON_OUTPUT=1` 时生效，
+  其余取值或缺少 build on output 时为 1（与 8f7e6214 行为相同）。
+- 只改 orchestrator，不改共识规则：块仍只在自己的 view 里以父块 QC 为据放出（`take_release`
+  要求 `required_payload_build_context()` 与构块上下文完全相同），QC 不成时连同其后代一并丢弃。
+- 新模块 `orchestrator/ahead.rs` 的 `AheadState` 取代 7 个单槽字段：`ready`（按 view 每 view 一个）、
+  `sealed`/`validated`（够不着的报告）、`output_builds`、`tips`、`building`、`emitting`。
+  - `take_release(new_view, required)`：放出 view 相同且上下文吻合的，丢弃 view ≤ new_view 的其余，保留更晚的。
+  - `take_reachable(new_view, depth)`：放出 view < new_view+depth 的报告（sealed 在前），丢弃过期的。
+  - `drop_block(hash)`：深度 2 时，放弃的块及在其上构的所有 payload/报告/输出构块记录一并删除
+    （release 不吻合、或当前 view 的 payload 上下文不吻合时）。仍在跑的构块保留守卫直到完成，产物到其 view 时被丢。
+  - `head_for(committed)`：沿 (tip, parent) 链走到最远的 tip，从不退回到链上 tip 的祖先；深度 1 只保留
+    1 个 tip（与原行为一致），深度 2 保留 4 个。
+  - `child_covered(child)`：子块已在输出构块、FCU 构块、emitting 或已持有为 payload 时为真。
+- `ahead_step(ready, current, depth, leads_next, output_enabled, child_covered)`：
+  view ≥ current+depth → Hold；sealed 且开 output 且子块未覆盖 → BuildOnOutput（深度 2 时可为 current+2）；
+  validated 且子块已覆盖 → AnnounceHead；validated 且块在未来 view → Hold；否则 Build。
+- 深度 2 下 validated 报告用完整的 `child_covered`（加 `building_on_parent == child` 与 `last_voted_view ≥ child.view`），
+  不会对已有构块的块再发 FCU 构块。深度 1 保持原规则，只在原规则会重复构块时计数
+  `n42_build_ahead_covered_child_builds_total`（供 fleet 判断深度 1 是否存在该问题）。
+- 发现：reth 对指向 canonical 祖先的 FCU 走 `apply_chain_update` 的"已是 canonical"分支，**不更新 finalized**；
+  深度 1 的单 tip 在新 tip 覆盖旧 tip 后、旧 tip 的父块 finalize 时会把 head 设为祖先，finalized 因此滞后一拍。
+  深度 2 的 tip 链不会出现；深度 1 保持原状未改。
+- 排序：QMDB 单 prepared 槽 —— 子块 root job 在 `wait_parent_committed` 等父块 WAL 落盘（`root_for` 要求 durable），
+  父块的 candidate 又是在祖父块提交后才 prepare 的，因此 N+2 必等 N+1、N+1 必等 N，归纳成立，不需新机制。
+  帧队列同理：N+2 的构块在 BUILD_ENTRY 前 `wait_applied(N+1)`，N+1 的 mark 线程在 N+2 构块开始前就已起。
+- 新指标：`n42_build_ahead_two_views_total`（child view = current+2 的输出构块数）；"building on the sealed own
+  block's output" 日志加 `views_ahead`。
+- 测试：`ahead.rs` 6 个（每 view 记录、release/丢弃、drop_block 级联、可达报告、head 不回退、child_covered）；
+  `mod.rs` 新增 `two_blocks_ahead_build_on_the_next_views_output`、view 切换放出并保留下一个 view 的 payload 等；
+  `tests/build_on_output.rs` 扩到三块：块 3 在块 2 的输出上构，此时块 1、块 2 都不在 engine 中（块 3 的状态是
+  块 2 输出叠块 1 输出叠 genesis），块 2 的 QMDB candidate 仍只 prepared，块 3 的 root job 等块 2 提交；
+  块 2、块 3 都与在 engine 状态上构的块逐项相同（hash、bundle、receipts、senders、两个 root、payload）。
+  说明：协调者原话"块 1 只 prepared 时构块 3"在 QMDB 上不可能 —— 块 2 的 root 必须等块 1 提交才有，块 3 要等块 2 封块。
+  实际可同时悬而未决的是：块 1 的 engine insert 与块 2 的 QMDB 提交，测试按此构造。
+- 问题：三块测试首版块 3 为空 —— 满块使 base fee 7→8→9，价格 8 的交易进不了块；价格改为 30/29/28。
+
+### 2. 预缺页 merge 表：`N42_MERGE_PREFAULT=1`
+
+- `graft_fold::prefaulted_state(n)`：同容量 `AddressMap` 填满占位账户后 `clear()`（保留表与已写页）；
+  `BatchMerger::with_state`。`parallel_build::merge_map`：每次 merge 结束后在 `merge-prefault` 线程为同样大小
+  （`keys.len()*2+64`）做下一张；只有大小相同才取用，否则走原来的新表（计数 `n42_merge_prefault_total{outcome}`，
+  耗时 `n42_merge_prefault_ms`）。
+- 发现：`AddressMap` 的 hasher 是 foldhash `RandomState`，**每张表的迭代顺序本来就随机**，因此等价性只比内容；
+  bundle 不按 map 顺序被读取（QMDB ops 排序、reverts 排序）。
+- 基准（exec_cost，10M 账户，95,238 笔转账，16 线程，轮间停 200 ms，中位数）：
+
+  | | wall | batches | merge（builder 线程） | minor faults |
+  |---|---|---|---|---|
+  | 新表 | 41.7 ms | 30 ms | 28 ms | 23,450 |
+  | 预缺页表 | 33.2 ms | 24 ms | 21 ms | 9,037 |
+
+  13 次 merge 中 12 次取到预缺页表（第 1 次尚无表）；两种方式 merge 结果相等（115,239 个账户）。
+  更正（续七）：基准与节点一样用 jemalloc（n42-node dev-dependency `tikv-jemallocator`），上表即 jemalloc 下的数；
+  fleet 上仍以 merge_ms 为准（CPU 竞争不同）。
+- 测试：`graft_fold::a_prefaulted_table_merges_as_a_fresh_one`（600 个 batch、400 账户，含 debit+credit 合并）。
+
+### 阶段状态
+
+- [x] 两块领先（开关、每 view 列表、validated 守卫、head 不回退、两 view 丢弃、排序论证、单测、三块等价测试）
+- [x] 预缺页 merge 表（开关、等价测试、基准前后）
+- [x] clippy -D warnings；n42-execution/network/consensus-service/node 979 passed 0 failed；profiling 构建
+  sha256 `b3e3e2a6dcf833199148e575a8f2c0d31ba798c140106a3426a2a3ce0b751900`
+
+### 后续
+
+- fleet：`N42_BUILD_AHEAD_DEPTH=2` 单独一腿、`N42_MERGE_PREFAULT=1` 单独一腿，再合并。
+- 深度 1 的 finalized 滞后（单 tip 回退到祖先）与重复 FCU 构块计数视 fleet 结果决定是否修。
+
+## 进度记录（2026-11-22 续七）：持久化积压与提交停顿（round BL，均默认关闭）
+
+### 现象
+
+`--engine.persistence-backpressure-threshold=1024` 下，每条 20M owner 腿在负载结束约 18 s 后出现一次 13–27 s 提交空档（run169 27.5 s；run171 13.3 s + 7.1 s），`beacon_backpressure_stall_duration` 2 次 18–25 s。未调高阈值时（run161）负载中每约 3 s 停 1.2–2.2 s。
+
+### 结论
+
+1. **每块持久化成本**：满块（95,238 笔转账）约 0.5 s（仅 node0 持久化）。并行写阶段中 rocksdb 写（TransactionHashNumbers + AccountsHistory，账户历史逐地址点读串行）约 0.23 s 为最长；之后串行提交中 rocksdb commit 约 0.18 s，static file finalize 每次约 18 ms（fsync 固定成本），mdbx（hashed state 37–64 ms 在并行阶段）不主导。空块约 13–20 ms，fsync 主导。吞吐约 19 万 tx/s，低于负载期链速约 45 万 tx/s，**积压在负载期间就以每秒 2–3 个满块增长**：run171 停顿发生在块 1409，即已持久化约到 385（15:51:41 产出），而负载在块约 520（15:52:07）结束；run169 停在 1403 ⇒ 已持久化约 379，负载约 565 结束。负载结束后每秒约 50 个空块把内存块数推到 1024 触发 backpressure。持续负载下终将撞阈值或耗尽内存。
+2. **finalized 滞后不是原因**：reth 持久化目标是 canonical head − memory_block_buffer_target，与 finalized 无关；finalized 只影响 tree_state 保留与 changeset 驱逐。仍加开关 `N42_FINALIZE_ON_TIP_CHAIN=1`（深度 1 时保留 tip 链，FCU 不再回退到祖先导致 finalized 不前进）。
+3. **立即持久化来源**：`validate_immediate_persistence`（34f62b0，2026-10-09，注释“Keep Reth 2.6+'s persistence window and state masking disabled for N42/QMDB”）；devlog-35 中阈值 16 曾导致 9 个大块一批 3.17 s 停顿。
+
+### 方案与持久性代价
+
+| 方案 | 开关 | 持久性代价 |
+|------|------|-----------|
+| 空闲时等交易再出块（最多 N ms，交易到达即结束等待） | `N42_IDLE_BLOCK_WAIT_MS`（上限 2000，0=关） | 无；消除负载后空块洪流，不增加负载期延迟 |
+| 账户历史分片并行读与扩展（输出相同） | `N42_PARALLEL_ACCOUNT_HISTORY=1`（reth 补丁） | 无 |
+| 不写 TransactionHashNumbers | CLI `--prune.transaction-lookup.full` | 无；失去按哈希查交易 RPC（n42 代码与 fleet 校验不依赖） |
+| 跳过账户/存储历史索引 | 仅设计 | 需写 prune checkpoint 让历史查询报错而非给错值；QMDB On 模式回退会用到 |
+| threshold>0 批量持久化 | 不推荐 | 崩溃丢内存块且 QMDB 领先 reth；节点启动校验拒绝；吞吐收益小 |
+
+### 实施
+
+- `payload.rs`：`try_build` 前 `idle_wait_for_transactions`（2 ms 轮询 pool pending + frame queue），BUILD_ENTRY 增 `idle_wait_ms`，直方图 `n42_idle_block_wait_ms`；测试 `idle_wait_tests`。
+- reth `rocksdb/provider.rs`：`parallel_account_history()`、`RocksDBBatch::append_account_history_shards`（rayon 读+分片，按 BTreeMap 顺序 put），测试 `test_parallel_account_history_shards_match_serial`（含分片拆分，与串行 dump 比对）。
+- `persist_cost_bench.rs`（`#[cfg(test)]`）：12 块 × 95,238 笔，20k 发送者。/data 上：串行 写 78 ms，commit tx hash 86 ms + 账户历史 26 ms，每块 rocksdb 190 ms；并行 写 44 ms，commit 88 + 27 ms，每块 159 ms。并行提交两个 batch 实测更慢（108→132 ms），已撤回。
+- 更正：exec_cost bench 使用 jemalloc（dev-dep `tikv-jemallocator`），续六中已改。
+
+### 问题
+
+- 在 n42 workspace 运行 `cargo test -p reth-provider` 报“不是 workspace 成员”→改在 reth workspace 用独立 target 目录。
+- 插入新方法时拆开了原 `append_account_history_shard` 的 doc 注释 → reth clippy missing_docs/doc list 报错，已移回。
+
+### 状态与后续
+
+- 门禁通过：n42 clippy、1002 测试 0 失败、profiling 构建。
+- fleet：先 `N42_IDLE_BLOCK_WAIT_MS=200` 单独一腿，看负载后 backpressure 停顿是否消失；再加 `N42_PARALLEL_ACCOUNT_HISTORY=1` 与 `--prune.transaction-lookup.full` 看负载期持久化落后是否缩小。
+- 副发现：区块时间戳领先墙钟约 1170 s（每块至少 +1 s，50 块/s 时持续“bumping”）。
+
+## 进度记录（2026-11-22）：round BJ
+
+二进制 8f7e6214（复制到 `/data/n42-build/bins/` 后运行；父块交易标记改到 `frame-mined` 线程，BUILD_ENTRY 拆出等待项），单执行节点，20M 笔，`N42_BUILD_ON_OUTPUT=1`，反压阈值 1024。
+原始输出 `.artifacts/native-port-p0/run172.out`、`run173.out` 及 `-tps.txt`。
+
+| 轮次 | 30 s 窗口（10 s 后） | 20 s 窗口 | 满块平均间隔 | 校验 |
+|---|---|---|---|---|
+| run172 | 447,619 | 447,619 | 197 ms | PASS，3126 块 |
+| run173 | 450,793 | 457,142 | 196 ms | PASS，3097 块 |
+
+- 较 run169（431,746）高约 4%；`n42_frame_queue_parent_wait_ms` 合计不变（约 2.0 s 对 2.2 s），提升来源未确认。
+- 与 n42-rs 同口径：450,793 对 5.69M，约 12.6 倍。
+- 轮次脚本问题：`export N42_BIN` 写在 `sha256sum $N42_BIN` 之后，空路径使 sha256sum 读标准输入，挂起约 4 小时；已修正后续脚本顺序。
+- 待测：round BK（领先两块、合并表预取）与 round BL（空闲等待、账户历史并行、不写交易哈希索引）；排队任务曾因主机内存紧张被停止，未运行。
