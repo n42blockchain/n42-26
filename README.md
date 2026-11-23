@@ -57,7 +57,7 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 
 - **HotStuff-2 Consensus**: 2-round optimistic commit with 3-round timeout recovery
 - **BLS12-381 Signatures**: Aggregated signatures for compact quorum certificates
-- **reth v2.11.0 Integration**: Uses upstream commit `b9abbcc1b982755baa9021e6874e2e58936ca65f` plus the sixteen checked-in N42 integration patches; aligned with Alloy 2.5.0 and evm2 (git rev `66687c18b34d3bdbb899f5eb7605070615c03475`, which replaced REVM in reth v2.9.0). The evm2 JIT is not enabled.
+- **reth v2.11.0 Integration**: Uses upstream commit `b9abbcc1b982755baa9021e6874e2e58936ca65f` plus the seventeen checked-in N42 integration patches; aligned with Alloy 2.5.0 and evm2 (git rev `66687c18b34d3bdbb899f5eb7605070615c03475`, which replaced REVM in reth v2.9.0). The evm2 JIT is not enabled.
 - **Reserve SBMT Path**: `N42_JMT=1` explicitly selects the legacy-compatible 16-shard sparse binary backend and RPC surface
 - **Compact Block Propagation**: Leader caches execution output; the default follower path skips duplicate EVM execution (cache hit ~3ms)
 - **QMDB Binary Twig Backend**: The QMDB-style 16-shard binary twig tree is the default N42 state-proof backend (`N42_TWIG` defaults on)

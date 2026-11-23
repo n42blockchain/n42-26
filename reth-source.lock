@@ -3,7 +3,7 @@
   "source": "https://github.com/paradigmxyz/reth",
   "upstream_tag": "v2.11.0",
   "upstream_commit": "b9abbcc1b982755baa9021e6874e2e58936ca65f",
-  "adapted_commit": "e037d26ce8589c907cce170ee380375d78364b25",
+  "adapted_commit": "48608ed84566e4088d93cc78e780bf8428e55e75",
   "patch_series": [
     {
       "name": "reth-qmdb-state-reader",
@@ -68,6 +68,10 @@
     {
       "name": "reth-insert-executed-stage-timers",
       "commit": "e037d26ce8589c907cce170ee380375d78364b25"
+    },
+    {
+      "name": "reth-parallel-account-history",
+      "commit": "48608ed84566e4088d93cc78e780bf8428e55e75"
     }
   ],
   "workspace_dependency_versions": {

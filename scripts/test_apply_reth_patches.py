@@ -23,6 +23,7 @@ PATCH_NAMES = (
     "reth-payload-cache-recent-outputs",
     "reth-inserted-block-cache-skip",
     "reth-insert-executed-stage-timers",
+    "reth-parallel-account-history",
 )
 
 
