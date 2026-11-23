@@ -110,7 +110,7 @@ fn refuse<T>(err: FoldRefused) -> Result<T, FoldRefused> {
 /// bundle instead of entering its accounts one by one a second time: a full
 /// block's 190,000 accounts through a second map and a second revert set
 /// were 45 ms of the batches' merge and 50 ms of the executor's finish.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct MergedBatches {
     /// Every account the batches changed, as the one batch that changed it
     /// left it. An account several batches changed (`shared`) holds the
@@ -125,6 +125,13 @@ pub struct MergedBatches {
     /// Accounts more than one batch changed, with whether one of them
     /// debited it (balance down or nonce up).
     shared: AddressMap<bool>,
+}
+
+impl MergedBatches {
+    /// The accounts the batches changed, in the order the bundle holds them.
+    pub fn addresses(&self) -> impl Iterator<Item = &Address> + '_ {
+        self.state.keys()
+    }
 }
 
 fn debits(original: Option<&AccountInfo>, info: &AccountInfo) -> bool {
@@ -206,6 +213,17 @@ impl BatchMerger {
         }
     }
 
+    /// A merger over `state`, an empty map made by [`prefaulted_state`].
+    pub fn with_state(state: AddressMap<BundleAccount>) -> Self {
+        debug_assert!(state.is_empty(), "a merger starts empty");
+        Self {
+            merged: MergedBatches {
+                state,
+                ..Default::default()
+            },
+        }
+    }
+
     /// Adds one batch's bundle, built against the same parent as the others
     /// with [`crate::batch_state::BatchState`], refusing a change to an
     /// account another batch changed too that the fold cannot model;
@@ -270,6 +288,29 @@ impl BatchMerger {
         }
         merged
     }
+}
+
+/// The empty map [`BatchMerger::with_capacity`] makes for `accounts`, with
+/// every page of its table already written: it is filled to its capacity
+/// with placeholder accounts and cleared, which keeps the table. A merger
+/// over it enters a block's accounts without the page faults of a fresh
+/// table. The table's iteration order is that of any fresh one: per table,
+/// from its random hasher seed; nothing reads the bundle in map order.
+pub fn prefaulted_state(accounts: usize) -> AddressMap<BundleAccount> {
+    let mut state: AddressMap<BundleAccount> =
+        AddressMap::with_capacity_and_hasher(accounts, Default::default());
+    let room = state.capacity();
+    for n in 0..room as u64 {
+        let mut bytes = [0u8; 20];
+        bytes[12..].copy_from_slice(&n.to_be_bytes());
+        state.insert(
+            Address::from(bytes),
+            BundleAccount::new(None, None, Default::default(), AccountStatus::LoadedNotExisting),
+        );
+    }
+    debug_assert_eq!(state.capacity(), room, "filled without regrowing");
+    state.clear();
+    state
 }
 
 /// Merges the batches' bundles, each built against the same parent with
@@ -778,5 +819,33 @@ mod tests {
         let b = one_account_bundle(x, Some(info(10, 0)), info(17, 0), AccountStatus::Changed);
         let merged = merge_batches(vec![a, b]).expect("mergeable");
         assert_eq!(merged.get(&x), Some(&info(12, 1)));
+    }
+
+    #[test]
+    fn a_prefaulted_table_merges_as_a_fresh_one() {
+        let batches = || {
+            (0..600u64)
+                .map(|n| {
+                    let x = addr(n % 400);
+                    let original = info(1_000, 0);
+                    let now = if n < 400 { info(900, 1) } else { info(1_005, 0) };
+                    CheckedBundle::new(one_account_bundle(x, Some(original), now, AccountStatus::Changed))
+                        .expect("checked")
+                })
+                .collect::<Vec<_>>()
+        };
+        let accounts = 600 * 2 + 64;
+        let mut fresh = BatchMerger::with_capacity(accounts);
+        let state = prefaulted_state(accounts);
+        assert!(state.is_empty());
+        let mut prefaulted = BatchMerger::with_state(state);
+        for (a, b) in batches().into_iter().zip(batches()) {
+            fresh.add(a).expect("merges");
+            prefaulted.add(b).expect("merges");
+        }
+        let (fresh, prefaulted) = (fresh.finish(), prefaulted.finish());
+        assert_eq!(fresh, prefaulted);
+        assert_eq!(prefaulted.addresses().count(), 400);
+        assert_eq!(fresh.get(&addr(3)), Some(&info(905, 1)));
     }
 }

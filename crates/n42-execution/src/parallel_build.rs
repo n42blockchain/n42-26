@@ -509,7 +509,11 @@ where
     let (mut open_us, mut run_us, mut merge_us, mut fold_us) = (0u64, 0u64, 0u64, 0u64);
     // Room for every sender and recipient, and for the block's own accounts
     // the fold enters afterwards.
-    let mut merger = crate::graft_fold::BatchMerger::with_capacity(keys.len() * 2 + 64);
+    let capacity = keys.len() * 2 + 64;
+    let mut merger = match merge_map::take(capacity) {
+        Some(state) => crate::graft_fold::BatchMerger::with_state(state),
+        None => crate::graft_fold::BatchMerger::with_capacity(capacity),
+    };
     let mut failed = None;
     let (send, results) = std::sync::mpsc::channel::<BatchOut>();
     pool.in_place_scope(|scope| {
@@ -557,6 +561,8 @@ where
     // The reverts' one sorted set, on the pool the batches have left.
     let merged = pool.install(|| merger.finish());
     phases.merge_ms = (fold_us + micros(at)) / 1000;
+    // The next block's map is made while this one's output is used.
+    merge_map::prepare(capacity);
     // Candidate order, as the serial builder would have laid the block out
     // (each sender's transfers were run in that order, and the merge does
     // not care): the slots are in that order already.
@@ -564,6 +570,104 @@ where
     skipped.sort_unstable();
     phases.collect_ms = at.elapsed().as_millis() as u64;
     Ok(ParallelRun { executed, skipped, merged, touched, phases })
+}
+
+/// `N42_MERGE_PREFAULT=1`: the batches' merge enters a block's accounts into
+/// a table made, and its pages written, on a background thread after the
+/// previous block's merge, instead of into a fresh table whose pages fault
+/// in on the builder thread as the merge fills them. The table is the size
+/// a fresh one would be and the merge's output is the same; a block of
+/// another size gets a fresh table.
+pub mod merge_map {
+    use crate::graft_fold::prefaulted_state;
+    use alloy_primitives::map::AddressMap;
+    use evm2::block::bundle_state::BundleAccount;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+    use std::sync::Mutex;
+
+    /// 0: from the environment; 1: off; 2: on.
+    static SWITCH: AtomicU8 = AtomicU8::new(0);
+    static READY: Mutex<Option<(usize, AddressMap<BundleAccount>)>> = Mutex::new(None);
+    static MAKING: AtomicBool = AtomicBool::new(false);
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static MISSES: AtomicU64 = AtomicU64::new(0);
+
+    /// Whether the merge takes a prefaulted table.
+    pub fn enabled() -> bool {
+        match SWITCH.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let on = std::env::var("N42_MERGE_PREFAULT").is_ok_and(|v| v == "1");
+                SWITCH.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+                on
+            }
+        }
+    }
+
+    /// Overrides the environment, for a comparison in one process.
+    pub fn set_enabled(on: bool) {
+        SWITCH.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+        if !on {
+            *READY.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// Merges that took a prefaulted table, and those that made a fresh one.
+    pub fn counts() -> (u64, u64) {
+        (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
+    }
+
+    /// Whether a table is ready.
+    pub fn ready() -> bool {
+        READY.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// The prefaulted table for `accounts`, if one of that size is ready.
+    pub(crate) fn take(accounts: usize) -> Option<AddressMap<BundleAccount>> {
+        if !enabled() {
+            return None;
+        }
+        let taken = READY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_if(|(made_for, _)| *made_for == accounts)
+            .map(|(_, state)| state);
+        let (counter, outcome) = match taken {
+            Some(_) => (&HITS, "hit"),
+            None => (&MISSES, "miss"),
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("n42_merge_prefault_total", "outcome" => outcome).increment(1);
+        taken
+    }
+
+    /// Makes the table for a next merge of `accounts` on a background
+    /// thread, unless one is being made.
+    pub(crate) fn prepare(accounts: usize) {
+        if !enabled() || MAKING.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if READY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|(made_for, _)| *made_for == accounts)
+        {
+            MAKING.store(false, Ordering::Release);
+            return;
+        }
+        let made = std::thread::Builder::new().name("merge-prefault".into()).spawn(move || {
+            let started = std::time::Instant::now();
+            let state = prefaulted_state(accounts);
+            metrics::histogram!("n42_merge_prefault_ms").record(started.elapsed().as_secs_f64() * 1000.0);
+            *READY.lock().unwrap_or_else(|e| e.into_inner()) = Some((accounts, state));
+            MAKING.store(false, Ordering::Release);
+        });
+        if made.is_err() {
+            MAKING.store(false, Ordering::Release);
+        }
+    }
 }
 
 static IMPORTS_PARALLEL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
