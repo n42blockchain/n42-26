@@ -93,6 +93,7 @@ rand.workspace = true
 [dev-dependencies]
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
+reth-db-api.workspace = true
 bitvec.workspace = true
 libp2p.workspace = true
 evm2.workspace = true
@@ -106,3 +107,5 @@ ed25519-dalek = { version = "3.0", default-features = false }
 # Match the production node's default allocator in its library-test benchmarks.
 [target.'cfg(unix)'.dev-dependencies]
 tikv-jemallocator = "0.7"
+# CPU profile of the execution-cost benchmark (`exec_cost_bench`).
+pprof = { version = "0.15", default-features = false }

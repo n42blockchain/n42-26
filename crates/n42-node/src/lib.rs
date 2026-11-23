@@ -118,6 +118,12 @@ pub fn validate_state_root_bypass_flags(
     Ok(())
 }
 
+#[cfg(all(test, unix))]
+mod exec_cost_bench;
+
+#[cfg(test)]
+mod persist_cost_bench;
+
 #[cfg(test)]
 mod state_root_flag_tests {
     use super::*;
