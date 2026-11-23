@@ -1,5 +1,6 @@
 pub mod attestation_store;
 pub mod blob_port;
+pub mod build_on_output;
 mod components;
 pub mod el;
 pub mod engine_types;

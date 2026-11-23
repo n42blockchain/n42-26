@@ -44,21 +44,32 @@ pub(super) fn remember_built(block: &Arc<RecoveredBlock<Block>>) {
 /// Inserts the block `payload` names if this node built it. Returns whether
 /// the engine tree has it queued ahead of every later engine message.
 pub(super) async fn try_insert(payload: &ExecutionData) -> bool {
-    let Some(built) = LAST_BUILT.lock().ok().and_then(|mut last| last.take()) else {
+    // Another node's block leaves the built block for its own payload.
+    let Some(built) = LAST_BUILT.lock().ok().and_then(|mut last| {
+        last.take_if(|built| {
+            built.header().parent_hash == payload.parent_hash()
+                && built.header().number == payload.block_number()
+                && built.body().transactions.len() == payload.payload.transactions().len()
+        })
+    }) else {
         return false;
     };
-    let same_block = built.header().parent_hash == payload.parent_hash()
-        && built.header().number == payload.block_number()
-        && built.body().transactions.len() == payload.payload.transactions().len();
-    if !same_block {
-        return false;
-    }
     let started = std::time::Instant::now();
-    let payload = payload.clone();
-    let prepared = tokio::task::spawn_blocking(move || prepare(&payload, built)).await;
-    let Ok(Some(block)) = prepared else {
-        metrics::counter!("n42_own_block_insert_total", "outcome" => "refused").increment(1);
-        return false;
+    let hash = payload.block_hash();
+    let prepared = {
+        let payload = payload.clone();
+        tokio::task::spawn_blocking(move || prepare(&payload, built))
+            .await
+            .unwrap_or(Err("prepare_panicked"))
+    };
+    let block = match prepared {
+        Ok(block) => block,
+        Err(reason) => {
+            crate::build_on_output::refuse(hash);
+            metrics::counter!("n42_own_block_insert_total", "outcome" => "refused").increment(1);
+            log_outcome(payload, reason);
+            return false;
+        }
     };
     let prepare_ms = started.elapsed().as_secs_f64() * 1000.0;
     let queued = reth_node_builder::submit_executed_block(Box::new(block))
@@ -69,18 +80,35 @@ pub(super) async fn try_insert(payload: &ExecutionData) -> bool {
     metrics::histogram!("n42_own_block_insert_ms", "stage" => "prepare").record(prepare_ms);
     metrics::histogram!("n42_own_block_insert_ms", "stage" => "total")
         .record(started.elapsed().as_secs_f64() * 1000.0);
+    log_outcome(payload, if queued { "inserted_executed" } else { "not_taken" });
     queued
 }
 
+/// One line per own block: how it reached the engine, and whether a child
+/// can be built on its output.
+fn log_outcome(payload: &ExecutionData, insert: &'static str) {
+    let hash = payload.block_hash();
+    tracing::info!(
+        target: "n42::el",
+        %hash,
+        number = payload.block_number(),
+        txs = payload.payload.transactions().len(),
+        insert,
+        output_published = crate::build_on_output::sealed(hash).is_some(),
+        "N42_OWN_BLOCK: own block handed to the engine"
+    );
+}
+
+/// The executed block to insert, or why `newPayload` takes the block.
 fn prepare(
     payload: &ExecutionData,
     built: Arc<RecoveredBlock<Block>>,
-) -> Option<BuiltPayloadExecutedBlock<N42Primitives>> {
+) -> Result<BuiltPayloadExecutedBlock<N42Primitives>, &'static str> {
     let stage = |name: &'static str, since: std::time::Instant| {
         metrics::histogram!("n42_own_block_insert_ms", "stage" => name)
             .record(since.elapsed().as_secs_f64() * 1000.0);
     };
-    let store = crate::payload::builder_qmdb_store()?;
+    let store = crate::payload::builder_qmdb_store().ok_or("no_builder_qmdb_store")?;
     let hash = payload.block_hash();
     let rebuild_started = std::time::Instant::now();
     let transactions_root = reth_evm::payload_cache::payload_transactions_root(&hash)
@@ -98,16 +126,30 @@ fn prepare(
         },
         transactions_root,
     )
-    .inspect_err(|error| {
+    .map_err(|error| {
         tracing::warn!(target: "n42::el", %hash, %error, "own block does not rebuild from the built body");
-    })
-    .ok()?
+        "header_does_not_rebuild"
+    })?
     .into_sealed_header();
     stage("rebuild", rebuild_started);
     let (parent_hash, state_root) = (header.parent_hash, header.state_root);
-    let binding = store.prepared_binding(parent_hash, state_root).ok()??;
     let (output, senders) =
-        reth_evm::payload_cache::take_payload_execution::<CachedExecution>(&hash)?;
+        reth_evm::payload_cache::take_payload_execution::<CachedExecution>(&hash)
+            .ok_or("no_builder_output")?;
+    let Some(binding) = store.prepared_binding(parent_hash, state_root).ok().flatten() else {
+        // No candidate to commit: a block that changes no state prepares
+        // none. `newPayload` takes the block, with the output it reuses; a
+        // child can still be built on a copy of that output.
+        if crate::build_on_output::enabled() {
+            crate::build_on_output::publish(header, Arc::new(output.clone()));
+        }
+        reth_evm::payload_cache::store_payload_execution(hash, (output, senders));
+        return Err("no_bound_candidate");
+    };
+    let output = Arc::new(output);
+    // A child can be built on this block from here on: its header hashes to
+    // the block's hash and the output is the builder's.
+    crate::build_on_output::publish(header.clone(), Arc::clone(&output));
     let (committed, (hashed_state, body)) = rayon::join(
         || {
             let started = std::time::Instant::now();
@@ -136,13 +178,15 @@ fn prepare(
     if !matches!(committed, Ok(Some(root)) if root == state_root) {
         // `newPayload` takes the block from here, with the execution it reuses.
         tracing::warn!(target: "n42::el", %hash, ?committed, "own block's QMDB candidate was not committed");
+        // The block stays readable for a child built on it already.
+        let output = Arc::try_unwrap(output).unwrap_or_else(|shared| (*shared).clone());
         reth_evm::payload_cache::store_payload_execution(hash, (output, senders));
-        return None;
+        return Err("qmdb_commit_refused");
     }
     reth_evm::payload_cache::remove_payload_transactions_root(&hash);
-    Some(BuiltPayloadExecutedBlock {
+    Ok(BuiltPayloadExecutedBlock {
         recovered_block: Arc::new(RecoveredBlock::new_sealed(sealed, senders)),
-        execution_output: Arc::new(output),
+        execution_output: output,
         hashed_state: Arc::new(hashed_state),
         trie_updates: Arc::default(),
     })

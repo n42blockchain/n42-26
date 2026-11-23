@@ -186,4 +186,16 @@ pub trait ExecutionLayer: Send + Sync + 'static {
         id: PayloadId,
         kind: ResolveKind,
     ) -> Option<Result<BuiltBlock, ElError>>;
+
+    /// Build a child of `parent`, an own block this node has sealed but the
+    /// engine may not have yet, from the block's execution output
+    /// (`N42_BUILD_ON_OUTPUT=1`). `None` ⇒ this layer cannot; the child is
+    /// then built through a forkchoice update once the engine has the block.
+    async fn build_on_sealed(
+        &self,
+        _parent: B256,
+        _attributes: PayloadAttributes,
+    ) -> Option<Result<BuiltBlock, ElError>> {
+        None
+    }
 }

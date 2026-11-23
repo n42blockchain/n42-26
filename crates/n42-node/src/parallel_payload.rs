@@ -175,7 +175,9 @@ where
     // its hook and receiver and compute the complete root at finish.
     drop(state_root_handle);
 
-    let state_provider = client.state_by_block_hash(parent_header.hash())?;
+    // An own block that is sealed but not yet in the engine is read from
+    // its published output (`N42_BUILD_ON_OUTPUT=1`).
+    let state_provider = crate::build_on_output::parent_state(&client, parent_header.hash())?;
     let evm_state_provider = (&state_provider).into_evm_state_provider();
     let cached_state_provider = execution_cache.map(|execution_cache| {
         CachedStateProvider::new(
@@ -394,7 +396,8 @@ where
             // call that changed a batch account is caught by the cache half
             // below, and the candidates then run serially.
             let open = || {
-                let provider = client.state_by_block_hash(parent_header.hash()).ok()?;
+                let provider =
+                    crate::build_on_output::parent_state(&client, parent_header.hash()).ok()?;
                 Some(StateProviderDatabase::new(provider.into_evm_state_provider()))
             };
             // N42_GRAFT_NO_CACHE=1: a batch that fills the block, in a block
@@ -876,6 +879,9 @@ where
                     let restored = n42_execution::restored_slots_for(key).unwrap_or_default();
                     let operations =
                         crate::exec_cache::gov5_sorted_operations(bundle_state, &restored, prague);
+                    // A parent built just before this block may still be
+                    // committing its own candidate, the one the store holds.
+                    crate::build_on_output::wait_parent_committed(store, parent_hash);
                     let root = store.prepare_bound_candidate(parent_hash, operations, key);
                     metrics::histogram!("n42_payload_builder_qmdb_root_ms")
                         .record(started.elapsed().as_secs_f64() * 1000.0);

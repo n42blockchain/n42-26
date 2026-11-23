@@ -214,6 +214,51 @@ impl ExecutionLayer for RethExecutionLayer {
             .record(started.elapsed().as_secs_f64() * 1_000.0);
         result
     }
+
+    async fn build_on_sealed(
+        &self,
+        parent: alloy_primitives::B256,
+        attributes: PayloadAttributes,
+    ) -> Option<Result<BuiltBlock, ElError>> {
+        // The block's output is published by its own insert.
+        if !crate::build_on_output::enabled()
+            || !super::own_block::enabled()
+            || self.payload_builder.is_none()
+        {
+            return None;
+        }
+        let started = std::time::Instant::now();
+        let built = tokio::task::spawn_blocking(move || {
+            crate::build_on_output::build(parent, attributes, crate::build_on_output::SEALED_WAIT)
+        })
+        .await
+        .unwrap_or_else(|error| Err(format!("build on a sealed block panicked: {error}")));
+        let outcome = if built.is_ok() { "built" } else { "failed" };
+        metrics::counter!("n42_build_on_output_total", "outcome" => outcome).increment(1);
+        tracing::info!(
+            target: "n42::el",
+            %parent,
+            outcome,
+            reason = built.as_ref().err().map(String::as_str).unwrap_or(""),
+            txs = built.as_ref().map_or(0, |payload| payload.block().body().transactions.len()),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            "N42_BUILD_ON_OUTPUT: child of the sealed own block"
+        );
+        metrics::histogram!("n42_engine_boundary_duration_ms", "phase" => "build_on_sealed")
+            .record(started.elapsed().as_secs_f64() * 1_000.0);
+        Some(built.map_err(ElError).map(|payload| {
+            let block = payload.block();
+            if let Ok(mut last) = self.last_built.lock() {
+                *last = Some((
+                    block.header().parent_hash,
+                    block.header().number,
+                    block.body().transactions.len(),
+                ));
+            }
+            super::own_block::remember_built(payload.block_arc());
+            to_built_block(payload)
+        }))
+    }
 }
 
 /// Converts `N42BuiltPayload` into the node-neutral [`BuiltBlock`] — all

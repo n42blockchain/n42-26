@@ -423,7 +423,7 @@ where
         let conf = ctx.payload_builder_config();
         let gas_limit = conf.gas_limit_for(ctx.chain_spec().chain());
 
-        Ok(N42InnerPayloadBuilder {
+        let builder = N42InnerPayloadBuilder {
             client: ctx.provider().clone(),
             pool,
             evm_config,
@@ -434,7 +434,18 @@ where
             consensus_state: self.consensus_state,
             eof_guard: self.eof_guard,
             parallel_transfers: crate::parallel_payload::enabled(),
-        })
+        };
+        // Only the parallel builder reads its parent's state through the
+        // sealed-block overlay.
+        if crate::build_on_output::enabled() && builder.parallel_transfers {
+            let direct = builder.clone();
+            crate::build_on_output::register_builder(Box::new(move |parent, attributes| {
+                direct
+                    .build_on(parent, attributes)
+                    .map_err(|error| error.to_string())
+            }));
+        }
+        Ok(builder)
     }
 }
 
@@ -527,6 +538,87 @@ impl<Pool, Client> N42InnerPayloadBuilder<Pool, Client, n42_execution::N42EvmCon
     }
 }
 
+impl<Pool, Client> N42InnerPayloadBuilder<Pool, Client, n42_execution::N42EvmConfig>
+where
+    Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks> + Clone,
+    Pool: TransactionPool<Transaction = crate::native_pool::N42PooledTransaction> + 'static,
+{
+    /// Builds one block on `parent` outside a payload job: the job generator
+    /// needs the parent in the provider, and an own block that is only sealed
+    /// is not (`N42_BUILD_ON_OUTPUT=1`). Everything else is the job's build.
+    pub fn build_on(
+        &self,
+        parent: reth_primitives_traits::SealedHeader,
+        attributes: EthPayloadAttributes,
+    ) -> Result<N42BuiltPayload, PayloadBuilderError> {
+        let id = {
+            let mut seed = [0u8; 40];
+            seed[..32].copy_from_slice(parent.hash().as_slice());
+            seed[32..].copy_from_slice(&attributes.timestamp.to_be_bytes());
+            let digest = alloy_primitives::keccak256(seed);
+            alloy_rpc_types_engine::PayloadId::new(digest[..8].try_into().expect("8 bytes"))
+        };
+        let args = BuildArguments::new(
+            Default::default(),
+            None,
+            None,
+            PayloadConfig::new(Arc::new(parent), attributes, id),
+            Default::default(),
+            None,
+        );
+        match self.try_build(args)? {
+            BuildOutcome::Better { payload, .. } | BuildOutcome::Freeze(payload) => Ok(payload),
+            BuildOutcome::Aborted { .. } => Err(PayloadBuilderError::other(
+                std::io::Error::other("build on a sealed block aborted"),
+            )),
+            BuildOutcome::Cancelled => Err(PayloadBuilderError::other(std::io::Error::other(
+                "build on a sealed block cancelled",
+            ))),
+        }
+    }
+}
+
+/// `N42_IDLE_BLOCK_WAIT_MS=<ms>`: a build that finds no transaction waiting
+/// waits up to that long for one before it builds an empty block. An idle
+/// chain then makes at most about one block per wait instead of one per
+/// consensus round, which keeps the engine's unpersisted blocks from piling up
+/// behind a persistence backlog. A transaction that arrives ends the wait.
+/// Unset or 0: no wait.
+fn idle_block_wait() -> Option<std::time::Duration> {
+    static WAIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *WAIT.get_or_init(|| {
+        std::env::var("N42_IDLE_BLOCK_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            .min(2_000)
+    });
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
+/// Waits, when [`idle_block_wait`] is set and `pending` counts no
+/// transaction, until one is pending or the wait is over. Returns how long
+/// it waited, if it did.
+fn idle_wait_for_transactions(pending: impl Fn() -> usize) -> Option<std::time::Duration> {
+    idle_wait_up_to(idle_block_wait()?, pending)
+}
+
+fn idle_wait_up_to(
+    wait: std::time::Duration,
+    pending: impl Fn() -> usize,
+) -> Option<std::time::Duration> {
+    if pending() > 0 {
+        return None;
+    }
+    let started = std::time::Instant::now();
+    while started.elapsed() < wait && pending() == 0 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let waited = started.elapsed();
+    metrics::histogram!("n42_idle_block_wait_ms").record(waited.as_secs_f64() * 1_000.0);
+    Some(waited)
+}
+
 impl<Pool, Client> PayloadBuilder
     for N42InnerPayloadBuilder<Pool, Client, n42_execution::N42EvmConfig>
 where
@@ -543,6 +635,7 @@ where
         // Log pool depth before building — key diagnostic for TPS bottleneck analysis.
         let frame_queue =
             crate::frame_queue::frame_queue_enabled().then(crate::frame_queue::FrameQueue::global);
+        let mut parent_wait_ms = 0.0;
         if let Some(queue) = frame_queue {
             // The parent's transactions leave the queue when its canonical
             // notification is applied; offering them again would only have
@@ -556,9 +649,12 @@ where
                     "frame queue has not applied the parent block; building anyway"
                 );
             }
-            metrics::histogram!("n42_frame_queue_parent_wait_ms")
-                .record(wait.elapsed().as_secs_f64() * 1_000.0);
+            parent_wait_ms = wait.elapsed().as_secs_f64() * 1_000.0;
+            metrics::histogram!("n42_frame_queue_parent_wait_ms").record(parent_wait_ms);
         }
+        let pending = || self.pool.pool_size().pending + frame_queue.map_or(0, |queue| queue.pending());
+        let idle_wait_ms = idle_wait_for_transactions(pending)
+            .map_or(0.0, |waited| waited.as_secs_f64() * 1_000.0);
         let pool_size = self.pool.pool_size();
         let pool_pending = pool_size.pending + frame_queue.map_or(0, |queue| queue.pending());
         let pool_queued = pool_size.queued;
@@ -575,6 +671,8 @@ where
             id = %args.config.payload_id(),
             parent = %args.config.parent_header.hash(),
             pool_pending,
+            frame_queue_parent_wait_ms = parent_wait_ms,
+            idle_wait_ms,
             "N42_BUILD_ENTRY: payload builder entered"
         );
         let result = crate::parallel_payload::build_with_parallel(
@@ -677,9 +775,26 @@ where
                         .transactions()
                         .map(|tx| *tx.hash())
                         .collect();
-                    rayon::spawn(move || {
+                    // On a thread of its own: on the global pool it queued
+                    // behind the block's root work while the child build
+                    // waited for it (`wait_applied`).
+                    let mark = move || {
                         queue.mark_mined(n42_tx_types::FrameStore::global(), number, &hashes);
-                    });
+                    };
+                    let mark = std::sync::Arc::new(std::sync::Mutex::new(Some(mark)));
+                    let spawned = {
+                        let mark = mark.clone();
+                        std::thread::Builder::new().name("frame-mined".into()).spawn(move || {
+                            if let Some(mark) = mark.lock().ok().and_then(|mut m| m.take()) {
+                                mark();
+                            }
+                        })
+                    };
+                    if spawned.is_err()
+                        && let Some(mark) = mark.lock().ok().and_then(|mut m| m.take())
+                    {
+                        rayon::spawn(mark);
+                    }
                 }
                 let tx_count = payload.block().body().transactions().count();
                 let gas_used = payload.block().header().gas_used;
@@ -749,5 +864,35 @@ where
         )?
         .into_payload()
         .ok_or(PayloadBuilderError::MissingPayload)
+    }
+}
+
+#[cfg(test)]
+mod idle_wait_tests {
+    use super::idle_wait_up_to;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn an_idle_build_waits_until_a_transaction_or_the_end_of_the_wait() {
+        // Work waiting: no wait at all.
+        assert_eq!(idle_wait_up_to(Duration::from_secs(5), || 3), None);
+        // Nothing arrives: the whole wait.
+        let waited = idle_wait_up_to(Duration::from_millis(30), || 0).expect("waited");
+        assert!(waited >= Duration::from_millis(30));
+        // A transaction arriving ends the wait.
+        let pending = AtomicUsize::new(0);
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(20));
+                pending.store(1, Ordering::Relaxed);
+            });
+            let waited =
+                idle_wait_up_to(Duration::from_secs(5), || pending.load(Ordering::Relaxed))
+                    .expect("waited");
+            assert!(waited < Duration::from_secs(1));
+        });
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
