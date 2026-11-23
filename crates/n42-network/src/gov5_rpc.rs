@@ -181,8 +181,14 @@ fn build_gov5_range_batch(
     let rlps = match reader.block_rlps_by_range(numbers) {
         Ok(rlps) => rlps,
         Err(error) => {
+            // After a served prefix the stream just ends (W2, below).
+            let frames = if previous_hash.is_some() {
+                Vec::new()
+            } else {
+                vec![encode_range_error(2, &error)?]
+            };
             return Ok(Gov5RangeBatch {
-                frames: vec![encode_range_error(2, &error)?],
+                frames,
                 last_hash: previous_hash,
                 stop: true,
             });
@@ -190,26 +196,37 @@ fn build_gov5_range_batch(
     };
     let mut frames = Vec::with_capacity(rlps.len() + 1);
     let mut stop = false;
+    // N42 sync standard (W2): once a block has been served (in this batch
+    // or an earlier one), an early stop closes the stream cleanly; an error
+    // chunk is only written before the first block.
+    let mut served = previous_hash.is_some();
+    let error_unless_served = |frames: &mut Vec<Vec<u8>>, served: bool, message: &str| {
+        if !served {
+            frames.push(encode_range_error(2, message)?);
+        }
+        io::Result::Ok(())
+    };
     for (offset, rlp) in rlps.into_iter().take(expected).enumerate() {
         let number = start + offset as u64;
         if rlp.len() > MAX_GOV5_RANGE_BLOCK_SIZE {
-            frames.push(encode_range_error(2, "block exceeds 64 MiB chunk limit")?);
+            error_unless_served(&mut frames, served, "block exceeds 64 MiB chunk limit")?;
             stop = true;
             break;
         }
         let decoded = match crate::gov5_block::decode_gov5_block_rlp(&rlp) {
             Ok(decoded) => decoded,
             Err(error) => {
-                frames.push(encode_range_error(
-                    2,
+                error_unless_served(
+                    &mut frames,
+                    served,
                     &format!("invalid canonical block: {error}"),
-                )?);
+                )?;
                 stop = true;
                 break;
             }
         };
         if decoded.header.number != number {
-            frames.push(encode_range_error(2, "canonical block number mismatch")?);
+            error_unless_served(&mut frames, served, "canonical block number mismatch")?;
             stop = true;
             break;
         }
@@ -221,13 +238,14 @@ fn build_gov5_range_batch(
             break;
         }
         previous_hash = Some(decoded.block_hash);
+        served = true;
         frames.push(encode_range_chunk(&Gov5RangeBlockChunk {
             fork_digest,
             rlp,
         })?);
     }
     if !stop && frames.len() < expected {
-        frames.push(encode_range_error(2, "block not found")?);
+        error_unless_served(&mut frames, served, "block not found")?;
         stop = true;
     }
     Ok(Gov5RangeBatch {
@@ -1908,8 +1926,8 @@ mod tests {
 
     /// Under a Tokio runtime batches are built on blocking threads, one ahead
     /// of the batch being written; a ranged reader is asked for whole batches
-    /// and a missing block on a batch boundary still ends the stream with the
-    /// gov5 "block not found" error after the linked prefix.
+    /// and a missing block on a batch boundary ends the stream cleanly (EOF)
+    /// after the linked prefix, with no error chunk (N42 sync standard W2).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bodies_by_range_pipelines_batches_on_blocking_threads() {
         let missing = 2 * GOV5_RANGE_BATCH_BLOCKS + 1;
@@ -1970,24 +1988,15 @@ mod tests {
             "three batches were requested"
         );
 
-        // The linked prefix comes back as blocks; the error frame that ends
-        // the stream is what a gov5 client sees after them.
+        // The linked prefix comes back as blocks and the stream then ends.
         let mut wire = futures::io::Cursor::new(wire.into_inner());
         let mut blocks = Vec::new();
         loop {
             let mut status = [0u8; 1];
             match wire.read(&mut status).await.unwrap() {
-                0 => panic!("stream must end with the gov5 not-found error"),
+                0 => break,
                 1 if status[0] == 0 => {}
-                1 => {
-                    let message =
-                        read_framed_payload(&mut wire, MAX_SNAPPY_FRAME_SIZE, MAX_GOV5_BLOCK_SIZE)
-                            .await
-                            .unwrap();
-                    assert_eq!(status[0], 2);
-                    assert_eq!(String::from_utf8_lossy(&message), "block not found");
-                    break;
-                }
+                1 => panic!("no error chunk after a served prefix, got code {}", status[0]),
                 _ => unreachable!(),
             }
             let mut fork_digest = [0u8; 4];
@@ -2005,6 +2014,30 @@ mod tests {
         assert_eq!(blocks.len() as u64, missing - 1);
         assert_eq!(blocks[0], stored[&1]);
         assert_eq!(blocks.last().unwrap(), &stored[&(missing - 1)]);
+    }
+
+    /// Before the first block a missing block is still reported with the
+    /// gov5 "block not found" error chunk; after one it is a clean stop.
+    #[test]
+    fn range_batch_reports_errors_only_before_the_first_block() {
+        let (hash, block) = range_block(1, B256::repeat_byte(9));
+        let reader = Gov5CanonicalBlockReader::new_ranged(
+            || Ok(5),
+            move |numbers| Ok(if *numbers.start() == 1 { vec![block.clone()] } else { Vec::new() }),
+        );
+        let first = build_gov5_range_batch(&reader, 2..=3, [1, 2, 3, 4], None).unwrap();
+        assert!(first.stop);
+        assert_eq!(first.frames.len(), 1);
+        assert_eq!(first.frames[0][0], 2, "error chunk before any block");
+
+        let prefix = build_gov5_range_batch(&reader, 1..=3, [1, 2, 3, 4], None).unwrap();
+        assert!(prefix.stop);
+        assert_eq!(prefix.frames.len(), 1);
+        assert_eq!(prefix.frames[0][0], 0, "only the served block, no error chunk");
+
+        let later = build_gov5_range_batch(&reader, 2..=3, [1, 2, 3, 4], Some(hash)).unwrap();
+        assert!(later.stop);
+        assert!(later.frames.is_empty(), "a later batch after a prefix ends cleanly");
     }
 
     /// Each batch is read from its own consistent view, so a reorg between
