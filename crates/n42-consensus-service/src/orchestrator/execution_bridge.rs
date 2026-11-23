@@ -55,6 +55,56 @@ pub fn build_on_seal_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("N42_BUILD_ON_SEAL").is_ok_and(|v| v == "1"))
 }
 
+/// `N42_BUILD_ON_OUTPUT=1`, on top of [`build_on_seal_enabled`]: the child of
+/// a leader's own block is built from the block's execution output as soon as
+/// the block is sealed, beside the block's own insert, instead of once the
+/// engine has the block. The block's validation then only moves the
+/// execution layer's head to it; a child build that produces nothing is
+/// started again the usual way.
+pub fn build_on_output_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        build_on_seal_enabled() && std::env::var("N42_BUILD_ON_OUTPUT").is_ok_and(|v| v == "1")
+    })
+}
+
+/// `N42_BUILD_AHEAD_DEPTH=2`, on top of [`build_on_output_enabled`]: a leader
+/// that leads the coming views builds up to two blocks past the current
+/// view's, the second on the first one's sealed output, instead of one. Each
+/// block is still proposed only in its own view under the QC of its parent,
+/// and is dropped, with every block built on it, if that QC does not form.
+/// Any other value, or the switch without build on output, is one block.
+pub fn build_ahead_depth() -> u64 {
+    static DEPTH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        let two = build_on_output_enabled()
+            && std::env::var("N42_BUILD_AHEAD_DEPTH").is_ok_and(|v| v.trim() == "2");
+        if two { 2 } else { 1 }
+    })
+}
+
+/// `N42_FINALIZE_ON_TIP_CHAIN=1`: with one block built ahead, a finalize
+/// names as head the newest own block on the committed block's chain, as
+/// two blocks ahead does, instead of only the newest own block's parent's
+/// child. The engine does not move finalized when the head it is given is an
+/// ancestor of its head, so the single tip, once replaced, left finalized a
+/// block behind on every other commit.
+pub fn finalize_on_tip_chain() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_FINALIZE_ON_TIP_CHAIN").is_ok_and(|v| v == "1"))
+}
+
+/// Where a leader's build comes from.
+pub(super) enum BuildSource {
+    /// A payload job started by a forkchoice update.
+    Job(PayloadId),
+    /// A build on an own block the engine may not have yet.
+    SealedParent {
+        parent: B256,
+        attributes: PayloadAttributes,
+    },
+}
+
 fn should_broadcast_execution_output(h2_v4_participant: bool) -> bool {
     should_broadcast_execution_output_with(h2_v4_participant, shared_execution_enabled())
 }
@@ -266,9 +316,7 @@ impl ConsensusService {
         // calls, triggering pipeline sync and permanent chain stalls.
         let parent = build_context.parent_hash;
         let is_ahead = ahead.is_some();
-        if let Some(building) = self.ahead_building
-            && building.parent_hash == parent
-        {
+        if let Some(building) = self.ahead.building_on(parent) {
             debug!(target: "n42::cl::exec_bridge", %parent, build_view = building.view,
                 "the build started ahead covers this parent, skipping");
             if !is_ahead && building == build_context {
@@ -279,7 +327,7 @@ impl ConsensusService {
             }
             return;
         }
-        if !is_ahead && self.ahead_emitting == Some(build_context) {
+        if !is_ahead && self.ahead.is_emitting(build_context) {
             debug!(target: "n42::cl::exec_bridge", %parent, view = build_context.view,
                 "this view's block was built ahead and is being released, skipping");
             self.next_build_at = None;
@@ -376,7 +424,7 @@ impl ConsensusService {
             }
         };
         if is_ahead {
-            self.ahead_building = Some(build_context);
+            self.ahead.start_building(build_context);
         } else {
             self.building_on_parent = Some(build_context);
             self.build_triggered_at = Some(build_start);
@@ -446,7 +494,7 @@ impl ConsensusService {
                         debug!(target: "n42::cl::exec_bridge", ?payload_id, "payload building started, spawning resolve task");
                         self.spawn_payload_resolve_task(
                             el.clone(),
-                            payload_id,
+                            BuildSource::Job(payload_id),
                             build_start,
                             build_context,
                         );
@@ -454,7 +502,7 @@ impl ConsensusService {
                         if is_ahead {
                             // Nothing is owed yet: the view's own build
                             // starts when the view does.
-                            self.ahead_building = None;
+                            self.ahead.end_building(build_context);
                             last_err = None;
                             break;
                         }
@@ -481,7 +529,7 @@ impl ConsensusService {
         if is_ahead {
             if let Some(e) = last_err {
                 debug!(target: "n42::cl::exec_bridge", error = %e, "build ahead not started");
-                self.ahead_building = None;
+                self.ahead.end_building(build_context);
             }
         } else if let Some(e) = last_err {
             error!(target: "n42::cl::exec_bridge", error = %e, "fork_choice_updated failed after retry");
@@ -491,6 +539,74 @@ impl ConsensusService {
             self.speculative_build_hash = None;
             // Also schedule retry on FCU error — the execution layer may recover.
             self.schedule_build_retry();
+        }
+    }
+
+    /// Starts the build of `context` on its parent's execution output: the
+    /// parent is an own block that is sealed, which the engine may not have
+    /// yet (`N42_BUILD_ON_OUTPUT`).
+    pub(super) async fn build_on_output(&mut self, context: super::PayloadBuildContext) {
+        if self.leader_disabled {
+            return;
+        }
+        let Some(el) = self.el.clone() else {
+            return;
+        };
+        let parent = context.parent_hash;
+        let covered = |building: Option<super::PayloadBuildContext>| {
+            building.is_some_and(|building| building.parent_hash == parent)
+        };
+        if self.ahead.building_on(parent).is_some()
+            || covered(self.building_on_parent)
+            || self.engine.last_voted_view() >= context.view
+        {
+            debug!(target: "n42::cl::exec_bridge", %parent, view = context.view,
+                "a build on this parent is under way or its view is voted, not building on its output");
+            return;
+        }
+        let parent_beacon_block_root = match self.committee_parent_beacon_root(parent) {
+            Ok(root) => root,
+            Err(error) => {
+                warn!(target: "n42::cl::exec_bridge", %parent, %error,
+                    "cannot stamp the committee-evidence root yet; the child is built once the block is validated");
+                return;
+            }
+        };
+        let attributes = self.build_payload_attributes(None, parent_beacon_block_root);
+        self.last_committed_timestamp = self.last_committed_timestamp.max(attributes.timestamp);
+        self.ahead.start_building(context);
+        self.ahead.start_output_build(context);
+        metrics::counter!("n42_build_on_output_started_total").increment(1);
+        info!(target: "n42::cl::exec_bridge", view = context.view, %parent,
+            views_ahead = context.view.saturating_sub(self.engine.current_view()),
+            "building on the sealed own block's output");
+        self.spawn_payload_resolve_task(
+            el,
+            BuildSource::SealedParent { parent, attributes },
+            Instant::now(),
+            context,
+        );
+    }
+
+    /// Makes the own block `head` the execution layer's head, as the build
+    /// of its child through a forkchoice update would have.
+    pub(super) async fn announce_own_head(&mut self, head: B256) {
+        let Some(el) = self.el.clone() else {
+            return;
+        };
+        let state = ForkchoiceState {
+            head_block_hash: head,
+            safe_block_hash: B256::ZERO,
+            finalized_block_hash: B256::ZERO,
+        };
+        match el
+            .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, state)
+            .await
+        {
+            Ok(updated) => debug!(target: "n42::cl::exec_bridge", %head,
+                status = ?updated.payload_status.status, "own block announced as head"),
+            Err(error) => warn!(target: "n42::cl::exec_bridge", %head, %error,
+                "own block could not be announced as head"),
         }
     }
 
@@ -532,7 +648,7 @@ impl ConsensusService {
     fn spawn_payload_resolve_task(
         &self,
         el: Arc<dyn ExecutionLayer>,
-        payload_id: PayloadId,
+        source: BuildSource,
         build_start: Instant,
         build_context: super::PayloadBuildContext,
     ) {
@@ -554,17 +670,26 @@ impl ConsensusService {
         let h2_v4_participant = self.h2_v4_identity.is_some();
 
         let handle = tokio::spawn(async move {
-            // Allow builder time to pack transactions from the pool.
-            let warmup = builder_warmup_delay();
-            if !warmup.is_zero() {
-                tokio::time::sleep(warmup).await;
-            }
-
-            let resolve_result = tokio::time::timeout(
-                PAYLOAD_BUILD_TIMEOUT,
-                el.resolve_payload(payload_id, ResolveKind::WaitForPending),
-            )
-            .await;
+            let build_el = el.clone();
+            let on_sealed = matches!(source, BuildSource::SealedParent { .. });
+            let resolve = async move {
+                match source {
+                    BuildSource::Job(payload_id) => {
+                        // Allow builder time to pack transactions from the pool.
+                        let warmup = builder_warmup_delay();
+                        if !warmup.is_zero() {
+                            tokio::time::sleep(warmup).await;
+                        }
+                        build_el
+                            .resolve_payload(payload_id, ResolveKind::WaitForPending)
+                            .await
+                    }
+                    BuildSource::SealedParent { parent, attributes } => {
+                        build_el.build_on_sealed(parent, attributes).await
+                    }
+                }
+            };
+            let resolve_result = tokio::time::timeout(PAYLOAD_BUILD_TIMEOUT, resolve).await;
 
             let payload_opt = match resolve_result {
                 Ok(result) => result,
@@ -594,6 +719,11 @@ impl ConsensusService {
                         build_context,
                     )
                     .await;
+                }
+                // A build on a sealed block that cannot run is built again
+                // the usual way once the block is validated.
+                Some(Err(e)) if on_sealed => {
+                    warn!(target: "n42::cl::exec_bridge", error = %e, "build on the sealed own block did not run")
                 }
                 Some(Err(e)) => {
                     error!(target: "n42::cl::exec_bridge", error = %e, "payload build failed")
@@ -1782,7 +1912,7 @@ async fn handle_built_payload(
                     .send(super::PayloadBuildReady {
                         context: build_context,
                         block_hash: hash,
-                        own_block_validated: true,
+                        kind: super::ReadyKind::OwnBlockValidated,
                     })
                     .await;
             }
@@ -1793,6 +1923,20 @@ async fn handle_built_payload(
     if leader_validation.is_some() {
         metrics::histogram!("n42_leader_emit_stage_ms", "stage" => "to_validation_spawn")
             .record(emit_started.elapsed().as_secs_f64() * 1000.0);
+    }
+    // The block's insert publishes its output for a child built on it now.
+    if leader_validation.is_some()
+        && build_on_output_enabled()
+        && block_ready_tx
+            .send(super::PayloadBuildReady {
+                context: build_context,
+                block_hash: hash,
+                kind: super::ReadyKind::OwnBlockSealed,
+            })
+            .await
+            .is_err()
+    {
+        debug!(target: "n42::cl::exec_bridge", %hash, "block_ready receiver dropped");
     }
     // The Gov5 copy is encoded beside serialization and the native send; it
     // is still pushed, and the proposal still released, only after both.
@@ -2082,7 +2226,7 @@ async fn handle_built_payload(
         .send(super::PayloadBuildReady {
             context: build_context,
             block_hash: hash,
-            own_block_validated: false,
+            kind: super::ReadyKind::Payload,
         })
         .await
         .is_err()

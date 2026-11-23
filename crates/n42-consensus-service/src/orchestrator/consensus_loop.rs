@@ -1685,10 +1685,7 @@ impl ConsensusService {
         self.consecutive_empty_skips = max_consecutive_empty_skips();
 
         if !self.engine.is_current_leader() {
-            self.ahead_ready = None;
-            self.ahead_validated = None;
-            self.ahead_building = None;
-            self.ahead_emitting = None;
+            self.ahead.clear();
         } else if self.take_ahead_build(new_view).await {
             debug!(target: "n42::cl::consensus_loop", new_view, "proposing the payload built ahead for this view");
             return;

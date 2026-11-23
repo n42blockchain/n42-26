@@ -1,3 +1,4 @@
+mod ahead;
 pub(crate) mod bad_block_cache;
 mod consensus_loop;
 mod execution_bridge;
@@ -527,9 +528,104 @@ pub(super) struct PayloadBuildContext {
 pub(super) struct PayloadBuildReady {
     context: PayloadBuildContext,
     block_hash: B256,
+    kind: ReadyKind,
+}
+
+/// What a [`PayloadBuildReady`] reports about its block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReadyKind {
+    /// The block may be proposed.
+    Payload,
+    /// Not a proposal release: the leader's own block is sealed and its
+    /// output published, so a child can be built on that output
+    /// (`N42_BUILD_ON_OUTPUT`).
+    OwnBlockSealed,
     /// Not a proposal release: the leader's own execution layer has accepted
     /// the block, so a child can be built on it (`N42_BUILD_ON_SEAL`).
-    own_block_validated: bool,
+    OwnBlockValidated,
+}
+
+/// A child build started on an own block's output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct OutputBuild {
+    context: PayloadBuildContext,
+    /// The build released a payload.
+    produced: bool,
+    /// The parent's validation, kept to build the child the usual way if
+    /// this build produces nothing.
+    validated: Option<PayloadBuildReady>,
+}
+
+/// What a leader does with an own block's sealed or validated report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AheadStep {
+    /// The block's view has not started: wait for it.
+    Hold,
+    /// Nothing to build.
+    Skip,
+    /// Build the child on the block's output.
+    BuildOnOutput(PayloadBuildContext),
+    /// The child is built on the output already: make the block the
+    /// execution layer's head.
+    AnnounceHead,
+    /// Build the child through a forkchoice update.
+    Build(PayloadBuildContext),
+}
+
+/// What an own block's sealed or validated report records before its
+/// child build starts: the block's own build context, so that its view does
+/// not start a second build on its parent while the block is on its way to
+/// its proposal (the child build takes over `ahead_building`); and, once the
+/// execution layer has accepted the block, `(tip, parent)`, so that a
+/// finalize of its parent leaves the block as the head.
+pub(super) fn own_block_guards(
+    ready: &PayloadBuildReady,
+    current_view: u64,
+) -> (Option<PayloadBuildContext>, Option<(B256, B256)>) {
+    if ready.context.view < current_view {
+        return (None, None);
+    }
+    let tip = (ready.kind == ReadyKind::OwnBlockValidated)
+        .then_some((ready.block_hash, ready.context.parent_hash));
+    (Some(ready.context), tip)
+}
+
+/// The step for `ready` while `current_view` is current. `depth`: how many
+/// views past the current one a leader builds (`N42_BUILD_AHEAD_DEPTH`);
+/// the child of a block `depth - 1` views ahead may be built on its output.
+/// `leads_next`: this node leads the view after the block's.
+/// `child_covered`: a build of the block's child exists already.
+pub(super) fn ahead_step(
+    ready: &PayloadBuildReady,
+    current_view: u64,
+    depth: u64,
+    leads_next: bool,
+    output_enabled: bool,
+    child_covered: bool,
+) -> AheadStep {
+    if ready.context.view >= current_view + depth.max(1) {
+        // `depth` blocks ahead at most: wait for a later view.
+        return AheadStep::Hold;
+    }
+    if ready.context.view < current_view || !leads_next {
+        return AheadStep::Skip;
+    }
+    let child = PayloadBuildContext {
+        view: ready.context.view + 1,
+        parent_hash: ready.block_hash,
+    };
+    match ready.kind {
+        ReadyKind::Payload => AheadStep::Skip,
+        ReadyKind::OwnBlockSealed if output_enabled && !child_covered => {
+            AheadStep::BuildOnOutput(child)
+        }
+        ReadyKind::OwnBlockSealed => AheadStep::Skip,
+        ReadyKind::OwnBlockValidated if child_covered => AheadStep::AnnounceHead,
+        // A forkchoice build of a block two views ahead waits for its
+        // parent's view, as with one block ahead.
+        ReadyKind::OwnBlockValidated if ready.context.view > current_view => AheadStep::Hold,
+        ReadyKind::OwnBlockValidated => AheadStep::Build(child),
+    }
 }
 
 /// Serializable proxy for `(BlockExecutionOutput<Receipt>, Vec<Address>)`.
@@ -1276,25 +1372,9 @@ pub struct ConsensusService {
     /// Set when build is triggered by eager import (before consensus commit).
     /// Cleared on ViewChanged or when finalize confirms the block.
     speculative_build_hash: Option<B256>,
-    /// A payload this leader built for the view after the current one, held
-    /// until that view starts and the LockedQC names its parent.
-    ahead_ready: Option<PayloadBuildReady>,
-    /// An own block of a later view that the execution layer has accepted;
-    /// its child is built once its view is the current one, so the leader
-    /// never runs more than one block ahead of consensus.
-    ahead_validated: Option<PayloadBuildReady>,
-    /// `(tip, parent)` of the newest own block the execution layer accepted
-    /// ahead of its commit. A finalize of `parent` keeps `tip` as head.
-    ahead_tip: Option<(B256, B256)>,
-    /// The build in flight for a view that has not started yet. Kept apart
-    /// from `building_on_parent`, which guards the current view's build until
-    /// its proposal is released.
-    ahead_building: Option<PayloadBuildContext>,
-    /// An own block built ahead that the execution layer has accepted and
-    /// whose proposal is still being prepared. `ahead_building` has moved on
-    /// to that block's child by then, so this is what keeps the block's own
-    /// view from starting a second build on the same parent.
-    ahead_emitting: Option<PayloadBuildContext>,
+    /// Blocks this leader builds ahead of their views: held payloads and
+    /// reports, child builds, guards and execution-layer tips, per view.
+    ahead: ahead::AheadState,
     /// View and parent hash for which a payload build task is currently running.
     /// Prevents duplicate builds based on the same parent, which produce different
     /// blocks at the same height and overwhelm reth with conflicting `new_payload` calls
@@ -2669,26 +2749,28 @@ impl ConsensusService {
     /// when its build began. A view change must never wrap an old child of B in
     /// a new Proposal justified by LockedQC(A).
     fn handle_payload_build_ready(&mut self, ready: PayloadBuildReady) -> bool {
+        if let Some(build) = self.ahead.output_build_mut(ready.context) {
+            build.produced = true;
+        }
         let current_context = self.required_payload_build_context();
         let owns_guard = self.building_on_parent == Some(ready.context);
         if owns_guard {
             self.building_on_parent = None;
         }
-        if self.ahead_building == Some(ready.context) {
-            self.ahead_building = None;
-        }
-        if self.ahead_emitting == Some(ready.context) {
-            self.ahead_emitting = None;
-        }
+        self.ahead.end_building(ready.context);
+        self.ahead.end_emitting(ready.context);
 
-        // Built ahead for the next view: consensus takes it when that view
+        // Built ahead for a later view: consensus takes it when that view
         // starts, if the LockedQC then names the block it was built on.
+        let current_view = self.engine.current_view();
+        let depth = execution_bridge::build_ahead_depth();
         if execution_bridge::build_on_seal_enabled()
-            && ready.context.view == self.engine.current_view() + 1
+            && ready.context.view > current_view
+            && ready.context.view <= current_view + depth
         {
             debug!(target: "n42::cl::orchestrator", built_view = ready.context.view,
                 block_hash = %ready.block_hash, "holding a payload built ahead of its view");
-            self.ahead_ready = Some(ready);
+            self.ahead.hold_payload(ready);
             return false;
         }
 
@@ -2703,6 +2785,11 @@ impl ConsensusService {
                 "discarding payload resolved for stale view or non-LockedQC parent"
             );
             counter!("n42_stale_payload_builds_total").increment(1);
+            // Two blocks ahead: what was built on this block is not
+            // proposed either.
+            if depth > 1 && ready.context.view == current_view {
+                self.drop_ahead_block(ready.block_hash);
+            }
             if owns_guard {
                 self.build_triggered_at = None;
             }
@@ -2742,82 +2829,148 @@ impl ConsensusService {
     /// execution layer has just accepted, when this validator also leads the
     /// next view. Only the build starts early: the block is proposed in its
     /// own view, justified by the QC of its parent, like any other.
-    async fn build_ahead_on(&mut self, validated: PayloadBuildReady) {
+    async fn build_ahead_on(&mut self, ready: PayloadBuildReady) {
         if !execution_bridge::build_on_seal_enabled() {
             return;
         }
+        let depth = execution_bridge::build_ahead_depth();
         let current_view = self.engine.current_view();
-        if validated.context.view >= current_view {
-            self.ahead_emitting = Some(validated.context);
-            // From here on a finalize of this block's parent leaves the
-            // block as the execution layer's head. Recorded before the child
-            // build starts: the parent's finalize may already be on its way.
-            self.ahead_tip = Some((validated.block_hash, validated.context.parent_hash));
+        let (emitting, tip) = own_block_guards(&ready, current_view);
+        if let Some(emitting) = emitting {
+            self.ahead.start_emitting(emitting);
         }
-        if validated.context.view > current_view {
-            // One block ahead at most: wait for this block's own view.
-            self.ahead_validated = Some(validated);
-            return;
+        if let Some((tip, parent)) = tip {
+            self.ahead
+                .record_tip(
+                    tip,
+                    parent,
+                    ahead::tip_capacity(depth, execution_bridge::finalize_on_tip_chain()),
+                );
         }
-        let next_view = validated.context.view + 1;
-        if validated.context.view < current_view || !self.engine.is_leader_for_view(next_view) {
-            return;
+        let leads_next = self.engine.is_leader_for_view(ready.context.view + 1);
+        let child = PayloadBuildContext {
+            view: ready.context.view + 1,
+            parent_hash: ready.block_hash,
+        };
+        let on_output = self.ahead.output_build(child).is_some();
+        let covered = self.ahead.child_covered(child)
+            || self.building_on_parent == Some(child)
+            || self.engine.last_voted_view() >= child.view;
+        let child_covered = if depth > 1 {
+            covered
+        } else {
+            ready.kind == ReadyKind::OwnBlockValidated && on_output
+        };
+        let step = ahead_step(
+            &ready,
+            current_view,
+            depth,
+            leads_next,
+            execution_bridge::build_on_output_enabled(),
+            child_covered,
+        );
+        if depth == 1 && covered && matches!(step, AheadStep::Build(_)) {
+            // One block ahead keeps its former rule; this records how often
+            // it builds a child that already has a build.
+            counter!("n42_build_ahead_covered_child_builds_total").increment(1);
+            debug!(target: "n42::cl::orchestrator", view = child.view, parent = %child.parent_hash,
+                "building a child that already has a build");
         }
-        counter!("n42_build_ahead_started_total").increment(1);
-        self.do_trigger_payload_build_on(
-            Some(PayloadBuildContext {
-                view: next_view,
-                parent_hash: validated.block_hash,
-            }),
-            None,
-        )
-        .await;
+        match step {
+            AheadStep::Hold if ready.kind == ReadyKind::OwnBlockSealed => {
+                self.ahead.sealed.push(ready);
+            }
+            AheadStep::Hold => self.ahead.validated.push(ready),
+            AheadStep::Skip => {}
+            AheadStep::BuildOnOutput(child) => {
+                if child.view > current_view + 1 {
+                    counter!("n42_build_ahead_two_views_total").increment(1);
+                }
+                self.build_on_output(child).await;
+            }
+            AheadStep::AnnounceHead => {
+                if let Some(build) = self.ahead.output_build_mut(child) {
+                    build.validated = Some(ready);
+                }
+                self.announce_own_head(ready.block_hash).await;
+            }
+            AheadStep::Build(child) => {
+                counter!("n42_build_ahead_started_total").increment(1);
+                self.do_trigger_payload_build_on(Some(child), None).await;
+            }
+        }
+    }
+
+    /// The parent's validation to build from when the build on its output
+    /// that `completed` ends without a payload; ends that build's record.
+    pub(super) fn take_failed_output_build(
+        &mut self,
+        completed: PayloadBuildContext,
+    ) -> Option<PayloadBuildReady> {
+        let build = self.ahead.take_output_build(completed)?;
+        if build.produced {
+            return None;
+        }
+        counter!("n42_build_on_output_fallback_total").increment(1);
+        warn!(target: "n42::cl::orchestrator", view = completed.view,
+            parent = %completed.parent_hash,
+            "the build on the sealed block produced no payload; building on the validated block");
+        build.validated
+    }
+
+    /// Forgets an own block that will not be proposed and every block
+    /// built ahead on it.
+    fn drop_ahead_block(&mut self, block: B256) {
+        let dropped = self.ahead.drop_block(block);
+        if dropped > 0 {
+            counter!("n42_build_ahead_discarded_total").increment(dropped as u64);
+            debug!(target: "n42::cl::orchestrator", %block, dropped,
+                "dropping what was built ahead on a block that is not proposed");
+        }
     }
 
     /// On entering `new_view` as leader: hands consensus the payload built
-    /// ahead for it, if it still fits, and starts the next one. Returns
-    /// whether a proposal was released, so the caller starts no other build.
+    /// ahead for it, if it still fits, and starts the builds now within
+    /// reach. Returns whether a proposal was released, so the caller starts
+    /// no other build.
     pub(super) async fn take_ahead_build(&mut self, new_view: u64) -> bool {
-        let released = match self.ahead_ready.take() {
-            Some(ready) if self.required_payload_build_context() == Some(ready.context) => {
+        let depth = execution_bridge::build_ahead_depth();
+        let release = self
+            .ahead
+            .take_release(new_view, self.required_payload_build_context());
+        for ready in release.discarded {
+            counter!("n42_build_ahead_discarded_total").increment(1);
+            debug!(target: "n42::cl::orchestrator", new_view, built_view = ready.context.view,
+                block_hash = %ready.block_hash, "payload built ahead no longer fits the view");
+            if depth > 1 {
+                self.drop_ahead_block(ready.block_hash);
+            }
+        }
+        let released = match release.released {
+            Some(ready) => {
                 counter!("n42_build_ahead_used_total").increment(1);
                 self.handle_payload_build_ready(ready)
             }
-            Some(ready) => {
-                counter!("n42_build_ahead_discarded_total").increment(1);
-                debug!(target: "n42::cl::orchestrator", new_view, built_view = ready.context.view,
-                    block_hash = %ready.block_hash, "payload built ahead no longer fits the view");
-                false
-            }
             None => false,
         };
-        if let Some(validated) = self.ahead_validated.take()
-            && validated.context.view == new_view
-        {
-            self.build_ahead_on(validated).await;
+        for held in self.ahead.take_reachable(new_view, depth) {
+            self.build_ahead_on(held).await;
         }
         released
     }
 
-    /// The head to announce when `committed` is finalized: the uncommitted
-    /// own block a child is being built on, when it is `committed`'s child,
-    /// so the execution layer is not moved off the block under construction.
+    /// The head to announce when `committed` is finalized: the newest
+    /// uncommitted own block on `committed`'s chain that the execution layer
+    /// has accepted, so it is not moved off the blocks under construction.
     pub(super) fn finalize_head_for(&self, committed: B256) -> B256 {
-        match self.ahead_tip {
-            Some((tip, parent)) if parent == committed => tip,
-            _ => committed,
-        }
+        self.ahead.head_for(committed)
     }
 
     /// Clears only the guard owned by the task that completed. An older
     /// resolve task may finish after a new-view build has already started.
     fn handle_payload_build_complete(&mut self, completed: PayloadBuildContext) -> bool {
-        if self.ahead_building == Some(completed) {
-            self.ahead_building = None;
-        }
-        if self.ahead_emitting == Some(completed) {
-            self.ahead_emitting = None;
-        }
+        self.ahead.end_building(completed);
+        self.ahead.end_emitting(completed);
         if self.building_on_parent != Some(completed) {
             debug!(target: "n42::cl::orchestrator", ?completed,
                 active = ?self.building_on_parent,
@@ -3182,11 +3335,7 @@ impl ConsensusService {
             state_diff_ready_tx,
             state_diff_ready_rx,
             speculative_build_hash: None,
-            ahead_ready: None,
-            ahead_validated: None,
-            ahead_tip: None,
-            ahead_building: None,
-            ahead_emitting: None,
+            ahead: ahead::AheadState::default(),
             building_on_parent: None,
             build_triggered_at: None,
             build_complete_tx,
@@ -3445,11 +3594,7 @@ impl ConsensusService {
             state_diff_ready_tx,
             state_diff_ready_rx,
             speculative_build_hash: None,
-            ahead_ready: None,
-            ahead_validated: None,
-            ahead_tip: None,
-            ahead_building: None,
-            ahead_emitting: None,
+            ahead: ahead::AheadState::default(),
             building_on_parent: None,
             build_triggered_at: None,
             build_complete_tx,
@@ -3919,10 +4064,10 @@ impl ConsensusService {
                     }
                 } => {
                     if let Some(ready) = payload_ready {
-                        if ready.own_block_validated {
-                            self.build_ahead_on(ready).await;
-                        } else {
+                        if ready.kind == ReadyKind::Payload {
                             self.handle_payload_build_ready(ready);
+                        } else {
+                            self.build_ahead_on(ready).await;
                         }
                     }
                 }
@@ -4011,7 +4156,11 @@ impl ConsensusService {
                     // Payload resolve task finished (success or failure).
                     // A stale task must never clear a newer view's build guard.
                     if let Some(completed) = completed_build {
+                        let fallback = self.take_failed_output_build(completed);
                         self.handle_payload_build_complete(completed);
+                        if let Some(validated) = fallback {
+                            self.build_ahead_on(validated).await;
+                        }
                     }
                 }
 
@@ -6061,7 +6210,7 @@ mod tests {
             !orch.handle_payload_build_ready(PayloadBuildReady {
                 context: stale_context,
                 block_hash: child,
-                own_block_validated: false,
+                kind: ReadyKind::Payload,
             }),
             "a payload from a sibling parent must not enter consensus"
         );
@@ -6083,7 +6232,7 @@ mod tests {
         assert!(orch.handle_payload_build_ready(PayloadBuildReady {
             context: locked_context,
             block_hash: child,
-            own_block_validated: false,
+            kind: ReadyKind::Payload,
         }));
 
         let proposal = match orch.output_rx.try_recv().expect("proposal output") {
@@ -6814,6 +6963,193 @@ mod tests {
         }));
     }
 
+    fn own_block_report(kind: ReadyKind, view: u64) -> PayloadBuildReady {
+        PayloadBuildReady {
+            context: PayloadBuildContext {
+                view,
+                parent_hash: B256::repeat_byte(0x0A),
+            },
+            block_hash: B256::repeat_byte(0x0B),
+            kind,
+        }
+    }
+
+    #[test]
+    fn a_sealed_own_block_starts_its_child_on_its_output() {
+        let sealed = own_block_report(ReadyKind::OwnBlockSealed, 5);
+        let child = PayloadBuildContext {
+            view: 6,
+            parent_hash: sealed.block_hash,
+        };
+        assert_eq!(
+            ahead_step(&sealed, 5, 1, true, true, false),
+            AheadStep::BuildOnOutput(child)
+        );
+        // Switched off, a sealed block starts nothing.
+        assert_eq!(ahead_step(&sealed, 5, 1, true, false, false), AheadStep::Skip);
+        // Not the next leader, or the view has moved on.
+        assert_eq!(ahead_step(&sealed, 5, 1, false, true, false), AheadStep::Skip);
+        assert_eq!(ahead_step(&sealed, 6, 1, true, true, false), AheadStep::Skip);
+        // The block's own view has not started: one block ahead at most.
+        assert_eq!(ahead_step(&sealed, 4, 1, true, true, false), AheadStep::Hold);
+        // A child already built starts nothing.
+        assert_eq!(ahead_step(&sealed, 5, 1, true, true, true), AheadStep::Skip);
+        // A proposal release is never a reason to build ahead.
+        let payload = own_block_report(ReadyKind::Payload, 5);
+        assert_eq!(ahead_step(&payload, 5, 1, true, true, false), AheadStep::Skip);
+    }
+
+    #[test]
+    fn two_blocks_ahead_build_on_the_next_views_output() {
+        // Block of view 6 sealed while view 5 is current: its child, of view
+        // 7, is built on its output.
+        let sealed = own_block_report(ReadyKind::OwnBlockSealed, 6);
+        let child = PayloadBuildContext {
+            view: 7,
+            parent_hash: sealed.block_hash,
+        };
+        assert_eq!(
+            ahead_step(&sealed, 5, 2, true, true, false),
+            AheadStep::BuildOnOutput(child)
+        );
+        assert_eq!(ahead_step(&sealed, 5, 1, true, true, false), AheadStep::Hold);
+        // Two blocks ahead at most.
+        let further = own_block_report(ReadyKind::OwnBlockSealed, 7);
+        assert_eq!(ahead_step(&further, 5, 2, true, true, false), AheadStep::Hold);
+        assert_eq!(
+            ahead_step(&further, 6, 2, true, true, false),
+            AheadStep::BuildOnOutput(PayloadBuildContext {
+                view: 8,
+                parent_hash: further.block_hash
+            })
+        );
+        // The validation of a block whose child is under way only moves
+        // the head; without a build of the child it waits for its view.
+        let validated = own_block_report(ReadyKind::OwnBlockValidated, 6);
+        assert_eq!(
+            ahead_step(&validated, 5, 2, true, true, true),
+            AheadStep::AnnounceHead
+        );
+        assert_eq!(ahead_step(&validated, 5, 2, true, true, false), AheadStep::Hold);
+        assert_eq!(
+            ahead_step(&validated, 6, 2, true, true, false),
+            AheadStep::Build(child)
+        );
+        // Not leading the view after the block's.
+        assert_eq!(ahead_step(&sealed, 5, 2, false, true, false), AheadStep::Skip);
+    }
+
+    #[test]
+    fn a_sealed_own_block_guards_its_own_view_before_its_child_starts() {
+        // run148: the child build on the output took over `ahead_building`
+        // while the block's proposal was still pending; the block's own view
+        // then started a second build on the block's parent.
+        let sealed = own_block_report(ReadyKind::OwnBlockSealed, 5);
+        assert_eq!(own_block_guards(&sealed, 5), (Some(sealed.context), None));
+        assert_eq!(own_block_guards(&sealed, 4), (Some(sealed.context), None));
+        assert_eq!(own_block_guards(&sealed, 6), (None, None));
+        let validated = own_block_report(ReadyKind::OwnBlockValidated, 5);
+        assert_eq!(
+            own_block_guards(&validated, 5),
+            (
+                Some(validated.context),
+                Some((validated.block_hash, validated.context.parent_hash))
+            )
+        );
+    }
+
+    #[test]
+    fn a_validated_own_block_builds_its_child_once() {
+        let validated = own_block_report(ReadyKind::OwnBlockValidated, 5);
+        let child = PayloadBuildContext {
+            view: 6,
+            parent_hash: validated.block_hash,
+        };
+        assert_eq!(
+            ahead_step(&validated, 5, 1, true, true, false),
+            AheadStep::Build(child)
+        );
+        assert_eq!(
+            ahead_step(&validated, 5, 1, true, true, true),
+            AheadStep::AnnounceHead,
+            "the child is built already"
+        );
+        assert_eq!(ahead_step(&validated, 4, 1, true, true, false), AheadStep::Hold);
+    }
+
+    #[test]
+    fn a_produced_child_held_for_its_view_covers_its_parent() {
+        let mut orch = make_test_orchestrator_with_state(None);
+        let validated = own_block_report(ReadyKind::OwnBlockValidated, 5);
+        let child = PayloadBuildContext {
+            view: 6,
+            parent_hash: validated.block_hash,
+        };
+        // The child was built on the output, produced, and its record ended.
+        orch.ahead.hold_payload(PayloadBuildReady {
+            context: child,
+            block_hash: B256::repeat_byte(0x0D),
+            kind: ReadyKind::Payload,
+        });
+        assert!(orch.ahead.child_covered(child));
+        assert!(orch.ahead.output_build(child).is_none());
+    }
+
+    #[test]
+    fn a_build_on_output_without_a_payload_falls_back_to_the_validated_block() {
+        let mut orch = make_test_orchestrator_with_state(None);
+        let validated = own_block_report(ReadyKind::OwnBlockValidated, 5);
+        let child = PayloadBuildContext {
+            view: 6,
+            parent_hash: validated.block_hash,
+        };
+        orch.ahead.start_output_build(child);
+        orch.ahead.output_build_mut(child).unwrap().validated = Some(validated);
+        let other = PayloadBuildContext { view: 7, ..child };
+        assert_eq!(orch.take_failed_output_build(other), None);
+        assert!(orch.ahead.output_build(child).is_some(), "another build's end keeps the record");
+        assert_eq!(orch.take_failed_output_build(child), Some(validated));
+        assert!(orch.ahead.output_build(child).is_none());
+
+        // A build that released its payload needs no second build.
+        orch.ahead.start_output_build(child);
+        orch.ahead.output_build_mut(child).unwrap().validated = Some(validated);
+        orch.ahead.start_building(child);
+        orch.handle_payload_build_ready(PayloadBuildReady {
+            context: child,
+            block_hash: B256::repeat_byte(0x0D),
+            kind: ReadyKind::Payload,
+        });
+        assert!(orch.ahead.output_build(child).is_some_and(|build| build.produced));
+        assert!(orch.ahead.building_on(child.parent_hash).is_none());
+        assert_eq!(orch.take_failed_output_build(child), None);
+    }
+
+    #[tokio::test]
+    async fn a_view_change_releases_the_held_payload_and_keeps_the_next_one() {
+        let mut orch = make_test_orchestrator_with_state(None);
+        let view = orch.engine.current_view();
+        let required = orch.required_payload_build_context().expect("genesis context");
+        let first = PayloadBuildReady {
+            context: PayloadBuildContext { view, ..required },
+            block_hash: B256::repeat_byte(0x21),
+            kind: ReadyKind::Payload,
+        };
+        let second = PayloadBuildReady {
+            context: PayloadBuildContext {
+                view: view + 1,
+                parent_hash: first.block_hash,
+            },
+            block_hash: B256::repeat_byte(0x22),
+            kind: ReadyKind::Payload,
+        };
+        orch.ahead.hold_payload(second);
+        orch.ahead.hold_payload(first);
+        // The released payload goes to consensus; the next view's waits.
+        orch.take_ahead_build(view).await;
+        assert_eq!(orch.ahead.ready, vec![second]);
+    }
+
     #[tokio::test]
     async fn test_block_ready_channel() {
         let mut orch = make_test_orchestrator_with_state(None);
@@ -6826,7 +7162,7 @@ mod tests {
                 parent_hash: B256::repeat_byte(0xEE),
             },
             block_hash: test_hash,
-            own_block_validated: false,
+            kind: ReadyKind::Payload,
         };
         block_ready_tx.send(ready).await.unwrap();
 
