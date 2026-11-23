@@ -20,7 +20,9 @@ pub const GOV5_BODIES_BY_RANGE_PROTOCOL: &str = "/rpc/bodies_by_range/1/ssz_snap
 /// Gov5's one-way Rotor/leader-direct HotStuff stream.
 pub const GOV5_HOTSTUFF_DIRECT_PROTOCOL: &str = "/rpc/hotstuff_direct/1";
 
-const MAX_GOV5_BLOCK_SIZE: usize = 32 * 1024 * 1024;
+/// Decoded bound for by-hash and push block chunks; the N42 sync standard
+/// (W1) sets every block chunk to 64 MiB, the range chunk bound.
+const MAX_GOV5_BLOCK_SIZE: usize = 64 * 1024 * 1024;
 const MAX_SNAPPY_FRAME_SIZE: usize = MAX_GOV5_BLOCK_SIZE + (MAX_GOV5_BLOCK_SIZE / 6) + 1024;
 const MAX_GOV5_HOTSTUFF_SIZE: usize = 16 * 1024;
 
@@ -1578,8 +1580,8 @@ mod tests {
     }
 
     #[test]
-    fn block_by_hash_rejects_payloads_above_32_mib() {
-        let oversized = vec![0u8; 32 * 1024 * 1024 + 1];
+    fn block_by_hash_rejects_payloads_above_64_mib() {
+        let oversized = vec![0u8; 64 * 1024 * 1024 + 1];
         let error = encode_chunked_block(&oversized, [1, 2, 3, 4]).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 
