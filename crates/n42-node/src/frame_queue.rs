@@ -460,7 +460,7 @@ impl<R: FnOnce() -> Rest + Send> BestTransactions for QueuedFrameTransactions<R>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alloy_consensus::{TxLegacy, transaction::Recovered};
     use alloy_primitives::{Bytes, Signature, TxKind, U256};
@@ -470,7 +470,7 @@ mod tests {
         identifier::{SenderId, TransactionId},
     };
 
-    fn tx(sender: u8, nonce: u64) -> QueuedTx {
+    pub(crate) fn tx(sender: u8, nonce: u64) -> QueuedTx {
         let signed = alloy_consensus::SignableTransaction::into_signed(
             TxLegacy {
                 chain_id: Some(1),

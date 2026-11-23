@@ -779,16 +779,21 @@ where
                 // block even though it is not queued here: a node that cannot
                 // put the block together stops importing, its queue never
                 // drains, and the gate never opens again.
-                if crate::frame_queue::frame_queue_enabled()
+                // The extended ack reports a frame now held as consumed
+                // (with none accepted): sending it again would only hold it
+                // again until this node's queue has room.
+                let held = if crate::frame_queue::frame_queue_enabled()
                     && n42_tx_types::frame_ref_blocks_enabled()
                 {
-                    admit_native_frame(&pool, stats, native, frame, true).await;
-                }
+                    admit_native_frame(&pool, stats, native, frame, true).await
+                } else {
+                    0
+                };
                 write_ack(
                     &mut stream,
                     0,
                     pending_before,
-                    0,
+                    held,
                     leased_credit_remaining,
                     extended_ack_enabled,
                     credit_probe_enabled,
@@ -1119,7 +1124,8 @@ const MAX_HELD_FRAMES: usize = 1 << 16;
 
 /// Authenticates a native frame and admits it. With `hold_only` the frame is
 /// kept for blocks that refer to it but is not offered to this node's builder;
-/// the caller reports it as deferred.
+/// the result is then the frame's size if the store holds it (none of it is
+/// accepted: the caller reports it as consumed), else 0.
 async fn admit_native_frame<P>(
     pool: &P,
     stats: &IngestStats,
@@ -1197,6 +1203,7 @@ where
     metrics::histogram!("n42_ingest_batch_duration_ms", "phase" => "native_authenticate", "auth" => outcome)
         .record(auth_start.elapsed().as_secs_f64() * 1_000.0);
     if hold_only {
+        let held = stored || n42_tx_types::FrameStore::global().get(&frame.root()).is_some();
         if stored {
             let mut held = HELD_FRAMES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if held.len() >= MAX_HELD_FRAMES {
@@ -1205,7 +1212,7 @@ where
             held.insert(frame.root());
         }
         metrics::counter!("n42_ingest_native_frames_total", "outcome" => "held").increment(1);
-        return 0;
+        return if held { num_txs } else { 0 };
     }
     metrics::counter!("n42_ingest_native_frames_total", "outcome" => outcome).increment(1);
     let held_before = HELD_FRAMES

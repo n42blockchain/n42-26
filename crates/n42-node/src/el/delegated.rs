@@ -26,6 +26,9 @@ const POLL: Duration = Duration::from_millis(5);
 pub struct DelegatedExecutionLayer {
     owner: SocketAddr,
     wait: Duration,
+    /// With the frame queue: takes committed blocks' transactions out of
+    /// this key's queue, which no canonical chain of its own drains.
+    committed: Option<std::sync::Arc<super::committed_frames::CommittedFrames>>,
 }
 
 impl DelegatedExecutionLayer {
@@ -42,7 +45,11 @@ impl DelegatedExecutionLayer {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(2_000);
-        Ok(Some(Self { owner, wait: Duration::from_millis(wait) }))
+        Ok(Some(Self {
+            owner,
+            wait: Duration::from_millis(wait),
+            committed: crate::frame_queue::frame_queue_enabled().then(Default::default),
+        }))
     }
 
     /// Whether the owner's canonical chain holds `hash`.
@@ -80,10 +87,21 @@ impl ExecutionLayer for DelegatedExecutionLayer {
     async fn new_payload(&self, payload: ExecutionData) -> Result<PayloadStatus, ElError> {
         let hash = payload.block_hash();
         let started = std::time::Instant::now();
+        // The block's transaction hashes, derived while the owner is asked.
+        let imported = self.committed.is_some().then(|| {
+            tokio::task::spawn_blocking(move || {
+                super::committed_frames::ImportedBlock::of(&payload)
+            })
+        });
         loop {
             if self.owner_holds(hash).await? {
                 metrics::histogram!("n42_delegated_el_wait_ms")
                     .record(started.elapsed().as_secs_f64() * 1000.0);
+                if let (Some(committed), Some(imported)) = (&self.committed, imported)
+                    && let Ok(block) = imported.await
+                {
+                    committed.imported(block);
+                }
                 return Ok(PayloadStatus::new(PayloadStatusEnum::Valid, Some(hash)));
             }
             if started.elapsed() >= self.wait {
@@ -100,6 +118,19 @@ impl ExecutionLayer for DelegatedExecutionLayer {
     ) -> Result<ForkchoiceUpdated, ElError> {
         // The owner moves its own head; this key has no chain to move.
         let status = if self.owner_holds(state.head_block_hash).await? {
+            // Only the finalized block is committed; the head may run ahead.
+            if let Some(committed) = self.committed.clone()
+                && !state.finalized_block_hash.is_zero()
+            {
+                let head = state.finalized_block_hash;
+                tokio::task::spawn_blocking(move || {
+                    committed.committed(
+                        crate::frame_queue::FrameQueue::global(),
+                        n42_tx_types::FrameStore::global(),
+                        head,
+                    )
+                });
+            }
             PayloadStatus::new(PayloadStatusEnum::Valid, Some(state.head_block_hash))
         } else {
             PayloadStatus::from_status(PayloadStatusEnum::Syncing)
