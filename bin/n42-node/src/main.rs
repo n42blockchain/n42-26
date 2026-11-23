@@ -1236,6 +1236,10 @@ fn main() {
             .unwrap_or_else(|| ".".into()),
     );
 
+    #[cfg(all(feature = "jemalloc", unix))]
+    n42_node::memory_watch::set_allocator_source(jemalloc_counters);
+    n42_node::memory_watch::spawn_memory_log();
+
     // Leave HTTP RPC disabled by default for release-oriented startup.
     //
     // NOTE: Do NOT call with_http_api()/with_ws_api() here — reth's
@@ -2156,6 +2160,25 @@ fn main() {
                     .flatten()
                     .unwrap_or_default();
 
+                {
+                    // Canonical blocks leave the in-memory state once persisted.
+                    let provider = full_node.provider.clone();
+                    n42_node::memory_watch::set_backlog_source(move || {
+                        let mut backlog = n42_node::memory_watch::Backlog::default();
+                        if let Some(head) = provider.canonical_in_memory_state().head_state() {
+                            for state in head.chain() {
+                                backlog.blocks += 1;
+                                backlog.transactions += state
+                                    .block_ref()
+                                    .recovered_block()
+                                    .body()
+                                    .transactions
+                                    .len() as u64;
+                            }
+                        }
+                        backlog
+                    });
+                }
                 let best_block_number = full_node.provider.best_block_number().unwrap_or(0);
                 let head_block_hash = {
                     if best_block_number > 0 {
@@ -3604,6 +3627,52 @@ fn main() {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
     }
+}
+
+/// jemalloc's allocated, active, resident, retained, mapped and metadata
+/// bytes, read after advancing its statistics epoch.
+#[cfg(all(feature = "jemalloc", unix))]
+fn jemalloc_counters() -> Vec<(&'static str, u64)> {
+    use std::ffi::{c_char, c_void};
+    // SAFETY: each name is NUL-terminated, and each counter is a size_t read
+    // into a size_t of the length passed.
+    unsafe fn read(name: &[u8]) -> Option<u64> {
+        let mut value: usize = 0;
+        let mut len = std::mem::size_of::<usize>();
+        let rc = unsafe {
+            tikv_jemalloc_sys::mallctl(
+                name.as_ptr() as *const c_char,
+                &mut value as *mut usize as *mut c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0).then_some(value as u64)
+    }
+    let mut epoch: u64 = 1;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: "epoch" takes and returns a u64.
+    unsafe {
+        tikv_jemalloc_sys::mallctl(
+            c"epoch".as_ptr(),
+            &mut epoch as *mut u64 as *mut c_void,
+            &mut len,
+            &mut epoch as *mut u64 as *mut c_void,
+            std::mem::size_of::<u64>(),
+        );
+    }
+    [
+        ("allocated", &b"stats.allocated\0"[..]),
+        ("active", b"stats.active\0"),
+        ("resident", b"stats.resident\0"),
+        ("retained", b"stats.retained\0"),
+        ("mapped", b"stats.mapped\0"),
+        ("metadata", b"stats.metadata\0"),
+    ]
+    .into_iter()
+    .filter_map(|(label, name)| unsafe { read(name) }.map(|bytes| (label, bytes)))
+    .collect()
 }
 
 #[cfg(test)]

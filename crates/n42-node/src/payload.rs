@@ -652,7 +652,12 @@ where
             parent_wait_ms = wait.elapsed().as_secs_f64() * 1_000.0;
             metrics::histogram!("n42_frame_queue_parent_wait_ms").record(parent_wait_ms);
         }
-        let pending = || self.pool.pool_size().pending + frame_queue.map_or(0, |queue| queue.pending());
+        // Behind a persistence backlog the build waits first, so the
+        // transactions it then takes are the ones there after the wait.
+        let backlog_wait_ms = crate::memory_watch::wait_for_persistence()
+            .map_or(0.0, |waited| waited.as_secs_f64() * 1_000.0);
+        let pending =
+            || self.pool.pool_size().pending + frame_queue.map_or(0, |queue| queue.pending());
         let idle_wait_ms = idle_wait_for_transactions(pending)
             .map_or(0.0, |waited| waited.as_secs_f64() * 1_000.0);
         let pool_size = self.pool.pool_size();
@@ -673,6 +678,7 @@ where
             pool_pending,
             frame_queue_parent_wait_ms = parent_wait_ms,
             idle_wait_ms,
+            backlog_wait_ms,
             "N42_BUILD_ENTRY: payload builder entered"
         );
         let result = crate::parallel_payload::build_with_parallel(

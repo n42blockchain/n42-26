@@ -10,6 +10,7 @@ pub mod exec_cache;
 pub mod frame_order;
 pub mod frame_queue;
 pub mod ingest;
+pub mod memory_watch;
 pub mod mobile_bridge;
 pub mod mobile_evidence;
 pub mod mobile_packet;
