@@ -35,8 +35,6 @@ use std::{
 
 /// Header bit of a native frame (`ingest.rs`).
 const NATIVE_FRAME: u32 = 0x4000_0000;
-/// Sends of one frame before it is given up on (20 ms apart).
-const MAX_FRAME_ATTEMPTS: u32 = 500;
 
 #[derive(Parser, Debug)]
 #[command(about = "Presigned 0x50 frames over the binary ingest")]
@@ -78,6 +76,12 @@ struct Args {
     /// Print the sender addresses (comma-separated) and the gateway public key, then exit.
     #[arg(long)]
     print_addresses: bool,
+    /// Sends of one refused frame before it is given up on (20 ms apart); 0 = never give up.
+    /// Under a sustained load the node's ingest gate refuses frames for as long as its queue is
+    /// above the high-water mark, and a dropped frame leaves a nonce gap for all of its senders,
+    /// so every later frame of those senders can never be included.
+    #[arg(long, default_value_t = 500)]
+    max_attempts: u32,
 }
 
 /// Knuth's multiplicative constant, as `n42-stress` and n42-rs `tx_flood` use it.
@@ -248,6 +252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .collect();
             let window = args.window.max(1);
+            let max_attempts = args.max_attempts;
             std::thread::spawn(move || -> std::io::Result<()> {
                 let mut stream = TcpStream::connect(&endpoint)?;
                 stream.set_nodelay(true)?;
@@ -256,25 +261,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // A frame refused for anything but the pool gate would come back
                 // refused forever; give up on it after ~10 s of retries.
                 let mut attempts = std::collections::HashMap::<usize, u32>::new();
+                // A group sends one frame at a time, and none past a refused one: its later
+                // frames are held until the frame in flight is accepted. A frame is one nonce of
+                // a group's senders, so a later frame of the group accepted first leaves a nonce
+                // gap that the node's queue keeps (counted against its high-water mark) and
+                // cannot build from.
+                let mut blocked = std::collections::HashSet::<usize>::new();
+                let mut held = VecDeque::<usize>::new();
                 loop {
                     while in_flight.len() < window {
-                        let Some(index) = retry.pop_front().or_else(|| queue.pop_front()) else {
+                        let next = if let Some(index) = retry.pop_front() {
+                            Some(index)
+                        } else {
+                            let mut picked = None;
+                            while let Some(index) = queue.pop_front() {
+                                let group = index % groups;
+                                if blocked.contains(&group)
+                                    || in_flight.iter().any(|i: &usize| i % groups == group)
+                                {
+                                    held.push_back(index);
+                                } else {
+                                    picked = Some(index);
+                                    break;
+                                }
+                            }
+                            picked
+                        };
+                        let Some(index) = next else {
                             break;
                         };
                         stream.write_all(&frames[index])?;
                         in_flight.push_back(index);
                     }
                     let Some(index) = in_flight.pop_front() else {
-                        break;
+                        if held.is_empty() {
+                            break;
+                        }
+                        // Every remaining frame waits on a refused group that is no longer in
+                        // flight (dropped after max attempts): give the held frames back.
+                        blocked.clear();
+                        queue.extend(held.drain(..));
+                        continue;
                     };
                     let mut ack = [0u8; 8];
                     stream.read_exact(&mut ack)?;
                     let count = u32::from_le_bytes(ack[..4].try_into().unwrap()) as u64;
+                    let group = index % groups;
                     if count == 0 {
                         deferred.fetch_add(1, Ordering::Relaxed);
                         let tries = attempts.entry(index).or_default();
                         *tries += 1;
-                        if *tries < MAX_FRAME_ATTEMPTS {
+                        if max_attempts == 0 || *tries < max_attempts {
+                            blocked.insert(group);
                             retry.push_back(index);
                         } else {
                             eprintln!("frame {index} refused {tries} times; dropped");
@@ -282,6 +320,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         std::thread::sleep(Duration::from_millis(20));
                     } else {
                         accepted.fetch_add(count, Ordering::Relaxed);
+                        blocked.remove(&group);
+                        // The group's held frames go first, in their original order.
+                        if held.iter().any(|i| i % groups == group) {
+                            let (mine, others): (VecDeque<usize>, VecDeque<usize>) =
+                                held.drain(..).partition(|i| i % groups == group);
+                            held = others;
+                            for index in mine.into_iter().rev() {
+                                queue.push_front(index);
+                            }
+                        }
                     }
                 }
                 stream.write_all(&0u32.to_le_bytes())?;
