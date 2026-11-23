@@ -196,7 +196,15 @@ def owned_process(runtime, index):
     pid = record["pid"]
     if process_identity(pid) != record["starttime"]:
         return None
-    command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\x00")
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except FileNotFoundError:
+        return None
+    # An exiting process (a zombie, or one whose memory is already released)
+    # reads an empty command line: it is the node shutting down.
+    if not raw:
+        return None
+    command = raw.split(b"\x00")
     if str(runtime / f"node{index}/reth").encode() not in command:
         raise ValueError(f"PID {pid} no longer belongs to this datadir; refusing to signal it")
     return pid
