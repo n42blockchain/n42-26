@@ -398,10 +398,17 @@ pub struct Gov5QmdbStateRootStore {
     read_spawn_failure: AtomicBool,
 }
 
+/// Read views [`Gov5QmdbStateRootStore::enable_read_views`] keeps whatever
+/// the byte budget: the newest block, its parent and the two before, which a
+/// build on an own block's output may read.
+const MIN_READ_VIEWS: usize = 4;
+
 #[derive(Debug)]
 struct QmdbReadViewCache {
     capacity: usize,
     byte_budget: usize,
+    /// Views kept even past the byte budget.
+    min_views: usize,
     logical_bytes: usize,
     views: HashMap<B256, Arc<QmdbReadView>>,
     order: VecDeque<B256>,
@@ -440,10 +447,16 @@ impl QmdbReadViewCache {
         } else {
             self.order.push_back(hash);
         }
-        // Keep the newest view even when it alone exceeds the budget: dropping
-        // it would force a full reconstruction for every execution provider.
+        // Keep the most recent views even when they exceed the budget:
+        // dropping one would force a full reconstruction (hundreds of
+        // milliseconds on a large state) for every execution provider that
+        // reads it. A leader building on its own sealed block reads the block
+        // before it, which is not the newest view; and consecutive views
+        // share all but their changed nodes, which the logical bytes charge
+        // once per view.
         while self.order.len() > 1
-            && (self.order.len() > self.capacity || self.logical_bytes > self.byte_budget)
+            && (self.order.len() > self.capacity
+                || (self.order.len() > self.min_views && self.logical_bytes > self.byte_budget))
         {
             if let Some(hash) = self.order.pop_front()
                 && let Some(view) = self.views.remove(&hash)
@@ -823,9 +836,10 @@ impl Gov5QmdbStateRootStore {
         &self,
         capacity: std::num::NonZeroUsize,
     ) -> Result<(), Gov5QmdbStateRootError> {
-        self.enable_read_views_with_budget(
+        self.enable_read_views_with_minimum(
             capacity,
             std::num::NonZeroUsize::new(512 * 1024 * 1024).unwrap(),
+            MIN_READ_VIEWS,
         )
     }
 
@@ -837,6 +851,17 @@ impl Gov5QmdbStateRootStore {
         &self,
         capacity: std::num::NonZeroUsize,
         byte_budget: std::num::NonZeroUsize,
+    ) -> Result<(), Gov5QmdbStateRootError> {
+        self.enable_read_views_with_minimum(capacity, byte_budget, 1)
+    }
+
+    /// [`Self::enable_read_views_with_budget`], keeping the `min_views` most
+    /// recently used views past the byte budget (at least the newest one).
+    pub fn enable_read_views_with_minimum(
+        &self,
+        capacity: std::num::NonZeroUsize,
+        byte_budget: std::num::NonZeroUsize,
+        min_views: usize,
     ) -> Result<(), Gov5QmdbStateRootError> {
         let _commit = self
             .commit
@@ -850,6 +875,7 @@ impl Gov5QmdbStateRootStore {
             *views = Some(QmdbReadViewCache {
                 capacity: capacity.get(),
                 byte_budget: byte_budget.get(),
+                min_views: min_views.max(1),
                 logical_bytes: 0,
                 views: HashMap::new(),
                 order: VecDeque::new(),
@@ -4511,6 +4537,33 @@ mod tests {
         );
         assert!(store.read_view_for(B256::repeat_byte(1)).unwrap().is_none());
         assert!(store.read_view_for(parent).unwrap().is_some());
+    }
+
+    #[test]
+    fn read_cache_keeps_the_recent_views_past_the_byte_budget() {
+        let (store, _) = store();
+        store
+            .enable_read_views_with_minimum(
+                std::num::NonZeroUsize::new(64).unwrap(),
+                std::num::NonZeroUsize::new(1).unwrap(),
+                4,
+            )
+            .unwrap();
+        let mut parent = store.base_block_hash();
+        for number in 1..=8 {
+            let hash = B256::repeat_byte(number);
+            store
+                .compute_and_commit(parent, hash, store.base_root(), Vec::new())
+                .unwrap();
+            parent = hash;
+        }
+        // Every view alone exceeds the budget; the four newest stay.
+        for number in 1..=4 {
+            assert!(store.read_view_for(B256::repeat_byte(number)).unwrap().is_none());
+        }
+        for number in 5..=8 {
+            assert!(store.read_view_for(B256::repeat_byte(number)).unwrap().is_some());
+        }
     }
 
     #[test]
