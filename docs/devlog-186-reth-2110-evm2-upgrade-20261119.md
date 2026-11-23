@@ -1217,3 +1217,62 @@ finish 55.3 / 54.7 → 55.3 / 55.7；周期 192.2 / 205.7 → 187.0 / 188.5。
 - 与 n42-rs 同口径：450,793 对 5.69M，约 12.6 倍。
 - 轮次脚本问题：`export N42_BIN` 写在 `sha256sum $N42_BIN` 之后，空路径使 sha256sum 读标准输入，挂起约 4 小时；已修正后续脚本顺序。
 - 待测：round BK（领先两块、合并表预取）与 round BL（空闲等待、账户历史并行、不写交易哈希索引）；排队任务曾因主机内存紧张被停止，未运行。
+
+## 进度记录（2026-11-23 续八）：run182 node0 OOM（round BM，均默认关闭）
+
+### 现象与证据
+
+run182（depth 2 + idle wait，无并行账户历史，26M，flood `--broadcast --connections 8`）node0 负载约 1 分钟时被 OOM kill。内核日志（22:41:54）是**全局 OOM**（`constraint=CONSTRAINT_NONE, global_oom`），由 native-flood 的分配触发：当时 node0 47.3 GB、六个 follower 12.8–13.8 GB（合计约 78 GB）、native-flood 3.8 GB，合计约 130.5 GB / 主机 136 GB。follower 的 13 GB 在 node0 死前已存在（run180/181 结束时也为 12.1–14.2 GB），不是 node0 死后重发造成的。
+
+node0 日志：frame queue 稳定在约 1.91–1.97M（`N42_INGEST_HIGH_WATER=2000000` 限住）；到 03:41:49 ingest accepted 24.24M ≈ 已提交约 22.3M + 队列 1.93M，入口没有额外积压。
+
+逐项排查（均有上限）：build_on_output `KEPT=4`、payload_cache 4、frame store 4096 帧（约 600 MB）、frame queue ≤ 2M、QMDB read cache depth 2 时 logical 0.72 GB（depth 1 为 2.3 GB）、undo 256 MB 上限、eth block cache 约 2.1 GB。**唯一没有上限的是 engine 中未持久化的 canonical 块**（只受 1024 块的 backpressure 约束）：每个满块在内存中带交易、senders、收据、BundleState（约 11.5 万账户含 original 与 reverts）、hashed state，估算约 150 MB/满块（约 1.6 KB/笔）。持久化速度：run181（并行账户历史）共 103 s，约 0.32 s/满块；run177（无）约 0.43 s/满块。负载 53 s 结束时积压约 100（181）与约 127（182）个满块，按 150 MB 计约 15–19 GB，加上负载后约 23 GB 的基线与约 4 GB 信封，与 47 GB 吻合。run181 很可能也接近这个峰值，只是主机余量刚好够用。
+
+另一项常驻内存：`committed_blocks` 环保留 10,000 个已提交块的广播信封（`SharedBlockData`，满块约 14.3 MB），26M 负载约 274 个满块，每个节点约 3.9 GB，七个节点合计约 27 GB。该信封用于同步服务与本地重驱，本轮未改动。
+
+结束时的 RSS 不能代表峰值：jemalloc 未开 background thread，空闲节点不再分配，脏页不会回收，所以 idle-wait 腿结束时 RSS 偏高（28/36 GB），没有 idle wait 的腿持续出块，脏页被回收。
+
+### 实施
+
+- `crates/n42-node/src/memory_watch.rs`（新）：
+  - `set_backlog_source` / `backlog()`：由 bin 注册，读取 `canonical_in_memory_state().head_state().chain()` 的块数与交易数（持久化后移出内存，即未持久化积压）。
+  - `N42_MAX_UNPERSISTED_TXS=<n>`（0/未设=关）：`try_build` 在 idle wait 之前，积压 ≥ n 时每 5 ms 轮询等待，最长 `N42_BACKLOG_WAIT_MS`（默认 1000，最大 3000，低于 4 s 基础视图超时），超时后照常构块（计数 `n42_persistence_backlog_wait_expired_total`）。直方图 `n42_persistence_backlog_wait_ms`，BUILD_ENTRY 增加 `backlog_wait_ms`。
+  - `N42_MEM_LOG_SECS=<s>`（0=关）：每 s 秒输出 `N42_MEM` 行：rss、jemalloc allocated/active/resident/retained/mapped/metadata（MiB）、未持久化块数与交易数、frame queue pending、frame store 帧数；同时设置 gauge `n42_mem_resident_bytes`、`n42_mem_allocator_bytes{counter}`、`n42_unpersisted_blocks`、`n42_unpersisted_transactions`。节点被 kill 后日志仍保留时间线。
+- `bin/n42-node`：`jemalloc` feature 增加 `tikv-jemalloc-sys`（0.7.1，`stats`），用 `mallctl` 读取计数；在 `on_node_started` 注册积压来源。
+- 测试：`memory_watch::tests`（等待在积压降下或到时限时结束；能读到 RSS）。
+
+### 代价
+
+- 按交易数限积压：无持久性代价（反而减少崩溃时丢失的内存块）；达到上限后链速降到持久化速度（run181 配置约 28 万 tx/s），20/30 s 窗口 TPS 在上限触达后下降。上限 3M 约 32 个满块，按 1.6 KB/笔约 5 GB。
+- jemalloc stats：reth 自身 jemalloc 构建即开启，开销很小。
+
+### 问题
+
+- `cargo fmt -p n42-node` 重排了大量无关文件（仓库并非 fmt 干净），已全部还原，只保留本轮改动。
+- clippy：`bool::then(..).unwrap_or(..)` 改为 if/else；`jemalloc_counters` 放在测试模块之后触发 `items_after_test_module`，已移到前面。
+
+### 状态与后续
+
+- 门禁：clippy 通过；四个 crate 982 测试 0 失败；n42-node-bin 25 测试通过；profiling 构建 sha256 `1e6483f9…a6a5c9`。
+- fleet：先加 `N42_MEM_LOG_SECS=2`（不改变行为）重跑 run181/182 配置，得到 rss、jemalloc 与未持久化交易数的时间线，确认每笔积压的内存；再用 `N42_MAX_UNPERSISTED_TXS`（例如 3000000）限住峰值。可选 `_RJEM_MALLOC_CONF=background_thread:true` 让空闲节点归还脏页。
+- 未改：`committed_blocks` 信封保留（每节点约 3.9 GB），改动会影响同步服务，需单独设计。
+
+## 进度记录（2026-11-23）：round BK–BO 与未持久化积压
+
+单执行节点，`N42_BUILD_ON_OUTPUT=1`，反压阈值 1024；原始输出 `.artifacts/native-port-p0/run17[4-9]*`、`run18[0-4]*`。
+
+| 轮次 | 配置 | 20 s 窗口 | 30 s 窗口 | 备注 |
+|---|---|---|---|---|
+| run174 | 领先两块，20M | 542,857 | 490,323（负载未覆盖） | 两视图构建 2729，stale 1 |
+| run175 | 合并表预取，20M | 461,904 | 450,793 | 无收益 |
+| run176 | 两者，20M | 538,095 | 493,591（未覆盖） | |
+| run177 | 空闲等待 200 ms，20M | 428,571 | 441,269 | 反压停顿 0 |
+| run178 | 三项持久化修复 | — | — | 节点拒绝 `--prune.transaction-lookup.full`（QMDB archive+ 不允许剪枝），弃用 |
+| run179 | 空闲等待 + 账户历史并行，20M | 409,523 | 425,396 | 停顿 0 |
+| run180/181 | 领先两块 + 空闲等待 + 账户历史并行，26M | 504,761 / 500,000 | 479,365 / 485,714 | 压测接收约 49 万/s，窗口内 24–26 块不满 |
+| run182 | 领先两块 + 空闲等待，26M | — | — | 全机 OOM，node0 47 GB 被杀 |
+| run184 | 同 run181 + `N42_MEM_LOG_SECS=2`，26M | — | — | 跑到负载结束后，后台任务因主机内存紧张被停，机群手动停止 |
+
+run184 node0 的 `N42_MEM` 时间线：未持久化交易 181 万 → 895 万时 jemalloc allocated 18.2 → 32.6 GB，约 2 KB/笔（满块约 190 MB）；
+峰值 170 块、1095 万笔未持久化，node0 RSS 41 GB；6 个 follower 各约 13 GB。结论：持续负载下的瓶颈是持久化（满块 0.3–0.4 s），
+领先两块的 ~54 万链速只能维持到内存耗尽；`N42_MAX_UNPERSISTED_TXS` 把链速限到持久化速度。下一步：20M 负载下测上限 3M 的持续吞吐；持久化提速需另行设计。
