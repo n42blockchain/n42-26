@@ -78,9 +78,20 @@ pub fn attributable_hash(encoded: &[u8]) -> Option<B256> {
     }
     let header_rlp = take_rlp_item(&mut payload)?;
     // Confirm it parses as a header before trusting the hash: otherwise any
-    // leading list item would masquerade as one.
-    Gov5NativeHeader::decode(header_rlp).ok()?;
+    // leading list item would masquerade as one. A Profile-1 block carries
+    // the 24-element header.
+    if Gov5NativeHeader::decode(header_rlp).is_err()
+        && n42_chainspec::profile1::Profile1Header::decode(header_rlp).is_err()
+    {
+        return None;
+    }
     Some(keccak256(header_rlp))
+}
+
+/// Decodes a served or gossiped block in either wire layout: the gov5 one or
+/// a Profile-1 chain's 24-element one.
+pub fn decode_wire_block_rlp(encoded: &[u8]) -> Result<Gov5GossipBlock, Gov5BlockError> {
+    decode_gov5_block_rlp(encoded).or_else(|gov5| decode_profile1_block_rlp(encoded).map_err(|_| gov5))
 }
 
 const GOV5_H2_SEAL_BYTES: usize = 96;
@@ -221,13 +232,16 @@ fn header_qc_wire(header_qc: Option<&Gov5HeaderQc>, view: u64, parent: B256) -> 
         if cursor == qc.block_hash {
             return &qc.wire;
         }
-        let Some(header) = n42_consensus::remembered_gov5_native_header(&cursor) else {
+        let Some(header) = n42_consensus::remembered_gov5_native_header(&cursor)
+            .map(|native| native.header)
+            .or_else(|| n42_consensus::remembered_profile1_header(&cursor).map(|p1| p1.header))
+        else {
             break;
         };
-        if header.header.number == 0 {
+        if header.number == 0 {
             break;
         }
-        cursor = header.header.parent_hash;
+        cursor = header.parent_hash;
     }
     metrics::counter!("n42_header_qc_omitted_total", "reason" => "ancestor").increment(1);
     tracing::warn!(target: "n42::interop::h2v4", %parent, qc_view = qc.view,
@@ -578,6 +592,9 @@ fn normalize_native_payload(
 /// form. Auxiliary verifier/reward lists are empty because execution validity
 /// and H2-v4 consensus authentication are carried independently.
 pub fn encode_gov5_block_rlp(execution: &ExecutionData) -> Result<Vec<u8>, Gov5BlockError> {
+    if let Some(header) = n42_consensus::remembered_profile1_header(&execution.block_hash()) {
+        return encode_profile1_payload(execution, &header);
+    }
     let block = reconstruct_gov5_block_raw(execution)?;
     validate_gov5_interop_header(&block.header)
         .map_err(|error| Gov5BlockError::HeaderProfile(error.to_string()))?;
@@ -611,8 +628,6 @@ pub fn encode_gov5_block_rlp(execution: &ExecutionData) -> Result<Vec<u8>, Gov5B
     } else {
         block.header.encode(&mut header_rlp);
     }
-    let transaction_bytes = &block.body.transactions;
-    let verifiers = Vec::<Bytes>::new();
     let rewards = n42_consensus::gov5_withdrawals_to_rewards(
         block
             .body
@@ -621,6 +636,160 @@ pub fn encode_gov5_block_rlp(execution: &ExecutionData) -> Result<Vec<u8>, Gov5B
             .map(|w| w.as_slice())
             .unwrap_or_default(),
     );
+    Ok(encode_block_wire(&header_rlp, &block.body.transactions, &rewards))
+}
+
+/// A locally built payload turned into a sealed Profile-1 block.
+#[derive(Debug)]
+pub struct Profile1BuiltBlock {
+    /// The payload under the Profile-1 hash, as the engine imports it.
+    pub payload: ExecutionData,
+    /// The sealed 24-element header (remembered in the native header
+    /// registry under its hash).
+    pub header: Profile1Header,
+}
+
+/// Turns a payload this node's builder assembled and executed into the
+/// Profile-1 block of `view` (mixed production standard B1-B12), sealed by
+/// `key` (B2, the leader of `view`).
+///
+/// The header carries the block's own execution results: `state_root` (the
+/// QMDB root), `receipts_root` (the native receipts root, B7), and the
+/// payload's own gas used and logs bloom. Deferred execution (A10/B13)
+/// replaces exactly these four with the parent's results at this step and
+/// nowhere else.
+///
+/// Fields that are execution inputs are checked, never changed: `prevRandao`
+/// must already be zero (B3) and the requests hash `sha256("")` (AM24, B8).
+/// Only header fields that do not enter execution are written: ommers hash
+/// and difficulty zero (B3), the rewards root of the withdrawals (B6),
+/// `slotNumber` = number (B10), the gap and `mobileRegistryRoot` (B11, B12),
+/// and `extraData` = `N42H || view || qc || seal` (B1). `header_qc` is the
+/// last CommitQC the leader holds; it is embedded when it names the parent
+/// or a remembered ancestor and is below `view`, else the QC is absent.
+pub fn seal_built_payload_for_profile1(
+    execution: &ExecutionData,
+    view: u64,
+    header_qc: Option<&Gov5HeaderQc>,
+    state_root: B256,
+    receipts_root: B256,
+    mobile_registry_root: B256,
+    key: &n42_primitives::BlsSecretKey,
+) -> Result<Profile1BuiltBlock, Gov5BlockError> {
+    let invalid = |reason: String| Gov5BlockError::HeaderProfile(format!("profile 1: {reason}"));
+    let block = execution
+        .payload
+        .clone()
+        .into_block_with_sidecar_raw(&execution.sidecar)
+        .map_err(|error| Gov5BlockError::PayloadReconstruction(error.to_string()))?;
+    let mut header = block.header;
+    if header.mix_hash != B256::ZERO {
+        return Err(invalid(format!("prevRandao {} is not zero (B3)", header.mix_hash)));
+    }
+    if header.requests_hash != Some(n42_chainspec::profile1::PROFILE1_REQUESTS_HASH) {
+        return Err(invalid(format!(
+            "requestsHash {:?} is not sha256(\"\") (AM24)",
+            header.requests_hash
+        )));
+    }
+    if header.block_access_list_hash.is_some() {
+        return Err(invalid("the payload carries a block access list".to_owned()));
+    }
+    let rewards = n42_consensus::gov5_withdrawals_to_rewards(
+        block
+            .body
+            .withdrawals
+            .as_ref()
+            .map(|withdrawals| withdrawals.as_slice())
+            .unwrap_or_default(),
+    );
+    header.ommers_hash = B256::ZERO;
+    header.difficulty = U256::ZERO;
+    header.state_root = state_root;
+    header.receipts_root = receipts_root;
+    header.withdrawals_root = Some(n42_consensus::gov5_native_rewards_root(&rewards));
+    header.slot_number = Some(header.number);
+    header.extra_data = n42_chainspec::profile1::profile1_extra(
+        view,
+        header_qc_wire(header_qc, view, header.parent_hash),
+    );
+    let mut sealed = Profile1Header {
+        header,
+        mobile_registry_root,
+    };
+    sealed
+        .seal(key)
+        .map_err(|error| invalid(error.to_string()))?;
+    let hash = remember_gov5_native_header(&sealed.encode());
+    // The payload carries no ommers hash, difficulty, withdrawals root,
+    // slot or registry root; what changed in it is the two roots, the
+    // extra data and the hash.
+    let mut payload = execution.clone();
+    let fields = payload.payload.as_v1_mut();
+    fields.state_root = state_root;
+    fields.receipts_root = receipts_root;
+    fields.extra_data = sealed.header.extra_data.clone();
+    fields.block_hash = hash;
+    Ok(Profile1BuiltBlock {
+        payload,
+        header: sealed,
+    })
+}
+
+/// The gov5 wire form of a Profile-1 payload under its remembered header:
+/// the payload's transactions and rewards must be the ones the header
+/// commits to.
+fn encode_profile1_payload(
+    execution: &ExecutionData,
+    header: &Profile1Header,
+) -> Result<Vec<u8>, Gov5BlockError> {
+    // The payload's extra data is longer than Ethereum allows; only the body
+    // is read here, the header is the remembered one.
+    let mut payload = execution.payload.clone();
+    payload.set_extra_data(Bytes::new());
+    let block = payload
+        .into_block_with_sidecar_raw(&execution.sidecar)
+        .map_err(|error| Gov5BlockError::PayloadReconstruction(error.to_string()))?
+        .try_map_transactions(|bytes| {
+            N42TxEnvelope::decode_2718_exact(bytes.as_ref())
+                .map_err(|error| Gov5BlockError::PayloadReconstruction(error.to_string()))
+        })?;
+    if calculate_transaction_root(&block.body.transactions) != header.header.transactions_root {
+        return Err(Gov5BlockError::TransactionRootMismatch);
+    }
+    let rewards = n42_consensus::gov5_withdrawals_to_rewards(
+        block
+            .body
+            .withdrawals
+            .as_ref()
+            .map(|withdrawals| withdrawals.as_slice())
+            .unwrap_or_default(),
+    );
+    if Some(n42_consensus::gov5_native_rewards_root(&rewards)) != header.header.withdrawals_root {
+        return Err(Gov5BlockError::RewardsRootMismatch);
+    }
+    Ok(encode_profile1_block_rlp(header, &block.body.transactions, &rewards))
+}
+
+/// Encodes a Profile-1 block in gov5's sealed-block wire form: the exact
+/// 24-element header, the transactions (EIP-2718), an empty verifier list and
+/// the rewards (B6). [`decode_profile1_block_rlp`] reads it back.
+pub fn encode_profile1_block_rlp(
+    header: &Profile1Header,
+    transactions: &[N42TxEnvelope],
+    rewards: &[Gov5Reward],
+) -> Vec<u8> {
+    let transactions: Vec<Bytes> = transactions
+        .iter()
+        .map(|transaction| transaction.encoded_2718().into())
+        .collect();
+    encode_block_wire(&header.encode(), &transactions, rewards)
+}
+
+/// `[header, transactions, verifiers (empty), rewards]` with the header
+/// already encoded.
+fn encode_block_wire(header_rlp: &[u8], transaction_bytes: &[Bytes], rewards: &[Gov5Reward]) -> Vec<u8> {
+    let verifiers = Vec::<Bytes>::new();
     let mut reward_items = Vec::new();
     for reward in rewards {
         RlpHeader {
@@ -639,7 +808,7 @@ pub fn encode_gov5_block_rlp(execution: &ExecutionData) -> Result<Vec<u8>, Gov5B
     .encode(&mut rewards_rlp);
     rewards_rlp.extend_from_slice(&reward_items);
     let payload_length =
-        header_rlp.len() + transaction_bytes.length() + verifiers.length() + rewards_rlp.len();
+        header_rlp.len() + alloy_rlp::list_length::<Bytes, Bytes>(transaction_bytes) + verifiers.length() + rewards_rlp.len();
     let mut encoded =
         Vec::with_capacity(alloy_rlp::length_of_length(payload_length) + payload_length);
     RlpHeader {
@@ -647,11 +816,11 @@ pub fn encode_gov5_block_rlp(execution: &ExecutionData) -> Result<Vec<u8>, Gov5B
         payload_length,
     }
     .encode(&mut encoded);
-    encoded.extend_from_slice(&header_rlp);
-    transaction_bytes.encode(&mut encoded);
+    encoded.extend_from_slice(header_rlp);
+    alloy_rlp::encode_list::<_, Bytes>(transaction_bytes, &mut encoded);
     verifiers.encode(&mut encoded);
     encoded.extend_from_slice(&rewards_rlp);
-    Ok(encoded)
+    encoded
 }
 
 /// Engine payloads do not carry `ommers_hash` or `difficulty`. Reth therefore
