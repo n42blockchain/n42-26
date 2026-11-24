@@ -146,16 +146,19 @@ fn cache_gov5_served_block(
 /// Retain a block seen on gossip, a direct push or the local broadcast without
 /// decoding its transactions: the node imports it through its own path, and
 /// the body is checked by [`servable_gov5_block`] only if a peer requests it.
-/// The first body retained for a hash is kept, so an unchecked copy cannot
-/// replace one already held.
+/// The first body retained for a hash is kept while it is the only one seen.
+/// A different body for the same hash settles the matter at once: the held
+/// one is decoded, kept if it passes and replaced by the new unchecked copy if
+/// it does not, so a corrupt body that arrived first cannot keep the honest
+/// one out. Identical copies, the usual case, cost one comparison.
 fn cache_gov5_served_block_unverified(
     blocks: &mut HashMap<B256, ServedGov5Block>,
     order: &mut VecDeque<B256>,
     rlp: &[u8],
 ) -> Result<B256, Gov5BlockError> {
     let hash = attributable_hash(rlp).ok_or(Gov5BlockError::InvalidRlp)?;
-    if !blocks.contains_key(&hash) {
-        insert_served_gov5_block(
+    match blocks.get_mut(&hash) {
+        None => insert_served_gov5_block(
             blocks,
             order,
             hash,
@@ -163,7 +166,15 @@ fn cache_gov5_served_block_unverified(
                 rlp: rlp.to_vec(),
                 verified: false,
             },
-        );
+        ),
+        Some(held) if !held.verified && held.rlp != rlp => {
+            if decode_gov5_block_rlp(&held.rlp).is_ok() {
+                held.verified = true;
+            } else {
+                held.rlp = rlp.to_vec();
+            }
+        }
+        Some(_) => {}
     }
     Ok(hash)
 }
@@ -4314,16 +4325,24 @@ mod tests {
         let rlp = served_block_fixture(1);
         let mut corrupt = rlp.clone();
         *corrupt.last_mut().unwrap() = 0x80;
-        // A corrupt body with an honest header is retained unchecked, never
-        // replaced by a later unchecked copy, and dropped instead of served.
+        // A corrupt body with an honest header is retained unchecked and
+        // dropped instead of served.
         let hash = cache_gov5_served_block_unverified(&mut blocks, &mut order, &corrupt).unwrap();
-        assert_eq!(
-            cache_gov5_served_block_unverified(&mut blocks, &mut order, &rlp).unwrap(),
-            hash
-        );
         assert!(!blocks[&hash].verified);
         assert!(servable_gov5_block(&mut blocks, &mut order, &hash).is_empty());
         assert!(blocks.is_empty() && order.is_empty());
+        // A corrupt body that arrived first gives way to a different copy,
+        // and that copy, once it is the one held, is not displaced in turn.
+        cache_gov5_served_block_unverified(&mut blocks, &mut order, &corrupt).unwrap();
+        cache_gov5_served_block_unverified(&mut blocks, &mut order, &rlp).unwrap();
+        assert_eq!(blocks[&hash].rlp, rlp);
+        cache_gov5_served_block_unverified(&mut blocks, &mut order, &corrupt).unwrap();
+        assert_eq!(blocks[&hash].rlp, rlp);
+        assert!(blocks[&hash].verified);
+        assert_eq!(order, VecDeque::from([hash]));
+        assert_eq!(servable_gov5_block(&mut blocks, &mut order, &hash), rlp);
+        blocks.clear();
+        order.clear();
         // A good body is served once checked and stays verified.
         cache_gov5_served_block_unverified(&mut blocks, &mut order, &rlp).unwrap();
         assert_eq!(servable_gov5_block(&mut blocks, &mut order, &hash), rlp);

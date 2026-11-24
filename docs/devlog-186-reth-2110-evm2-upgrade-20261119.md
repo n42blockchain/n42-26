@@ -1359,3 +1359,32 @@ PR #31（本分支合入 main）评审中确认的三处缺陷，各附回归测
 - 未跑完整 workspace 测试与 E2E。
 - 评审中其余发现（64 MiB 推送在授权前解码、未验证的块数据缓存、共享执行下未修改条目不受根约束、网关担保帧的验签、两个 crate 移出 workspace）未在本次处理，需维护者决定。
 - 附带：`scripts/apply-reth-patches.sh`（`declare -A`）与 `scripts/check-reth-source.sh`（`mapfile`）在 macOS 自带 bash 3.2 上不能运行。
+
+## 进度记录（2026-11-24 续）：PR #31 评审的另外两处网络层修复
+
+### 4. 先到的坏正文挡住同哈希的好正文
+
+- **缺陷**：`cache_gov5_served_block_unverified`（`n42-network/src/service.rs`）只解析头部就缓存，同哈希的后续副本一律忽略；按哈希服务时解码失败则删除且无替补。头部正确、正文损坏的副本先到，诚实副本不被保留，本节点在该块落盘前无法按哈希提供它。
+- **修复**：同哈希来了**字节不同**的副本时当场裁决：解码已持有的那份，通过则标记 verified 并保留，失败则换成新副本（仍为未校验）。字节相同的副本（正常情况）只多一次比较，不解码。
+- **代价**：只有出现冲突副本时才多一次解码；攻击者每次冲突最多让节点解码一次已持有的正文，且通过后该条目变为 verified，不再重复。
+- **测试**：`gov5_unverified_body_is_checked_when_served` 改为断言"坏的先到会让位给好的；好的持有后不被坏的顶掉"。原测试断言的是相反行为。
+
+### 5. 块推送在鉴权前解码，单连接并发流过多
+
+- **缺陷**：`Gov5BlockPushCodec::read_request` 在事件处理器检查发送方（`gov5_direct_source_authorized`）之前就读入并 Snappy 解码，上限 64 MiB；`request_response::Config::default()` 每连接允许 100 条并发流，未授权对端可让节点同时持有约 6.4 GiB 的解码缓冲。
+- **修复**：`gov5_block_push` 行为加 `.with_max_concurrent_streams(GOV5_BLOCK_PUSH_MAX_STREAMS)`，取 8（`transport.rs`）。发送方每个 view 推一块，领先两块时也只有两三条在途。
+- **考虑过的替代**：把鉴权挪到 codec 里。libp2p 的 codec 拿不到对端身份，要改成自定义协议处理器，改动面大，未做。
+- **注意**：该上限同时约束出站流。持续高负载下若单连接在途推送超过 8 条，多出的会失败并走 gossip / 按哈希抓取；机群压测时请留意 `n42_gov5_block_push_send_failures_total`。
+
+### 状态
+
+- n42-network 单元测试 225 通过、0 失败；clippy（`--all-targets -D warnings`）通过。
+- 未在机群上跑。
+
+### 评审中仍未处理、需维护者决定的项
+
+- **未验证的 `pending_block_data` 条目**：`handle_h2_v4_gov5_block` 的提前返回按信封自报的哈希取消抓取（与 `execution_bridge.rs` 中"不在此处 retire"的注释相悖），且条目不再随提交清空。彻底修复需要让 eager import 的失败回传给主循环以便驱逐条目，涉及新的通道消息，未动。
+- **共享执行（`N42_SHARED_EXECUTION=1`）**：对端 compact 输出里 `is_not_modified` 的账户与未变更的槽不受 QMDB 根约束，而 reth 的 hashed state 会全量写入；`original_info` 与 reverts 同样无法校验。结构检查堵不住全部，根本上是"只信同机 leader"的信任假设，需在调用点限定来源。
+- **网关担保的 0x50 帧**：发送方仅由公钥推出即进入 sender cache，导入时不再验签；块是否有效取决于本地缓存。需明确网关是否可信。
+- **serve cache 的总字节上限**：`MAX_SERVED_GOV5_BLOCKS = 1024` × 64 MiB，未加字节预算。
+- 自有块"已入队即 VALID"、`N42_QMDB_ADOPT_BUILT`、构建前等待叠加超过 view 超时、stale own-block tips：均依赖可选开关或特定时序，评审未能完全确认触发路径。
