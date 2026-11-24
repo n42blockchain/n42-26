@@ -489,6 +489,15 @@ pub fn decode_h2_qc(data: &[u8]) -> Result<H2QuorumCertificate, H2WireError> {
     decode_qc(data)
 }
 
+/// Encodes a quorum certificate in gov5's canonical SSZ representation.
+///
+/// The inverse of [`decode_h2_qc`]: the exact bytes gov5's `encodeQC` writes,
+/// both inside messages and in a header's extra data
+/// (`buildHeaderExtra(view, committedQC)`).
+pub fn encode_h2_qc(value: &H2QuorumCertificate) -> Result<Vec<u8>, H2WireError> {
+    encode_qc(value)
+}
+
 fn encode_qc(value: &H2QuorumCertificate) -> Result<Vec<u8>, H2WireError> {
     validate_bitmap(&value.signers_bitmap)?;
     let mut out = Vec::new();

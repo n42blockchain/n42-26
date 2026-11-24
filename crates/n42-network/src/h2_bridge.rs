@@ -122,6 +122,14 @@ pub fn quorum_certificate_from_h2(
     qc_from_h2(qc)
 }
 
+/// Converts a native quorum certificate into gov5's H2 representation, as the
+/// H2-v4 bridge sends it in a Decide.
+pub fn quorum_certificate_to_h2(
+    qc: &QuorumCertificate,
+) -> Result<H2QuorumCertificate, H2BridgeError> {
+    qc_to_h2(qc)
+}
+
 fn tc_to_h2(tc: &TimeoutCertificate) -> Result<H2TimeoutCertificate, H2BridgeError> {
     Ok(H2TimeoutCertificate {
         view: tc.view,
