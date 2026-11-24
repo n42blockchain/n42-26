@@ -1276,3 +1276,53 @@ node0 日志：frame queue 稳定在约 1.91–1.97M（`N42_INGEST_HIGH_WATER=20
 run184 node0 的 `N42_MEM` 时间线：未持久化交易 181 万 → 895 万时 jemalloc allocated 18.2 → 32.6 GB，约 2 KB/笔（满块约 190 MB）；
 峰值 170 块、1095 万笔未持久化，node0 RSS 41 GB；6 个 follower 各约 13 GB。结论：持续负载下的瓶颈是持久化（满块 0.3–0.4 s），
 领先两块的 ~54 万链速只能维持到内存耗尽；`N42_MAX_UNPERSISTED_TXS` 把链速限到持久化速度。下一步：20M 负载下测上限 3M 的持续吞吐；持久化提速需另行设计。
+
+## 进度记录（2026-11-23 续九）：满块持久化成本拆解与两项无代价优化（round BP，均默认关闭）
+
+### 当前拆解（run185 node0，`_sum`/`_count`；quantile 行只反映空闲尾部，不可用）
+
+persistence 周期合计 84.9 s / 567 次（810 块，其中满块 209）：并行写阶段 `total` 26.2 s（RocksDB 25.5 s 为最长；静态文件 8.3 s、MDBX 10.1 s 其中 hashed state 9.8 s，均被遮住），之后串行提交：RocksDB 31.4 s、静态文件 24.6 s、MDBX 2.5 s（693 次 commit）。空块成本小，按满块摊约 0.40 s：RocksDB 写 ~120 ms（账户历史；交易哈希批在其旁并行）+ RocksDB 提交 ~150 ms + 静态文件提交 ~110 ms + MDBX 提交 ~12 ms；hashed state ~47 ms、静态文件写 ~40 ms 在写阶段被遮住。HashedAccounts 整轮只有写（cursor-upsert 2048 万）、零读。
+
+### 两处根因（均有测量）
+
+1. **静态文件提交 = 6 个段配置的串行原子写**：每段 temp 文件 fsync + rename + 目录 fsync。空闲磁盘 6 段共 0.4 ms；有并发写盘负载时串行 135 ms、并行 27–39 ms（XFS 日志强制可合并）。fleet 上 commit_sf 均值 35 ms/次，负载期更高。
+2. **RocksDB 提交的大头是交易哈希批的 memtable 插入**：storage v2 的 `write_tx_hash_numbers` 按区块顺序（哈希随机）put，跳表插入每次都要重新定位。bench（95,238 笔/块，12 块，/data）：按哈希排序后提交 95→40 ms（空闲）、115→67 ms（磁盘负载）；同时并发提交两个批次反而更慢（134/199 ms），放弃。
+
+### 实施（reth-worktree，两项开关 + 计时器）
+
+- `N42_SORTED_TX_HASHES=1`：`tx_hash_entries` 收集后 `par_sort_unstable_by_key` 再 put；批次内容不变。测试 `test_sorted_tx_hashes_write_the_same_entries`（TestBlockBuilder 11 块，两种顺序写入后 `TransactionHashNumbers` 全表相同）。
+- `N42_SF_PARALLEL_FINALIZE=1`：`StaticFileWriters::finalize_with` 每段一个线程写配置，全部 join 后返回第一个错误。测试 `test_parallel_finalize_writes_the_same_files`（headers + 两个 changeset 段，11 块跨文件，逐文件字节相同，重开后读回相同）。
+- 计时器 `save_blocks_rocksdb_tx_hashes`、`save_blocks_rocksdb_account_history`（写阶段内两个任务各自耗时）。
+- n42 侧：`persist_cost_bench` 增加 sorted / concurrent 模式与 `N42_PERSIST_BENCH_LOAD=1` 磁盘负载。
+
+### 持久性/重启语义论证
+
+- 排序：同一个原子 WriteBatch、同一组键值，提交点不变。
+- 并行 finalize：每段配置仍原子写入并 fsync，全部在 RocksDB 与 MDBX 提交之前完成；崩溃时可能出现的状态从“前缀若干段已 finalize”变为“任意子集已 finalize”。静态文件一致性检查逐段独立对照 MDBX checkpoint 修复（`check_consistency` 按段循环、`ensure_invariants`），RocksDB 仍在全部段之后提交，所以不会出现新的需要修复的组合。
+- 不可做：静态文件 finalize 与 RocksDB 提交并行——RocksDB 的交易哈希修复要从静态文件读取超出 checkpoint 的交易，RocksDB 先于静态文件落盘会留下无法定位的残留条目。
+
+### 需用户决定的设计（未实施）
+
+| 方案 | 每满块收益（估） | 代价 |
+|------|-----------------|------|
+| 账户历史索引 off/deferred（参照 n42-rs `N42_ACCOUNT_HISTORY=off` + 缺口标记 + changeset 扫描回退） | RocksDB 写 ~120 ms + 提交 ~30 ms | archive+ 历史状态查询在缺口内变慢（结果仍精确或报错）；修复器与 unwind 逻辑改动 |
+| 交易哈希索引后台补建（从 transactions 段，类似 `heal_transaction_hash_numbers`） | 提交 40–67 ms（排序后） | archive+ 要求 tx lookup；补建完成前按哈希查不到已持久化交易 |
+| hashed 表不写（n42-rs `N42_HASHED_TABLES=off`） | MDBX 47 ms（目前被遮住）+ 表增长 | reth 库不再自含最新状态，所有最新读必须由 QMDB 提供（Only 模式），重启依赖 QMDB |
+| persistence threshold > 0 批量 | 每次提交固定成本摊薄 | 崩溃丢更多内存块、QMDB 领先 reth 更多块；需审计重启路径并放开 `validate_immediate_persistence`；积压时现已自然成批 |
+| `--prune.sender-recovery.full` 等 CLI 裁剪 | 0（静态文件写被遮住） | archive+ 拒绝 CLI 裁剪 |
+
+n42-rs 的做法（`docs/PERSISTENCE_COST_STUDY.md`）：fleet 用 `--prune.transaction-lookup.full`、`N42_HASHED_TABLES=off`、threshold 8 / buffer 6；满块（16 万笔）178 ms，其中账户历史 119 ms 是关键路径；另有静态文件并行编码与提前回写开关（本链静态文件写被遮住，暂不需要）。
+
+## 进度记录（2026-11-23 续）：round BP / BQ，持久化限速与两项持久化提速
+
+均为单执行节点 20M，领先两块 + 空闲等待 + 账户历史并行 + `N42_MAX_UNPERSISTED_TXS=3000000`，机群带主机内存看门狗（可用 < 16 GiB 即停）；
+原始输出 `.artifacts/native-port-p0/run185*`、`run186*`。
+
+| 轮次 | 二进制 | 30 s 窗口 | 20 s 窗口 | 持久化总耗时 | rocksdb 提交 | 静态文件提交 | 积压等待（超时） | node0 RSS |
+|---|---|---|---|---|---|---|---|---|
+| run185 | 1e6483f9 | 317,460 | 366,666 | 84.9 s | 31.4 s | 24.6 s | 21（13） | 25.7 GB（峰值约 31 GB） |
+| run186 | 6806bc3b，`N42_SORTED_TX_HASHES=1 N42_SF_PARALLEL_FINALIZE=1` | 431,746 | 514,285 | 66.0 s | 11.0 s | 20.2 s | 5（0） | 26.7 GB |
+
+- 交易哈希排序使 rocksdb 提交降到约三分之一；静态文件并行落盘在机群上只省约 18%。
+- run186 rocksdb 写阶段中账户历史 28.4 s，交易哈希 2.2 s：下一个瓶颈是账户历史索引（关闭/推迟需用户决定，见续九）。
+- 机器占用：BP 约 4 分钟、BQ 约 4 分钟，前后均自动释放。
