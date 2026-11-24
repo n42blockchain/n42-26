@@ -56,6 +56,13 @@ impl VoteRules {
         self.profile1
     }
 
+    /// The deferred-execution depth headers are built and checked at
+    /// ([`crate::deferred_depth`]): header N carries the result of N−1 on
+    /// Profile 1 (A10), its own result otherwise (`None`).
+    pub const fn deferred_depth(self) -> Option<u64> {
+        if self.profile1 { Some(1) } else { None }
+    }
+
     /// A14: whether `profile` may sign and verify consensus messages.
     pub const fn signing_profile_allowed(
         self,
@@ -81,12 +88,15 @@ mod tests {
         assert!(!today.round1_needs_execution());
         assert!(!today.unknown_parent_abstains());
         assert!(!today.commit_vote_needs_own_execution());
+        assert_eq!(today.deferred_depth(), None);
         assert!(today.signing_profile_allowed(ConsensusSigningProfile::Native));
         assert!(today.signing_profile_allowed(ConsensusSigningProfile::Gov5Legacy));
         let p1 = VoteRules::PROFILE1;
         assert!(p1.round1_needs_execution());
         assert!(p1.unknown_parent_abstains());
         assert!(p1.commit_vote_needs_own_execution());
+        assert_eq!(p1.deferred_depth(), Some(1));
+        assert!(p1.deferred_depth().unwrap() <= crate::deferred_depth::MAX_DEPTH);
         assert!(!p1.signing_profile_allowed(ConsensusSigningProfile::Native));
         assert!(!p1.signing_profile_allowed(ConsensusSigningProfile::Gov5Legacy));
         assert!(p1.signing_profile_allowed(ConsensusSigningProfile::H2V4(

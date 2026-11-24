@@ -18,6 +18,7 @@ mod receipt;
 pub mod rotor;
 pub mod validator;
 pub mod vote_log;
+pub mod deferred_depth;
 pub mod vote_rules;
 
 pub use adapter::{
