@@ -1,4 +1,5 @@
 pub mod native;
+pub mod profile1;
 
 use alloy_genesis::{Genesis, GenesisAccount};
 use alloy_primitives::{Address, Bytes, U256, address, bytes};
@@ -42,7 +43,7 @@ pub struct ConsensusConfig {
 /// Default for `ConsensusConfig::max_historical_epochs` when omitted from
 /// JSON/TOML chainspecs (kept in sync with
 /// `n42_consensus::DEFAULT_MAX_HISTORICAL_EPOCHS`).
-fn default_max_historical_epochs() -> usize {
+pub(crate) fn default_max_historical_epochs() -> usize {
     32
 }
 

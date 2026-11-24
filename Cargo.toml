@@ -62,6 +62,7 @@ reth-errors = { path = "../reth/crates/errors" }
 reth-execution-cache = { path = "../reth/crates/engine/execution-cache" }
 reth-db = { path = "../reth/crates/storage/db" }
 reth-db-common = { path = "../reth/crates/storage/db-common" }
+reth-cli = { path = "../reth/crates/cli/cli" }
 reth-cli-commands = { path = "../reth/crates/cli/commands" }
 reth-cli-runner = { path = "../reth/crates/cli/runner" }
 reth-stages-types = { path = "../reth/crates/stages/types" }
