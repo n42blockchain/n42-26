@@ -104,8 +104,14 @@ pub fn validate_gov5_replay_v2_header(header: &Header) -> Result<(), N42HeaderPr
     if header.parent_beacon_block_root.is_none() {
         return invalid("parent consensus-evidence root is absent");
     }
-    if header.requests_hash != Some(EMPTY_ROOT_HASH) {
-        return invalid("execution requests root is not the canonical empty root");
+    // As on Ethereum: no requests hash before Prague, and from it the
+    // EIP-7685 hash of no requests (replay runs no request system calls).
+    // Which of the two a given block must carry is the inner rule's to say.
+    if !matches!(
+        header.requests_hash,
+        None | Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH)
+    ) {
+        return invalid("execution requests hash is not the EIP-7685 empty hash");
     }
     if header.block_access_list_hash.is_some() {
         return invalid("block access list is unsupported in replay-v2 v1 history");
@@ -226,33 +232,10 @@ impl<C> N42Consensus<C>
 where
     C: EthChainSpec + EthereumHardforks,
 {
-    /// [`normalized_gov5_header`] plus the Prague fill-in for the live H2 shape.
-    ///
-    /// gov5 runs Prague (`pectraTime`: EIP-2935, the 7002/7251 system calls,
-    /// EIP-7702) but its miner never stamps `requestsHash`; the wire header
-    /// carries the `0x80` placeholder, decoded as `None`. Chain 94 produces no
-    /// execution requests, so for the inner Ethereum rules the empty requests
-    /// hash stands in — reth then compares it with the hash of the (empty)
-    /// requests execution produced, exactly the check gov5 skips. The original
-    /// sealed header remains hash-authenticated; only the temporary copy is
-    /// filled in.
-    ///
-    /// From gov5's `pragueTime` its miner does stamp the field and its
-    /// validators check it ([`crate::gov5_requests_hash_active_at`]). Nothing
-    /// is filled in from then on: a header without the field fails the inner
-    /// Prague rule, as it fails on gov5.
+    /// [`normalized_gov5_header`]. The requests hash is the header's own, as
+    /// on Ethereum: a live Prague header without one fails the inner rule.
     fn normalize_header(&self, header: &Header) -> Result<Header, N42HeaderProfileError> {
-        let mut normalized = normalized_gov5_header(header)?;
-        if validate_gov5_replay_v2_header(header).is_err()
-            && normalized.requests_hash.is_none()
-            && !crate::gov5_requests_hash_active_at(header.timestamp)
-            && self
-                .chain_spec
-                .is_prague_active_at_timestamp(header.timestamp)
-        {
-            normalized.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
-        }
-        Ok(normalized)
+        normalized_gov5_header(header)
     }
 
     /// Create a new N42 consensus adapter (without validator set).
@@ -372,15 +355,7 @@ where
                 },
                 |(_, bloom)| bloom,
             );
-            let mut header = block.header().clone();
-            if header.requests_hash.is_none()
-                && !crate::gov5_requests_hash_active_at(header.timestamp)
-                && self
-                    .chain_spec
-                    .is_prague_active_at_timestamp(header.timestamp)
-            {
-                header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
-            }
+            let header = block.header().clone();
             let receipts_root = header.receipts_root;
             let header_only = RecoveredBlock::new_unhashed(
                 N42Block {
@@ -736,7 +711,7 @@ mod tests {
             blob_gas_used: Some(0),
             excess_blob_gas: Some(0),
             parent_beacon_block_root: Some(B256::ZERO),
-            requests_hash: Some(EMPTY_ROOT_HASH),
+            requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
             ..Default::default()
         };
         let parent = SealedHeader::seal_slow(replay_header(1, B256::repeat_byte(0x11), 4));
@@ -755,11 +730,11 @@ mod tests {
         ));
     }
 
-    /// A live gov5 header under Prague carries no requests hash (the `0x80`
-    /// placeholder); the inner rules see the empty requests hash instead, and
-    /// post-execution then checks it against the requests execution produced.
+    /// A live gov5 header under Prague carries the requests hash, as on
+    /// Ethereum: one without it is refused, and post-execution checks the
+    /// hash against the requests execution produced.
     #[test]
-    fn gov5_prague_header_without_requests_hash_is_accepted_when_no_requests_were_produced() {
+    fn gov5_prague_header_is_held_to_the_requests_hash() {
         let chain_spec = reth_chainspec::MAINNET.clone();
         // Mainnet's Prague timestamp, which is also gov5's `pectraTime`.
         let prague = 1_746_612_311_u64;
@@ -779,29 +754,24 @@ mod tests {
             blob_gas_used: Some(0),
             excess_blob_gas: Some(0),
             parent_beacon_block_root: Some(B256::ZERO),
-            requests_hash: None,
+            requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
             ..Default::default()
         };
         gov5.validate_header(&SealedHeader::seal_slow(header.clone()))
             .unwrap();
-        assert_eq!(
-            gov5.normalize_header(&header).unwrap().requests_hash,
-            Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH)
-        );
-        // Before Prague nothing is filled in.
+        // Nothing is filled in for a header that lacks the field.
+        let without = Header { requests_hash: None, ..header.clone() };
+        assert_eq!(gov5.normalize_header(&without).unwrap().requests_hash, None);
+        assert!(matches!(
+            gov5.validate_header(&SealedHeader::seal_slow(without)),
+            Err(ConsensusError::RequestsHashMissing)
+        ));
+        // Before Prague it is the other way round.
         header.timestamp = prague - 1;
-        assert_eq!(gov5.normalize_header(&header).unwrap().requests_hash, None);
-        // From gov5's pragueTime the field is the header's own to carry, and
-        // nothing is filled in for one that lacks it. (The setting is global;
-        // the time is far beyond every other test's timestamps.)
-        crate::set_gov5_requests_hash_time(Some(4_000_000_000_000));
-        header.timestamp = 4_000_000_000_000;
-        assert_eq!(gov5.normalize_header(&header).unwrap().requests_hash, None);
-        header.timestamp = 4_000_000_000_000 - 1;
-        assert_eq!(
-            gov5.normalize_header(&header).unwrap().requests_hash,
-            Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH)
-        );
+        assert!(matches!(
+            gov5.validate_header(&SealedHeader::seal_slow(header.clone())),
+            Err(ConsensusError::RequestsHashUnexpected)
+        ));
 
         // Post-execution: an empty request list matches; a produced request does not.
         let receipt = EthereumReceipt {

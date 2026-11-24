@@ -366,25 +366,11 @@ fn normalize_native_payload(
         None => payload.into_block_with_sidecar_raw(&execution.sidecar),
     }
     .map_err(|error| Gov5BlockError::PayloadReconstruction(error.to_string()))?;
-    // From gov5's pragueTime the header carries the requests hash the builder
-    // computed; before it the field is left out, which only an empty request
-    // set allows.
-    let requests_hash_held = n42_consensus::gov5_requests_hash_active_at(block.header.timestamp);
-    if requests_hash_held && block.header.requests_hash.is_none() {
+    // The requests hash stays as the builder set it, as on Ethereum: none
+    // before Prague, the hash of the block's requests from it.
+    if block.header.block_access_list_hash.is_some() || block.header.slot_number.is_some() {
         return Err(Gov5BlockError::PayloadReconstruction(
-            "native producer needs the requests hash from gov5's pragueTime".into(),
-        ));
-    }
-    if (!requests_hash_held
-        && block
-            .header
-            .requests_hash
-            .is_some_and(|hash| hash != alloy_eips::eip7685::EMPTY_REQUESTS_HASH))
-        || block.header.block_access_list_hash.is_some()
-        || block.header.slot_number.is_some()
-    {
-        return Err(Gov5BlockError::PayloadReconstruction(
-            "native producer cannot omit non-empty requests or later-fork commitments".into(),
+            "native producer cannot carry later-fork commitments".into(),
         ));
     }
     let rewards = n42_consensus::gov5_withdrawals_to_rewards(
@@ -400,11 +386,6 @@ fn normalize_native_payload(
     block.header.state_root = state_root;
     block.header.receipts_root = receipts_root;
     block.header.withdrawals_root = Some(n42_consensus::gov5_native_rewards_root(&rewards));
-    // Gov5 executes Prague system calls from its pectraTime, but its native
-    // miner stamps requestsHash only from its pragueTime.
-    if !requests_hash_held {
-        block.header.requests_hash = None;
-    }
     let mut extra = Vec::with_capacity(12 + GOV5_H2_SEAL_BYTES);
     extra.extend_from_slice(b"N42H");
     extra.extend_from_slice(&view.to_le_bytes());
@@ -419,7 +400,7 @@ fn normalize_native_payload(
     let hash = remember_gov5_native_header(&native.encode());
     // The payload carries no ommers hash, difficulty or withdrawals root, so
     // the changed header fields it holds are the two roots, the extra data and
-    // the hash; the requests hash lives in the sidecar. This is the payload
+    // the hash; the requests hash lives in the sidecar, untouched. This is the payload
     // `ExecutionData::from_block_unchecked` derives from the edited block.
     let mut normalized = execution.clone();
     let fields = normalized.payload.as_v1_mut();
@@ -427,12 +408,6 @@ fn normalize_native_payload(
     fields.receipts_root = block.header.receipts_root;
     fields.extra_data = block.header.extra_data;
     fields.block_hash = hash;
-    if !requests_hash_held && normalized.sidecar.requests_hash().is_some() {
-        normalized.sidecar = match normalized.sidecar.cancun() {
-            Some(cancun) => alloy_rpc_types_engine::ExecutionPayloadSidecar::v3(cancun.clone()),
-            None => alloy_rpc_types_engine::ExecutionPayloadSidecar::none(),
-        };
-    }
     Ok(normalized)
 }
 
@@ -569,13 +544,6 @@ fn reconstruct_gov5_block_raw(
             .withdrawals
             .is_some()
             .then(|| n42_consensus::gov5_native_rewards_root(&rewards));
-        // Engine cannot spell a nil native requestsHash. Only an empty
-        // execution-request set can stand in for it.
-        if native.header.requests_hash.is_none()
-            && block.header.requests_hash == Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH)
-        {
-            block.header.requests_hash = None;
-        }
         if block.header == native.header && native.hash() == expected_hash {
             return Ok(block);
         }
@@ -945,7 +913,6 @@ mod tests {
         rebuilt.header.state_root = state_root;
         rebuilt.header.receipts_root = receipts_root;
         rebuilt.header.withdrawals_root = Some(n42_consensus::gov5_native_rewards_root(&rewards));
-        rebuilt.header.requests_hash = None;
         let mut extra = b"N42H".to_vec();
         extra.extend_from_slice(&5u64.to_le_bytes());
         extra.resize(12 + GOV5_H2_SEAL_BYTES, 0);
@@ -968,7 +935,7 @@ mod tests {
             assert_eq!(normalized.payload, expected.payload);
             assert_eq!(normalized.sidecar.cancun(), expected.sidecar.cancun());
             assert_eq!(normalized.sidecar.prague(), expected.sidecar.prague());
-            assert!(normalized.sidecar.requests_hash().is_none());
+            assert_eq!(normalized.sidecar.requests_hash(), execution.sidecar.requests_hash());
             assert!(gov5_normalization_preserves_execution_input(&execution, &normalized));
             // Handed over, the payload normalizes to the same one.
             let built = normalize_built_payload_for_gov5_h2(
@@ -1174,71 +1141,10 @@ mod tests {
         assert_eq!(decoded.mobile_registry_root, None);
     }
 
-    /// From gov5's pragueTime a native child carries the requests hash the
-    /// builder computed, as field 21, and the engine payload keeps it; one
-    /// second earlier the field is left out as before.
-    #[test]
-    fn a_native_child_carries_the_requests_hash_from_gov5_prague_time() {
-        // Far beyond every other test's timestamps: the setting is global.
-        const REQUESTS_HASH_TIME: u64 = 4_000_000_000_000;
-        n42_consensus::set_gov5_requests_hash_time(Some(REQUESTS_HASH_TIME));
-        let parent = Gov5NativeHeader {
-            header: Header {
-                number: 7,
-                withdrawals_root: Some(keccak256([])),
-                blob_gas_used: Some(0),
-                excess_blob_gas: Some(0),
-                parent_beacon_block_root: Some(B256::repeat_byte(0xa2)),
-                ..Default::default()
-            },
-            mobile_registry_root: None,
-        };
-        let parent_hash = remember_gov5_native_header(&parent.encode());
-        let child = |timestamp: u64, requests_hash: Option<B256>| {
-            let block: Block<TxEnvelope> = Block {
-                header: Header {
-                    parent_hash,
-                    number: 8,
-                    timestamp,
-                    transactions_root: calculate_transaction_root::<TxEnvelope>(&[]),
-                    withdrawals_root: Some(alloy_consensus::constants::EMPTY_ROOT_HASH),
-                    blob_gas_used: Some(0),
-                    excess_blob_gas: Some(0),
-                    parent_beacon_block_root: Some(B256::repeat_byte(0x44)),
-                    requests_hash,
-                    ..Default::default()
-                },
-                body: BlockBody { withdrawals: Some(Default::default()), ..Default::default() },
-            };
-            let execution = ExecutionData::from_block_unchecked(block.header.hash_slow(), &block);
-            normalize_execution_payload_for_gov5_h2(&execution, 8, B256::repeat_byte(0x71), keccak256([]))
-        };
-        let empty = alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
-
-        let before = child(REQUESTS_HASH_TIME - 1, Some(empty)).unwrap();
-        assert!(before.sidecar.requests_hash().is_none());
-        let decoded = decode_gov5_block_rlp(&encode_gov5_block_rlp(&before).unwrap()).unwrap();
-        assert_eq!(decoded.header.requests_hash, None);
-
-        let at = child(REQUESTS_HASH_TIME, Some(empty)).unwrap();
-        assert_eq!(at.sidecar.requests_hash(), Some(empty));
-        let decoded = decode_gov5_block_rlp(&encode_gov5_block_rlp(&at).unwrap()).unwrap();
-        assert_eq!(decoded.block_hash, at.block_hash());
-        assert_eq!(decoded.header.requests_hash, Some(empty));
-        assert_eq!(decoded.mobile_registry_root, None);
-        // The native encoding ends at the requests hash: twenty-one fields.
-        let raw = n42_consensus::gov5_native_header_rlp(&at.block_hash()).unwrap();
-        assert_eq!(keccak256(&raw[..]), at.block_hash());
-        assert_eq!(&raw[raw.len() - 32..], empty.as_slice());
-
-        // A payload built without the field cannot be sealed from that time.
-        assert!(child(REQUESTS_HASH_TIME, None).is_err());
-    }
-
-    /// The shape of live chain-94 testnet headers since Gov5 moved the
-    /// registry root behind Glamsterdam: twenty fields, ending at the parent
-    /// beacon root. A child keeps the rewards and the committee link and
-    /// carries no registry root; its own child does the same.
+    /// A native parent as Gov5 writes it since it moved the registry root
+    /// behind Glamsterdam: no registry root. A child keeps the rewards and
+    /// the committee link and carries no registry root either; its own child
+    /// does the same.
     #[test]
     fn a_native_parent_without_registry_root_gets_a_native_child() {
         use alloy_eips::eip4895::{Withdrawal, Withdrawals};
@@ -1304,8 +1210,8 @@ mod tests {
                 decoded.header.parent_beacon_block_root,
                 block.header.parent_beacon_block_root
             );
-            // Twenty fields: nothing after the parent beacon root.
-            assert_eq!(decoded.header.requests_hash, None);
+            // Then the requests hash the builder set, as on Ethereum.
+            assert_eq!(decoded.header.requests_hash, block.header.requests_hash);
             parent_hash = normalized.block_hash();
         }
     }
@@ -1409,7 +1315,8 @@ mod tests {
         );
         assert_eq!(decoded.header.blob_gas_used, Some(0));
         assert_eq!(decoded.header.excess_blob_gas, Some(0));
-        assert_eq!(decoded.header.requests_hash, None);
+        // The requests hash is the builder's, as on Ethereum.
+        assert_eq!(decoded.header.requests_hash, block.header.requests_hash);
         assert_eq!(
             decoded.rewards,
             n42_consensus::gov5_withdrawals_to_rewards(&withdrawals)
@@ -1425,15 +1332,6 @@ mod tests {
         let mut tampered = normalized.clone();
         tampered.payload.as_v1_mut().state_root = B256::ZERO;
         assert!(encode_gov5_block_rlp(&tampered).is_err());
-
-        let mut unsupported = block;
-        unsupported.header.requests_hash = Some(B256::repeat_byte(0x55));
-        let unsupported =
-            ExecutionData::from_block_unchecked(unsupported.header.hash_slow(), &unsupported);
-        assert!(
-            normalize_execution_payload_for_gov5_h2(&unsupported, 11032, B256::ZERO, B256::ZERO)
-                .is_err()
-        );
     }
 
     #[test]

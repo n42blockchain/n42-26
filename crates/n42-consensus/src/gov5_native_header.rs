@@ -20,29 +20,6 @@ use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// The timestamp from which gov5 native headers carry `requestsHash`;
-/// `u64::MAX` while they never do.
-static REQUESTS_HASH_TIME: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(u64::MAX);
-
-/// Sets the timestamp from which gov5 native headers carry `requestsHash`
-/// (`None`: never, the default).
-///
-/// gov5 runs the Prague execution rules from its `pectraTime` but stamps and
-/// verifies the header's requests hash only from its `pragueTime`, as
-/// Ethereum does from Prague. A chain that turned the execution rules on
-/// first has headers without the field up to that later time and with it
-/// from then on, so the two times are held apart here.
-pub fn set_gov5_requests_hash_time(time: Option<u64>) {
-    REQUESTS_HASH_TIME.store(time.unwrap_or(u64::MAX), std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Whether a gov5 native header at `timestamp` carries `requestsHash`
-/// ([`set_gov5_requests_hash_time`]).
-pub fn gov5_requests_hash_active_at(timestamp: u64) -> bool {
-    timestamp >= REQUESTS_HASH_TIME.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Errors from decoding a gov5 native header.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Gov5NativeHeaderError {

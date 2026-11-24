@@ -229,46 +229,14 @@ fn activate_gov5_pos_execution(chain: &mut ChainSpec) {
 /// gov5 block includes those writes, so a member that recomputes roots must run
 /// the same fork: `N42_GOV5_PRAGUE_TIME=<unix seconds>` activates it. Recorded
 /// chain-94 blocks 13,560,376..13,565,343 reproduce their roots only with it.
-///
-/// gov5's own `pragueTime` is a later, separate time: from it the miner stamps
-/// the header's requests hash and validators check it, as Ethereum does from
-/// Prague ([`gov5_requests_hash_time`]). It is read before the genesis value
-/// is overwritten here and handed to the header profile.
 fn apply_gov5_prague_time(chain: &mut ChainSpec) -> Option<u64> {
     let prague_time = env_parse::<u64>("N42_GOV5_PRAGUE_TIME")?;
-    n42_consensus::set_gov5_requests_hash_time(gov5_requests_hash_time(
-        &chain.genesis,
-        prague_time,
-    ));
     chain.hardforks.insert(
         EthereumHardfork::Prague,
         ForkCondition::Timestamp(prague_time),
     );
     chain.genesis.config.prague_time = Some(prague_time);
     Some(prague_time)
-}
-
-/// The timestamp from which gov5 headers carry the requests hash, given the
-/// genesis and gov5's `pectraTime` (`N42_GOV5_PRAGUE_TIME`), or `None` when
-/// the chain never does.
-///
-/// It is the genesis key `requestsHashTime` when present (the key n42-rs
-/// reads), and otherwise the genesis `pragueTime` when that is later than
-/// `pectraTime`: the gov5 chainspec names its requests-hash fork `pragueTime`
-/// and its Prague execution rules `pectraTime`. A `pragueTime` at or before
-/// `pectraTime` is not a requests-hash time: such a chainspec sealed gov5's
-/// former empty-trie spelling, or nothing, and is left as it was.
-fn gov5_requests_hash_time(genesis: &alloy_genesis::Genesis, pectra_time: u64) -> Option<u64> {
-    genesis
-        .config
-        .extra_fields
-        .get("requestsHashTime")
-        .and_then(|value| {
-            value
-                .as_u64()
-                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-        })
-        .or(genesis.config.prague_time.filter(|time| *time > pectra_time))
 }
 
 fn resolve_observer_genesis_hash(
@@ -3747,24 +3715,6 @@ mod observer_identity_tests {
         assert!(validate_immediate_persistence(1, 0, 0).is_err());
         assert!(validate_immediate_persistence(0, 1, 0).is_err());
         assert!(validate_immediate_persistence(0, 0, 1).is_err());
-    }
-
-    #[test]
-    fn the_requests_hash_time_is_the_gov5_prague_time_after_pectra() {
-        let pectra = 1_746_612_311;
-        let mut genesis = alloy_genesis::Genesis::default();
-        // No later fork time: headers never carry the field.
-        assert_eq!(gov5_requests_hash_time(&genesis, pectra), None);
-        genesis.config.prague_time = Some(pectra);
-        assert_eq!(gov5_requests_hash_time(&genesis, pectra), None);
-        // gov5's pragueTime, later than its pectraTime.
-        genesis.config.prague_time = Some(pectra + 1_000);
-        assert_eq!(gov5_requests_hash_time(&genesis, pectra), Some(pectra + 1_000));
-        // The explicit key wins, as a number or as text.
-        for value in [serde_json::json!(1_900_000_000u64), serde_json::json!("1900000000")] {
-            genesis.config.extra_fields.insert("requestsHashTime".to_string(), value);
-            assert_eq!(gov5_requests_hash_time(&genesis, pectra), Some(1_900_000_000));
-        }
     }
 
     #[test]

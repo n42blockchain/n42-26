@@ -89,12 +89,23 @@ impl N42EvmConfig {
     /// receipts, withdrawals and restored-slot tracking.
     pub fn with_evm_factory(chain_spec: Arc<ChainSpec>, evm_factory: N42EvmFactory) -> Self {
         let inner = EthEvmConfig::new_with_evm_factory(chain_spec.clone(), evm_factory.clone());
+        // A gov5 root rule's activation time in the genesis `config`, a
+        // number or decimal text.
+        let rule_time = |key: &str| {
+            let value = chain_spec.genesis().config.extra_fields.get(key)?;
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        };
+        let (unchanged_account_no_op_time, storage_net_change_time) =
+            (rule_time("unchangedAccountNoOpTime"), rule_time("storageNetChangeTime"));
         let factory =
             TrackingBlockExecutorFactory::new(EthBlockExecutorFactory::new_with_receipt_builder(
                 N42ReceiptBuilder,
                 chain_spec.clone(),
                 evm_factory,
-            ));
+            ))
+            .with_gov5_root_rules(unchanged_account_no_op_time, storage_net_change_time);
         Self {
             inner,
             factory,
