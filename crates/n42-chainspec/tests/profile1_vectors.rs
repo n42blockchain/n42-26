@@ -341,3 +341,20 @@ fn a_profile1_config_from_genesis_requires_the_profile_field() {
     assert!(!profile1::genesis_declares_profile(&genesis));
     assert!(profile1::resolve_genesis_profile(&genesis).unwrap().is_none());
 }
+
+/// AM2: on Profile 1 `hotstuff.maxBlockBytes` is the only block size bound,
+/// at every fork; other chains keep the 8 MiB cap from Osaka on.
+#[test]
+fn profile1_block_size_bound_is_max_block_bytes() {
+    use n42_chainspec::profile1::block_rlp_size_limit;
+    const ETH: usize = 8 * 1024 * 1024;
+    let (_, config, _) = profile1_chain_spec(&genesis_8s()).unwrap();
+    assert_eq!(config.max_block_bytes, 64 * 1024 * 1024);
+    let max = Some(config.max_block_bytes);
+    assert_eq!(block_rlp_size_limit(max, true, ETH), Some(64 * 1024 * 1024));
+    assert_eq!(block_rlp_size_limit(max, false, ETH), Some(64 * 1024 * 1024));
+    assert_eq!(block_rlp_size_limit(None, true, ETH), Some(ETH));
+    assert_eq!(block_rlp_size_limit(None, false, ETH), None);
+    // No profile installed in this process: today's rule.
+    assert_eq!(n42_chainspec::profile1::installed_block_rlp_size_limit(true, ETH), Some(ETH));
+}

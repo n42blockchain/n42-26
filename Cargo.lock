@@ -7222,6 +7222,7 @@ dependencies = [
  "hex",
  "libp2p",
  "metrics",
+ "n42-chainspec",
  "n42-consensus",
  "n42-mobile",
  "n42-primitives",

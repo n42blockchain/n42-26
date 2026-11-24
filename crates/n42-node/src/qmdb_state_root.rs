@@ -50,7 +50,7 @@ use crate::{
     node::N42Node,
     qmdb_read_view::QmdbReadView,
     qmdb_state::{
-        gov5_qmdb_operations_with_restored, gov5_restored_slots_key, with_gov5_prague_system_caller,
+        gov5_qmdb_operations_with_restored, gov5_restored_slots_key,
     },
 };
 
@@ -2623,7 +2623,15 @@ impl StateRootJob<N42Primitives> for Gov5QmdbStateRootJob {
         }
         let derive_started = std::time::Instant::now();
         let restored = n42_execution::restored_slots_for(key).unwrap_or_default();
-        let mut operations = gov5_qmdb_operations_with_restored(&output.state, &restored);
+        let mut operations = match self.chain_spec.as_ref() {
+            Some(chain_spec) => crate::qmdb_state::gov5_block_operations(
+                &output.state,
+                &restored,
+                chain_spec,
+                block.timestamp,
+            ),
+            None => gov5_qmdb_operations_with_restored(&output.state, &restored),
+        };
         metrics::histogram!("n42_qmdb_root_job_ms", "stage" => "derive")
             .record(derive_started.elapsed().as_secs_f64() * 1000.0);
         if std::env::var_os("N42_QMDB_DEBUG_ROOT").is_some() {
@@ -2640,14 +2648,8 @@ impl StateRootJob<N42Primitives> for Gov5QmdbStateRootJob {
                 );
             }
         }
-        if self.chain_spec.as_ref().is_some_and(|chain_spec| {
-            reth_chainspec::EthereumHardforks::is_prague_active_at_timestamp(
-                chain_spec.as_ref(),
-                block.timestamp,
-            )
-        }) {
-            with_gov5_prague_system_caller(&mut operations);
-        }
+        // `gov5_block_operations` added the system caller's leaf where the
+        // chain writes it; without a chain spec no block is Prague.
         if std::env::var_os("N42_QMDB_TRACE_OPERATIONS").is_some() {
             for operation in &operations {
                 tracing::info!(

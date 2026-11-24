@@ -282,6 +282,9 @@ where
         .map(|user_limit| std::cmp::min(user_limit, protocol_max_blob_count).max(1))
         .unwrap_or(protocol_max_blob_count);
     let is_osaka = chain_spec.is_osaka_active_at_timestamp(attributes.timestamp());
+    // AM2: `hotstuff.maxBlockBytes` on Profile 1, the 8 MiB cap from Osaka otherwise.
+    let block_size_limit =
+        n42_chainspec::profile1::installed_block_rlp_size_limit(is_osaka, MAX_RLP_BLOCK_SIZE);
     let withdrawals_rlp_length = attributes
         .withdrawals
         .as_ref()
@@ -359,7 +362,7 @@ where
                 && pool_tx.sender() != to
                 && pool_tx.sender() != beneficiary
                 && to != beneficiary;
-            let length = if is_osaka {
+            let length = if block_size_limit.is_some() {
                 pool_tx.transaction.consensus_ref().inner().length()
             } else {
                 0
@@ -371,7 +374,7 @@ where
                     .saturating_add(length)
                     .saturating_add(withdrawals_rlp_length)
                     .saturating_add(1024)
-                    <= MAX_RLP_BLOCK_SIZE;
+                    <= block_size_limit.unwrap_or(usize::MAX);
             if !plain || !fits {
                 replay.push_back(pool_tx);
                 break;
@@ -631,18 +634,19 @@ where
         let tx = pool_tx.to_consensus();
         consensus_total += consensus_start.elapsed();
 
-        // MAX_RLP_BLOCK_SIZE applies from Osaka only: the RLP length is not
-        // computed before it (about 2 us a transaction).
-        let tx_rlp_len = if is_osaka {
+        // The size bound (MAX_RLP_BLOCK_SIZE from Osaka, maxBlockBytes on
+        // Profile 1): without one the RLP length is not computed (about 2 us
+        // a transaction).
+        let tx_rlp_len = if let Some(limit) = block_size_limit {
             let len = tx.inner().length();
             let estimated_block_size_with_tx =
                 block_transactions_rlp_length + len + withdrawals_rlp_length + 1024; // 1Kb of overhead for the block header
-            if estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
+            if estimated_block_size_with_tx > limit {
                 best_txs.mark_invalid(
                     &pool_tx,
                     InvalidPoolTransactionError::OversizedData {
                         size: estimated_block_size_with_tx,
-                        limit: MAX_RLP_BLOCK_SIZE,
+                        limit,
                     },
                 );
                 continue;
@@ -870,7 +874,8 @@ where
                 );
                 (store, key, ctx.parent_hash)
             });
-        let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp());
+        let timestamp = attributes.timestamp();
+        let root_chain_spec = chain_spec.as_ref();
         let bundle_state = &execution_state;
         let (qmdb_root, block) = std::thread::scope(|scope| {
             let qmdb_root = qmdb_root_job.map(|(store, key, parent_hash)| {
@@ -878,7 +883,12 @@ where
                     let started = std::time::Instant::now();
                     let restored = n42_execution::restored_slots_for(key).unwrap_or_default();
                     let operations =
-                        crate::exec_cache::gov5_sorted_operations(bundle_state, &restored, prague);
+                        crate::exec_cache::gov5_sorted_operations(
+                            bundle_state,
+                            &restored,
+                            root_chain_spec,
+                            timestamp,
+                        );
                     // A parent built just before this block may still be
                     // committing its own candidate, the one the store holds.
                     crate::build_on_output::wait_parent_committed(store, parent_hash);
@@ -979,10 +989,12 @@ where
     if cancel.is_cancelled() {
         return Ok(BuildOutcome::Cancelled);
     }
-    if is_osaka && block.rlp_length() > MAX_RLP_BLOCK_SIZE {
+    if let Some(limit) = block_size_limit
+        && block.rlp_length() > limit
+    {
         return Err(PayloadBuilderError::other(ConsensusError::BlockTooLarge {
             rlp_length: block.rlp_length(),
-            max_rlp_length: MAX_RLP_BLOCK_SIZE,
+            max_rlp_length: limit,
         }));
     }
 

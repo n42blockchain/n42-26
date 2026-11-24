@@ -269,6 +269,77 @@ pub fn gov5_qmdb_operations_with_restored(
     operations
 }
 
+/// Whether a block at `timestamp` writes the system caller's leaf
+/// ([`with_gov5_prague_system_caller`]): from Prague on, but not under the
+/// Profile-1 Amsterdam execution (D3: the system caller is written only when
+/// its account changed, and under Glamsterdam it never does).
+pub fn gov5_system_caller_leaf_at<C>(chain_spec: &C, timestamp: u64) -> bool
+where
+    C: reth_chainspec::EthChainSpec + reth_chainspec::EthereumHardforks + ?Sized,
+{
+    reth_chainspec::EthereumHardforks::is_prague_active_at_timestamp(chain_spec, timestamp)
+        && !profile1_write_rules_at(chain_spec, timestamp)
+}
+
+/// Whether a block at `timestamp` takes the Profile-1 write-set rules (A9,
+/// D3, D5): a Profile-1 chain under its Amsterdam execution (AM1).
+pub fn profile1_write_rules_at<C>(chain_spec: &C, timestamp: u64) -> bool
+where
+    C: reth_chainspec::EthChainSpec + ?Sized,
+{
+    n42_execution::profile1_amsterdam_execution_at(chain_spec).is_some_and(|at| timestamp >= at)
+}
+
+/// The QMDB operations of one executed block, unsorted, exactly as this
+/// node's root job and builder derive them.
+///
+/// Other chains: [`gov5_qmdb_operations_with_restored`] (gov5's replay-v2
+/// rule) plus the system caller's leaf where [`gov5_system_caller_leaf_at`]
+/// says so.
+///
+/// Profile 1 ([`profile1_write_rules_at`]): a key is written only when its
+/// post-block value differs from its pre-block value.
+/// - A9: an account touched and left as it was (the existing recipient of a
+///   zero-value transfer) gets no op. An account with a storage op keeps its
+///   account op (V3 open point 1, gov5 today: the EIP-2935 and EIP-4788
+///   contracts and a contract whose slots changed).
+/// - D5: a slot changed and restored within the block gets no op (no
+///   restored-slot rewrite).
+/// - D3: no system caller leaf.
+pub fn gov5_block_operations<C>(
+    state: &BundleState,
+    restored: &[RestoredSlot],
+    chain_spec: &C,
+    timestamp: u64,
+) -> Vec<QmdbOperation>
+where
+    C: reth_chainspec::EthChainSpec + reth_chainspec::EthereumHardforks + ?Sized,
+{
+    if profile1_write_rules_at(chain_spec, timestamp) {
+        let mut operations = gov5_qmdb_operations(state);
+        let unchanged: HashSet<_> = state
+            .state
+            .iter()
+            .filter(|(_, account)| {
+                !account.was_destroyed()
+                    && account.info.is_some()
+                    && account.info == account.original_info
+                    && !account.storage.values().any(|slot| slot.is_changed())
+            })
+            .map(|(address, _)| gov5_account_key(&address.into_array()))
+            .collect();
+        if !unchanged.is_empty() {
+            operations.retain(|operation| !unchanged.contains(&operation.key));
+        }
+        return operations;
+    }
+    let mut operations = gov5_qmdb_operations_with_restored(state, restored);
+    if gov5_system_caller_leaf_at(chain_spec, timestamp) {
+        with_gov5_prague_system_caller(&mut operations);
+    }
+    operations
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -465,9 +465,25 @@ where
         // Besides the root, the inner check reads the transactions only for
         // the blob gas sum and, from Osaka on, the block size. A block with
         // neither is checked on a copy without its transactions.
-        let needs_transactions = self
-            .chain_spec
-            .is_osaka_active_at_timestamp(header.timestamp)
+        //
+        // AM2: on Profile 1 `hotstuff.maxBlockBytes` is the only size bound;
+        // the inner 8 MiB check never sees the transactions.
+        let profile1_max_block_bytes =
+            n42_chainspec::profile1::profile1_config().map(|config| config.max_block_bytes);
+        if let Some(max) = profile1_max_block_bytes
+            && let Some(limit) =
+                n42_chainspec::profile1::block_rlp_size_limit(Some(max), true, usize::MAX)
+            && block.rlp_length() > limit
+        {
+            return Err(ConsensusError::BlockTooLarge {
+                rlp_length: block.rlp_length(),
+                max_rlp_length: limit,
+            });
+        }
+        let needs_transactions = (profile1_max_block_bytes.is_none()
+            && self
+                .chain_spec
+                .is_osaka_active_at_timestamp(header.timestamp))
             || body
                 .transactions
                 .iter()

@@ -93,6 +93,58 @@ pub fn n42_profile() -> Option<N42Profile> {
     *PROFILE.get_or_init(|| None)
 }
 
+static PROFILE1_CONFIG: OnceLock<Profile1Config> = OnceLock::new();
+
+/// Installs the Profile-1 configuration for the components that read it
+/// outside the consensus service (the block size bound of the payload
+/// builders and of the import check). Once, at start-up, with
+/// [`install_n42_profile`]. Returns `false` when one was installed already.
+pub fn install_profile1_config(config: Profile1Config) -> bool {
+    PROFILE1_CONFIG.set(config).is_ok()
+}
+
+/// The installed Profile-1 configuration, on a Profile-1 node only.
+pub fn profile1_config() -> Option<&'static Profile1Config> {
+    (n42_profile() == Some(N42Profile::Profile1))
+        .then(|| PROFILE1_CONFIG.get())
+        .flatten()
+}
+
+/// AM2: the RLP size bound of a block. On Profile 1 `hotstuff.maxBlockBytes`
+/// is the only bound and applies at every fork; on other chains it is
+/// EIP-7934's `eth_limit` from Osaka on, none before.
+pub fn block_rlp_size_limit(
+    profile1_max_block_bytes: Option<u64>,
+    is_osaka: bool,
+    eth_limit: usize,
+) -> Option<usize> {
+    match profile1_max_block_bytes {
+        Some(max) => Some(usize::try_from(max).unwrap_or(usize::MAX)),
+        None => is_osaka.then_some(eth_limit),
+    }
+}
+
+/// [`block_rlp_size_limit`] for this process.
+pub fn installed_block_rlp_size_limit(is_osaka: bool, eth_limit: usize) -> Option<usize> {
+    block_rlp_size_limit(
+        profile1_config().map(|config| config.max_block_bytes),
+        is_osaka,
+        eth_limit,
+    )
+}
+
+/// C1-C4: the transaction types valid on Profile 1: legacy (0x00), EIP-2930
+/// (0x01), EIP-1559 (0x02) and EIP-7702 (0x04). Blob transactions (0x03,
+/// C2) and every other type, 0x50 included (C4; Profile 1 has no
+/// `altSigTx`), are refused.
+pub fn check_profile1_tx_type(ty: u8) -> Result<(), String> {
+    match ty {
+        0x00 | 0x01 | 0x02 | 0x04 => Ok(()),
+        0x03 => Err("profile 1 (C2): blob transactions are not valid".to_owned()),
+        other => Err(format!("profile 1 (C4): transaction type {other:#04x} is not valid")),
+    }
+}
+
 /// Environment variables that set or override a consensus-visible value in
 /// this client. On a Profile-1 genesis a node refuses to start when any is
 /// set (P3, J4, AM10). On other chains they keep their meaning.
@@ -338,6 +390,13 @@ pub fn profile1_chain_spec(
     }
     let header = profile1_genesis_header(&genesis, &config)?;
     let mut spec = ChainSpec::from(genesis);
+    // AM1: `amsterdamTime` switches on the Amsterdam *execution* set only
+    // (raised in the EVM configuration, `n42-execution`
+    // `profile1_amsterdam_execution_at`). reth's Amsterdam hardfork stays off,
+    // so the EIP-7928 block access list and the EIP-8282 end-of-block calls,
+    // both gated on it, never run. The genesis keeps the field as written.
+    spec.hardforks
+        .remove(&reth_chainspec::EthereumHardfork::Amsterdam);
     spec.genesis_header = SealedHeader::new(header.header.clone(), header.hash());
     Ok((spec, config, header))
 }

@@ -176,6 +176,10 @@ where
         .map(|user_limit| std::cmp::min(user_limit, protocol_max_blob_count).max(1))
         .unwrap_or(protocol_max_blob_count);
     let is_osaka = chain_spec.is_osaka_active_at_timestamp(attributes.timestamp());
+    // AM2: on Profile 1 `hotstuff.maxBlockBytes` replaces the 8 MiB EIP-7934
+    // cap at every fork; other chains keep the cap from Osaka on.
+    let block_size_limit =
+        n42_chainspec::profile1::installed_block_rlp_size_limit(is_osaka, MAX_RLP_BLOCK_SIZE);
     let withdrawals_rlp_length = attributes
         .withdrawals
         .as_ref()
@@ -224,12 +228,14 @@ where
         let estimated_block_size_with_tx =
             block_transactions_rlp_length + tx_rlp_len + withdrawals_rlp_length + 1024; // 1Kb of overhead for the block header
 
-        if is_osaka && estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
+        if let Some(limit) = block_size_limit
+            && estimated_block_size_with_tx > limit
+        {
             best_txs.mark_invalid(
                 &pool_tx,
                 InvalidPoolTransactionError::OversizedData {
                     size: estimated_block_size_with_tx,
-                    limit: MAX_RLP_BLOCK_SIZE,
+                    limit,
                 },
             );
             continue;
@@ -444,10 +450,12 @@ where
         "sealed built block"
     );
 
-    if is_osaka && block.rlp_length() > MAX_RLP_BLOCK_SIZE {
+    if let Some(limit) = block_size_limit
+        && block.rlp_length() > limit
+    {
         return Err(PayloadBuilderError::other(ConsensusError::BlockTooLarge {
             rlp_length: block.rlp_length(),
-            max_rlp_length: MAX_RLP_BLOCK_SIZE,
+            max_rlp_length: limit,
         }));
     }
 
