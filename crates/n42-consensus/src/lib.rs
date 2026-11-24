@@ -18,6 +18,7 @@ mod receipt;
 pub mod rotor;
 pub mod validator;
 pub mod vote_log;
+pub mod vote_rules;
 
 pub use adapter::{
     GOV5_HEADER_EXTRA_MAGIC, MAX_GOV5_HEADER_EXTRA_BYTES, MIN_GOV5_HEADER_EXTRA_BYTES,
@@ -51,3 +52,4 @@ pub use validator::{
     leader_tenure, view_after_tc,
 };
 pub use vote_log::{NoopVoteLog, VoteLogWriter};
+pub use vote_rules::VoteRules;
