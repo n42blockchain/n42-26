@@ -1082,7 +1082,7 @@ impl Gov5QmdbStateRootStore {
         expected_root: B256,
         binding: B256,
     ) -> Result<Option<B256>, Gov5QmdbStateRootError> {
-        match self.commit_operations(parent_hash, block_hash, expected_root, Err(binding)) {
+        match self.commit_operations(parent_hash, block_hash, Some(expected_root), Err(binding)) {
             Ok(root) => Ok(Some(root)),
             Err(Gov5QmdbStateRootError::NoBoundCandidate) => Ok(None),
             Err(error) => Err(error),
@@ -1179,16 +1179,32 @@ impl Gov5QmdbStateRootStore {
         expected_root: B256,
         operations: Vec<QmdbOperation>,
     ) -> Result<B256, Gov5QmdbStateRootError> {
-        self.commit_operations(parent_hash, block_hash, expected_root, Ok(operations))
+        self.commit_operations(parent_hash, block_hash, Some(expected_root), Ok(operations))
+    }
+
+    /// [`Self::compute_and_commit`] for a block whose header does not commit
+    /// its own state root (Profile 1, deferred execution: header N carries
+    /// N−1's root). The block's root is what its operations give on its
+    /// parent; it is committed under that root and returned. The caller has
+    /// checked the header's carried fields before calling.
+    pub fn compute_and_commit_own(
+        &self,
+        parent_hash: B256,
+        block_hash: B256,
+        operations: Vec<QmdbOperation>,
+    ) -> Result<B256, Gov5QmdbStateRootError> {
+        self.commit_operations(parent_hash, block_hash, None, Ok(operations))
     }
 
     /// `source` is the block's operations, or the binding of the prepared
-    /// candidate whose operations are to be used.
+    /// candidate whose operations are to be used. `expected_root` is the
+    /// root the block's header commits; `None` commits whatever root the
+    /// operations give (deferred execution).
     fn commit_operations(
         &self,
         parent_hash: B256,
         block_hash: B256,
-        expected_root: B256,
+        expected_root: Option<B256>,
         source: Result<Vec<QmdbOperation>, B256>,
     ) -> Result<B256, Gov5QmdbStateRootError> {
         let _commit = self
@@ -1235,7 +1251,7 @@ impl Gov5QmdbStateRootStore {
         }
         if let Some(stored) = state.blocks.get(&block_hash) {
             let result = if stored.parent_hash == parent_hash
-                && stored.root == expected_root
+                && expected_root.is_none_or(|expected| stored.root == expected)
                 && same_operations(&stored.operations(block_hash)?, &operations)
             {
                 metrics::counter!("n42_qmdb_commit_outcomes_total", "outcome" => "cache_hit")
@@ -1276,7 +1292,9 @@ impl Gov5QmdbStateRootStore {
                 true
             }
         };
-        let read_parent = if overlap_enabled && !prepared_matches {
+        // The overlapped read view is labelled with the header's root, so a
+        // block without one (deferred execution) builds its view afterwards.
+        let read_parent = if overlap_enabled && !prepared_matches && expected_root.is_some() {
             self.read_views
                 .read()
                 .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?
@@ -1315,7 +1333,7 @@ impl Gov5QmdbStateRootStore {
                             let started = std::time::Instant::now();
                             let view = Arc::new(parent.with_operations(
                                 block_hash,
-                                expected_root,
+                                expected_root.unwrap_or_default(),
                                 &operations,
                             ));
                             (view, started.elapsed())
@@ -1363,7 +1381,9 @@ impl Gov5QmdbStateRootStore {
                 return Err(error);
             }
         };
-        if root != expected_root {
+        if let Some(expected_root) = expected_root
+            && root != expected_root
+        {
             if let Some(undo) = &undo {
                 state.tree.apply_undo(undo)?;
             }
@@ -2596,6 +2616,9 @@ impl StateRootJob<N42Primitives> for Gov5QmdbStateRootJob {
         let key = gov5_restored_slots_key(block, self.env_key);
         metrics::histogram!("n42_qmdb_root_job_ms", "stage" => "key")
             .record(key_started.elapsed().as_secs_f64() * 1000.0);
+        if let Some(depth) = self.deferred_depth(block) {
+            return self.finish_deferred(block, &output, key, depth);
+        }
         // The builder derived this exact execution's operations already; the
         // key names its parent, environment and ordered transactions.
         if adopt_built_operations() {
@@ -2621,6 +2644,37 @@ impl StateRootJob<N42Primitives> for Gov5QmdbStateRootJob {
                 ));
             }
         }
+        let operations = self.sorted_operations(block, &output, key);
+        let commit_started = std::time::Instant::now();
+        let _commit_time = CommitStageTimer(commit_started);
+        let root = match self.store.compute_and_commit(
+            block.parent_hash,
+            block.hash(),
+            block.state_root,
+            operations,
+        ) {
+            Ok(root) => root,
+            // Return the independently computed root so Reth classifies the payload as
+            // deterministically Invalid through its normal BodyStateRootDiff path. The store did
+            // not publish the mismatching candidate.
+            Err(Gov5QmdbStateRootError::RootMismatch { got, .. }) => got,
+            Err(error) => return Err(ProviderError::other(error)),
+        };
+        Ok(StateRootJobOutcome::new(
+            root,
+            Arc::new(TrieUpdates::default()),
+        ))
+    }
+}
+
+impl Gov5QmdbStateRootJob {
+    /// The block's QMDB operations, sorted by key.
+    fn sorted_operations(
+        &self,
+        block: &RecoveredBlock<n42_tx_types::Block>,
+        output: &BlockExecutionOutput<Receipt>,
+        key: B256,
+    ) -> Vec<QmdbOperation> {
         let derive_started = std::time::Instant::now();
         let restored = n42_execution::restored_slots_for(key).unwrap_or_default();
         let mut operations = match self.chain_spec.as_ref() {
@@ -2670,23 +2724,117 @@ impl StateRootJob<N42Primitives> for Gov5QmdbStateRootJob {
         );
         metrics::histogram!("n42_qmdb_root_job_ms", "stage" => "sort")
             .record(sort_started.elapsed().as_secs_f64() * 1000.0);
+        operations
+    }
+
+    /// The deferred-execution depth of `block`'s header: Profile 1 (A10),
+    /// whose headers carry a slot number, is depth 1. `None` for a header
+    /// that commits its own result.
+    fn deferred_depth(&self, block: &RecoveredBlock<n42_tx_types::Block>) -> Option<u64> {
+        let chain_spec = self.chain_spec.as_ref()?;
+        (block.slot_number.is_some()
+            && n42_chainspec::profile1::genesis_declares_profile(
+                reth_chainspec::EthChainSpec::genesis(chain_spec.as_ref()),
+            ))
+        .then_some(1)
+    }
+
+    /// Deferred import validation (`deferred-execution-design.md` 3.2a):
+    /// the header's five carried fields must be this node's result for its
+    /// depth-`depth` ancestor (`n42_consensus::deferred_depth`), by hash.
+    ///
+    /// - The ancestor's result is not filed here: a provider error, which
+    ///   reth neither caches nor reports as Invalid; the import is retried
+    ///   once the parent is executed.
+    /// - The fields differ: nothing is committed and the job returns a root
+    ///   other than the header's, so reth marks the block Invalid through
+    ///   its BodyStateRootDiff path. The field that differs is logged.
+    /// - They match: the block's operations are committed under the root
+    ///   they give, the block's own five fields are filed under its hash,
+    ///   and the header's root is returned.
+    fn finish_deferred(
+        &self,
+        block: &RecoveredBlock<n42_tx_types::Block>,
+        output: &BlockExecutionOutput<Receipt>,
+        key: B256,
+        depth: u64,
+    ) -> ProviderResult<StateRootJobOutcome> {
+        use n42_consensus::deferred_depth::{CarriedError, ParentLink, expected_fields};
+        let carried = n42_consensus::ExecutedFields::carried_by(block.header());
+        let Some(parent_fields) = n42_consensus::executed_fields(&block.parent_hash) else {
+            metrics::counter!("n42_deferred_import_total", "outcome" => "parent_unknown")
+                .increment(1);
+            return Err(ProviderError::other(Gov5QmdbStateRootError::Persistence(format!(
+                "deferred execution: the result of parent {} of block {} is not known here",
+                block.parent_hash,
+                block.hash()
+            ))));
+        };
+        let link = ParentLink {
+            number: block.number.saturating_sub(1),
+            hash: block.parent_hash,
+            // Read at depth 2 only; this chain runs depth 1.
+            parent_hash: B256::ZERO,
+        };
+        let expected = match expected_fields(&link, depth, parent_fields, |hash| {
+            n42_consensus::executed_fields(hash)
+        }) {
+            Ok(expected) => expected,
+            Err(CarriedError::AncestorUnknown(ancestor)) => {
+                metrics::counter!("n42_deferred_import_total", "outcome" => "parent_unknown")
+                    .increment(1);
+                return Err(ProviderError::other(Gov5QmdbStateRootError::Persistence(
+                    format!("deferred execution: the result of {ancestor} is not known here"),
+                )));
+            }
+            Err(error) => {
+                return Err(ProviderError::other(Gov5QmdbStateRootError::Persistence(
+                    error.to_string(),
+                )));
+            }
+        };
+        if let Some(field) = carried.first_difference(&expected) {
+            metrics::counter!("n42_deferred_import_total", "outcome" => "refused").increment(1);
+            tracing::error!(
+                target: "n42::qmdb",
+                block = block.number,
+                block_hash = %block.hash(),
+                parent_hash = %block.parent_hash,
+                field,
+                carried = ?carried,
+                expected = ?expected,
+                "REJECTING block: its deferred execution fields are not this node's result for its parent"
+            );
+            // Any root but the header's: reth refuses through BodyStateRootDiff.
+            let mut refused = block.state_root;
+            refused.0[31] ^= 0x01;
+            return Ok(StateRootJobOutcome::new(refused, Arc::new(TrieUpdates::default())));
+        }
+        let operations = self.sorted_operations(block, output, key);
         let commit_started = std::time::Instant::now();
         let _commit_time = CommitStageTimer(commit_started);
-        let root = match self.store.compute_and_commit(
-            block.parent_hash,
-            block.hash(),
-            block.state_root,
-            operations,
-        ) {
-            Ok(root) => root,
-            // Return the independently computed root so Reth classifies the payload as
-            // deterministically Invalid through its normal BodyStateRootDiff path. The store did
-            // not publish the mismatching candidate.
-            Err(Gov5QmdbStateRootError::RootMismatch { got, .. }) => got,
-            Err(error) => return Err(ProviderError::other(error)),
+        let own_root = self
+            .store
+            .compute_and_commit_own(block.parent_hash, block.hash(), operations)
+            .map_err(ProviderError::other)?;
+        let result = &output.result;
+        let own = n42_consensus::ExecutedFields {
+            state_root: own_root,
+            receipts_root: n42_consensus::gov5_native_receipts_root(&result.receipts),
+            logs_bloom: result.receipts.iter().fold(
+                alloy_primitives::Bloom::ZERO,
+                |bloom, receipt| bloom | alloy_consensus::TxReceipt::bloom(receipt),
+            ),
+            // The block's gas as execution reports it (EIP-8037
+            // max(regular, state)), not the receipts' cumulative.
+            gas_used: result.gas_used,
+            requests_hash: result.requests.requests_hash(),
         };
+        n42_consensus::remember_executed_fields(block.hash(), own)
+            .map_err(|error| ProviderError::other(Gov5QmdbStateRootError::Persistence(error.to_string())))?;
+        metrics::counter!("n42_deferred_import_total", "outcome" => "filed").increment(1);
         Ok(StateRootJobOutcome::new(
-            root,
+            block.state_root,
             Arc::new(TrieUpdates::default()),
         ))
     }

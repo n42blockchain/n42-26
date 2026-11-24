@@ -179,6 +179,11 @@ pub const PROFILE1_FORBIDDEN_ENV: &[&str] = &[
     // A13/AM19: the Round-1 vote waits for the own import; a vote released
     // on cached data is not allowed.
     "N42_COLOCATED_VOTE",
+    // A10: a header carries its parent's result, so the import commits the
+    // QMDB operations under the root they give and compares the carried
+    // fields; neither switch has a deferred variant.
+    "N42_QMDB_ADOPT_BUILT",
+    "N42_LEADER_INSERT_EXECUTED",
 ];
 
 /// Prefixes of forbidden variables: every gov5 interop switch

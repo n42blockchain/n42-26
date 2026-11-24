@@ -49,8 +49,15 @@ fn v1() -> (V1, Profile1ImportGate) {
 
 impl V1 {
     /// The refusals checked on import, with the vector's names.
+    /// V1's import refusals the header gate decides. Its two requestsHash
+    /// refusals are not among them: under AM25 requestsHash is a deferred
+    /// field, refused by the engine's deferred check (`n42-node`'s
+    /// `profile1_deferred.rs`), not by the static header rules.
     fn import_refusals(&self) -> Vec<(String, Vec<u8>)> {
         self.refusals("import")
+            .into_iter()
+            .filter(|(name, _)| !name.starts_with("requestsHash"))
+            .collect()
     }
 
     fn refusals(&self, check: &str) -> Vec<(String, Vec<u8>)> {
@@ -134,7 +141,7 @@ async fn follower_import_admits_v1_and_refuses_every_import_refusal() {
     }
 
     let refusals = f.import_refusals();
-    assert_eq!(refusals.len(), 23);
+    assert_eq!(refusals.len(), 21);
     for (name, header) in refusals {
         let (hash, broadcast) = block_data(&header, 2);
         orch.handle_block_data(bincode::serialize(&broadcast).unwrap()).await;
@@ -254,7 +261,7 @@ async fn catchup_import_refuses_before_new_payload() {
         assert!(!admitted(&orch, decoded.hash()), "{name}");
         refused += 1;
     }
-    assert_eq!(refused, 23);
+    assert_eq!(refused, 21);
 
     let wire2 = gov5_wire_block(&f.block2, block2.header.beneficiary);
     let decoded2 = orch.decode_wire_block(&wire2).unwrap();

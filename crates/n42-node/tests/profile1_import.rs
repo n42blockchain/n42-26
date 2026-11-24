@@ -9,7 +9,9 @@
 //! canonical as a forkchoice update does and persisted, and read back from
 //! the provider under their Profile-1 hashes.
 //!
-//! The headers carry their own execution results (no deferral yet).
+//! Deferred execution (A10/AM25): each header carries its parent's five
+//! execution fields; the engine's QMDB state-root job checks them against
+//! this node's result for the parent and files the block's own.
 
 use alloy_consensus::{BlockBody, EMPTY_OMMER_ROOT_HASH, Header, proofs};
 use alloy_eips::{eip2718::Decodable2718, eip4895::Withdrawals};
@@ -121,6 +123,8 @@ struct Produced {
     standard: ExecutionData,
     receipts_root: B256,
     leader: usize,
+    /// The block's own result, which its child carries.
+    own: n42_consensus::ExecutedFields,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -186,14 +190,24 @@ fn produce(
     let operations = gov5_block_operations(&output.state, &[], spec, timestamp);
     let qmdb_root = B256::from(tree.apply_sorted_ops(operations)?);
     let receipts_root = n42_network::gov5_native_receipts_root(&output.result.receipts);
-    header.gas_used = output.result.gas_used;
-    header.logs_bloom = output
-        .result
-        .receipts
-        .iter()
-        .fold(Bloom::ZERO, |bloom, receipt| {
-            bloom | alloy_primitives::logs_bloom(receipt.logs.iter())
-        });
+    let own = n42_consensus::ExecutedFields {
+        state_root: qmdb_root,
+        receipts_root,
+        logs_bloom: output
+            .result
+            .receipts
+            .iter()
+            .fold(Bloom::ZERO, |bloom, receipt| {
+                bloom | alloy_primitives::logs_bloom(receipt.logs.iter())
+            }),
+        gas_used: output.result.gas_used,
+        requests_hash: output.result.requests.requests_hash(),
+    };
+    // A10/AM25: the header carries the parent's result.
+    let carried = n42_consensus::executed_fields(&parent.hash()).expect("the parent's result");
+    header.gas_used = carried.gas_used;
+    header.logs_bloom = carried.logs_bloom;
+    header.requests_hash = Some(carried.requests_hash);
     let standard = Block {
         header,
         body: BlockBody {
@@ -207,8 +221,8 @@ fn produce(
         &execution,
         view,
         None,
-        qmdb_root,
-        receipts_root,
+        carried.state_root,
+        carried.receipts_root,
         B256::ZERO,
         &keys[leader],
     )?;
@@ -223,8 +237,9 @@ fn produce(
         payload: built.payload,
         qmdb_root,
         standard: execution,
-        receipts_root,
+        receipts_root: carried.receipts_root,
         leader,
+        own,
     })
 }
 
@@ -236,6 +251,10 @@ async fn a_profile1_chain_imports_through_reth_and_becomes_canonical() -> eyre::
     let genesis_hash = genesis_header.hash();
     assert_eq!(spec.genesis_hash(), genesis_hash);
     n42_consensus::remember_gov5_native_header(&genesis_header.encode());
+    n42_consensus::remember_executed_fields(
+        genesis_hash,
+        n42_consensus::ExecutedFields::carried_by(&genesis_header.header),
+    )?;
     let keys = validator_keys();
 
     // reth's database: the genesis header under its Profile-1 hash and the
@@ -344,8 +363,8 @@ async fn a_profile1_chain_imports_through_reth_and_becomes_canonical() -> eyre::
                 "the follower's payload is the leader's"
             );
 
-            // The same block sealed with a wrong QMDB root is refused by the
-            // engine's state-root check, and nothing is committed for it.
+            // The same block carrying a wrong state root is refused by the
+            // engine's deferred check, and nothing is committed for it.
             let tampered = n42_network::seal_built_payload_for_profile1(
                 &produced.standard,
                 view,
@@ -379,6 +398,13 @@ async fn a_profile1_chain_imports_through_reth_and_becomes_canonical() -> eyre::
             assert_eq!(block.header().slot_number, Some(block.header().number));
             assert_eq!(block.header().requests_hash, Some(PROFILE1_REQUESTS_HASH));
             assert_eq!(store.root_for(hash)?, Some(produced.qmdb_root));
+            // The engine filed the block's own result for its child.
+            assert_eq!(n42_consensus::executed_fields(&hash), Some(produced.own));
+            assert_eq!(
+                n42_consensus::ExecutedFields::carried_by(block.header()),
+                n42_consensus::executed_fields(&parent.hash()).unwrap(),
+                "the header carries its parent's result"
+            );
             // What the engine tree does with a valid block, then with a
             // forkchoice update to it: the block becomes the canonical head.
             overlay.insert_block(checked.executed_block.clone());

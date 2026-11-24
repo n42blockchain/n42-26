@@ -3644,6 +3644,17 @@ fn main() {
                 if let Some(header) = full_node.provider.header(consensus_head_hash)? {
                     orchestrator = orchestrator.with_recovered_head_timestamp(header.timestamp);
                 }
+                // A10 (design 3.1/3.8): the first header after a restart
+                // carries the head's result, which must be this node's own;
+                // it is never taken from a header.
+                if profile1.is_some()
+                    && consensus_head_number > 0
+                    && n42_consensus::executed_fields(&consensus_head_hash).is_none()
+                {
+                    return Err(eyre::eyre!(
+                        "refusing to start: profile 1: no executed result for head {consensus_head_number} ({consensus_head_hash}) in executed_fields.log"
+                    ));
+                }
                 if let Some(config) = &profile1 {
                     let head = full_node
                         .provider

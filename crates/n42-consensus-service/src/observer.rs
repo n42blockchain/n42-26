@@ -2641,7 +2641,11 @@ mod tests {
 
         let mut refused = 0;
         for refusal in vector["refusals"].as_array().unwrap() {
-            if refusal["check"] != "import" {
+            // AM25: requestsHash is a deferred field, refused by the
+            // engine's deferred check, not by the header gate.
+            if refusal["check"] != "import"
+                || refusal["name"].as_str().unwrap().starts_with("requestsHash")
+            {
                 continue;
             }
             let header = raw(&refusal["rlp"]);
@@ -2652,6 +2656,6 @@ mod tests {
             );
             refused += 1;
         }
-        assert_eq!(refused, 23);
+        assert_eq!(refused, 21);
     }
 }

@@ -259,8 +259,8 @@ fn build_execution_data(
 }
 
 /// The Engine API payload of a Profile-1 block (mixed production standard
-/// B1-B12): a V3 payload whose sidecar carries the requests hash (AM24,
-/// `sha256("")`), with the rewards as withdrawals (B6). The payload holds
+/// B1-B12): a V3 payload whose sidecar carries the header's requests hash
+/// (B8; under AM25 the parent's), with the rewards as withdrawals (B6). The payload holds
 /// neither `slotNumber` nor `mobileRegistryRoot`; the engine validator binds
 /// them back from the remembered 24-element header, and the identity here is
 /// that header's hash.
@@ -282,8 +282,9 @@ fn build_profile1_execution_data(
     if header.slot_number != Some(number) {
         return Err(profile_error("slotNumber is not the block number"));
     }
-    if header.requests_hash != Some(n42_chainspec::profile1::PROFILE1_REQUESTS_HASH) {
-        return Err(profile_error("requestsHash is not sha256(\"\")"));
+    // B8: present; its value is N−1's (AM25), checked on execution.
+    if header.requests_hash.is_none() {
+        return Err(profile_error("requestsHash is missing"));
     }
     if header.block_access_list_hash.is_some() {
         return Err(ReplayImportPlanError::MissingBlockAccessList(number));

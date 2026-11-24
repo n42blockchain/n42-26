@@ -357,6 +357,45 @@ where
         receipt_root_bloom: Option<reth_consensus::ReceiptRootBloom>,
         block_access_list_hash: Option<B256>,
     ) -> Result<(), ConsensusError> {
+        if self.header_profile == N42HeaderProfile::Gov5H2 && self.is_profile1_header(block.header())
+        {
+            // Profile 1 (A10/AM25): header N carries N−1's result, so N's own
+            // receipts root, bloom, gas and requests hash are not in N's
+            // header. They are compared with what N's child carries: the
+            // QMDB state-root job checks N's five carried fields against this
+            // node's result for N−1 and files N's own. Here the copy the
+            // inner rules read gets N's own values, which makes only their
+            // self-comparison of the deferred fields a tautology; everything
+            // else they check still applies.
+            let logs_bloom = receipt_root_bloom.map_or_else(
+                || {
+                    result.receipts.iter().fold(Bloom::ZERO, |bloom, receipt| {
+                        bloom | receipt.with_bloom_ref().bloom_ref()
+                    })
+                },
+                |(_, bloom)| bloom,
+            );
+            let receipts_root = gov5_native_receipts_root(&result.receipts);
+            let mut header = block.header().clone();
+            header.receipts_root = receipts_root;
+            header.logs_bloom = logs_bloom;
+            header.gas_used = result.gas_used;
+            header.requests_hash = Some(result.requests.requests_hash());
+            let header_only = RecoveredBlock::new_unhashed(
+                N42Block {
+                    header,
+                    body: Default::default(),
+                },
+                Vec::new(),
+            );
+            return <EthBeaconConsensus<C> as FullConsensus<N42Primitives>>::validate_block_post_execution(
+                &self.inner,
+                &header_only,
+                result,
+                Some((receipts_root, logs_bloom)),
+                block_access_list_hash,
+            );
+        }
         if self.header_profile == N42HeaderProfile::Gov5H2 {
             let native_root = gov5_native_receipts_root(&result.receipts);
             if native_root != block.header().receipts_root {

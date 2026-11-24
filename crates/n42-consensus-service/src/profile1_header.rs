@@ -59,7 +59,7 @@ pub enum Profile1HeaderInvalid {
     TimeBeforeParent { time: u64, parent: u64 },
     #[error("profile 1 (B4): timestamp too far ahead of the local clock: {time} > floor(now) + 2 = {bound}")]
     TimeFuture { time: u64, bound: u64 },
-    #[error("profile 1 (B8, AM24): requestsHash is not sha256(\"\") of EIP-7685: {0:?}")]
+    #[error("profile 1 (B8): requestsHash is missing")]
     RequestsHash(Option<B256>),
     #[error("profile 1 (B9): blob gas fields are not zero: blobGasUsed {used:?}, excessBlobGas {excess:?}")]
     BlobGas {
@@ -163,8 +163,10 @@ pub fn validate_profile1_header(
             parent: p.timestamp,
         });
     }
-    // B8 (AM24): EIP-7685's empty requests hash; the empty-trie root is refused.
-    if h.requests_hash != Some(n42_chainspec::profile1::PROFILE1_REQUESTS_HASH) {
+    // B8: present. Its value is a deferred field (AM25: N−1's EIP-7685
+    // requests hash), compared with this node's execution of the parent on
+    // import (the QMDB state-root job), not here.
+    if h.requests_hash.is_none() {
         return Err(Profile1HeaderInvalid::RequestsHash(h.requests_hash));
     }
     // B9.
@@ -709,6 +711,7 @@ mod tests {
         let f = Fixture::load();
         let rules = f.rules();
         let mut checked = 0;
+        let mut deferred = 0;
         for refusal in f.vector["refusals"].as_array().unwrap() {
             let name = refusal["name"].as_str().unwrap();
             let raw = hex::decode(refusal["rlp"].as_str().unwrap()).unwrap();
@@ -720,12 +723,28 @@ mod tests {
                             validate_profile1_header(&header, &f.block1, &rules, f.is_ancestor())
                                 .map_err(|error| error.to_string())
                         });
+                    if name.starts_with("requestsHash") {
+                        // AM25: requestsHash is a deferred field. The header
+                        // passes the static rules; it is refused because it
+                        // is not block 1's executed requests hash (block 1
+                        // produced no requests: sha256("")).
+                        result.expect(name);
+                        let header = Profile1Header::decode(&raw).unwrap();
+                        let mut executed_parent =
+                            n42_consensus::ExecutedFields::carried_by(&header.header);
+                        executed_parent.requests_hash =
+                            n42_chainspec::profile1::PROFILE1_REQUESTS_HASH;
+                        assert_eq!(
+                            n42_consensus::ExecutedFields::carried_by(&header.header)
+                                .first_difference(&executed_parent),
+                            Some("requestsHash"),
+                            "{name}"
+                        );
+                        deferred += 1;
+                        continue;
+                    }
                     let error = result.expect_err(name);
                     eprintln!("{name}: {error}  [gov5: {}]", refusal["gov5Message"]);
-                    if name.starts_with("requestsHash") {
-                        // AM24: the empty-trie root is refused by B8 itself.
-                        assert!(error.contains("(B8, AM24)"), "{name}: {error}");
-                    }
                     checked += 1;
                 }
                 "vote" => {
@@ -745,7 +764,8 @@ mod tests {
                 other => panic!("{name}: unknown check {other}"),
             }
         }
-        assert_eq!(checked, 24);
+        assert_eq!(checked, 22);
+        assert_eq!(deferred, 2, "V1's two requestsHash refusals");
     }
 
     /// A leader's own block reaches its gate through no import path. Its
