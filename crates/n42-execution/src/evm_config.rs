@@ -97,7 +97,9 @@ pub struct N42EvmConfig {
 /// (`n42_chainspec::profile1::profile1_chain_spec`), so what reth and evm2
 /// gate on the chain spec's Amsterdam stays off: the EIP-7928 block access
 /// list (builder and payload validator) and the EIP-8282 end-of-block
-/// builder-request calls. EIP-7997 is in neither client.
+/// builder-request calls (the latter not by evm2, which gates them on its
+/// spec alone: the executor factory turns them off on every native chain, see
+/// [`eip8282_builder_requests_active`]). EIP-7997 is in neither client.
 pub fn profile1_amsterdam_execution_at<C: reth_chainspec::EthChainSpec + ?Sized>(
     chain_spec: &C,
 ) -> Option<u64> {
@@ -106,6 +108,29 @@ pub fn profile1_amsterdam_execution_at<C: reth_chainspec::EthChainSpec + ?Sized>
         return None;
     }
     genesis.config.amsterdam_time
+}
+
+/// Whether blocks of the chain with `genesis` make the EIP-8282
+/// builder-request system calls at their end (from Amsterdam on, as evm2
+/// decides): only on a chain that is not N42-native.
+///
+/// This is gov5's rule (`UsesEIP8282BuilderRequests(time)` = Glamsterdam and
+/// not `IsN42Native`) and the mixed production standard's D2 ("no EIP-8282
+/// calls"); n42-rs gates on the same predicate
+/// (`!reth_chainspec::qmdb::is_n42_native(genesis)`, docs/EVM2_PORT_PLAN.md
+/// S1). evm2 (rev 66687c18) gates the two calls on its spec alone, and
+/// Profile 1 runs the Amsterdam spec from `amsterdamTime` (AM1), so without
+/// the gate n42-26 calls both predeploy addresses at the end of every such
+/// block. They have no code on N42 chains, but anyone can deploy it (the
+/// predeploys are deployable by Nick's method, and native chains admit
+/// pre-EIP-155 transactions); from then on a node making the calls diverges
+/// from gov5. An Ethereum-compatible chain (not native) keeps the calls
+/// whenever its spec schedules Amsterdam. The switch is the vendored evm2
+/// repair `EthBlockExecutor::set_eip8282_builder_requests`
+/// (`vendor/dependency-repairs/evm2-66687c18`), set per executor by
+/// `TrackingBlockExecutorFactory::create_executor`.
+pub fn eip8282_builder_requests_active(genesis: &alloy_genesis::Genesis) -> bool {
+    !n42_chainspec::native::is_n42_native(genesis)
 }
 
 impl N42EvmConfig {

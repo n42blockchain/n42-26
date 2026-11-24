@@ -34,7 +34,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 无需改写 Cargo.toml。用 `bash scripts/check-reth-source.sh <reth-source>` 验证源码。
 
 EVM 为 evm2（reth v2.9.0 起取代 revm）：git `alloy-rs/evm2` rev
-`66687c18b34d3bdbb899f5eb7605070615c03475`，经 `[patch]` 指向 `DaniPopes/evm2` 同一 rev 以保证图中只有一份；
+`66687c18b34d3bdbb899f5eb7605070615c03475`；evm2 本体经 `[patch]` 换成 vendored 修复
+`vendor/dependency-repairs/evm2-66687c18`（同一 rev，加 `set_eip8282_builder_requests` 开关，N42 原生链关闭
+EIP-8282 调用，见其 `N42-PROVENANCE.md`），evm2-macros / evm2-jit 经 `[patch]` 指向 `DaniPopes/evm2` 同一 rev，图中各只有一份；
 workspace 不再依赖 revm、alloy-evm、reth-revm。reth-primitives-traits 0.8.2 等 reth-core crate 经
 `[patch.crates-io]` 取自 `paradigmxyz/reth-core` rev `275ce4cf5befeb9f1e8acd935ff2882d2d25fc61`；
 Alloy 2.5.0、alloy-primitives 1.7.3。`vendor/dependency-repairs/evm2-inspectors-0.1.0` 取代原 revm-inspectors 修复。

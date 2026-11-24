@@ -570,3 +570,72 @@ AM19 与检查早于提案；被拒块无 Round 1；非 Profile 1 无效果）�
 - 门禁：`cargo clippy --workspace --all-targets -D warnings` 通过；`cargo test --workspace` 2080 通过、0 失败、38 忽略。
 - EIP-8282 创世 alloc 拒绝（方案 C）已按协调撤销：预部署地址可由 Nick 方法在创世后部署，创世规则无法保证调用为空操作；由用户在 evm2 侧决定。
 - 后续：设计 3.10 手机端语义；V5 的 AM25 请求块；observer 的 E12（目前只有 orchestrator 停机）。
+
+## 11. EIP-8282 在原生链上关闭
+
+分支 `feat/evm2-no-8282-native`（基于 1512a00）。owner 批准的方案 A：vendor 并修补 evm2。
+
+### 11.1 问题
+
+- evm2 rev 66687c18 的 `post_execution_system_call_state_changes`（upstream `execution.rs:382-450`，条件在 :422）
+  只要 `spec_id.enables(AMSTERDAM)` 就在块尾调用两个 EIP-8282 预部署地址（builder deposit `0x0000BFF4…8282`、
+  builder exit `0x000064D6…8282`），从不看链配置。
+- Profile 1 从 `amsterdamTime` 把 evm2 spec 提到 AMSTERDAM（AM1），同时去掉 reth 的 Amsterdam 硬分叉，所以 n42-26
+  在每个 Profile-1 块都发出这两个调用。n42-rs 自 2026-11-06 也用同一 evm2 rev，同样会调用（其
+  `docs/EVM2_PORT_PLAN.md` S1 计划加门）。gov5 在原生链上不调用（`UsesEIP8282BuilderRequests` = Glamsterdam 且非
+  `IsN42Native`；标准 D2）。
+- 地址目前无代码，调用是空操作；但预部署可用 Nick 方法由任何人部署（原生链接受 pre-155 交易），之后调用会改状态、
+  产生 0x03/0x04 请求（或合约 revert 让所有块无效），与 gov5 分叉。
+
+### 11.2 设计决策
+
+- 开关放在 evm2 的 `EthBlockExecutor`（一个字段 + `set_eip8282_builder_requests`），默认 `true` 即上游行为，
+  `start_block` 保留该值；`apply_post_execution_changes`（`finish` 也走它）把它传给新函数
+  `post_execution_system_call_state_changes_with_builder_requests`。原函数签名不变、内部传 `true`。
+- 没有改 `BlockExecutionContext` / `EthBlockRules`：前者被 reth 测试按字面量构造，加字段会破坏 reth 编译；后者
+  `derive(Default)` 得到 `false`，默认值会与上游相反，且 reth 在 big-block 分段时每段重建 rules。
+- 不用 reth 的 `set_spec_id(OSAKA)` 绕过（n42-rs 计划的路线）：它同时改变 deposit 请求扫描与系统调用的 spec，
+  语义比单独开关宽；vendor 的成本是升级 evm2 时重放一个小 diff。
+- 谓词：`eip8282_builder_requests_active(genesis) = !n42_chainspec::native::is_n42_native(genesis)`，即 gov5 的
+  `IsN42Native`（consensus 为 hotstuff/apos，或 config 有 hotstuff/apos 段，或声明了 n42Profile），与 n42-rs
+  `crates/chainspec/src/qmdb.rs` `is_n42_native` 同一规则。最初写的是“链配置有 reth Amsterdam 才调用”（模仿
+  alloy-evm），在三方共享的链上结果相同，但按协调方更正（n42-rs 已在 evm2 上，并按原生性门控）改为原生性谓词，
+  与 gov5、标准和 n42-rs S1 对齐。非原生（以太坊兼容）链只要 spec 到 Amsterdam 就照常调用。
+- 放置点：`TrackingBlockExecutorFactory::create_executor`。`N42EvmConfig` 的所有执行器（引擎导入、payload builder、
+  并行构建、手机验证器）都从这里创建；grep 确认没有绕过它直接用内层 `EthEvmConfig` / `EthBlockExecutorFactory` 执行的路径。
+
+### 11.3 实施细节
+
+- `vendor/dependency-repairs/evm2-66687c18/`：只 vendor `crates/evm2`（src、build.rs、README 实体拷贝——上游是指向根
+  README 的符号链接、LICENSE*、根目录 LICENSES/），`Cargo.toml` 按 `cargo package` 方式展平（去掉 dev-deps、tests、
+  examples、lints；`std` 特性去掉只属于 dev-dep 的 `ark-std/std`），末尾 `[workspace]` 使其不属于本 workspace。
+  `N42-PATCH.diff`（两个文件）、`N42-PROVENANCE.md`（来源、改动、原因、升级重放步骤）。
+- workspace `Cargo.toml` `[patch."https://github.com/alloy-rs/evm2"]`：`evm2` 改为 path；evm2-macros / evm2-jit 仍指向
+  DaniPopes 同 rev。`Cargo.lock` 只剩一个 `evm2`（无 source 行），`cargo tree -i evm2` 只显示 path 包；reth-core 的旧
+  pin（f93318f）同样被折叠进来。
+- `n42-chainspec::native::is_n42_native`、`n42_execution::eip8282_builder_requests_active`（n42-execution 新增
+  `alloy-genesis` 依赖）。
+- `docker/n42-node/Dockerfile` 增加 `COPY n42-26/vendor/`：此前镜像构建已缺 evm2-inspectors 等 vendored 修复，
+  evm2 本体 vendor 后不复制就无法构建。CI workflow 直接检出整个仓库，vendor 随仓库可用；`reth-source.lock`、
+  `check-reth-source.sh` 只管 reth 源，不涉及 evm2。
+
+### 11.4 测试（`crates/n42-node/tests/profile1_vectors.rs`）
+
+预部署按部署后的样子放进状态：alloy-eips 代码、nonce 1、excess 槽 = 2^256-1（inhibitor），并各排一个待处理请求
+（count 1、tail 1、条目槽）。用 V3/main 前两个块（空块、普通转账）。
+
+- `profile1_amsterdam_makes_no_eip8282_calls`：从创世起就有代码。两个地址不进 bundle，无 0x03/0x04 请求，
+  每块 QMDB 写集、根、requests 与地址为空时相同。
+- `profile1_mid_chain_eip8282_deploy_makes_no_calls`：块 k 后才出现代码（模拟 Nick 方法 CREATE），块 k+1 同上相等。
+- `non_native_amsterdam_chain_keeps_the_eip8282_calls`：去掉 n42Profile/consensus/hotstuff 并加回 reth Amsterdam，
+  两个调用照常发生：excess 槽从 MAX 变 0，产生 0x03 和 0x04 请求（上游默认行为，防止过度门控）。
+- 反向验证：把开关强制为 `true` 时两个原生链测试失败（地址被改），恢复后通过。
+- `n42-chainspec` `n42_native_follows_gov5` 覆盖谓词。
+
+### 11.5 后续
+
+- n42-rs S1/S2 可对照：谓词 `crates/n42-chainspec/src/native.rs` `is_n42_native`，门
+  `crates/n42-execution/src/evm_config.rs` `eip8282_builder_requests_active`，设置点
+  `crates/n42-execution/src/restored_slots.rs` `create_executor`。
+- 升级 evm2 时按 `N42-PROVENANCE.md` 重放；若上游提供开关（例如 `EthBlockRules` 上的 builder_requests），删除 vendor。
+- gov5 发布含 8282 代码与排队请求的 V5 用例（n42-rs S8）后加入本仓库。

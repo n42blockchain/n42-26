@@ -404,8 +404,11 @@ pub fn profile1_chain_spec(
     // AM1: `amsterdamTime` switches on the Amsterdam *execution* set only
     // (raised in the EVM configuration, `n42-execution`
     // `profile1_amsterdam_execution_at`). reth's Amsterdam hardfork stays off,
-    // so the EIP-7928 block access list and the EIP-8282 end-of-block calls,
-    // both gated on it, never run. The genesis keeps the field as written.
+    // so the EIP-7928 block access list, gated on it, never runs. The EIP-8282
+    // end-of-block calls are gated on its spec by evm2, so the executor factory
+    // turns them off on every native chain
+    // (`n42_execution::eip8282_builder_requests_active`). The genesis keeps the
+    // field as written.
     spec.hardforks
         .remove(&reth_chainspec::EthereumHardfork::Amsterdam);
     spec.genesis_header = SealedHeader::new(header.header.clone(), header.hash());

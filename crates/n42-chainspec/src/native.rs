@@ -36,9 +36,42 @@ pub fn frame_blocks_enabled(genesis: &Genesis) -> bool {
     flag(genesis, FRAME_BLOCKS_KEY)
 }
 
+/// Genesis `config` key gov5 reads the consensus engine from
+/// (`params.ChainConfig.Consensus`).
+pub const CONSENSUS_KEY: &str = "consensus";
+
+/// Whether the genesis describes an N42-native chain: gov5's `IsN42Native`
+/// (`params/config.go:473`) — consensus `hotstuff` or `apos`, or a `hotstuff`
+/// / `apos` section in the config — and every Profile-1 genesis. The same rule
+/// as n42-rs `crates/chainspec/src/qmdb.rs` `is_n42_native`.
+pub fn is_n42_native(genesis: &Genesis) -> bool {
+    if crate::profile1::genesis_declares_profile(genesis) {
+        return true;
+    }
+    let fields = &genesis.config.extra_fields;
+    let consensus: Option<String> = fields
+        .get_deserialized(CONSENSUS_KEY)
+        .and_then(Result::ok);
+    matches!(consensus.as_deref(), Some("hotstuff" | "apos"))
+        || fields.contains_key("hotstuff")
+        || fields.contains_key("apos")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn n42_native_follows_gov5() {
+        let native = |config| is_n42_native(&genesis(config));
+        assert!(native(serde_json::json!({ "chainId": 94, "consensus": "hotstuff" })));
+        assert!(native(serde_json::json!({ "chainId": 94, "consensus": "apos" })));
+        assert!(native(serde_json::json!({ "chainId": 4242, "hotstuff": { "leaderTenure": 8 } })));
+        assert!(native(serde_json::json!({ "chainId": 4242, "apos": {} })));
+        assert!(native(serde_json::json!({ "chainId": 4242, "n42Profile": 1 })));
+        assert!(!native(serde_json::json!({ "chainId": 1 })));
+        assert!(!native(serde_json::json!({ "chainId": 1, "consensus": "clique" })));
+    }
 
     fn genesis(config: serde_json::Value) -> Genesis {
         serde_json::from_value(serde_json::json!({ "config": config, "alloc": {} })).unwrap()
