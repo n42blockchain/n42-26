@@ -102,6 +102,26 @@ pub fn gov5_qmdb_genesis_tree(genesis: &Genesis) -> Result<QmdbCompatTree, QmdbO
     Ok(tree)
 }
 
+/// Whether the genesis activates gov5's `unchangedAccountNoOpTime` rule from block zero.
+///
+/// Without the rule gov5 appends a leaf for an account whose first access in a block was a
+/// zero `AddBalance` -- in practice the fee recipient of a block whose transactions pay no
+/// priority fee -- although its value did not change. revm reports that account as not
+/// modified, so this node writes no leaf for it and the two clients commit different QMDB
+/// roots for the same block. With the rule active gov5 skips such accounts as well.
+pub fn gov5_unchanged_account_rule_active_from_genesis(genesis: &Genesis) -> bool {
+    genesis
+        .config
+        .extra_fields
+        .get("unchangedAccountNoOpTime")
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        })
+        .is_some_and(|activation| activation <= genesis.timestamp)
+}
+
 /// Convert one reth execution bundle to the account/storage leaf mutations gov5 applies before
 /// computing its replay-v2 QMDB root.
 ///
@@ -288,6 +308,32 @@ pub fn gov5_qmdb_operations_with_restored(
 mod tests {
     use super::*;
     use alloy_genesis::GenesisAccount;
+
+    #[test]
+    fn unchanged_account_rule_requires_a_genesis_activation() {
+        let mut genesis = Genesis {
+            timestamp: 1_000,
+            ..Default::default()
+        };
+        assert!(!gov5_unchanged_account_rule_active_from_genesis(&genesis));
+        for (value, active) in [
+            (serde_json::json!(0), true),
+            (serde_json::json!("0"), true),
+            (serde_json::json!(1_000), true),
+            (serde_json::json!(1_001), false),
+            (serde_json::json!(null), false),
+        ] {
+            genesis
+                .config
+                .extra_fields
+                .insert("unchangedAccountNoOpTime".into(), value);
+            assert_eq!(
+                gov5_unchanged_account_rule_active_from_genesis(&genesis),
+                active
+            );
+        }
+    }
+
     use alloy_primitives::{Address, U256};
     use evm2::evm::AccountInfo;
     use reth_trie_common::bundle_state::{AccountStatus, BundleAccount, StorageSlot};

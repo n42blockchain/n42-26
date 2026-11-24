@@ -1759,6 +1759,17 @@ fn main() {
                 "N42_GOV5_H2_PARTICIPANT requires N42_GOV5_QMDB_EXECUTION=1 or N42_GOV5_STATE_ROOT_TRUST=1"
             ));
         }
+        if h2_v4_participant
+            && qmdb_execution.is_some()
+            && !n42_node::qmdb_state::gov5_unchanged_account_rule_active_from_genesis(
+                &builder.config().chain.genesis,
+            )
+        {
+            warn!(
+                target: "n42::interop::h2v4",
+                "genesis does not activate unchangedAccountNoOpTime from block zero: a block whose transactions pay no priority fee gets a different QMDB root on gov5 and on this node, and validators of the other client will reject it"
+            );
+        }
         let allow_deterministic_validator_peers =
             !consensus_config_from_file || env_bool("N42_ALLOW_DETERMINISTIC_P2P");
         if !observer_mode && consensus_config_from_file && allow_deterministic_validator_peers {

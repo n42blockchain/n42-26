@@ -1433,3 +1433,10 @@ PR #31（本分支合入 main）评审中确认的三处缺陷，各附回归测
 - 单元测试：n42-tx-types 36 通过；n42-network 226 通过；n42-consensus-service 268 通过；n42-node 311 通过、1 失败（仍是 macOS 上的 `memory_watch::tests::resident_memory_is_read`）；n42-node-bin 全部通过。
 - clippy（上述五个 crate，`--all-targets -D warnings`）通过。
 - 未跑完整 workspace 测试、E2E 与机群；第 8 项的启动拒绝只有函数级测试，没有起真实节点验证。
+
+## 进度记录（2026-11-24 续三）：合入 main 以解除 PR #31 的冲突
+
+- **冲突两处**：`Cargo.lock` 取本分支版本（main 上只是 11-13 的 semver 刷新，本分支已换成 reth v2.11.0 / evm2 的整套依赖；`--locked` 下全 workspace 可编译）；`DEVLOG.md` 两条索引都保留。
+- **重号**：main 上 PR #30 的 `devlog-186-mixed-3go-4rust-fresh-fleet-20261117.md` 改名为 `devlog-187-…`，标题与编号说明同步修改；本文件保留 186，因为已被 `CLAUDE.md` 与多处文档引用。
+- **自动合并后需手工修的一处**：PR #30 的测试 `pre_shanghai_leader_payload_is_registered_for_direct_broadcast` 调用 `gov5_native_receipts_root(&[])`，本分支该函数已带类型参数，补为 `::<alloy_consensus::TxType>`。
+- **状态**：`cargo clippy --workspace --all-targets --locked -- -D warnings` 通过；单元测试 n42-network 227、n42-consensus-service 268、n42-node 312（另 1 个失败仍是 macOS 上的 `resident_memory_is_read`）、n42-node-bin 25、n42-execution 156、n42-tx-types 36、n42-consensus 253，均无其他失败。未跑 E2E。

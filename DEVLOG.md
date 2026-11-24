@@ -16,6 +16,7 @@ Logs are split into separate files by phase for easy maintenance:
 
 | File | Content | Phase |
 |------|---------|-------|
+| [devlog-187-mixed-3go-4rust-fresh-fleet-20261117](docs/devlog-187-mixed-3go-4rust-fresh-fleet-20261117.md) | 3 Gov5 + 4 n42-26 全新创世混合舰队（单机）：修复 pre-Shanghai leader 未注册原生头导致无法出块；零小费交易在未设 `unchangedAccountNoOpTime` 时两端 QMDB 根不同并新增启动告警；停启/掉节点/kill -9 演练 17 项通过 | Interop |
 | [devlog-186-reth-2110-evm2-upgrade-20261119](docs/devlog-186-reth-2110-evm2-upgrade-20261119.md) | Reth v2.11.0 upgrade with revm replaced by evm2: nineteen-patch series (eight ported, import-batch pair dropped, eleven new), mobile SDK on evm2, touched-but-unchanged accounts kept in the bundle, `n42-parallel-evm` / `n42-evm-bench` parked; lock, patches, scripts, CI and docs aligned | Upgrade |
 | [devlog-180-native-port-phase1-20261107](docs/devlog-180-native-port-phase1-20261107.md) | Native-path port phase 1: node on N42Primitives (pool/payload/engine/RPC/QMDB/mobile), 0x50 gated by genesis `altSigTx`; 1851/0 tests; 7-node 0x50 + mixed 0x02/0x50 over RPC with matching roots; tx storage format change | Port |
 | [devlog-181-native-port-phase2-20261107](docs/devlog-181-native-port-phase2-20261107.md) | Native-path port phase 2: native ingest frames (gateway attestation, batch Ed25519 fallback), native-flood, in-process pprof, asm-keccak; 7 nodes on one host commit 1.6 M attested 0x50 txs at ~59k TPS (~65-70k steady), profile attribution | Port |

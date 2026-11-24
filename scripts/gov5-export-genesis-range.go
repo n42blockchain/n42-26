@@ -7,11 +7,11 @@
 // Lives here but does NOT build here: it imports gov5's packages, so copy it
 // into the gov5 checkout and run it there.
 //
-//     cp scripts/gov5-export-genesis-range.go ../n42-gov5/   # or C:
-42
-42-gov5
+//     cp scripts/gov5-export-genesis-range.go ../n42-gov5/
 //     cd ../n42-gov5
-//     go run ./gov5-export-genesis-range.go //         -db  <gov5-datadir>/chaindata //         -out <somewhere>/genesis-range.n42frng
+//     go run ./gov5-export-genesis-range.go \
+//         -db  <gov5-datadir>/chaindata \
+//         -out <somewhere>/genesis-range.n42frng
 //
 // Pair it with gov5's own `cmd/n42-qmdb-export` for the QMDB checkpoint; the
 // observer needs both. Why this exists: the finalized-range format is defined
