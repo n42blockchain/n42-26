@@ -10497,6 +10497,36 @@ mod tests {
         assert_eq!(mock.new_payload_hashes().len(), 50);
     }
 
+    /// Second review, R1: a stopped client keeps no decoded reply, neither
+    /// one already queued nor one whose decode was still running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopped_client_retains_no_decoded_reply() {
+        let (mut orch, _network, _mock, peer, chain) =
+            range_catchup_orchestrator(crate::range_catchup::AnchorMode::Observe).await;
+        let (top_hash, top_rlp) = chain[49].clone();
+        orch.remember_h2_v4_block_view(top_hash, 50);
+        orch.handle_h2_v4_gov5_block(peer, top_rlp, None).await;
+        assert!(orch.range_catchup.is_active());
+        let rlps: Vec<Vec<u8>> = chain[..49].iter().map(|(_, rlp)| rlp.clone()).collect();
+        // One result already queued, one decode started right before the stop.
+        orch.range_decoded.decode(peer, 1, rlps.clone());
+        let queued = loop {
+            if let Ok(item) = orch.range_decoded.rx.try_recv() {
+                break item;
+            }
+            tokio::task::yield_now().await;
+        };
+        orch.range_decoded.tx.send(queued).unwrap();
+        orch.range_decoded.decode(peer, 1, rlps);
+        orch.on_range_catchup_stopped(crate::range_catchup::Deactivation::Stalled)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            orch.range_decoded.rx.try_recv().is_err(),
+            "nothing of the stopped round is held"
+        );
+    }
+
     /// Review item 5: under a leader tenure consecutive blocks share a
     /// header view. Such a block imports without a forkchoice update, which
     /// the first version counted as a failure (three stopped the client).

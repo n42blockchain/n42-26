@@ -55,16 +55,48 @@ pub(super) fn range_anchor_mode() -> AnchorMode {
 /// A range reply decoded off the orchestrator loop.
 pub(super) type RangeDecoded = (PeerId, u64, RangeReply);
 
+/// Decoded replies on their way back to the loop. A decode task sends only
+/// while the round it was started in is current, under the same lock that
+/// [`Self::retire`] takes, so once a round is retired nothing of it is held:
+/// queued results are drained and late ones are dropped by their task.
 pub(super) struct RangeDecodeLane {
     pub(super) tx: mpsc::UnboundedSender<RangeDecoded>,
     pub(super) rx: mpsc::UnboundedReceiver<RangeDecoded>,
+    round: std::sync::Arc<std::sync::Mutex<u64>>,
 }
 
 impl RangeDecodeLane {
     pub(super) fn new() -> Self {
         // Bounded by the client's requests in flight.
         let (tx, rx) = mpsc::unbounded_channel();
-        Self { tx, rx }
+        Self {
+            tx,
+            rx,
+            round: Default::default(),
+        }
+    }
+
+    /// Decodes `rlps` on the blocking pool and queues the result, unless the
+    /// round has been retired by then.
+    pub(super) fn decode(&self, source: PeerId, start: u64, rlps: Vec<Vec<u8>>) {
+        let lane = self.tx.clone();
+        let round = self.round.clone();
+        let started = *round.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        tokio::task::spawn_blocking(move || {
+            let reply = RangeReply::Blocks(rlps.into_iter().map(decode_range_block).collect());
+            let current = round.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *current == started {
+                let _ = lane.send((source, start, reply));
+            }
+        });
+    }
+
+    /// Ends the current round: drops every queued result and makes decode
+    /// tasks still running drop theirs.
+    pub(super) fn retire(&mut self) {
+        let mut round = self.round.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *round = round.wrapping_add(1);
+        while self.rx.try_recv().is_ok() {}
     }
 }
 
@@ -148,7 +180,7 @@ impl ConsensusService {
         self.range_catchup.note_loose_anchor(block.block_hash);
         if !was_active {
             // Replies of an earlier round still in the lane are stale.
-            while self.range_decoded.rx.try_recv().is_ok() {}
+            self.range_decoded.retire();
             self.range_catchup
                 .note_strict_anchor(self.engine.last_committed_qc().block_hash);
             self.range_catchup
@@ -206,12 +238,7 @@ impl ConsensusService {
         }
         let reply = match outcome {
             Gov5RangeOutcome::Blocks(rlps) => {
-                let lane = self.range_decoded.tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let reply =
-                        RangeReply::Blocks(rlps.into_iter().map(decode_range_block).collect());
-                    let _ = lane.send((source, start, reply));
-                });
+                self.range_decoded.decode(source, start, rlps);
                 return;
             }
             Gov5RangeOutcome::Refused { code, message } => {
@@ -365,7 +392,9 @@ impl ConsensusService {
         }
     }
 
-    async fn on_range_catchup_stopped(&mut self, reason: Deactivation) {
+    pub(super) async fn on_range_catchup_stopped(&mut self, reason: Deactivation) {
+        // Nothing of the stopped round may stay queued while caught up.
+        self.range_decoded.retire();
         let stats = self.range_catchup.stats().clone();
         if reason == Deactivation::Diverged {
             error!(
