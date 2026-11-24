@@ -236,10 +236,16 @@ where
     /// requests execution produced, exactly the check gov5 skips. The original
     /// sealed header remains hash-authenticated; only the temporary copy is
     /// filled in.
+    ///
+    /// From gov5's `pragueTime` its miner does stamp the field and its
+    /// validators check it ([`crate::gov5_requests_hash_active_at`]). Nothing
+    /// is filled in from then on: a header without the field fails the inner
+    /// Prague rule, as it fails on gov5.
     fn normalize_header(&self, header: &Header) -> Result<Header, N42HeaderProfileError> {
         let mut normalized = normalized_gov5_header(header)?;
         if validate_gov5_replay_v2_header(header).is_err()
             && normalized.requests_hash.is_none()
+            && !crate::gov5_requests_hash_active_at(header.timestamp)
             && self
                 .chain_spec
                 .is_prague_active_at_timestamp(header.timestamp)
@@ -368,6 +374,7 @@ where
             );
             let mut header = block.header().clone();
             if header.requests_hash.is_none()
+                && !crate::gov5_requests_hash_active_at(header.timestamp)
                 && self
                     .chain_spec
                     .is_prague_active_at_timestamp(header.timestamp)
@@ -784,6 +791,17 @@ mod tests {
         // Before Prague nothing is filled in.
         header.timestamp = prague - 1;
         assert_eq!(gov5.normalize_header(&header).unwrap().requests_hash, None);
+        // From gov5's pragueTime the field is the header's own to carry, and
+        // nothing is filled in for one that lacks it. (The setting is global;
+        // the time is far beyond every other test's timestamps.)
+        crate::set_gov5_requests_hash_time(Some(4_000_000_000_000));
+        header.timestamp = 4_000_000_000_000;
+        assert_eq!(gov5.normalize_header(&header).unwrap().requests_hash, None);
+        header.timestamp = 4_000_000_000_000 - 1;
+        assert_eq!(
+            gov5.normalize_header(&header).unwrap().requests_hash,
+            Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH)
+        );
 
         // Post-execution: an empty request list matches; a produced request does not.
         let receipt = EthereumReceipt {

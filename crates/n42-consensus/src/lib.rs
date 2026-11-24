@@ -31,8 +31,9 @@ pub use committee_pool::{
 };
 pub use error::ConsensusError as N42ConsensusError;
 pub use gov5_native_header::{
-    Gov5NativeHeader, Gov5NativeHeaderError, gov5_native_header_rlp, remember_gov5_native_header,
-    remembered_gov5_native_header,
+    Gov5NativeHeader, Gov5NativeHeaderError, gov5_native_header_rlp,
+    gov5_requests_hash_active_at, remember_gov5_native_header, remembered_gov5_native_header,
+    set_gov5_requests_hash_time,
 };
 pub use gov5_rewards::{
     Gov5Reward, Gov5RewardError, gov5_native_rewards_root, gov5_rewards_to_withdrawals,

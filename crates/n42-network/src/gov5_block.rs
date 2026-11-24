@@ -142,7 +142,7 @@ pub fn normalize_execution_payload_for_gov5_h2_with_transactions_root(
     // A native chain-94 parent selects the post-Cancun profile. Never erase
     // executed withdrawals or the committee link as the early devnet profile does.
     if let Some(parent) = n42_consensus::remembered_gov5_native_header(&execution.parent_hash())
-        && (parent.mobile_registry_root.is_some() || native_cancun_genesis(&parent))
+        && native_profile_parent(&parent)
     {
         return normalize_native_payload(
             execution,
@@ -230,15 +230,22 @@ fn remember_pre_shanghai_native_header(header: &alloy_consensus::Header) {
     remember_gov5_native_header(&native.encode());
 }
 
-// Gov5 seeds a Cancun block-zero header without mobileRegistryRoot. Its
-// first live native block must still retain withdrawals and Cancun markers.
-fn native_cancun_genesis(parent: &Gov5NativeHeader) -> bool {
-    parent.header.number == 0
-        && parent.mobile_registry_root.is_none()
-        && parent.header.withdrawals_root.is_some()
-        && parent.header.blob_gas_used.is_some()
-        && parent.header.excess_blob_gas.is_some()
-        && parent.header.parent_beacon_block_root.is_some()
+// Whether a child of `parent` is built on the native chain-94 profile, which
+// keeps withdrawals (the rewards) and the Cancun markers (the committee link).
+//
+// Gov5 before 2026-10-29 stamped a zero mobileRegistryRoot at field 23 of
+// every native header but the genesis one, and that field marked the profile.
+// Gov5 since then writes the root only once MobileAnchor and Glamsterdam are
+// both active, at field 24, and refuses it earlier
+// (`IsMobileRegistryRootInHeader`), so a native header of today's chain ends
+// at the parent beacon root, as its genesis always has. The Cancun fields
+// mark the profile on both: the early devnet profile strips every one of them.
+fn native_profile_parent(parent: &Gov5NativeHeader) -> bool {
+    parent.mobile_registry_root.is_some()
+        || (parent.header.withdrawals_root.is_some()
+            && parent.header.blob_gas_used.is_some()
+            && parent.header.excess_blob_gas.is_some()
+            && parent.header.parent_beacon_block_root.is_some())
 }
 
 /// A locally built payload normalized by
@@ -270,9 +277,7 @@ pub fn normalize_built_payload_for_gov5_h2(
     transactions_root: Option<B256>,
 ) -> Result<NormalizedBuiltPayload, Gov5BlockError> {
     let native = n42_consensus::remembered_gov5_native_header(&execution.parent_hash())
-        .is_some_and(|parent| {
-            parent.mobile_registry_root.is_some() || native_cancun_genesis(&parent)
-        });
+        .is_some_and(|parent| native_profile_parent(&parent));
     let set_aside = (native && transactions_root.is_some())
         .then(|| std::mem::take(&mut execution.payload.as_v1_mut().transactions));
     let mut payload = normalize_execution_payload_for_gov5_h2_with_transactions_root(
@@ -342,7 +347,11 @@ fn normalize_native_payload(
     transactions_root: Option<B256>,
     parent: &Gov5NativeHeader,
 ) -> Result<ExecutionData, Gov5BlockError> {
-    if parent.mobile_registry_root != Some(B256::ZERO) && !native_cancun_genesis(parent) {
+    // The child's header takes its parent's shape: no registry root on a
+    // chain whose headers carry none, the zero root where every header carries
+    // it. Which of the two the validators accept is decided by the Gov5
+    // version they run, and the parent is a header they accepted.
+    if parent.mobile_registry_root.is_some_and(|root| root != B256::ZERO) {
         return Err(Gov5BlockError::PayloadReconstruction(
             "native mobile registry updates are not implemented".into(),
         ));
@@ -357,10 +366,20 @@ fn normalize_native_payload(
         None => payload.into_block_with_sidecar_raw(&execution.sidecar),
     }
     .map_err(|error| Gov5BlockError::PayloadReconstruction(error.to_string()))?;
-    if block
-        .header
-        .requests_hash
-        .is_some_and(|hash| hash != alloy_eips::eip7685::EMPTY_REQUESTS_HASH)
+    // From gov5's pragueTime the header carries the requests hash the builder
+    // computed; before it the field is left out, which only an empty request
+    // set allows.
+    let requests_hash_held = n42_consensus::gov5_requests_hash_active_at(block.header.timestamp);
+    if requests_hash_held && block.header.requests_hash.is_none() {
+        return Err(Gov5BlockError::PayloadReconstruction(
+            "native producer needs the requests hash from gov5's pragueTime".into(),
+        ));
+    }
+    if (!requests_hash_held
+        && block
+            .header
+            .requests_hash
+            .is_some_and(|hash| hash != alloy_eips::eip7685::EMPTY_REQUESTS_HASH))
         || block.header.block_access_list_hash.is_some()
         || block.header.slot_number.is_some()
     {
@@ -381,8 +400,11 @@ fn normalize_native_payload(
     block.header.state_root = state_root;
     block.header.receipts_root = receipts_root;
     block.header.withdrawals_root = Some(n42_consensus::gov5_native_rewards_root(&rewards));
-    // Gov5 executes Prague system calls, but its native miner omits requestsHash.
-    block.header.requests_hash = None;
+    // Gov5 executes Prague system calls from its pectraTime, but its native
+    // miner stamps requestsHash only from its pragueTime.
+    if !requests_hash_held {
+        block.header.requests_hash = None;
+    }
     let mut extra = Vec::with_capacity(12 + GOV5_H2_SEAL_BYTES);
     extra.extend_from_slice(b"N42H");
     extra.extend_from_slice(&view.to_le_bytes());
@@ -392,7 +414,7 @@ fn normalize_native_payload(
         .map_err(|error| Gov5BlockError::HeaderProfile(error.to_string()))?;
     let native = Gov5NativeHeader {
         header: block.header.clone(),
-        mobile_registry_root: Some(B256::ZERO),
+        mobile_registry_root: parent.mobile_registry_root,
     };
     let hash = remember_gov5_native_header(&native.encode());
     // The payload carries no ommers hash, difficulty or withdrawals root, so
@@ -405,7 +427,7 @@ fn normalize_native_payload(
     fields.receipts_root = block.header.receipts_root;
     fields.extra_data = block.header.extra_data;
     fields.block_hash = hash;
-    if normalized.sidecar.requests_hash().is_some() {
+    if !requests_hash_held && normalized.sidecar.requests_hash().is_some() {
         normalized.sidecar = match normalized.sidecar.cancun() {
             Some(cancun) => alloy_rpc_types_engine::ExecutionPayloadSidecar::v3(cancun.clone()),
             None => alloy_rpc_types_engine::ExecutionPayloadSidecar::none(),
@@ -1148,7 +1170,144 @@ mod tests {
         assert_eq!(decoded.header.excess_blob_gas, Some(0));
         assert_eq!(decoded.header.parent_beacon_block_root, Some(B256::ZERO));
         assert_eq!(decoded.header.withdrawals_root, Some(keccak256([])));
-        assert_eq!(decoded.mobile_registry_root, Some(B256::ZERO));
+        // The child takes the genesis header's shape, as current Gov5 does.
+        assert_eq!(decoded.mobile_registry_root, None);
+    }
+
+    /// From gov5's pragueTime a native child carries the requests hash the
+    /// builder computed, as field 21, and the engine payload keeps it; one
+    /// second earlier the field is left out as before.
+    #[test]
+    fn a_native_child_carries_the_requests_hash_from_gov5_prague_time() {
+        // Far beyond every other test's timestamps: the setting is global.
+        const REQUESTS_HASH_TIME: u64 = 4_000_000_000_000;
+        n42_consensus::set_gov5_requests_hash_time(Some(REQUESTS_HASH_TIME));
+        let parent = Gov5NativeHeader {
+            header: Header {
+                number: 7,
+                withdrawals_root: Some(keccak256([])),
+                blob_gas_used: Some(0),
+                excess_blob_gas: Some(0),
+                parent_beacon_block_root: Some(B256::repeat_byte(0xa2)),
+                ..Default::default()
+            },
+            mobile_registry_root: None,
+        };
+        let parent_hash = remember_gov5_native_header(&parent.encode());
+        let child = |timestamp: u64, requests_hash: Option<B256>| {
+            let block: Block<TxEnvelope> = Block {
+                header: Header {
+                    parent_hash,
+                    number: 8,
+                    timestamp,
+                    transactions_root: calculate_transaction_root::<TxEnvelope>(&[]),
+                    withdrawals_root: Some(alloy_consensus::constants::EMPTY_ROOT_HASH),
+                    blob_gas_used: Some(0),
+                    excess_blob_gas: Some(0),
+                    parent_beacon_block_root: Some(B256::repeat_byte(0x44)),
+                    requests_hash,
+                    ..Default::default()
+                },
+                body: BlockBody { withdrawals: Some(Default::default()), ..Default::default() },
+            };
+            let execution = ExecutionData::from_block_unchecked(block.header.hash_slow(), &block);
+            normalize_execution_payload_for_gov5_h2(&execution, 8, B256::repeat_byte(0x71), keccak256([]))
+        };
+        let empty = alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
+
+        let before = child(REQUESTS_HASH_TIME - 1, Some(empty)).unwrap();
+        assert!(before.sidecar.requests_hash().is_none());
+        let decoded = decode_gov5_block_rlp(&encode_gov5_block_rlp(&before).unwrap()).unwrap();
+        assert_eq!(decoded.header.requests_hash, None);
+
+        let at = child(REQUESTS_HASH_TIME, Some(empty)).unwrap();
+        assert_eq!(at.sidecar.requests_hash(), Some(empty));
+        let decoded = decode_gov5_block_rlp(&encode_gov5_block_rlp(&at).unwrap()).unwrap();
+        assert_eq!(decoded.block_hash, at.block_hash());
+        assert_eq!(decoded.header.requests_hash, Some(empty));
+        assert_eq!(decoded.mobile_registry_root, None);
+        // The native encoding ends at the requests hash: twenty-one fields.
+        let raw = n42_consensus::gov5_native_header_rlp(&at.block_hash()).unwrap();
+        assert_eq!(keccak256(&raw[..]), at.block_hash());
+        assert_eq!(&raw[raw.len() - 32..], empty.as_slice());
+
+        // A payload built without the field cannot be sealed from that time.
+        assert!(child(REQUESTS_HASH_TIME, None).is_err());
+    }
+
+    /// The shape of live chain-94 testnet headers since Gov5 moved the
+    /// registry root behind Glamsterdam: twenty fields, ending at the parent
+    /// beacon root. A child keeps the rewards and the committee link and
+    /// carries no registry root; its own child does the same.
+    #[test]
+    fn a_native_parent_without_registry_root_gets_a_native_child() {
+        use alloy_eips::eip4895::{Withdrawal, Withdrawals};
+        let parent = Gov5NativeHeader {
+            header: Header {
+                number: 0xdfbd53,
+                base_fee_per_gas: Some(7),
+                withdrawals_root: Some(B256::repeat_byte(0xa5)),
+                blob_gas_used: Some(0),
+                excess_blob_gas: Some(0),
+                parent_beacon_block_root: Some(B256::repeat_byte(0xa2)),
+                ..Default::default()
+            },
+            mobile_registry_root: None,
+        };
+        let mut parent_hash = remember_gov5_native_header(&parent.encode());
+        let withdrawals = Withdrawals::new(vec![Withdrawal {
+            index: 0,
+            validator_index: 0,
+            address: Address::repeat_byte(0x31),
+            amount: 1_000_000_000,
+        }]);
+        for number in [parent.header.number + 1, parent.header.number + 2] {
+            let block: Block<TxEnvelope> = Block {
+                header: Header {
+                    parent_hash,
+                    number,
+                    base_fee_per_gas: Some(7),
+                    transactions_root: calculate_transaction_root::<TxEnvelope>(&[]),
+                    withdrawals_root: Some(alloy_consensus::proofs::calculate_withdrawals_root(
+                        &withdrawals,
+                    )),
+                    blob_gas_used: Some(0),
+                    excess_blob_gas: Some(0),
+                    parent_beacon_block_root: Some(B256::repeat_byte(0x44)),
+                    requests_hash: Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH),
+                    ..Default::default()
+                },
+                body: BlockBody {
+                    withdrawals: Some(withdrawals.clone()),
+                    ..Default::default()
+                },
+            };
+            let execution = ExecutionData::from_block_unchecked(block.header.hash_slow(), &block);
+            let normalized = normalize_execution_payload_for_gov5_h2(
+                &execution,
+                number,
+                B256::repeat_byte(0x71),
+                keccak256([]),
+            )
+            .unwrap();
+            let decoded =
+                decode_gov5_block_rlp(&encode_gov5_block_rlp(&normalized).unwrap()).unwrap();
+            assert_eq!(decoded.block_hash, normalized.block_hash());
+            assert_eq!(decoded.mobile_registry_root, None);
+            assert_eq!(
+                decoded.header.withdrawals_root,
+                Some(n42_consensus::gov5_native_rewards_root(&decoded.rewards))
+            );
+            assert_eq!(decoded.rewards, n42_consensus::gov5_withdrawals_to_rewards(&withdrawals));
+            assert_eq!(decoded.header.blob_gas_used, Some(0));
+            assert_eq!(
+                decoded.header.parent_beacon_block_root,
+                block.header.parent_beacon_block_root
+            );
+            // Twenty fields: nothing after the parent beacon root.
+            assert_eq!(decoded.header.requests_hash, None);
+            parent_hash = normalized.block_hash();
+        }
     }
 
     fn append_reward_to_block_rlp(encoded: &[u8]) -> Vec<u8> {
