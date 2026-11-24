@@ -81,10 +81,14 @@ impl RangeDecodeLane {
     pub(super) fn decode(&self, source: PeerId, start: u64, rlps: Vec<Vec<u8>>) {
         let lane = self.tx.clone();
         let round = self.round.clone();
-        let started = *round.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let started = *round
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         tokio::task::spawn_blocking(move || {
             let reply = RangeReply::Blocks(rlps.into_iter().map(decode_range_block).collect());
-            let current = round.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let current = round
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if *current == started {
                 let _ = lane.send((source, start, reply));
             }
@@ -94,7 +98,10 @@ impl RangeDecodeLane {
     /// Ends the current round: drops every queued result and makes decode
     /// tasks still running drop theirs.
     pub(super) fn retire(&mut self) {
-        let mut round = self.round.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut round = self
+            .round
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *round = round.wrapping_add(1);
         while self.rx.try_recv().is_ok() {}
     }
