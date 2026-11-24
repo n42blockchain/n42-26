@@ -12,8 +12,14 @@
 //!   live path (`stop_at`). The staged suffix is released by the existing
 //!   `release_ready_h2_v4_catchup_blocks` once the head reaches it. Both
 //!   check the head before every import, and the task runs one at a time.
-//! - When the client stops (caught up, stalled, or the execution layer keeps
-//!   refusing), the reverse hash walk resumes from the staged suffix.
+//! - A block whose header view does not exceed the execution-validated view
+//!   (a leader tenure repeats views) imports without a forkchoice update and
+//!   leaves the execution head where it was. The client then continues from
+//!   its own position, and the staged suffix is released on top of it.
+//! - When the client stops (caught up, stalled, diverged, or the execution
+//!   layer keeps refusing), the reverse hash walk resumes from the staged
+//!   suffix. That walk is not governed by `N42_SYNC_ANCHOR`, so `enforce` is
+//!   not a security boundary yet.
 //! - While caught up the client does nothing: no per-block work, no timer.
 
 use super::ConsensusService;
@@ -25,7 +31,7 @@ use n42_consensus::{ConsensusEngine, ValidatorSet};
 use n42_network::h2_v4::H2V4ChainIdentity;
 use n42_network::h2_wire::H2QuorumCertificate;
 use n42_network::{Gov5RangeOutcome, PeerId};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Blocks imported per wake-up; the loop yields to consensus between batches.
 const RANGE_IMPORT_BATCH: usize = 32;
@@ -170,6 +176,18 @@ impl ConsensusService {
                 RangeReply::Failed { unsupported }
             }
         };
+        self.on_range_reply_decoded(source, start, reply).await;
+    }
+
+    pub(super) async fn on_range_reply_decoded(
+        &mut self,
+        source: PeerId,
+        start: u64,
+        reply: RangeReply,
+    ) {
+        if !self.range_catchup.is_active() {
+            return;
+        }
         let engine = &self.engine;
         let schedule = self.epoch_schedule.as_ref();
         let identity = self.h2_v4_identity;
@@ -255,37 +273,62 @@ impl ConsensusService {
                 .copied()
                 .filter(|view| *view > 0)
                 .unwrap_or(block.view);
-            let imported = self
+            // `true` without a head move is a block at or below the
+            // execution-validated view (a repeated header view): executed,
+            // made canonical by the next forkchoice update. The reverse walk
+            // treats it the same way.
+            if !self
                 .import_h2_v4_catchup_block(block.source, decoded, view)
-                .await;
-            if !imported || self.head_block_hash != block.hash {
+                .await
+            {
                 warn!(
                     target: "n42::interop::range",
                     number = block.number,
                     hash = %block.hash,
                     view,
-                    imported,
-                    "range catch-up block did not become the execution head"
+                    "range catch-up block was not executed"
                 );
                 if let Some(reason) = self.range_catchup.import_failed(block.number, now) {
                     self.on_range_catchup_stopped(reason).await;
                 }
                 return;
             }
+            self.range_catchup.imported(block.number, block.hash);
             counter!("n42_range_catchup_imported_total").increment(1);
             if block.loose_only {
                 counter!("n42_range_catchup_loose_only_total").increment(1);
             }
         }
+        if let Some(reason) = self.range_catchup.take_stop() {
+            self.on_range_catchup_stopped(reason).await;
+            return;
+        }
         gauge!("n42_range_catchup_buffered_blocks")
             .set(self.range_catchup.buffered_blocks() as f64);
         if self.h2_v4_catchup_active {
-            self.release_ready_h2_v4_catchup_blocks().await;
+            match self.range_catchup.position() {
+                (number, Some(hash)) if number > self.head_block_number => {
+                    self.release_ready_h2_v4_catchup_blocks_from(number, hash)
+                        .await;
+                }
+                _ => {
+                    self.release_ready_h2_v4_catchup_blocks().await;
+                }
+            }
         }
     }
 
     async fn on_range_catchup_stopped(&mut self, reason: Deactivation) {
         let stats = self.range_catchup.stats().clone();
+        if reason == Deactivation::Diverged {
+            error!(
+                target: "n42::interop::range",
+                head = self.head_block_number,
+                head_hash = %self.head_block_hash,
+                "range catch-up: the authenticated chain does not extend the execution head; \
+                 the head is on another branch (operator attention needed)"
+            );
+        }
         info!(
             target: "n42::interop::range",
             ?reason,
@@ -294,6 +337,9 @@ impl ConsensusService {
             released_loose_only = stats.released_loose_only,
             faults = stats.faults,
             tail_evicted = stats.tail_evicted,
+            budget_evicted = stats.budget_evicted,
+            conflicts = stats.conflicts,
+            received = stats.blocks_received,
             qc_verifications = stats.qc_verifications,
             "range catch-up stopped"
         );

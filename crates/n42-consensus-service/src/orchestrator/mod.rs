@@ -1763,7 +1763,19 @@ impl ConsensusService {
         ready.into_iter().map(|(_, hash)| hash).collect()
     }
 
+    #[cfg(test)]
     fn ready_h2_v4_catchup_heights(&self) -> Option<Vec<u64>> {
+        self.ready_h2_v4_catchup_heights_from(self.head_block_number, self.head_block_hash)
+    }
+
+    /// The staged heights that extend `(base_number, base_hash)`, in order.
+    /// The base is the execution head, or a block the range
+    /// client imported without a forkchoice update (a repeated header view).
+    fn ready_h2_v4_catchup_heights_from(
+        &self,
+        base_number: u64,
+        base_hash: B256,
+    ) -> Option<Vec<u64>> {
         if !self.h2_v4_catchup_active {
             return None;
         }
@@ -1775,13 +1787,13 @@ impl ConsensusService {
         // successor of the durable head. Keep the common incomplete check O(1)
         // and perform the full hash-chain validation only once that boundary
         // is present.
-        let expected_first_height = self.head_block_number.checked_add(1)?;
+        let expected_first_height = base_number.checked_add(1)?;
         let (&first_height, (_, oldest_rlp, _)) = self.h2_v4_catchup_blocks.first_key_value()?;
         if first_height != expected_first_height {
             return None;
         }
         let oldest = n42_network::decode_gov5_block_rlp(oldest_rlp).ok()?;
-        if oldest.header.parent_hash != self.head_block_hash {
+        if oldest.header.parent_hash != base_hash {
             return None;
         }
         // The unbound-message cache can release old, already-executed blocks
@@ -1800,7 +1812,7 @@ impl ConsensusService {
                 return None;
             }
             selected_heights.push(height);
-            if candidate.header.parent_hash == self.head_block_hash {
+            if candidate.header.parent_hash == base_hash {
                 selected_heights.reverse();
                 return Some(selected_heights);
             }
@@ -1813,7 +1825,17 @@ impl ConsensusService {
     }
 
     async fn release_ready_h2_v4_catchup_blocks(&mut self) -> bool {
-        let Some(selected_heights) = self.ready_h2_v4_catchup_heights() else {
+        self.release_ready_h2_v4_catchup_blocks_from(self.head_block_number, self.head_block_hash)
+            .await
+    }
+
+    async fn release_ready_h2_v4_catchup_blocks_from(
+        &mut self,
+        base_number: u64,
+        base_hash: B256,
+    ) -> bool {
+        let Some(selected_heights) = self.ready_h2_v4_catchup_heights_from(base_number, base_hash)
+        else {
             return false;
         };
         let mut catchup = Vec::with_capacity(selected_heights.len());
@@ -10383,6 +10405,16 @@ mod tests {
         (orch, network, mock, peer, chain)
     }
 
+    async fn deliver_range_reply(
+        orch: &mut ConsensusService,
+        peer: n42_network::PeerId,
+        start: u64,
+        rlps: Vec<Vec<u8>>,
+    ) {
+        orch.handle_range_reply(peer, start, n42_network::Gov5RangeOutcome::Blocks(rlps))
+            .await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn range_catchup_replaces_the_reverse_walk_and_imports_each_height_once() {
         let (mut orch, network, mock, peer, chain) =
@@ -10408,8 +10440,7 @@ mod tests {
         );
 
         let rlps = chain[..49].iter().map(|(_, rlp)| rlp.clone()).collect();
-        orch.handle_range_reply(peer, 1, n42_network::Gov5RangeOutcome::Blocks(rlps))
-            .await;
+        deliver_range_reply(&mut orch, peer, 1, rlps).await;
         for _ in 0..4 {
             orch.drive_range_catchup().await;
         }
@@ -10437,8 +10468,7 @@ mod tests {
         orch.drive_range_catchup().await;
         assert_eq!(network.range_requests.lock().unwrap().len(), 1);
         let rlps = chain[..49].iter().map(|(_, rlp)| rlp.clone()).collect();
-        orch.handle_range_reply(peer, 1, n42_network::Gov5RangeOutcome::Blocks(rlps))
-            .await;
+        deliver_range_reply(&mut orch, peer, 1, rlps).await;
         orch.drive_range_catchup().await;
         assert!(
             mock.new_payload_hashes().is_empty(),
@@ -10451,6 +10481,40 @@ mod tests {
         }
         assert_eq!(orch.head_block_number, 50);
         assert_eq!(mock.new_payload_hashes().len(), 50);
+    }
+
+    /// Review item 5: under a leader tenure consecutive blocks share a
+    /// header view. Such a block imports without a forkchoice update, which
+    /// the first version counted as a failure (three stopped the client).
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_header_views_import_without_stopping_the_client() {
+        let (mut orch, network, mock, peer, _) =
+            range_catchup_orchestrator(crate::range_catchup::AnchorMode::Observe).await;
+        let mut chain = Vec::new();
+        let mut parent = orch.head_block_hash;
+        for number in 1..=50u64 {
+            // Tenure of four: views 1,1,1,1,2,2,2,2,...; the staged top
+            // block carries a view of its own.
+            let view = if number == 50 { 100 } else { (number - 1) / 4 + 1 };
+            let (hash, rlp) = test_gov5_block_rlp(parent, number, view);
+            chain.push((hash, rlp));
+            parent = hash;
+        }
+        let (top_hash, top_rlp) = chain[49].clone();
+        orch.remember_h2_v4_block_view(top_hash, 100);
+        orch.handle_h2_v4_gov5_block(peer, top_rlp, None).await;
+        assert!(orch.range_catchup.is_active());
+        orch.drive_range_catchup().await;
+        assert_eq!(network.range_requests.lock().unwrap().clone(), vec![(peer, 1, 49)]);
+        let rlps = chain[..49].iter().map(|(_, rlp)| rlp.clone()).collect();
+        deliver_range_reply(&mut orch, peer, 1, rlps).await;
+        for _ in 0..6 {
+            orch.drive_range_catchup().await;
+        }
+        assert_eq!(orch.head_block_number, 50);
+        assert_eq!(orch.head_block_hash, top_hash);
+        let expected: Vec<B256> = chain.iter().map(|(hash, _)| *hash).collect();
+        assert_eq!(mock.new_payload_hashes(), expected, "each height once, in order");
     }
 
     #[tokio::test(flavor = "current_thread")]
