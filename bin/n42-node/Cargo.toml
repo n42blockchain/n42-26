@@ -52,6 +52,7 @@ reth-storage-api.workspace = true
 reth-provider.workspace = true
 reth-db-common.workspace = true
 reth-db-api.workspace = true
+reth-cli.workspace = true
 reth-cli-commands.workspace = true
 reth-cli-runner.workspace = true
 reth-stages-types.workspace = true

@@ -1,3 +1,4 @@
+mod chainspec_parser;
 mod keystore;
 #[cfg(feature = "pprof")]
 mod pprof_capture;
@@ -53,7 +54,6 @@ use reth_chainspec::{
     ChainSpec, ChainSpecProvider, EthereumHardfork, EthereumHardforks, ForkCondition,
 };
 use reth_ethereum_cli::Cli;
-use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_core::args::{DefaultEngineValues, DefaultRpcServerArgs};
 use reth_primitives_traits::SealedHeader;
 use reth_storage_api::{BlockHashReader, BlockNumReader, BlockReader, HeaderProvider};
@@ -1213,6 +1213,39 @@ fn resolve_validator_p2p_keypair(
 /// the genesis `config.hotstuff` (with the bench env overrides) and installs
 /// them for the whole process, before any consensus component exists, so the
 /// engine, the H2-v4 verifier and the orchestrator all use one value.
+/// Resolves the genesis production profile (`config.n42Profile`, mixed
+/// production standard P2) and installs it for the whole process. On Profile 1
+/// a node refuses to start when the environment sets a consensus value the
+/// genesis owns (J4, AM10). A genesis without the field keeps today's rules.
+fn install_genesis_profile(
+    genesis: &alloy_genesis::Genesis,
+) -> eyre::Result<Option<n42_chainspec::profile1::Profile1Config>> {
+    let resolved = n42_chainspec::profile1::resolve_genesis_profile(genesis)
+        .map_err(|error| eyre::eyre!("refusing to start: {error}"))?;
+    if resolved.is_some() {
+        n42_chainspec::profile1::refuse_profile1_env()
+            .map_err(|error| eyre::eyre!("refusing to start: {error}"))?;
+    }
+    let profile = resolved.as_ref().map(|(profile, _)| *profile);
+    n42_chainspec::profile1::install_n42_profile(profile).map_err(|installed| {
+        eyre::eyre!(
+            "refusing to start: profile {installed:?} was already in force before the genesis one {profile:?}"
+        )
+    })?;
+    if let Some((_, config)) = &resolved {
+        info!(
+            target: "n42::cli",
+            chain_id = config.chain_id,
+            validators = config.validators.len(),
+            leader_tenure = config.leader_tenure,
+            epoch_length = config.epoch_length,
+            block_interval_ms = config.block_interval_ms,
+            "N42 production profile 1"
+        );
+    }
+    Ok(resolved.map(|(_, config)| config))
+}
+
 fn install_genesis_leader_schedule(genesis: &alloy_genesis::Genesis) -> eyre::Result<()> {
     let resolved = n42_consensus::LeaderSchedule::resolve_for_genesis(genesis)
         .map_err(|error| eyre::eyre!("refusing to start: {error}"))?;
@@ -1321,7 +1354,7 @@ fn main() {
         );
     }
 
-    if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |mut builder, _| {
+    if let Err(err) = Cli::<chainspec_parser::N42ChainSpecParser>::parse().run(async move |mut builder, _| {
         let engine_config = builder.config().tree_config();
         validate_immediate_persistence(
             engine_config.persistence_threshold(),
@@ -1330,6 +1363,7 @@ fn main() {
         )
         .map_err(eyre::Report::msg)?;
         info!(target: "n42::cli", "Launching N42 node");
+        let profile1 = install_genesis_profile(&builder.config().chain.genesis)?;
         install_genesis_leader_schedule(&builder.config().chain.genesis)?;
 
         // Warn about benchmark/debug env vars that weaken security.
@@ -1371,10 +1405,19 @@ fn main() {
         metrics::gauge!("n42_deferred_state_root_enabled")
             .set(if skip_root || defer_root { 1.0 } else { 0.0 });
 
-        // Priority: N42_CONSENSUS_CONFIG file > N42_VALIDATOR_COUNT dev mode.
+        // Priority: Profile-1 genesis > N42_CONSENSUS_CONFIG file >
+        // N42_VALIDATOR_COUNT dev mode. On Profile 1 the other two are
+        // refused above (J4), so the genesis is the only source (A2).
         let consensus_config_path = std::env::var("N42_CONSENSUS_CONFIG").ok();
-        let consensus_config_from_file = consensus_config_path.is_some();
+        let consensus_config_from_file = consensus_config_path.is_some() || profile1.is_some();
         let mut consensus_config = match consensus_config_path {
+            _ if profile1.is_some() => {
+                info!(target: "n42::cli", "consensus config from the Profile 1 genesis");
+                profile1
+                    .as_ref()
+                    .expect("checked by the guard")
+                    .consensus_config()
+            }
             Some(path) => {
                 info!(target: "n42::cli", path, "loading consensus config from file");
                 ConsensusConfig::from_file(std::path::Path::new(&path))
