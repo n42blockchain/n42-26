@@ -1,3 +1,4 @@
+mod chainspec_parser;
 mod keystore;
 #[cfg(feature = "pprof")]
 mod pprof_capture;
@@ -11,7 +12,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use alloy_consensus::Header;
 use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256, U256, keccak256};
-use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, PayloadStatusEnum};
+use alloy_rpc_types_engine::{ExecutionData, PayloadStatusEnum};
 use clap::Parser;
 use n42_chainspec::{ConsensusConfig, ValidatorInfo};
 use n42_consensus::{
@@ -53,7 +54,6 @@ use reth_chainspec::{
     ChainSpec, ChainSpecProvider, EthereumHardfork, EthereumHardforks, ForkCondition,
 };
 use reth_ethereum_cli::Cli;
-use reth_ethereum_cli::chainspec::EthereumChainSpecParser;
 use reth_node_core::args::{DefaultEngineValues, DefaultRpcServerArgs};
 use reth_primitives_traits::SealedHeader;
 use reth_storage_api::{BlockHashReader, BlockNumReader, BlockReader, HeaderProvider};
@@ -65,6 +65,35 @@ use std::sync::{Arc, Mutex, Once, atomic::AtomicBool};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+/// E14 fork-choice tags of a Profile-1 node over reth: block links from the
+/// Profile-1 header registry (the block being committed may not be canonical
+/// yet) or else from reth, and the highest block reth has persisted.
+fn profile1_fcu_tags<N>(
+    provider: reth_provider::providers::BlockchainProvider<N>,
+) -> n42_consensus_service::fcu_tags::ForkchoiceTags
+where
+    N: reth_provider::providers::ProviderNodeTypes<Primitives = n42_tx_types::N42Primitives>,
+{
+    let in_memory = provider.canonical_in_memory_state();
+    n42_consensus_service::fcu_tags::ForkchoiceTags::new(
+        move |hash| {
+            if let Some(header) = n42_consensus::remembered_profile1_header(hash) {
+                return Some((header.header.number, header.header.parent_hash));
+            }
+            provider
+                .header(*hash)
+                .ok()
+                .flatten()
+                .map(|header| (header.number, header.parent_hash))
+        },
+        move || {
+            in_memory
+                .get_persisted_num_hash()
+                .map(|block| (block.number, block.hash))
+        },
+    )
+}
 
 /// Serve gov5 bodies-by-range from one consistent storage view per batch.
 ///
@@ -108,11 +137,16 @@ where
                     .ok_or_else(|| {
                         format!("canonical hash is missing for persisted block {number}")
                     })?;
-                let native = n42_consensus::Gov5NativeHeader::recover(&block.header, block_hash)
-                    .ok_or_else(|| {
-                        format!("cannot recover persisted native header {block_hash}")
-                    })?;
-                n42_consensus::remember_gov5_native_header(&native.encode());
+                // Profile 1 (PR 8): the 24-element header is remembered by
+                // hash; the reth header does not hash to it, so no native
+                // header is recovered from it.
+                if n42_consensus::remembered_profile1_header(&block_hash).is_none() {
+                    let native = n42_consensus::Gov5NativeHeader::recover(&block.header, block_hash)
+                        .ok_or_else(|| {
+                            format!("cannot recover persisted native header {block_hash}")
+                        })?;
+                    n42_consensus::remember_gov5_native_header(&native.encode());
+                }
                 let execution = ExecutionData::from_block_unchecked(block_hash, &block);
                 rlps.push(
                     n42_network::encode_gov5_block_rlp(&execution)
@@ -136,9 +170,11 @@ where
         {
             return Ok(None);
         }
-        let native = n42_consensus::Gov5NativeHeader::recover(&block.header, hash)
-            .ok_or_else(|| format!("cannot recover persisted native header {hash}"))?;
-        n42_consensus::remember_gov5_native_header(&native.encode());
+        if n42_consensus::remembered_profile1_header(&hash).is_none() {
+            let native = n42_consensus::Gov5NativeHeader::recover(&block.header, hash)
+                .ok_or_else(|| format!("cannot recover persisted native header {hash}"))?;
+            n42_consensus::remember_gov5_native_header(&native.encode());
+        }
         let execution = ExecutionData::from_block_unchecked(hash, &block);
         n42_network::encode_gov5_block_rlp(&execution)
             .map(Some)
@@ -276,6 +312,25 @@ where
         metrics::counter!("n42_parallel_import_parent_state_total", "source" => "engine-tree")
             .increment(1);
         Some(state)
+    })
+}
+
+/// Profile 1 (design 3.4): the deferred proposal check over the parent's
+/// post-state, from reth's persisted state or its engine tree.
+fn profile1_deferred_checker<N>(
+    provider: reth_provider::providers::BlockchainProvider<N>,
+) -> n42_node::el::DeferredChecker
+where
+    N: reth_provider::providers::ProviderNodeTypes<ChainSpec = reth_chainspec::ChainSpec>,
+{
+    use reth_chainspec::ChainSpecProvider as _;
+    let chain_spec = provider.chain_spec();
+    n42_node::el::DeferredChecker::new(chain_spec, move |hash| {
+        use reth_provider::StateProviderFactory as _;
+        if let Ok(state) = provider.state_by_block_hash(hash) {
+            return Some(state);
+        }
+        provider.executed_state_by_block_hash(hash).ok().flatten()
     })
 }
 
@@ -434,6 +489,66 @@ fn load_qmdb_execution_checkpoint(
         .verify_and_build(chain_id, &expected_genesis)
         .map_err(|error| eyre::eyre!("failed to materialize QMDB checkpoint: {error}"))?;
     Ok((portable, verified))
+}
+
+/// Profile 1: block zero of the genesis file is the QMDB execution base. The
+/// tree is the genesis alloc's (`n42_chainspec::profile1::qmdb_genesis_tree`),
+/// whose root the Profile-1 genesis header already commits; no external
+/// checkpoint or range is read.
+fn load_profile1_execution_base(
+    genesis: &Genesis,
+    chain_id: u64,
+    genesis_header: Header,
+    genesis_hash: B256,
+    branch_state_path: &Path,
+    max_replay_depth: usize,
+) -> eyre::Result<QmdbExecutionBootstrap> {
+    let tree = gov5_qmdb_genesis_tree(genesis)
+        .map_err(|error| eyre::eyre!("failed to build the Profile-1 QMDB genesis state: {error}"))?;
+    let root = B256::from(tree.root());
+    if root != genesis_header.state_root {
+        return Err(eyre::eyre!(
+            "the genesis alloc gives QMDB root {root}, the Profile-1 genesis header commits {}",
+            genesis_header.state_root
+        ));
+    }
+    let checkpoint = QmdbPortableVerification {
+        chain_id,
+        genesis_hash: genesis_hash.0,
+        block_number: 0,
+        block_hash: genesis_hash.0,
+        root: root.0,
+        next_slot: tree.next_slot(),
+        live_count: tree.next_slot(),
+    };
+    let store = Gov5QmdbStateRootStore::persistent(
+        genesis_hash,
+        root,
+        tree.snapshot(),
+        max_replay_depth,
+        branch_state_path.to_path_buf(),
+    )
+    .map_err(|error| eyre::eyre!("failed to initialize the Profile-1 QMDB store: {error}"))?;
+    // A10/AM25: header N carries N−1's execution result; the registry of
+    // results lives beside the QMDB state, genesis seeded with its own fields.
+    let executed_fields_log = branch_state_path.with_file_name("executed_fields.log");
+    let loaded = n42_consensus::install_executed_fields_log(
+        &executed_fields_log,
+        genesis_hash,
+        &genesis_header,
+    )
+    .map_err(|error| eyre::eyre!("refusing to start: {error}"))?;
+    info!(target: "n42::profile1", %genesis_hash, %root, executed_fields_loaded = loaded, "QMDB execution base: the genesis alloc");
+    Ok(QmdbExecutionBootstrap {
+        store: Arc::new(store),
+        checkpoint,
+        base_block_number: 0,
+        base_block_hash: genesis_hash,
+        base_root: root,
+        genesis_header,
+        execution_genesis: genesis.clone(),
+        execution_profile: "profile1",
+    })
 }
 
 /// Establish block zero as the execution base by binding four independently checked views of it:
@@ -804,6 +919,7 @@ fn historical_replay_checkpoint_due(position: usize, total: usize, interval: usi
 async fn import_authenticated_replay_plan(
     execution: &dyn n42_node::el::ExecutionLayer,
     plan: &ReplayExecutionPlan,
+    fcu_tags: Option<&n42_consensus_service::fcu_tags::ForkchoiceTags>,
 ) -> eyre::Result<B256> {
     let verification = plan.verification();
     let replay_started = std::time::Instant::now();
@@ -849,11 +965,11 @@ async fn import_authenticated_replay_plan(
             let forkchoice = execution
                 .fork_choice_updated_for(
                     ExecutionPath::HISTORICAL_SEQUENTIAL,
-                    ForkchoiceState {
-                        head_block_hash: block_hash,
-                        safe_block_hash: block_hash,
-                        finalized_block_hash: block_hash,
-                    },
+                    n42_consensus_service::fcu_tags::forkchoice_state(
+                        fcu_tags,
+                        block_hash,
+                        block_hash,
+                    ),
                 )
                 .await
                 .map_err(|error| {
@@ -1212,6 +1328,84 @@ fn resolve_validator_p2p_keypair(
 /// the genesis `config.hotstuff` (with the bench env overrides) and installs
 /// them for the whole process, before any consensus component exists, so the
 /// engine, the H2-v4 verifier and the orchestrator all use one value.
+/// Profile 1: the header gate of the orchestrator or observer, seeded with
+/// the genesis header and, after a restart, with the durable head. Reth stores
+/// the alloy view of a header; the head is trusted only when its 24-element
+/// form with a zero registry root hashes to the durable head hash (the only
+/// registry root a Profile-1 chain has today). Otherwise the gate starts from
+/// genesis and admits nothing until the head's header is supplied again.
+fn profile1_import_gate(
+    genesis: &alloy_genesis::Genesis,
+    config: &n42_chainspec::profile1::Profile1Config,
+    head: Option<(B256, alloy_consensus::Header)>,
+) -> eyre::Result<n42_consensus_service::profile1_header::Profile1ImportGate> {
+    let genesis_header = n42_chainspec::profile1::profile1_genesis_header(genesis, config)
+        .map_err(|error| eyre::eyre!("refusing to start: {error}"))?;
+    n42_consensus::remember_gov5_native_header(&genesis_header.encode());
+    let mut gate =
+        n42_consensus_service::profile1_header::Profile1ImportGate::new(config, genesis_header)
+            .map_err(|error| eyre::eyre!("refusing to start: profile 1 header gate: {error}"))?;
+    if let Some((hash, header)) = head
+        && header.number > 0
+    {
+        let head = n42_chainspec::profile1::Profile1Header {
+            header,
+            mobile_registry_root: B256::ZERO,
+        };
+        if head.hash() == hash {
+            // The leader's build and the engine bind the head by its encoding.
+            n42_consensus::remember_gov5_native_header(&head.encode());
+            gate.seed(head);
+        } else {
+            tracing::warn!(
+                target: "n42::profile1",
+                %hash,
+                "durable head is not a 24-element header with a zero registry root; the header gate starts from genesis"
+            );
+        }
+    }
+    info!(target: "n42::profile1", genesis_hash = %gate.identity().genesis_hash, "profile 1 header gate installed on every import path and the Round-1 vote");
+    Ok(gate)
+}
+
+/// Resolves the genesis production profile (`config.n42Profile`, mixed
+/// production standard P2) and installs it for the whole process. On Profile 1
+/// a node refuses to start when the environment sets a consensus value the
+/// genesis owns (J4, AM10). A genesis without the field keeps today's rules.
+fn install_genesis_profile(
+    genesis: &alloy_genesis::Genesis,
+) -> eyre::Result<Option<n42_chainspec::profile1::Profile1Config>> {
+    let resolved = n42_chainspec::profile1::resolve_genesis_profile(genesis)
+        .map_err(|error| eyre::eyre!("refusing to start: {error}"))?;
+    if resolved.is_some() {
+        n42_chainspec::profile1::refuse_profile1_env()
+            .map_err(|error| eyre::eyre!("refusing to start: {error}"))?;
+    }
+    let profile = resolved.as_ref().map(|(profile, _)| *profile);
+    n42_chainspec::profile1::install_n42_profile(profile).map_err(|installed| {
+        eyre::eyre!(
+            "refusing to start: profile {installed:?} was already in force before the genesis one {profile:?}"
+        )
+    })?;
+    if let Some((_, config)) = &resolved {
+        if !n42_chainspec::profile1::install_profile1_config(config.clone()) {
+            return Err(eyre::eyre!(
+                "refusing to start: a profile 1 configuration was already installed"
+            ));
+        }
+        info!(
+            target: "n42::cli",
+            chain_id = config.chain_id,
+            validators = config.validators.len(),
+            leader_tenure = config.leader_tenure,
+            epoch_length = config.epoch_length,
+            block_interval_ms = config.block_interval_ms,
+            "N42 production profile 1"
+        );
+    }
+    Ok(resolved.map(|(_, config)| config))
+}
+
 fn install_genesis_leader_schedule(genesis: &alloy_genesis::Genesis) -> eyre::Result<()> {
     let resolved = n42_consensus::LeaderSchedule::resolve_for_genesis(genesis)
         .map_err(|error| eyre::eyre!("refusing to start: {error}"))?;
@@ -1320,7 +1514,7 @@ fn main() {
         );
     }
 
-    if let Err(err) = Cli::<EthereumChainSpecParser>::parse().run(async move |mut builder, _| {
+    if let Err(err) = Cli::<chainspec_parser::N42ChainSpecParser>::parse().run(async move |mut builder, _| {
         let engine_config = builder.config().tree_config();
         validate_immediate_persistence(
             engine_config.persistence_threshold(),
@@ -1329,6 +1523,7 @@ fn main() {
         )
         .map_err(eyre::Report::msg)?;
         info!(target: "n42::cli", "Launching N42 node");
+        let profile1 = install_genesis_profile(&builder.config().chain.genesis)?;
         install_genesis_leader_schedule(&builder.config().chain.genesis)?;
 
         // Warn about benchmark/debug env vars that weaken security.
@@ -1370,10 +1565,19 @@ fn main() {
         metrics::gauge!("n42_deferred_state_root_enabled")
             .set(if skip_root || defer_root { 1.0 } else { 0.0 });
 
-        // Priority: N42_CONSENSUS_CONFIG file > N42_VALIDATOR_COUNT dev mode.
+        // Priority: Profile-1 genesis > N42_CONSENSUS_CONFIG file >
+        // N42_VALIDATOR_COUNT dev mode. On Profile 1 the other two are
+        // refused above (J4), so the genesis is the only source (A2).
         let consensus_config_path = std::env::var("N42_CONSENSUS_CONFIG").ok();
-        let consensus_config_from_file = consensus_config_path.is_some();
+        let consensus_config_from_file = consensus_config_path.is_some() || profile1.is_some();
         let mut consensus_config = match consensus_config_path {
+            _ if profile1.is_some() => {
+                info!(target: "n42::cli", "consensus config from the Profile 1 genesis");
+                profile1
+                    .as_ref()
+                    .expect("checked by the guard")
+                    .consensus_config()
+            }
             Some(path) => {
                 info!(target: "n42::cli", path, "loading consensus config from file");
                 ConsensusConfig::from_file(std::path::Path::new(&path))
@@ -1489,7 +1693,11 @@ fn main() {
             .unwrap_or_else(|_| "./n42-data".to_string())
             .into();
         let observer_mode = env_bool("N42_OBSERVER_MODE");
-        let h2_v4_participant = env_bool("N42_GOV5_H2_PARTICIPANT");
+        // Profile 1: every node is an H2-v4 participant keyed by the genesis
+        // chain id and hash, with the gov5 header profile and QMDB execution
+        // from block zero; none of it is configured by the environment (J4).
+        let profile1_node = profile1.is_some();
+        let h2_v4_participant = env_bool("N42_GOV5_H2_PARTICIPANT") || profile1_node;
         if observer_mode && h2_v4_participant {
             return Err(eyre::eyre!(
                 "N42_OBSERVER_MODE and N42_GOV5_H2_PARTICIPANT are mutually exclusive"
@@ -1498,11 +1706,15 @@ fn main() {
         // H2-v4 participants replace the builder's state root with the QMDB
         // root during Gov5 normalization, so the builder's MPT root is skipped.
         n42_node::payload::set_builder_state_root_replaced(h2_v4_participant);
-        let header_profile = resolve_header_profile(
-            observer_mode || h2_v4_participant,
-            env_bool("N42_GOV5_HEADER_PROFILE"),
-            std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
-        )?;
+        let header_profile = if profile1_node {
+            N42HeaderProfile::Gov5H2
+        } else {
+            resolve_header_profile(
+                observer_mode || h2_v4_participant,
+                env_bool("N42_GOV5_HEADER_PROFILE"),
+                std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
+            )?
+        };
         let interop_genesis = resolve_observer_genesis_hash(
             B256::ZERO,
             std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
@@ -1568,7 +1780,22 @@ fn main() {
             &data_dir.join("gov5_qmdb_branches.bin"),
         )
         .is_file();
-        let qmdb_execution = if env_bool("N42_GOV5_QMDB_EXECUTION")
+        let qmdb_execution = if profile1_node {
+            if builder.config().prune_config().is_some() {
+                return Err(eyre::eyre!(
+                    "profile 1 QMDB execution rejects all CLI pruning options"
+                ));
+            }
+            let chain = &builder.config().chain;
+            Some(load_profile1_execution_base(
+                &chain.genesis,
+                chain.chain.id(),
+                chain.genesis_header().clone(),
+                chain.genesis_hash(),
+                &data_dir.join("gov5_qmdb_branches.bin"),
+                DEFAULT_QMDB_REPLAY_DEPTH,
+            )?)
+        } else if env_bool("N42_GOV5_QMDB_EXECUTION")
             || bootstrap_bundle.is_some()
         {
             if builder.config().prune_config().is_some() {
@@ -1914,6 +2141,8 @@ fn main() {
         }
 
         let my_pubkey = secret_key.public_key();
+        // Profile 1 (B2): this validator seals its own blocks with its key.
+        let profile1_seal_key = secret_key.clone();
         let resolved_my_index = startup_validator_set.index_of_public_key(&my_pubkey);
         if h2_v4_participant && resolved_my_index.is_none() {
             return Err(eyre::eyre!(
@@ -2793,10 +3022,34 @@ fn main() {
                         observer =
                             observer.with_epoch_schedule(consensus_config.epoch_length, schedule);
                     }
+                    if let Some(config) = &profile1 {
+                        let head = full_node
+                            .provider
+                            .header(observer_head)?
+                            .map(|header| (observer_head, header));
+                        // A10 (design 3.8): an observer restarted at a head
+                        // checks the head's child against its own result.
+                        if let Some((hash, header)) = &head {
+                            n42_consensus::require_head_result(header.number, *hash).map_err(
+                                |error| eyre::eyre!("refusing to start: profile 1 observer: {error}"),
+                            )?;
+                        }
+                        observer = observer.with_profile1_gate(profile1_import_gate(
+                            &full_node.provider.chain_spec().genesis,
+                            config,
+                            head,
+                        )?);
+                    }
+                    // E14: safe = the head's parent, finalized = persisted.
+                    let observer_fcu_tags =
+                        profile1.as_ref().map(|_| profile1_fcu_tags(full_node.provider.clone()));
+                    if let Some(tags) = &observer_fcu_tags {
+                        observer = observer.with_fcu_tags(tags.clone());
+                    }
 
                     task_executor.spawn_critical_task("n42-observer-orchestrator", Box::pin(async move {
                         if let Some(plan) = replay_plan {
-                            match import_authenticated_replay_plan(observer_el.as_ref(), &plan).await {
+                            match import_authenticated_replay_plan(observer_el.as_ref(), &plan, observer_fcu_tags.as_ref()).await {
                                 Ok(imported) => info!(
                                     target: "n42::cli",
                                     %imported,
@@ -3407,7 +3660,10 @@ fn main() {
                             .with_follower_import(follower_import(
                                 full_node.evm_config.clone(),
                                 full_node.provider.clone(),
-                            )),
+                            ))
+                            .with_deferred_check(profile1.as_ref().map(|_| {
+                                profile1_deferred_checker(full_node.provider.clone())
+                            })),
                         ),
                         Err(error) => {
                             eprintln!("ERROR: {error}");
@@ -3459,9 +3715,37 @@ fn main() {
                 if let Some(header) = full_node.provider.header(consensus_head_hash)? {
                     orchestrator = orchestrator.with_recovered_head_timestamp(header.timestamp);
                 }
+                // A10 (design 3.1/3.8): the first header after a restart
+                // carries the head's result, which must be this node's own;
+                // it is never taken from a header.
+                if profile1.is_some() {
+                    n42_consensus::require_head_result(consensus_head_number, consensus_head_hash)
+                        .map_err(|error| eyre::eyre!("refusing to start: profile 1: {error}"))?;
+                }
+                if let Some(config) = &profile1 {
+                    let head = full_node
+                        .provider
+                        .header(consensus_head_hash)?
+                        .map(|header| (consensus_head_hash, header));
+                    orchestrator = orchestrator.with_profile1_gate(
+                        profile1_import_gate(
+                            &full_node.provider.chain_spec().genesis,
+                            config,
+                            head,
+                        )?
+                        .with_seal_key(Arc::new(profile1_seal_key.clone())),
+                    );
+                }
 
                 if h2_v4_participant {
-                    if env_bool("N42_GOV5_NATIVE_PRODUCER") {
+                    if profile1.is_some() {
+                        // A8: devBlockReward to the coinbase and to the
+                        // faucet every block, carried as withdrawals.
+                        let rewards = n42_node::sinks::Gov5WithdrawalSource::from_genesis(
+                            &full_node.provider.chain_spec().genesis, fee_recipient,
+                        ).map_err(eyre::Report::msg)?;
+                        orchestrator = orchestrator.with_withdrawal_source(Arc::new(rewards));
+                    } else if env_bool("N42_GOV5_NATIVE_PRODUCER") {
                         if qmdb_execution_store.is_none() || trusted_state_root_base.is_some() {
                             return Err(eyre::eyre!("native producer requires recomputed QMDB roots"));
                         }
@@ -3644,6 +3928,24 @@ fn main() {
                     orchestrator = orchestrator.with_evidence_store(Arc::clone(store));
                 }
 
+                // E14: safe = the committed head's parent, finalized = the
+                // highest persisted block at or below it.
+                let participant_fcu_tags =
+                    profile1.as_ref().map(|_| profile1_fcu_tags(full_node.provider.clone()));
+                if let Some(tags) = &participant_fcu_tags {
+                    orchestrator = orchestrator.with_fcu_tags(tags.clone());
+                }
+                // E12: evidence of a halt survives restarts; the node starts
+                // halted while `profile1_halt.json` is in the data directory.
+                if profile1.is_some() {
+                    let halt = n42_consensus_service::halt::Halt::open(&data_dir)
+                        .map_err(|error| eyre::eyre!("refusing to start: profile 1: halt evidence: {error}"))?;
+                    if let Some(evidence) = halt.evidence() {
+                        tracing::error!(target: "n42::profile1", ?evidence, dir = %data_dir.display(), "starting HALTED (E12): move profile1_halt.json out of the data directory to resume");
+                    }
+                    orchestrator = orchestrator.with_halt(Arc::new(halt));
+                }
+
                 let orchestrator = orchestrator;
 
                 task_executor.spawn_critical_task(
@@ -3653,6 +3955,7 @@ fn main() {
                             match import_authenticated_replay_plan(
                                 participant_replay_el.as_ref(),
                                 &plan,
+                                participant_fcu_tags.as_ref(),
                             )
                             .await
                             {

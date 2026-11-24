@@ -421,7 +421,15 @@ where
         evm_config: n42_execution::N42EvmConfig,
     ) -> eyre::Result<Self::PayloadBuilder> {
         let conf = ctx.payload_builder_config();
-        let gas_limit = conf.gas_limit_for(ctx.chain_spec().chain());
+        let mut gas_limit = conf.gas_limit_for(ctx.chain_spec().chain());
+        // A23: every Profile-1 header carries hotstuff.gasLimit (= the
+        // genesis gasLimit); the builder must not move toward another target.
+        let chain_spec = ctx.chain_spec();
+        let genesis = chain_spec.genesis();
+        if n42_chainspec::profile1::genesis_declares_profile(genesis) {
+            gas_limit = genesis.gas_limit;
+            tracing::info!(target: "n42::payload", gas_limit, "profile 1: block gas limit fixed by the genesis (A23)");
+        }
 
         let builder = N42InnerPayloadBuilder {
             client: ctx.provider().clone(),

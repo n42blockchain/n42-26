@@ -420,17 +420,22 @@ impl ConsensusEngine {
         // Gov5's H2 profile is import-gated: an R1 vote attests that this node
         // has executed and validated the proposed payload, not merely seen its
         // hash. Keep the native profile's established optimistic path intact.
-        if self.signing_profile.is_gov5() {
+        // Profile 1 (A13, AM19, AM23) is always execution-gated.
+        if self.signing_profile.is_gov5() || self.vote_rules.round1_needs_execution() {
             self.pending_proposal = Some(super::state_machine::PendingProposal {
                 view,
                 block_hash: proposal.block_hash,
                 justify_block: proposal.justify_qc.block_hash,
             });
-            if self.imported_blocks.contains(&proposal.block_hash) {
+            let checked = self.vote_rules.round1_needs_execution()
+                && self.checked_parents.get(&proposal.block_hash).is_some();
+            if self.refused_blocks.get(&proposal.block_hash).is_some() {
+                tracing::warn!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, "Round-1 vote withheld: the deferred check refused the block");
+            } else if self.imported_blocks.contains(&proposal.block_hash) || checked {
                 if !self.extends_justify(proposal.block_hash) {
                     return Ok(());
                 }
-                tracing::info!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, "import-gated vote: block already execution-validated");
+                tracing::info!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, checked, "import-gated vote: block already execution-validated or checked");
                 self.send_vote(view, proposal.block_hash)?;
             } else {
                 tracing::info!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, "import-gated vote: waiting for execution validation");
@@ -494,6 +499,17 @@ impl ConsensusEngine {
                 my_index = self.my_index,
                 "observer (or stale my_index): skipping commit vote"
             );
+            return Ok(());
+        }
+
+        // Profile 1 (A13, AM19): the commit vote attests this node's own
+        // execution of the block; held until it, `on_block_imported` re-enters
+        // with the held PrepareQC. The lock above has already moved.
+        if self.vote_rules.commit_vote_needs_own_execution()
+            && !self.imported_blocks.contains(&pqc.block_hash)
+        {
+            tracing::info!(target: "n42::interop::h2v4", view, block_hash = %pqc.block_hash, "holding the commit vote until this node executes the block");
+            self.held_prepare_qc = Some(pqc);
             return Ok(());
         }
 
@@ -592,6 +608,13 @@ impl ConsensusEngine {
         block_hash: B256,
         parent_hash: Option<B256>,
     ) -> ConsensusResult<()> {
+        // Profile 1: only this node's execution of the block, reported with
+        // its parent, is vote evidence; block data alone (cached, or voted on
+        // a builder's check) is not.
+        if parent_hash.is_none() && self.vote_rules.round1_needs_execution() {
+            tracing::debug!(target: "n42::interop::h2v4", %block_hash, "block data without its execution: not vote evidence on Profile 1");
+            return Ok(());
+        }
         if self.imported_blocks.insert(block_hash) {
             if self.imported_block_fifo.len() >= MAX_IMPORTED_BLOCKS {
                 self.evict_oldest_imported_block();
@@ -609,20 +632,68 @@ impl ConsensusEngine {
             self.imported_parents.remove(&block_hash);
         }
 
-        if self.signing_profile.is_gov5()
+        let gated = self.signing_profile.is_gov5() || self.vote_rules.round1_needs_execution();
+        if gated
+            && self.refused_blocks.get(&block_hash).is_none()
             && let Some(pending) = self.pending_proposal.as_ref()
             && pending.view == self.round_state.current_view()
             && pending.block_hash == block_hash
             && self.round_state.may_vote_in(pending.view)
         {
             let view = pending.view;
-            if !self.extends_justify(block_hash) {
-                return Ok(());
+            if self.extends_justify(block_hash) {
+                tracing::info!(target: "n42::interop::h2v4", view, %block_hash, "import-gated vote: execution validated, sending vote");
+                self.send_vote(view, block_hash)?;
             }
-            tracing::info!(target: "n42::interop::h2v4", view, %block_hash, "import-gated vote: execution validated, sending vote");
-            self.send_vote(view, block_hash)?;
+        }
+
+        // The commit vote held for this block's execution (Profile 1).
+        if self
+            .held_prepare_qc
+            .as_ref()
+            .is_some_and(|held| held.block_hash == block_hash)
+            && let Some(held) = self.held_prepare_qc.take()
+            && held.view == self.round_state.current_view()
+        {
+            tracing::info!(target: "n42::interop::h2v4", view = held.view, %block_hash, "block executed, casting the held commit vote");
+            self.process_prepare_qc(held)?;
         }
         Ok(())
+    }
+
+    /// Profile 1, Phase B: the deferred check passed for `block_hash` before
+    /// its import. Releases the pending Round-1 vote under the same extends
+    /// rule as an import; the CommitVote still waits for the import.
+    pub(super) fn on_block_checked(
+        &mut self,
+        block_hash: B256,
+        parent_hash: B256,
+    ) -> ConsensusResult<()> {
+        if !self.vote_rules.round1_needs_execution() || self.refused_blocks.get(&block_hash).is_some() {
+            return Ok(());
+        }
+        self.checked_parents.insert(block_hash, parent_hash);
+        if let Some(pending) = self.pending_proposal.as_ref()
+            && pending.view == self.round_state.current_view()
+            && pending.block_hash == block_hash
+            && self.round_state.may_vote_in(pending.view)
+        {
+            let view = pending.view;
+            if self.extends_justify(block_hash) {
+                tracing::info!(target: "n42::interop::h2v4", view, %block_hash, "checked vote: deferred check passed before the import, sending vote");
+                self.send_vote(view, block_hash)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Profile 1: the deferred check refused `block_hash`; its Round-1 vote
+    /// is withheld from now on.
+    pub(super) fn on_block_refused(&mut self, block_hash: B256) {
+        if self.vote_rules.round1_needs_execution() {
+            self.checked_parents.remove(&block_hash);
+            self.refused_blocks.insert(block_hash, ());
+        }
     }
 
     /// The extends rule: a proposal's block has to be a child of the block its
@@ -642,13 +713,28 @@ impl ConsensusEngine {
         if pending.justify_block == B256::ZERO {
             return true;
         }
-        let Some(parent) = self.imported_parents.get(&block_hash).copied() else {
+        let Some(parent) = self
+            .imported_parents
+            .get(&block_hash)
+            .or_else(|| self.checked_parents.get(&block_hash))
+            .copied()
+        else {
+            // Profile 1 (AM19): the block's parent has to be the justify
+            // block, so a parent not known here abstains (n42-rs, audit
+            // 2026-10 A-2).
+            if self.vote_rules.unknown_parent_abstains() {
+                tracing::debug!(target: "n42::interop::h2v4",
+                    view = pending.view, %block_hash,
+                    "import-gated vote withheld: the block's parent is not known here"
+                );
+                return false;
+            }
             return true;
         };
         // A zero parent is no parent: gov5 reads it as unknown, and so do
         // the harness's mock blocks.
         if parent == B256::ZERO {
-            return true;
+            return !self.vote_rules.unknown_parent_abstains();
         }
         if parent != pending.justify_block {
             tracing::warn!(target: "n42::interop::h2v4",

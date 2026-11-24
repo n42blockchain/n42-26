@@ -23,6 +23,8 @@ COPY n42-26/Cargo.toml n42-26/Cargo.lock /build/n42-26/
 COPY n42-26/crates/ /build/n42-26/crates/
 COPY n42-26/bin/ /build/n42-26/bin/
 COPY n42-26/tests/e2e/ /build/n42-26/tests/e2e/
+# Vendored dependency repairs the workspace [patch]es in (evm2 itself among them).
+COPY n42-26/vendor/ /build/n42-26/vendor/
 
 WORKDIR /build/n42-26
 

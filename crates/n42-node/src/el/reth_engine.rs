@@ -25,6 +25,8 @@ pub struct RethExecutionLayer {
     /// The block this node resolved from its builder last: parent, number
     /// and transaction count, which survive the header normalization.
     last_built: std::sync::Mutex<Option<(alloy_primitives::B256, u64, usize)>>,
+    /// Profile 1: the deferred proposal check (design 3.4).
+    deferred: Option<super::deferred::DeferredChecker>,
 }
 
 impl RethExecutionLayer {
@@ -39,6 +41,7 @@ impl RethExecutionLayer {
             import_gate: super::import_gate::ImportGate::configured().map(std::sync::Arc::new),
             follower_import: None,
             last_built: std::sync::Mutex::new(None),
+            deferred: None,
         }
     }
 
@@ -50,6 +53,7 @@ impl RethExecutionLayer {
             import_gate: super::import_gate::ImportGate::configured().map(std::sync::Arc::new),
             follower_import: None,
             last_built: std::sync::Mutex::new(None),
+            deferred: None,
         }
     }
 }
@@ -69,6 +73,12 @@ impl RethExecutionLayer {
             self.import_gate = Some(Default::default());
         }
         self.follower_import = follower_import;
+        self
+    }
+
+    /// Profile 1: checks proposals before their import (design 3.4).
+    pub fn with_deferred_check(mut self, checker: Option<super::deferred::DeferredChecker>) -> Self {
+        self.deferred = checker;
         self
     }
 
@@ -213,6 +223,21 @@ impl ExecutionLayer for RethExecutionLayer {
         metrics::histogram!("n42_engine_boundary_duration_ms", "phase" => "payload_resolve")
             .record(started.elapsed().as_secs_f64() * 1_000.0);
         result
+    }
+
+    async fn deferred_check(
+        &self,
+        payload: &ExecutionData,
+    ) -> n42_consensus_service::deferred_check::DeferredCheck {
+        let Some(checker) = self.deferred.clone() else {
+            return n42_consensus_service::deferred_check::DeferredCheck::Unsupported;
+        };
+        let payload = payload.clone();
+        tokio::task::spawn_blocking(move || checker.check(&payload))
+            .await
+            .unwrap_or_else(|error| {
+                n42_consensus_service::deferred_check::DeferredCheck::Retry(error.to_string())
+            })
     }
 
     async fn build_on_sealed(

@@ -3918,7 +3918,6 @@ dependencies = [
 [[package]]
 name = "evm2"
 version = "0.1.0"
-source = "git+https://github.com/DaniPopes/evm2?rev=66687c18b34d3bdbb899f5eb7605070615c03475#66687c18b34d3bdbb899f5eb7605070615c03475"
 dependencies = [
  "alloy-consensus",
  "alloy-eip7928",
@@ -6914,14 +6913,17 @@ dependencies = [
  "alloy-consensus",
  "alloy-genesis",
  "alloy-primitives",
+ "alloy-rlp",
  "libp2p",
  "n42-primitives",
+ "n42-twig-core",
  "reth-chainspec",
  "reth-ethereum-primitives",
  "reth-primitives-traits",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.21",
  "toml 1.1.8+spec-1.1.0",
 ]
 
@@ -6954,6 +6956,7 @@ dependencies = [
  "reth-primitives-traits",
  "serde_json",
  "sha2 0.11.1",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -7063,6 +7066,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-eip7928",
  "alloy-eips",
+ "alloy-genesis",
  "alloy-primitives",
  "alloy-rpc-types-engine",
  "bincode",
@@ -7219,6 +7223,7 @@ dependencies = [
  "hex",
  "libp2p",
  "metrics",
+ "n42-chainspec",
  "n42-consensus",
  "n42-mobile",
  "n42-primitives",
@@ -7283,6 +7288,7 @@ dependencies = [
  "reth-consensus",
  "reth-consensus-common",
  "reth-db-api",
+ "reth-db-common",
  "reth-engine-primitives",
  "reth-engine-tree",
  "reth-errors",
@@ -7363,6 +7369,7 @@ dependencies = [
  "pprof",
  "rand 0.10.3",
  "reth-chainspec",
+ "reth-cli",
  "reth-cli-commands",
  "reth-cli-runner",
  "reth-db-api",

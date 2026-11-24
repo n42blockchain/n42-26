@@ -393,6 +393,16 @@ pub fn remembered_gov5_native_header(hash: &B256) -> Option<Gov5NativeHeader> {
     (decoded.encode().as_slice() == raw.as_ref()).then_some(decoded)
 }
 
+/// The remembered encoding of `hash` decoded as a Profile-1 header (24
+/// elements), re-checked to hash to `hash`.
+pub fn remembered_profile1_header(
+    hash: &B256,
+) -> Option<n42_chainspec::profile1::Profile1Header> {
+    let raw = gov5_native_header_rlp(hash)?;
+    let decoded = n42_chainspec::profile1::Profile1Header::decode(&raw).ok()?;
+    (decoded.hash() == *hash).then_some(decoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

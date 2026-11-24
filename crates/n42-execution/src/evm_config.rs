@@ -8,7 +8,7 @@ use reth_evm::{
     ReceiptBuilder, ReceiptBuilderCtx, SenderRecoveryCache,
 };
 use reth_evm_ethereum::{
-    EthBlockAssembler, EthBlockExecutionCtx, EthBlockExecutorFactory, EthEvmConfig,
+    EthBlockAssembler, EthBlockExecutionCtx, EthBlockExecutorFactory, EthEvmConfig, EvmFactory,
 };
 use reth_primitives_traits::{
     BlockTy, HeaderTy, Recovered, SealedBlock, SealedHeader, SignedTransaction,
@@ -77,6 +77,60 @@ pub struct N42EvmConfig {
     factory: TrackingBlockExecutorFactory<N42BlockExecutorFactory>,
     /// Assembles blocks of N42 transactions.
     assembler: EthBlockAssembler<ChainSpec>,
+    /// The factory, for the spec raise of [`Self::amsterdam_execution_at`].
+    evm_factory: N42EvmFactory,
+    /// Profile 1 (AM1): from this time on blocks execute under evm2's
+    /// Amsterdam rules, while reth's Amsterdam hardfork stays off in the chain
+    /// spec. See [`profile1_amsterdam_execution_at`].
+    amsterdam_execution_at: Option<u64>,
+}
+
+/// Profile 1 (mixed production standard AM1): `config.amsterdamTime` of a
+/// Profile-1 genesis switches on exactly the Amsterdam execution set of
+/// n42-rs `docs/GLAMSTERDAM_EXECUTION_PARITY.md`: evm2's
+/// [`SpecId::AMSTERDAM`](evm2::SpecId::AMSTERDAM) version (its gas table,
+/// EIP-8037 state gas and the 2^32-1 transaction gas cap, EIP-2780 intrinsic
+/// gas, EIP-7623/7976 floor, EIP-7981, EIP-8038, EIP-7708 transfer logs,
+/// EIP-7778, EIP-7954 code and initcode caps, EIP-8246, EIP-8024, EIP-7843
+/// SLOTNUM = the block number). The chain spec built for a Profile-1 genesis
+/// carries no reth Amsterdam hardfork
+/// (`n42_chainspec::profile1::profile1_chain_spec`), so what reth and evm2
+/// gate on the chain spec's Amsterdam stays off: the EIP-7928 block access
+/// list (builder and payload validator) and the EIP-8282 end-of-block
+/// builder-request calls (the latter not by evm2, which gates them on its
+/// spec alone: the executor factory turns them off on every native chain, see
+/// [`eip8282_builder_requests_active`]). EIP-7997 is in neither client.
+pub fn profile1_amsterdam_execution_at<C: reth_chainspec::EthChainSpec + ?Sized>(
+    chain_spec: &C,
+) -> Option<u64> {
+    let genesis = chain_spec.genesis();
+    if !n42_chainspec::profile1::genesis_declares_profile(genesis) {
+        return None;
+    }
+    genesis.config.amsterdam_time
+}
+
+/// Whether blocks of the chain with `genesis` make the EIP-8282
+/// builder-request system calls at their end (from Amsterdam on, as evm2
+/// decides): only on a chain that is not N42-native.
+///
+/// This is gov5's rule (`UsesEIP8282BuilderRequests(time)` = Glamsterdam and
+/// not `IsN42Native`) and the mixed production standard's D2 ("no EIP-8282
+/// calls"); n42-rs gates on the same predicate
+/// (`!reth_chainspec::qmdb::is_n42_native(genesis)`, docs/EVM2_PORT_PLAN.md
+/// S1). evm2 (rev 66687c18) gates the two calls on its spec alone, and
+/// Profile 1 runs the Amsterdam spec from `amsterdamTime` (AM1), so without
+/// the gate n42-26 calls both predeploy addresses at the end of every such
+/// block. They have no code on N42 chains, but anyone can deploy it (the
+/// predeploys are deployable by Nick's method, and native chains admit
+/// pre-EIP-155 transactions); from then on a node making the calls diverges
+/// from gov5. An Ethereum-compatible chain (not native) keeps the calls
+/// whenever its spec schedules Amsterdam. The switch is the vendored evm2
+/// repair `EthBlockExecutor::set_eip8282_builder_requests`
+/// (`vendor/dependency-repairs/evm2-66687c18`), set per executor by
+/// `TrackingBlockExecutorFactory::create_executor`.
+pub fn eip8282_builder_requests_active(genesis: &alloy_genesis::Genesis) -> bool {
+    !n42_chainspec::native::is_n42_native(genesis)
 }
 
 impl N42EvmConfig {
@@ -103,14 +157,49 @@ impl N42EvmConfig {
             TrackingBlockExecutorFactory::new(EthBlockExecutorFactory::new_with_receipt_builder(
                 N42ReceiptBuilder,
                 chain_spec.clone(),
-                evm_factory,
+                evm_factory.clone(),
             ))
             .with_gov5_root_rules(unchanged_account_no_op_time, storage_net_change_time);
+        let amsterdam_execution_at = profile1_amsterdam_execution_at(&chain_spec);
         Self {
             inner,
             factory,
             assembler: EthBlockAssembler::new(chain_spec),
+            evm_factory,
+            amsterdam_execution_at,
         }
+    }
+
+    /// Whether a block at `timestamp` executes under the Amsterdam rules
+    /// while the chain spec schedules no reth Amsterdam (Profile 1, AM1).
+    pub fn amsterdam_execution_active_at(&self, timestamp: u64) -> bool {
+        self.amsterdam_execution_at
+            .is_some_and(|at| timestamp >= at)
+    }
+
+    /// Raises an environment to evm2's Amsterdam version for a block under
+    /// the Profile-1 Amsterdam execution, with SLOTNUM = `slot` (EIP-7843;
+    /// a Profile-1 header's slot number is its block number, B10).
+    fn raise_to_amsterdam(
+        &self,
+        mut env: EvmEnvFor<Self>,
+        timestamp: u64,
+        slot: u64,
+    ) -> EvmEnvFor<Self> {
+        if !self.amsterdam_execution_active_at(timestamp) {
+            return env;
+        }
+        if !env.spec.enables(evm2::SpecId::AMSTERDAM) {
+            let max_blobs_per_tx = env.version.max_blobs_per_tx;
+            let chain_id = self.chain_spec().chain.id();
+            env.spec = self.evm_factory.spec_id(evm2::SpecId::AMSTERDAM);
+            env.version = self
+                .evm_factory
+                .version(evm2::SpecId::AMSTERDAM, chain_id);
+            env.version.max_blobs_per_tx = max_blobs_per_tx;
+        }
+        env.block.slot_num = alloy_primitives::U256::from(slot);
+        env
     }
 
     /// Returns a reference to the inner Ethereum configuration.
@@ -146,7 +235,12 @@ impl ConfigureEvm for N42EvmConfig {
     }
 
     fn evm_env(&self, header: &HeaderTy<Self::Primitives>) -> Result<EvmEnvFor<Self>, Self::Error> {
-        self.inner.evm_env(header)
+        let env = self.inner.evm_env(header)?;
+        Ok(self.raise_to_amsterdam(
+            env,
+            header.timestamp,
+            header.slot_number.unwrap_or(header.number),
+        ))
     }
 
     fn next_evm_env(
@@ -154,7 +248,13 @@ impl ConfigureEvm for N42EvmConfig {
         parent: &HeaderTy<Self::Primitives>,
         attributes: &Self::NextBlockEnvCtx,
     ) -> Result<EvmEnvFor<Self>, Self::Error> {
-        self.inner.next_evm_env(parent, attributes)
+        let env = self.inner.next_evm_env(parent, attributes)?;
+        let number = parent.number.saturating_add(1);
+        Ok(self.raise_to_amsterdam(
+            env,
+            attributes.timestamp,
+            attributes.slot_number.unwrap_or(number),
+        ))
     }
 
     fn context_for_block<'a>(
@@ -191,7 +291,12 @@ impl ConfigureEvm for N42EvmConfig {
 
 impl ConfigureEngineEvm<ExecutionData> for N42EvmConfig {
     fn evm_env_for_payload(&self, payload: &ExecutionData) -> Result<EvmEnvFor<Self>, Self::Error> {
-        self.inner.evm_env_for_payload(payload)
+        let env = self.inner.evm_env_for_payload(payload)?;
+        let slot = payload
+            .payload
+            .as_v4()
+            .map_or(payload.payload.block_number(), |v4| v4.slot_number);
+        Ok(self.raise_to_amsterdam(env, payload.payload.timestamp(), slot))
     }
 
     fn context_for_payload<'a>(

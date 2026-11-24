@@ -18,6 +18,9 @@ mod receipt;
 pub mod rotor;
 pub mod validator;
 pub mod vote_log;
+pub mod deferred_depth;
+pub mod executed_fields;
+pub mod vote_rules;
 
 pub use adapter::{
     GOV5_HEADER_EXTRA_MAGIC, MAX_GOV5_HEADER_EXTRA_BYTES, MIN_GOV5_HEADER_EXTRA_BYTES,
@@ -30,9 +33,13 @@ pub use committee_pool::{
     ConsensusEvidence as CommitteeConsensusEvidence, SimulatedCommitteePool, shared_committee_pool,
 };
 pub use error::ConsensusError as N42ConsensusError;
+pub use executed_fields::{
+    CarriedMismatch, ExecutedFields, ExecutedFieldsError, RestartError, carried_mismatch, executed_fields, record_carried_mismatch, require_head_result, install_executed_fields_log,
+    remember_executed_fields, wait_for_executed_fields,
+};
 pub use gov5_native_header::{
     Gov5NativeHeader, Gov5NativeHeaderError, gov5_native_header_rlp, remember_gov5_native_header,
-    remembered_gov5_native_header,
+    remembered_gov5_native_header, remembered_profile1_header,
 };
 pub use gov5_rewards::{
     Gov5Reward, Gov5RewardError, gov5_native_rewards_root, gov5_rewards_to_withdrawals,
@@ -51,3 +58,4 @@ pub use validator::{
     leader_tenure, view_after_tc,
 };
 pub use vote_log::{NoopVoteLog, VoteLogWriter};
+pub use vote_rules::VoteRules;

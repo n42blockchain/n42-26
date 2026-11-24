@@ -19,7 +19,7 @@ pub mod restored_slots;
 pub mod state_diff;
 pub mod witness;
 
-pub use evm_config::N42EvmConfig;
+pub use evm_config::{N42EvmConfig, eip8282_builder_requests_active, profile1_amsterdam_execution_at};
 pub use evm_factory::N42EvmFactory;
 pub use execution_path::{EvmStrategy, ExecutionPath, ExecutionWorkload};
 pub use executor::{execute_block_full, execute_block_with_witness};

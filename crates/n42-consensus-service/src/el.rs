@@ -198,4 +198,17 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     ) -> Option<Result<BuiltBlock, ElError>> {
         None
     }
+
+    /// Profile 1 (design 3.4): the deferred proposal check of `payload`
+    /// against its parent's post-state, without executing it: the header's
+    /// carried fields are this node's result for the parent, and every
+    /// transaction is includable ([`crate::deferred_check`]).
+    /// [`DeferredCheck::Unsupported`](crate::deferred_check::DeferredCheck)
+    /// by default: the vote then waits for the import.
+    async fn deferred_check(
+        &self,
+        _payload: &ExecutionData,
+    ) -> crate::deferred_check::DeferredCheck {
+        crate::deferred_check::DeferredCheck::Unsupported
+    }
 }

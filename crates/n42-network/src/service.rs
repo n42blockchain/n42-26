@@ -24,7 +24,7 @@ use crate::gossipsub::topics::{
     blob_sidecar_topic, block_announce_topic, consensus_topic, gov5_block_topic, gov5_h2_topic,
     h2_v4_topic, mempool_topic, verification_receipts_topic,
 };
-use crate::gov5_block::{Gov5BlockError, attributable_hash, decode_gov5_block_rlp};
+use crate::gov5_block::{Gov5BlockError, attributable_hash, decode_wire_block_rlp};
 use crate::gov5_rpc::{
     GOV5_BLOCK_BY_HASH_PROTOCOL, Gov5BlockByHashRequest, Gov5BlockByHashResponse,
     Gov5BlockPushRequest, Gov5BlockPushResponse, Gov5BodiesByRangeRequest,
@@ -135,7 +135,7 @@ fn cache_gov5_served_block(
     {
         return Ok(hash);
     }
-    decode_gov5_block_rlp(rlp)?;
+    decode_wire_block_rlp(rlp)?;
     insert_served_gov5_block(
         blocks,
         order,
@@ -173,7 +173,7 @@ fn cache_gov5_served_block_unverified(
             },
         ),
         Some(held) if !held.verified && held.rlp != rlp => {
-            if decode_gov5_block_rlp(&held.rlp).is_ok() {
+            if decode_wire_block_rlp(&held.rlp).is_ok() {
                 held.verified = true;
             } else {
                 held.rlp = rlp.to_vec();
@@ -230,7 +230,7 @@ fn servable_gov5_block(
         return Vec::new();
     };
     if !block.verified {
-        if decode_gov5_block_rlp(&block.rlp).is_err() {
+        if decode_wire_block_rlp(&block.rlp).is_err() {
             blocks.remove(hash);
             order.retain(|retained| retained != hash);
             return Vec::new();

@@ -51,6 +51,9 @@ pub enum LeaderScheduleError {
     /// A field is present but not an unsigned 64-bit integer.
     #[error("genesis config.hotstuff.{0} is not an unsigned 64-bit integer")]
     Field(&'static str),
+    /// A Profile-1 genesis whose leader rules cannot be used.
+    #[error("{0}")]
+    Profile1(String),
 }
 
 /// The schedule together with what the environment changed, for the caller
@@ -147,10 +150,55 @@ impl LeaderSchedule {
         })
     }
 
-    /// [`Self::resolve`] for a genesis and this process's environment.
+    /// The rules of a Profile-1 chain (mixed production standard A15, A22,
+    /// AM12): the mandatory `leaderTenure` (>= 1) and rotate-on-timeout from
+    /// view 0, with no field and no override. A bench override is refused,
+    /// not applied (AM10).
+    pub fn resolve_profile1(
+        config: &n42_chainspec::profile1::Profile1Config,
+        env_tenure: Option<&str>,
+        env_rotate: Option<&str>,
+    ) -> Result<ResolvedLeaderSchedule, LeaderScheduleError> {
+        for (name, value) in [
+            (LEADER_TENURE_ENV, env_tenure),
+            (ROTATE_ON_TIMEOUT_ENV, env_rotate),
+        ] {
+            if value.is_some() {
+                return Err(LeaderScheduleError::Profile1(format!(
+                    "{name} is set; a Profile 1 chain reads its leader rules only from the genesis"
+                )));
+            }
+        }
+        if config.leader_tenure == 0 {
+            return Err(LeaderScheduleError::Profile1(
+                "leaderTenure must be >= 1".to_owned(),
+            ));
+        }
+        let schedule = Self {
+            tenure: config.leader_tenure,
+            rotate_on_timeout_from: Some(0),
+        };
+        Ok(ResolvedLeaderSchedule {
+            schedule,
+            genesis: schedule,
+            notes: Vec::new(),
+        })
+    }
+
+    /// [`Self::resolve`] for a genesis and this process's environment; on a
+    /// Profile-1 genesis, [`Self::resolve_profile1`].
     pub fn resolve_for_genesis(
         genesis: &alloy_genesis::Genesis,
     ) -> Result<ResolvedLeaderSchedule, LeaderScheduleError> {
+        if let Some((_, config)) = n42_chainspec::profile1::resolve_genesis_profile(genesis)
+            .map_err(|error| LeaderScheduleError::Profile1(error.to_string()))?
+        {
+            return Self::resolve_profile1(
+                &config,
+                std::env::var(LEADER_TENURE_ENV).ok().as_deref(),
+                std::env::var(ROTATE_ON_TIMEOUT_ENV).ok().as_deref(),
+            );
+        }
         Self::resolve(
             genesis.config.extra_fields.get("hotstuff"),
             std::env::var(LEADER_TENURE_ENV).ok().as_deref(),
@@ -505,6 +553,61 @@ mod tests {
         let fleet = LeaderSchedule::resolve(None, Some("1000000"), None).unwrap();
         assert_eq!(fleet.schedule.tenure, 1_000_000);
         assert_eq!(fleet.schedule.rotate_on_timeout_from, None);
+    }
+
+    fn profile1_genesis(tenure: u64) -> serde_json::Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../n42-chainspec/testdata/profile1/V1/genesis_8s.json");
+        let mut genesis: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        genesis["config"]["hotstuff"]["leaderTenure"] = tenure.into();
+        genesis
+    }
+
+    #[test]
+    fn profile1_rotates_on_timeout_from_view_zero_and_refuses_overrides() {
+        let (spec, config, _) =
+            n42_chainspec::profile1::profile1_chain_spec(&profile1_genesis(8)).unwrap();
+        let resolved = LeaderSchedule::resolve_profile1(&config, None, None).unwrap();
+        assert_eq!(
+            resolved.schedule,
+            LeaderSchedule {
+                tenure: 8,
+                rotate_on_timeout_from: Some(0),
+            }
+        );
+        assert!(resolved.schedule.rotates_at(0));
+        assert_eq!(resolved.schedule.view_after_tc(3, config.epoch_length), 8);
+        // The parsed genesis takes the same path.
+        if std::env::var_os(LEADER_TENURE_ENV).is_none()
+            && std::env::var_os(ROTATE_ON_TIMEOUT_ENV).is_none()
+        {
+            assert_eq!(
+                LeaderSchedule::resolve_for_genesis(&spec.genesis)
+                    .unwrap()
+                    .schedule,
+                resolved.schedule
+            );
+        }
+        for (tenure, rotate) in [(Some("8"), None), (None, Some("0")), (None, Some("1"))] {
+            assert!(matches!(
+                LeaderSchedule::resolve_profile1(&config, tenure, rotate),
+                Err(LeaderScheduleError::Profile1(_))
+            ));
+        }
+        // A non-profile genesis keeps today's rules and overrides.
+        let plain: alloy_genesis::Genesis = serde_json::from_value(serde_json::json!({
+            "config": {"chainId": 94, "hotstuff": {"leaderTenure": 8}},
+            "alloc": {}
+        }))
+        .unwrap();
+        assert!(!n42_chainspec::profile1::genesis_declares_profile(&plain));
+        let mut broken = spec.genesis.clone();
+        broken.config.extra_fields.insert("n42Profile".into(), 2.into());
+        assert!(matches!(
+            LeaderSchedule::resolve_for_genesis(&broken),
+            Err(LeaderScheduleError::Profile1(_))
+        ));
     }
     use alloy_primitives::Address;
     use n42_chainspec::ValidatorInfo;

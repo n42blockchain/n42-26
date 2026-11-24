@@ -1099,6 +1099,9 @@ impl Drop for EagerImportInFlight {
 }
 type StateDiffReady = (B256, n42_execution::state_diff::StateDiff);
 type CommitExecutionTimeout = (u64, B256);
+/// `(block, parent, outcome)` of a Profile-1 deferred proposal check.
+type DeferredCheckDone = (B256, B256, crate::deferred_check::DeferredCheck);
+
 type EagerImportDone = (
     B256,
     u64,
@@ -1165,6 +1168,17 @@ pub struct ConsensusService {
     /// Enables bidirectional H2-v4 consensus conversion. `None` preserves the
     /// native network and observer behavior exactly.
     h2_v4_identity: Option<n42_network::h2_v4::H2V4ChainIdentity>,
+    /// Profile 1 (mixed production standard): the header gate every imported
+    /// block and every Round-1 vote passes. `None` on every other chain.
+    profile1: Option<crate::profile1_header::Profile1ImportGate>,
+    /// E14 fork-choice tags of a deferred-execution chain (Profile 1):
+    /// safe = the committed head's parent, finalized = the highest persisted
+    /// block at or below safe. `None`: every tag names the committed block.
+    fcu_tags: Option<crate::fcu_tags::ForkchoiceTags>,
+    /// E12 halt latch of a Profile-1 node; `None` on every other chain.
+    halt: Option<Arc<crate::halt::Halt>>,
+    /// Committed block per height (Profile 1), for conflicting commits.
+    committed_heights: crate::halt::CommittedHeights,
     /// H2-authenticated block hash -> consensus view. Gov5 block gossip is not
     /// executed until one of these bindings exists.
     h2_v4_block_views: BTreeMap<B256, u64>,
@@ -1365,6 +1379,10 @@ pub struct ConsensusService {
     /// Allows the next leader to start building before consensus commits the current block.
     eager_import_done_tx: mpsc::Sender<EagerImportDone>,
     eager_import_done_rx: mpsc::Receiver<EagerImportDone>,
+    /// Profile 1, Phase B: deferred proposal checks run beside the eager
+    /// import report `(block, parent, outcome)` here.
+    deferred_check_tx: mpsc::Sender<DeferredCheckDone>,
+    deferred_check_rx: mpsc::Receiver<DeferredCheckDone>,
     /// Wakes a committed lifecycle that did not receive `new_payload(Valid)`
     /// within the bounded grace period. The timer runs outside the consensus
     /// loop; its handler starts the retained-data import/catch-up fallback.
@@ -1754,7 +1772,7 @@ impl ConsensusService {
             .iter()
             .filter(|(hash, _)| self.h2_v4_block_views.contains_key(*hash))
             .map(|(hash, (_, rlp))| {
-                let height = n42_network::decode_gov5_block_rlp(rlp)
+                let height = self.decode_wire_block(rlp)
                     .map(|block| block.header.number)
                     // Keep malformed entries visible to the canonical handler,
                     // which records the rejection. They sort behind valid bodies.
@@ -1795,7 +1813,7 @@ impl ConsensusService {
         if first_height != expected_first_height {
             return None;
         }
-        let oldest = n42_network::decode_gov5_block_rlp(oldest_rlp).ok()?;
+        let oldest = self.decode_wire_block(oldest_rlp).ok()?;
         if oldest.header.parent_hash != base_hash {
             return None;
         }
@@ -1804,13 +1822,13 @@ impl ConsensusService {
         // authenticated block, select only the exact parent-hash chain that
         // terminates at the durable execution head.
         let (&last_height, (_, newest_rlp, _)) = self.h2_v4_catchup_blocks.last_key_value()?;
-        let newest = n42_network::decode_gov5_block_rlp(newest_rlp).ok()?;
+        let newest = self.decode_wire_block(newest_rlp).ok()?;
         let mut expected_hash = newest.block_hash;
         let mut height = last_height;
         let mut selected_heights = Vec::new();
         loop {
             let (_, candidate_rlp, _) = self.h2_v4_catchup_blocks.get(&height)?;
-            let candidate = n42_network::decode_gov5_block_rlp(candidate_rlp).ok()?;
+            let candidate = self.decode_wire_block(candidate_rlp).ok()?;
             if candidate.block_hash != expected_hash {
                 return None;
             }
@@ -1860,7 +1878,7 @@ impl ConsensusService {
             "releasing reverse-delivered authenticated Gov5 ancestry in execution order"
         );
         for (catchup_source, catchup_rlp, catchup_view) in catchup {
-            let catchup_block = match n42_network::decode_gov5_block_rlp(&catchup_rlp) {
+            let catchup_block = match self.decode_wire_block(&catchup_rlp) {
                 Ok(block) => block,
                 Err(error) => {
                     error!(target: "n42::interop::h2v4", %error, "buffered Gov5 block failed repeat decoding");
@@ -1881,6 +1899,63 @@ impl ConsensusService {
             "authenticated Gov5 ancestry reached a durable execution head"
         );
         true
+    }
+
+    /// Decodes a gov5-wire block with the header layout of this chain.
+    fn decode_wire_block(
+        &self,
+        rlp: &[u8],
+    ) -> Result<n42_network::Gov5GossipBlock, n42_network::Gov5BlockError> {
+        n42_network::decode_block_rlp_for(rlp, self.profile1.is_some())
+    }
+
+    /// Profile 1: admits the header of `hash` through the gate, from `raw`
+    /// or from the remembered encoding. `true` on every other chain. A
+    /// refused header is logged with its rule id and must not be imported or
+    /// voted on.
+    pub(super) fn profile1_admit_hash(
+        &mut self,
+        hash: B256,
+        raw: Option<&[u8]>,
+        path: &'static str,
+    ) -> bool {
+        let Some(gate) = self.profile1.as_mut() else {
+            return true;
+        };
+        gate.admit_known(hash, raw)
+            .map_err(|refusal| crate::profile1_header::log_profile1_refusal(hash, path, &refusal))
+            .is_ok()
+    }
+
+    /// Profile 1: admits the header of a decoded gov5-wire block.
+    pub(super) fn profile1_admit_block(
+        &mut self,
+        block: &n42_network::Gov5GossipBlock,
+        path: &'static str,
+    ) -> bool {
+        let Some(gate) = self.profile1.as_mut() else {
+            return true;
+        };
+        gate.admit_block(block)
+            .map_err(|refusal| {
+                crate::profile1_header::log_profile1_refusal(block.block_hash, path, &refusal)
+            })
+            .is_ok()
+    }
+
+    /// Profile 1, B4 vote half: whether this node may send its Round-1 vote
+    /// for `hash` now. `true` on every other chain.
+    pub(super) fn profile1_vote_allowed(&mut self, hash: B256) -> bool {
+        let Some(gate) = self.profile1.as_mut() else {
+            return true;
+        };
+        // The leader's vote on its own block: admit the header it sealed.
+        gate.admit_own_sealed(hash);
+        gate.check_vote(&hash)
+            .map_err(|refusal| {
+                crate::profile1_header::log_profile1_refusal(hash, "round1_vote", &refusal)
+            })
+            .is_ok()
     }
 
     async fn handle_h2_v4_gov5_block(
@@ -1904,7 +1979,7 @@ impl ConsensusService {
             self.retire_h2_v4_fetch_satisfied_elsewhere(hash).await;
             return;
         }
-        let block = match n42_network::decode_gov5_block_rlp(&rlp) {
+        let block = match self.decode_wire_block(&rlp) {
             Ok(block) => block,
             Err(error) => {
                 counter!("n42_h2_v4_blocks_rejected_total", "reason" => "decode").increment(1);
@@ -2049,6 +2124,11 @@ impl ConsensusService {
         block: n42_network::Gov5GossipBlock,
         view: u64,
     ) -> bool {
+        // Profile 1: the header is checked against its parent before the
+        // payload reaches execution (reverse-walk and range catch-up alike).
+        if !self.profile1_admit_block(&block, "catchup") {
+            return false;
+        }
         let Some(el) = self.el.clone() else {
             error!(target: "n42::interop::h2v4", "cannot import authenticated Gov5 catch-up without an execution layer");
             return false;
@@ -2097,11 +2177,7 @@ impl ConsensusService {
             return true;
         }
 
-        let forkchoice = ForkchoiceState {
-            head_block_hash: block_hash,
-            safe_block_hash: block_hash,
-            finalized_block_hash: block_hash,
-        };
+        let forkchoice = self.fcu_state(block_hash, block_hash);
         match el
             .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, forkchoice)
             .await
@@ -2172,6 +2248,9 @@ impl ConsensusService {
         if self.pending_block_data.contains_key(&block.block_hash) {
             counter!("n42_h2_v4_gov5_block_already_cached_total").increment(1);
             debug!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, "native block data already cached; Gov5 copy not converted");
+            return;
+        }
+        if !self.profile1_admit_block(&block, "follower_import") {
             return;
         }
         let mut execution_data = match crate::replay_import::build_gov5_gossip_execution_data(
@@ -3324,12 +3403,17 @@ impl ConsensusService {
         let (import_done_tx, import_done_rx) = mpsc::channel(256);
         let (finalize_done_tx, finalize_done_rx) = mpsc::channel(256);
         let (eager_import_done_tx, eager_import_done_rx) = mpsc::channel(256);
+        let (deferred_check_tx, deferred_check_rx) = mpsc::channel(256);
         let (commit_execution_timeout_tx, commit_execution_timeout_rx) = mpsc::channel(256);
         let (state_diff_ready_tx, state_diff_ready_rx) = mpsc::channel(256);
         let (build_complete_tx, build_complete_rx) = mpsc::channel(256);
         Self {
             engine,
             h2_v4_identity: None,
+            profile1: None,
+            fcu_tags: None,
+            halt: None,
+            committed_heights: Default::default(),
             h2_v4_block_views: BTreeMap::new(),
             h2_v4_block_view_order: VecDeque::new(),
             h2_v4_block_numbers: BTreeMap::new(),
@@ -3410,6 +3494,8 @@ impl ConsensusService {
             bg_import_queue: VecDeque::new(),
             eager_import_done_tx,
             eager_import_done_rx,
+            deferred_check_tx,
+            deferred_check_rx,
             commit_execution_timeout_tx,
             commit_execution_timeout_rx,
             state_diff_ready_tx,
@@ -3562,14 +3648,20 @@ impl ConsensusService {
         let (import_done_tx, import_done_rx) = mpsc::channel(256);
         let (finalize_done_tx, finalize_done_rx) = mpsc::channel(256);
         let (eager_import_done_tx, eager_import_done_rx) = mpsc::channel(256);
+        let (deferred_check_tx, deferred_check_rx) = mpsc::channel(256);
         let (commit_execution_timeout_tx, commit_execution_timeout_rx) = mpsc::channel(256);
         let (state_diff_ready_tx, state_diff_ready_rx) = mpsc::channel(256);
         let (build_complete_tx, build_complete_rx) = mpsc::channel(256);
 
-        let slot_time_ms: u64 = std::env::var("N42_BLOCK_INTERVAL_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        // Profile 1 (A16/A17): the genesis owns the slot; the environment
+        // variable is refused at startup.
+        let slot_time_ms: u64 = match n42_chainspec::profile1::profile1_config() {
+            Some(config) => config.block_interval_ms,
+            None => std::env::var("N42_BLOCK_INTERVAL_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+        };
         let slot_time = Duration::from_millis(slot_time_ms);
 
         let fast_propose = std::env::var("N42_FAST_PROPOSE")
@@ -3595,6 +3687,10 @@ impl ConsensusService {
         Self {
             engine,
             h2_v4_identity: None,
+            profile1: None,
+            fcu_tags: None,
+            halt: None,
+            committed_heights: Default::default(),
             h2_v4_block_views: BTreeMap::new(),
             h2_v4_block_view_order: VecDeque::new(),
             h2_v4_block_numbers: BTreeMap::new(),
@@ -3675,6 +3771,8 @@ impl ConsensusService {
             bg_import_queue: VecDeque::new(),
             eager_import_done_tx,
             eager_import_done_rx,
+            deferred_check_tx,
+            deferred_check_rx,
             commit_execution_timeout_tx,
             commit_execution_timeout_rx,
             state_diff_ready_tx,
@@ -3742,6 +3840,146 @@ impl ConsensusService {
         self.engine.enable_h2_v4_signing(identity);
         self.h2_v4_identity = Some(identity);
         self
+    }
+
+    /// Profile 1: checks every imported header with [`validate_profile1_header`]
+    /// against its admitted parent before its payload reaches execution, reads
+    /// gov5 block bodies with the 24-element header, and holds the Round-1 vote
+    /// for a header whose time is past `floor(now) + 2` (B4).
+    ///
+    /// [`validate_profile1_header`]: crate::profile1_header::validate_profile1_header
+    pub fn with_profile1_gate(mut self, gate: crate::profile1_header::Profile1ImportGate) -> Self {
+        self.profile1 = Some(gate);
+        self
+    }
+
+    /// E14: on a deferred-execution chain every forkchoice update names the
+    /// committed head's parent as safe and a persisted ancestor as finalized.
+    pub fn with_fcu_tags(mut self, tags: crate::fcu_tags::ForkchoiceTags) -> Self {
+        self.fcu_tags = Some(tags);
+        self
+    }
+
+    /// E12: halts import, voting and producing on proof that the committed
+    /// chain and this node's execution disagree (see [`crate::halt`]).
+    pub fn with_halt(mut self, halt: Arc<crate::halt::Halt>) -> Self {
+        self.halt = Some(halt);
+        self
+    }
+
+    /// Whether this node is halted (E12).
+    pub(super) fn halted(&self) -> bool {
+        self.halt.as_ref().is_some_and(|halt| halt.is_halted())
+    }
+
+    /// E12 check of a committed block on Profile 1: a conflicting commit, or
+    /// carried fields that are not this node's result for the parent, trips
+    /// the halt. Returns `true` if the node is halted.
+    pub(super) fn profile1_check_committed(
+        &mut self,
+        view: u64,
+        block_hash: B256,
+        commit_qc: Option<&QuorumCertificate>,
+    ) -> bool {
+        let Some(halt) = self.halt.clone() else {
+            return false;
+        };
+        if halt.is_halted() {
+            return true;
+        }
+        let header = n42_consensus::remembered_profile1_header(&block_hash);
+        let mut reason = None;
+        if let Some(header) = &header
+            && let Some((number, committed)) = self.committed_heights.commit(
+                header.header.number,
+                block_hash,
+                header.header.parent_hash,
+            )
+        {
+            reason = Some(crate::halt::HaltReason::ConflictingCommit {
+                number,
+                committed,
+                conflicting: block_hash,
+            });
+        }
+        if reason.is_none() {
+            let parent = header.as_ref().map(|header| header.header.parent_hash);
+            reason = crate::halt::committed_block_verdict(
+                block_hash,
+                parent.unwrap_or_default(),
+                header
+                    .as_ref()
+                    .map(|header| n42_consensus::ExecutedFields::carried_by(&header.header)),
+                parent.and_then(|parent| n42_consensus::executed_fields(&parent)),
+                n42_consensus::carried_mismatch(&block_hash),
+            );
+        }
+        let Some(reason) = reason else {
+            return false;
+        };
+        halt.trip(crate::halt::HaltEvidence {
+            reason,
+            view,
+            commit_qc: commit_qc.and_then(|qc| serde_json::to_value(qc).ok()),
+            at_unix_ms: crate::now_unix_ms(),
+        });
+        true
+    }
+
+    /// The halted node's loop: every consensus message, block and engine
+    /// output is dropped unprocessed until the channels close (shutdown).
+    async fn idle_halted(&mut self) {
+        let mut reminder = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                output = self.output_rx.recv() => if output.is_none() { return },
+                event = self.net_event_rx.recv() => if event.is_none() { return },
+                _ = reminder.tick() => {
+                    error!(
+                        target: "n42::profile1",
+                        evidence = ?self.halt.as_ref().and_then(|halt| halt.evidence()),
+                        "HALTED (E12): not importing, voting or producing; move profile1_halt.json out of the consensus data directory and restart to resume"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Profile 1, Phase B: a deferred check that ran beside the import. A
+    /// pass releases the Round-1 vote before the import completes; a
+    /// refusal withholds it; anything else leaves the vote to the import
+    /// (Phase A).
+    pub(super) fn handle_deferred_check_done(
+        &mut self,
+        hash: B256,
+        parent: B256,
+        outcome: crate::deferred_check::DeferredCheck,
+    ) {
+        use crate::deferred_check::DeferredCheck;
+        let event = match outcome {
+            DeferredCheck::Checked => n42_consensus::ConsensusEvent::BlockChecked {
+                block_hash: hash,
+                parent_hash: parent,
+            },
+            DeferredCheck::Refused(reason) => {
+                warn!(target: "n42::profile1", %hash, %reason, "Round-1 vote withheld: the deferred check refused the proposal");
+                n42_consensus::ConsensusEvent::BlockRefused(hash)
+            }
+            DeferredCheck::Retry(reason) => {
+                debug!(target: "n42::profile1", %hash, %reason, "deferred check not decidable yet; the vote waits for the import");
+                return;
+            }
+            DeferredCheck::Unsupported => return,
+        };
+        if let Err(error) = self.engine.process_event(event) {
+            error!(target: "n42::profile1", %hash, %error, "failed to apply the deferred check");
+        }
+    }
+
+    /// The forkchoice state that makes `head` reth's head with the E14 tags
+    /// of the committed block `committed`.
+    pub(super) fn fcu_state(&self, head: B256, committed: B256) -> ForkchoiceState {
+        crate::fcu_tags::forkchoice_state(self.fcu_tags.as_ref(), head, committed)
     }
 
     /// Stamps gov5's committee-evidence root into every payload this node
@@ -3947,7 +4185,9 @@ impl ConsensusService {
             "N42 consensus layer initialized"
         );
 
-        self.initialize_startup_schedule().await;
+        if !self.halted() {
+            self.initialize_startup_schedule().await;
+        }
 
         // Set validator context for Rotor relay forwarding in network layer
         self.network
@@ -3955,6 +4195,10 @@ impl ConsensusService {
             .await;
 
         loop {
+            if self.halted() {
+                self.idle_halted().await;
+                break;
+            }
             // Bind this Sleep to the view/deadline from which it was created. The
             // event loop recreates and drops the timer after every selected branch;
             // the checks in the timeout branch are defense-in-depth against a stale
@@ -4232,6 +4476,12 @@ impl ConsensusService {
                         // A late eager completion may close a committed Case C
                         // and advance the guard outside handle_block_committed.
                         self.save_consensus_state();
+                    }
+                }
+
+                checked = self.deferred_check_rx.recv() => {
+                    if let Some((hash, parent, outcome)) = checked {
+                        self.handle_deferred_check_done(hash, parent, outcome);
                     }
                 }
 
@@ -5260,6 +5510,8 @@ mod tests {
         /// Every attribute-less forkchoiceUpdated head - the canonical-writer
         /// audit trail (import paths must NEVER appear here).
         fcu_heads: Arc<Mutex<Vec<B256>>>,
+        /// Every attribute-less forkchoiceUpdated as (head, safe, finalized).
+        fcu_states: Arc<Mutex<Vec<(B256, B256, B256)>>>,
         /// Every new_payload block hash.
         new_payload_hashes: Arc<Mutex<Vec<B256>>>,
     }
@@ -5272,6 +5524,7 @@ mod tests {
                 build_parents: Arc::new(Mutex::new(Vec::new())),
                 build_forkchoices: Arc::new(Mutex::new(Vec::new())),
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
+                fcu_states: Arc::new(Mutex::new(Vec::new())),
                 new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -5291,6 +5544,7 @@ mod tests {
                 build_parents: Arc::new(Mutex::new(Vec::new())),
                 build_forkchoices: Arc::new(Mutex::new(Vec::new())),
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
+                fcu_states: Arc::new(Mutex::new(Vec::new())),
                 new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -5310,8 +5564,16 @@ mod tests {
                 build_parents: Arc::new(Mutex::new(Vec::new())),
                 build_forkchoices: Arc::new(Mutex::new(Vec::new())),
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
+                fcu_states: Arc::new(Mutex::new(Vec::new())),
                 new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn fcu_states(&self) -> Vec<(B256, B256, B256)> {
+            self.fcu_states
+                .lock()
+                .expect("mock execution-layer lock")
+                .clone()
         }
 
         fn fcu_heads(&self) -> Vec<B256> {
@@ -5373,6 +5635,10 @@ mod tests {
                 .lock()
                 .expect("mock execution-layer lock")
                 .push(state.head_block_hash);
+            self.fcu_states
+                .lock()
+                .expect("mock execution-layer lock")
+                .push((state.head_block_hash, state.safe_block_hash, state.finalized_block_hash));
             let mut statuses = self.fcu_statuses.lock().expect("mock execution-layer lock");
             let status = if statuses.len() > 1 {
                 statuses.pop_front().expect("non-empty FCU status queue")
@@ -10577,7 +10843,7 @@ mod tests {
         assert!(orch.range_catchup.is_active());
         let rlps: Vec<Vec<u8>> = chain[..49].iter().map(|(_, rlp)| rlp.clone()).collect();
         // One result already queued, one decode started right before the stop.
-        orch.range_decoded.decode(peer, 1, rlps.clone());
+        orch.range_decoded.decode(peer, 1, rlps.clone(), false);
         let queued = loop {
             if let Ok(item) = orch.range_decoded.rx.try_recv() {
                 break item;
@@ -10585,7 +10851,7 @@ mod tests {
             tokio::task::yield_now().await;
         };
         orch.range_decoded.tx.send(queued).unwrap();
-        orch.range_decoded.decode(peer, 1, rlps);
+        orch.range_decoded.decode(peer, 1, rlps, false);
         orch.on_range_catchup_stopped(crate::range_catchup::Deactivation::Stalled)
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -10668,4 +10934,7 @@ mod tests {
         orch.drive_range_catchup().await;
         assert!(network.range_requests.lock().unwrap().is_empty());
     }
+
+    /// Profile 1: the V1 header vectors through the real import entry points.
+    mod profile1;
 }

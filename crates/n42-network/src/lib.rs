@@ -32,7 +32,8 @@ pub use finalized_range::{
 };
 pub use gov5_block::attributable_hash as gov5_attributable_hash;
 pub use gov5_block::{
-    Gov5BlockError, Gov5GossipBlock, Gov5HeaderExtra, Gov5HeaderQc, decode_gov5_block_rlp,
+    Gov5BlockError, Gov5GossipBlock, Gov5HeaderExtra, Gov5HeaderQc, decode_block_rlp_for,
+    decode_gov5_block_rlp, decode_profile1_block_rlp, decode_wire_block_rlp, encode_profile1_block_rlp, profile1_built_own_fields, profile1_seal_preserves_execution_input, Profile1BuiltBlock, seal_built_payload_for_profile1,
     decode_gov5_header_extra, encode_gov5_block_rlp, gov5_header_extra, NormalizedBuiltPayload, gov5_header_view, gov5_normalization_preserves_execution_input,
     normalize_built_payload_for_gov5_h2, normalize_execution_payload_for_gov5_h2,
     normalize_execution_payload_for_gov5_h2_with_transactions_root,

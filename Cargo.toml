@@ -62,6 +62,7 @@ reth-errors = { path = "../reth/crates/errors" }
 reth-execution-cache = { path = "../reth/crates/engine/execution-cache" }
 reth-db = { path = "../reth/crates/storage/db" }
 reth-db-common = { path = "../reth/crates/storage/db-common" }
+reth-cli = { path = "../reth/crates/cli/cli" }
 reth-cli-commands = { path = "../reth/crates/cli/commands" }
 reth-cli-runner = { path = "../reth/crates/cli/runner" }
 reth-stages-types = { path = "../reth/crates/stages/types" }
@@ -238,10 +239,14 @@ strip = false
 # Fee-disabled traceCall must retain the Geth beneficiary prestate
 # (vendor/dependency-repairs/evm2-inspectors-0.1.0/N42-PROVENANCE.md).
 evm2-inspectors = { path = "vendor/dependency-repairs/evm2-inspectors-0.1.0" }
-# As Reth v2.11.0 does: reth-core (rev 275ce4cf) still pins an older evm2, so
-# without this the graph carries two evm2 copies. The patch goes through the
-# pre-transfer URL because Cargo rejects a patch from the same source.
-evm2 = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+# evm2 itself is the vendored copy of rev 66687c18 with one repair: the embedder can
+# turn off the EIP-8282 builder-request calls, which N42 native chains never make
+# (vendor/dependency-repairs/evm2-66687c18/N42-PROVENANCE.md). As in Reth v2.11.0,
+# the patch also folds reth-core's older evm2 pin (rev f93318f) into the same copy.
+evm2 = { path = "vendor/dependency-repairs/evm2-66687c18" }
+# The workspace and the vendored evm2 name evm2-macros by the alloy-rs URL; the
+# patch goes through the pre-transfer URL because Cargo rejects a patch from the
+# same source, so the graph keeps one copy of each.
 evm2-jit = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
 evm2-macros = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
 

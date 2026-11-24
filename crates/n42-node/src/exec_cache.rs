@@ -360,15 +360,17 @@ fn take_built_gov5_roots(hash: &B256) -> Option<(B256, B256)> {
 
 /// The QMDB operations of a block's state changes in the tree's canonical
 /// order. The ordering buffer is owned here, before the tree lock is taken.
-pub(crate) fn gov5_sorted_operations(
+pub(crate) fn gov5_sorted_operations<C>(
     state: &reth_trie_common::bundle_state::BundleState,
     restored: &[n42_execution::RestoredSlot],
-    prague: bool,
-) -> Vec<n42_twig_core::qmdb_compat::QmdbOperation> {
-    let mut operations = crate::qmdb_state::gov5_qmdb_operations_with_restored(state, restored);
-    if prague {
-        crate::qmdb_state::with_gov5_prague_system_caller(&mut operations);
-    }
+    chain_spec: &C,
+    timestamp: u64,
+) -> Vec<n42_twig_core::qmdb_compat::QmdbOperation>
+where
+    C: reth_chainspec::EthChainSpec + reth_chainspec::EthereumHardforks + ?Sized,
+{
+    let mut operations =
+        crate::qmdb_state::gov5_block_operations(state, restored, chain_spec, timestamp);
     rayon::slice::ParallelSliceMut::par_sort_unstable_by_key(
         operations.as_mut_slice(),
         |operation| operation.key,
@@ -405,14 +407,7 @@ fn gov5_normalization_roots(
     let hashed_ms = started.elapsed().as_secs_f64() * 1000.0;
     let key = gov5_restored_slots_key_for_payload(execution, chain_spec, Some(tx_hashes))?;
     let restored = n42_execution::restored_slots_for(key).unwrap_or_default();
-    let operations = gov5_sorted_operations(
-        &output.state,
-        &restored,
-        reth_chainspec::EthereumHardforks::is_prague_active_at_timestamp(
-            chain_spec,
-            payload.timestamp,
-        ),
-    );
+    let operations = gov5_sorted_operations(&output.state, &restored, chain_spec, payload.timestamp);
     let operations_ms = started.elapsed().as_secs_f64() * 1000.0 - hashed_ms;
     let operation_count = operations.len();
     let state_root = match qmdb_store {

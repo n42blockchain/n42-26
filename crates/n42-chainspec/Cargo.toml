@@ -8,6 +8,7 @@ description = "N42 chain specification with consensus parameters"
 
 [dependencies]
 n42-primitives.workspace = true
+n42-twig-core.workspace = true
 
 reth-chainspec.workspace = true
 reth-ethereum-primitives.workspace = true
@@ -16,11 +17,13 @@ reth-primitives-traits.workspace = true
 alloy-consensus = { workspace = true, features = ["serde"] }
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
+alloy-rlp.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 libp2p.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

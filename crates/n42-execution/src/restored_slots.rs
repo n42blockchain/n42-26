@@ -272,10 +272,19 @@ where
         );
         let timestamp = evm.block().timestamp.saturating_to::<u64>();
         let before = |rule: Option<u64>| rule.is_none_or(|time| timestamp < time);
+        let builder_requests =
+            crate::evm_config::eip8282_builder_requests_active(self.inner.chain_spec().genesis());
+        let mut inner = self.inner.create_executor(evm, ctx);
+        // No EIP-8282 calls on an N42-native chain (gov5 `IsN42Native`,
+        // `eip8282_builder_requests_active`); evm2 alone would make them
+        // whenever its spec is Amsterdam. Every executor of `N42EvmConfig`
+        // (import, payload builders, parallel build, mobile verifier) is
+        // created here.
+        inner.inner.set_eip8282_builder_requests(builder_requests);
         TrackingExecutor {
             keeps_touched: before(self.unchanged_account_no_op_time),
             keeps_restored: before(self.storage_net_change_time),
-            inner: self.inner.create_executor(evm, ctx),
+            inner,
             context_key,
             tx_hashes: Vec::new(),
             first_seen: HashMap::new(),

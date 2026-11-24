@@ -176,17 +176,68 @@ where
         .map(|user_limit| std::cmp::min(user_limit, protocol_max_blob_count).max(1))
         .unwrap_or(protocol_max_blob_count);
     let is_osaka = chain_spec.is_osaka_active_at_timestamp(attributes.timestamp());
+    // AM2: on Profile 1 `hotstuff.maxBlockBytes` replaces the 8 MiB EIP-7934
+    // cap at every fork; other chains keep the cap from Osaka on.
+    let block_size_limit =
+        n42_chainspec::profile1::installed_block_rlp_size_limit(is_osaka, MAX_RLP_BLOCK_SIZE);
     let withdrawals_rlp_length = attributes
         .withdrawals
         .as_ref()
         .map(|withdrawals| withdrawals.length())
         .unwrap_or(0);
 
+    // Profile 1 (design 3.3): every proposed block must pass the deferred
+    // proposal check of gov5 and n42-26 followers, which judges the block's
+    // transactions against the parent's post-state without executing them.
+    // The builder applies the same rules as it packs.
+    let mut includability = n42_chainspec::profile1::genesis_declares_profile(chain_spec.genesis())
+        .then(|| {
+            n42_consensus_service::deferred_check::IncludabilityFilter::new(
+                n42_consensus_service::deferred_check::PlanHeader {
+                    number: parent_header.number + 1,
+                    gas_limit,
+                    base_fee: Some(base_fee),
+                },
+                crate::el::intrinsic_rules(
+                    chain_spec.as_ref(),
+                    parent_header.number + 1,
+                    attributes.timestamp(),
+                ),
+            )
+        });
+
     while let Some(pool_tx) = best_txs.next() {
         // check if the job was cancelled, if so we can exit early
         if cancel.is_cancelled() {
             return Ok(BuildOutcome::Cancelled);
         }
+
+        let admitted = match includability.as_ref() {
+            Some(filter) => {
+                let tx = pool_tx.transaction.clone_into_consensus();
+                let planned = crate::el::plan_tx(tx.inner(), Ok(pool_tx.sender()));
+                match filter.admit(&planned, |address| {
+                    state_provider
+                        .basic_account(address)
+                        .map(|account| account.map(crate::el::sender_state))
+                }) {
+                    Ok(admitted) => Some(admitted),
+                    Err(Ok(error)) => return Err(PayloadBuilderError::other(error)),
+                    Err(Err(refusal)) => {
+                        trace!(target: "payload_builder", tx = ?pool_tx.hash(), reason = %refusal.0, "not includable under deferred execution");
+                        metrics::counter!("n42_builder_not_includable_total").increment(1);
+                        best_txs.mark_invalid(
+                            &pool_tx,
+                            InvalidPoolTransactionError::Consensus(
+                                InvalidTransactionError::TxTypeNotSupported,
+                            ),
+                        );
+                        continue;
+                    }
+                }
+            }
+            None => None,
+        };
 
         // ensure we still have capacity for this transaction
         let exceeds_gas_limit = if separate_block_gas {
@@ -224,12 +275,14 @@ where
         let estimated_block_size_with_tx =
             block_transactions_rlp_length + tx_rlp_len + withdrawals_rlp_length + 1024; // 1Kb of overhead for the block header
 
-        if is_osaka && estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
+        if let Some(limit) = block_size_limit
+            && estimated_block_size_with_tx > limit
+        {
             best_txs.mark_invalid(
                 &pool_tx,
                 InvalidPoolTransactionError::OversizedData {
                     size: estimated_block_size_with_tx,
-                    limit: MAX_RLP_BLOCK_SIZE,
+                    limit,
                 },
             );
             continue;
@@ -358,6 +411,10 @@ where
         block_regular_gas_used += gas_output.regular_gas_used();
         block_state_gas_used += gas_output.state_gas_used();
 
+        if let (Some(filter), Some(admitted)) = (includability.as_mut(), admitted) {
+            filter.commit(admitted);
+        }
+
         // Add blob tx sidecar to the payload.
         if let Some(sidecar) = blob_tx_sidecar {
             blob_sidecars.push_sidecar_variant(sidecar.as_ref().clone());
@@ -444,10 +501,12 @@ where
         "sealed built block"
     );
 
-    if is_osaka && block.rlp_length() > MAX_RLP_BLOCK_SIZE {
+    if let Some(limit) = block_size_limit
+        && block.rlp_length() > limit
+    {
         return Err(PayloadBuilderError::other(ConsensusError::BlockTooLarge {
             rlp_length: block.rlp_length(),
-            max_rlp_length: MAX_RLP_BLOCK_SIZE,
+            max_rlp_length: limit,
         }));
     }
 

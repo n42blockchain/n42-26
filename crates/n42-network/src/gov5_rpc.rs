@@ -132,7 +132,8 @@ impl Gov5CanonicalBlockReader {
         let Some(reader) = &self.block_rlp_by_hash else { return Ok(None) };
         let Some(rlp) = reader(hash)? else { return Ok(None) };
         if rlp.len() > MAX_GOV5_BLOCK_SIZE { return Err("stored block exceeds by-hash bound".into()) }
-        let block = crate::gov5_block::decode_gov5_block_rlp(&rlp).map_err(|e| e.to_string())?;
+        // Either header layout: gov5's native one or Profile 1's (PR 8).
+        let block = crate::gov5_block::decode_wire_block_rlp(&rlp).map_err(|e| e.to_string())?;
         if block.block_hash != hash { return Err("stored block differs from requested hash".into()) }
         Ok(Some(rlp))
     }
@@ -213,7 +214,8 @@ fn build_gov5_range_batch(
             stop = true;
             break;
         }
-        let decoded = match crate::gov5_block::decode_gov5_block_rlp(&rlp) {
+        // Either header layout: gov5's native one or Profile 1's (PR 8).
+        let decoded = match crate::gov5_block::decode_wire_block_rlp(&rlp) {
             Ok(decoded) => decoded,
             Err(error) => {
                 error_unless_served(
@@ -2121,6 +2123,40 @@ mod tests {
             read(prefix_wire[..3].to_vec()).is_err(),
             "nothing usable before the first block"
         );
+    }
+
+    /// PR 8: a Profile-1 chain is served by range and by hash (24-element
+    /// headers); the server's check reads either layout.
+    #[test]
+    fn range_and_hash_serve_profile1_blocks() {
+        let v1: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../n42-chainspec/testdata/profile1/V1/header_profile_v1.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let raw = alloy_primitives::hex::decode(v1["headers"][0]["rlp"].as_str().unwrap()).unwrap();
+        let mut header = n42_chainspec::profile1::Profile1Header::decode(&raw).unwrap();
+        header.header.transactions_root = alloy_consensus::EMPTY_ROOT_HASH;
+        header.header.withdrawals_root = Some(n42_consensus::gov5_native_rewards_root(&[]));
+        let rlp = crate::gov5_block::encode_profile1_block_rlp(&header, &[], &[]);
+        assert!(crate::gov5_block::decode_gov5_block_rlp(&rlp).is_err(), "not gov5's layout");
+        let decoded = crate::gov5_block::decode_profile1_block_rlp(&rlp).unwrap();
+        let number = decoded.header.number;
+        let served = rlp.clone();
+        let by_hash = rlp.clone();
+        let reader = Gov5CanonicalBlockReader::new_ranged(
+            move || Ok(number),
+            move |numbers| Ok(if *numbers.start() == number { vec![served.clone()] } else { Vec::new() }),
+        )
+        .with_hash_reader(move |_| Ok(Some(by_hash.clone())));
+        let batch = build_gov5_range_batch(&reader, number..=number, [1, 2, 3, 4], None).unwrap();
+        assert_eq!(batch.frames.len(), 1);
+        assert_eq!(batch.frames[0][0], 0, "the block is served, not an error chunk");
+        assert_eq!(batch.last_hash, Some(decoded.block_hash));
+        assert_eq!(reader.block_rlp_by_hash(decoded.block_hash).unwrap(), Some(rlp));
     }
 
     #[test]

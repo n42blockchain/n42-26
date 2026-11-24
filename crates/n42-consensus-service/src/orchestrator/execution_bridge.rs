@@ -210,9 +210,13 @@ impl ConsensusService {
         let Some(pool) = &self.committee_pool else {
             return Ok(B256::ZERO);
         };
+        // A Profile-1 parent is remembered in its 24-element form; its alloy
+        // view carries the same number and receipts root followers link to.
         let header = n42_consensus::remembered_gov5_native_header(&parent)
+            .map(|native| native.header)
+            .or_else(|| n42_consensus::remembered_profile1_header(&parent).map(|p1| p1.header))
             .ok_or_else(|| format!("native header of parent {parent} is not remembered"))?;
-        pool.child_beacon_root(header.header.number, &parent, &header.header.receipts_root)
+        pool.child_beacon_root(header.number, &parent, &header.receipts_root)
             .map_err(|error| format!("committee evidence for parent {parent}: {error}"))
     }
 
@@ -256,7 +260,12 @@ impl ConsensusService {
 
         PayloadAttributes {
             timestamp,
-            prev_randao: self.prev_randao_cache,
+            // Profile 1 (B3): prevRandao (mixHash) is zero in every header.
+            prev_randao: if self.profile1.is_some() {
+                B256::ZERO
+            } else {
+                self.prev_randao_cache
+            },
             suggested_fee_recipient: self.fee_recipient,
             withdrawals: Some(withdrawals),
             // N42 has no beacon chain. Without a committee pool B256::ZERO is a
@@ -434,6 +443,7 @@ impl ConsensusService {
         let timestamp = attrs.timestamp;
 
         let same_execution_branch = parent == self.head_block_hash;
+        let committed_tags = self.fcu_state(self.head_block_hash, self.head_block_hash);
         let fcu_state = ForkchoiceState {
             // Build on the branch certified by LockedQC. When the local head
             // differs, it may be a sibling rather than an ancestor; advertising
@@ -442,13 +452,15 @@ impl ConsensusService {
             // imported the LockedQC block, it returns Syncing/no payload and the
             // existing retry path defers instead of falling back to another fork.
             head_block_hash: parent,
+            // E14: on Profile 1 the committed head's tags are its parent
+            // and a persisted ancestor, not the head itself.
             safe_block_hash: if same_execution_branch {
-                self.head_block_hash
+                committed_tags.safe_block_hash
             } else {
                 B256::ZERO
             },
             finalized_block_hash: if same_execution_branch {
-                self.head_block_hash
+                committed_tags.finalized_block_hash
             } else {
                 B256::ZERO
             },
@@ -674,6 +686,9 @@ impl ConsensusService {
         let header_qc = h2_v4_participant
             .then(|| n42_network::Gov5HeaderQc::from_commit_qc(self.engine.last_committed_qc()))
             .flatten();
+        // Profile 1: the built block is sealed into its 24-element header.
+        let profile1_seal_key = self.profile1.as_ref().and_then(|gate| gate.seal_key());
+        let profile1 = self.profile1.is_some();
 
         let handle = tokio::spawn(async move {
             let build_el = el.clone();
@@ -724,6 +739,7 @@ impl ConsensusService {
                         build_start,
                         build_context,
                         header_qc,
+                        profile1.then_some(profile1_seal_key),
                     )
                     .await;
                 }
@@ -831,7 +847,17 @@ impl ConsensusService {
         }
 
         let hash = broadcast.block_hash;
-        if let Some(raw) = broadcast.native_header_rlp.as_deref()
+        if self.profile1.is_some() {
+            // Profile 1: the 24-element header is checked against its
+            // admitted parent before anything is cached, imported or voted.
+            if !self.profile1_admit_hash(
+                hash,
+                broadcast.native_header_rlp.as_deref(),
+                "follower_import",
+            ) {
+                return;
+            }
+        } else if let Some(raw) = broadcast.native_header_rlp.as_deref()
             && !super::remember_direct_native_header(hash, raw)
         {
             warn!(target: "n42::cl::exec_bridge", %hash, "block data carries an invalid native header");
@@ -961,6 +987,9 @@ impl ConsensusService {
             );
             let in_flight =
                 super::EagerImportInFlight::enter(&self.eager_imports_in_flight, hash);
+            // Profile 1, Phase B: the deferred check runs beside the import.
+            let deferred_check_tx = (self.profile1.is_some() && !self.halted())
+                .then(|| self.deferred_check_tx.clone());
             tokio::spawn(async move {
                 let _in_flight = in_flight;
                 let decompress_start = std::time::Instant::now();
@@ -1039,6 +1068,14 @@ impl ConsensusService {
                 let block_number = execution_data.block_number();
                 let parent_hash = execution_data.parent_hash();
                 let tx_count = execution_data.transaction_count();
+                if let Some(checked_tx) = deferred_check_tx {
+                    let checker = eh.clone();
+                    let payload = execution_data.clone();
+                    tokio::spawn(async move {
+                        let outcome = checker.deferred_check(&payload).await;
+                        let _ = checked_tx.send((hash, parent_hash, outcome)).await;
+                    });
+                }
                 let has_staking_target =
                     super::execution_might_contain_staking_target(&execution_data);
                 if bad_blocks.should_skip(hash, "block_data_eager") {
@@ -1303,6 +1340,14 @@ impl ConsensusService {
             self.discard_unvalidated_sidecar_diff(broadcast.view, broadcast.block_hash);
             return false;
         }
+        if !self.profile1_admit_hash(
+            broadcast.block_hash,
+            broadcast.native_header_rlp.as_deref(),
+            "sync_import",
+        ) {
+            self.discard_unvalidated_sidecar_diff(broadcast.view, broadcast.block_hash);
+            return false;
+        }
         let engine_handle = match self.el {
             Some(ref el) => el.clone(),
             None => return false,
@@ -1457,11 +1502,7 @@ impl ConsensusService {
             return;
         }
 
-        let fcu_state = ForkchoiceState {
-            head_block_hash: broadcast.block_hash,
-            safe_block_hash: broadcast.block_hash,
-            finalized_block_hash: broadcast.block_hash,
-        };
+        let fcu_state = self.fcu_state(broadcast.block_hash, broadcast.block_hash);
         match engine_handle
             .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, fcu_state)
             .await
@@ -1671,11 +1712,7 @@ impl ConsensusService {
                         continue;
                     }
                     info!(target: "n42::cl::exec_bridge", %retry_hash, "syncing block retry succeeded");
-                    let fcu = ForkchoiceState {
-                        head_block_hash: retry_hash,
-                        safe_block_hash: retry_hash,
-                        finalized_block_hash: retry_hash,
-                    };
+                    let fcu = self.fcu_state(retry_hash, retry_hash);
                     match engine_handle
                         .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, fcu)
                         .await
@@ -1793,6 +1830,26 @@ fn copy_payload(
     copy
 }
 
+/// How long a Profile-1 leader waits for its parent's execution result. The
+/// builder could only build on an executed parent, so the result is normally
+/// filed already; the wait covers the job that is still filing it.
+const PROFILE1_PARENT_RESULT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The parent's execution result a Profile-1 header carries (A10/AM25), as
+/// this node filed it; `None` after [`PROFILE1_PARENT_RESULT_WAIT`].
+async fn profile1_parent_result(parent: B256) -> Option<n42_consensus::ExecutedFields> {
+    let deadline = Instant::now() + PROFILE1_PARENT_RESULT_WAIT;
+    loop {
+        if let Some(fields) = n42_consensus::executed_fields(&parent) {
+            return Some(fields);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Leader pipelined import: broadcast block data, trigger consensus, then import eagerly.
 ///
 /// The leader already executed all transactions during payload building.  Instead of calling
@@ -1829,6 +1886,8 @@ async fn handle_built_payload(
     build_start: Instant,
     build_context: super::PayloadBuildContext,
     header_qc: Option<n42_network::Gov5HeaderQc>,
+    // `Some` on a Profile-1 chain: the key the block is sealed with (B2).
+    profile1_seal: Option<Option<Arc<n42_primitives::BlsSecretKey>>>,
 ) {
     let BuiltBlock {
         mut hash,
@@ -1861,6 +1920,60 @@ async fn handle_built_payload(
             .as_ref()
             .and_then(|cache| cache.built_transactions_root(original_hash));
         let normalize_started = Instant::now();
+        if let Some(seal_key) = profile1_seal {
+            // Profile 1: the 24-element header sealed by this leader
+            // (B1-B12). It carries the parent's execution result (A10/AM25);
+            // the block's own goes to the registry under the sealed hash,
+            // where its child's build and every import look for it.
+            let Some(seal_key) = seal_key else {
+                error!(target: "n42::profile1", %original_hash, "refusing to propose: this node holds no sealing key");
+                return;
+            };
+            let parent = execution_data.parent_hash();
+            let Some(carried) = profile1_parent_result(parent).await else {
+                // Never guess or zero-fill: the build is dropped and the
+                // view's pacemaker retries once the parent is executed.
+                error!(target: "n42::profile1", %original_hash, %parent, "not proposing: the parent's execution result is not filed here");
+                metrics::counter!("n42_profile1_build_parent_result_missing_total").increment(1);
+                return;
+            };
+            let own = n42_network::profile1_built_own_fields(
+                &execution_data,
+                gov5_state_root,
+                gov5_receipts_root,
+            );
+            let sealed = match n42_network::seal_built_payload_for_profile1(
+                &execution_data,
+                current_view,
+                header_qc.as_ref(),
+                &carried,
+                B256::ZERO,
+                &seal_key,
+            ) {
+                Ok(sealed) => sealed,
+                Err(error) => {
+                    error!(target: "n42::profile1", %original_hash, %error, "refusing to propose a payload that cannot be sealed as a Profile-1 block");
+                    return;
+                }
+            };
+            let preserves_execution_input = n42_network::profile1_seal_preserves_execution_input(
+                &execution_data,
+                &sealed.payload,
+            );
+            hash = sealed.payload.block_hash();
+            if let Err(error) = n42_consensus::remember_executed_fields(hash, own) {
+                error!(target: "n42::profile1", %hash, %error, "refusing to propose: the block's own execution result cannot be filed");
+                return;
+            }
+            if let Some(ref cache) = exec_output_cache
+                && (!preserves_execution_input || !cache.rekey_gov5_built(original_hash, hash))
+            {
+                cache.evict(original_hash);
+            }
+            execution_data = sealed.payload;
+            metrics::histogram!("n42_leader_emit_stage_ms", "stage" => "normalize")
+                .record(normalize_started.elapsed().as_secs_f64() * 1000.0);
+        } else {
         let normalized = match n42_network::normalize_built_payload_for_gov5_h2(
             execution_data,
             current_view,
@@ -1895,6 +2008,7 @@ async fn handle_built_payload(
         execution_data = normalized.payload;
         metrics::histogram!("n42_leader_emit_stage_ms", "stage" => "normalize")
             .record(normalize_started.elapsed().as_secs_f64() * 1000.0);
+        }
     }
     let actual_parent = execution_data.parent_hash();
     let payload_hash = execution_data.block_hash();

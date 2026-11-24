@@ -76,6 +76,14 @@ impl CommitteePoolConfig {
         let Some(pool) = hotstuff.get("committeePool") else {
             return Ok(None);
         };
+        // Profile 1 (standard A19): the pool is always on and has no
+        // `enabled` flag; the genesis reader has refused one already.
+        if n42_chainspec::profile1::genesis_declares_profile(genesis) {
+            let pool = pool
+                .as_object()
+                .ok_or(CommitteePoolConfigError::Field("(object)"))?;
+            return Self::from_fields(pool).map(Some);
+        }
         Self::from_json(pool)
     }
 
@@ -93,6 +101,13 @@ impl CommitteePoolConfig {
         if !enabled {
             return Ok(None);
         }
+        Self::from_fields(pool).map(Some)
+    }
+
+    /// The pool's sizes and seed, the `enabled` flag aside.
+    fn from_fields(
+        pool: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self, CommitteePoolConfigError> {
         let usize_field = |name: &'static str| -> Result<usize, CommitteePoolConfigError> {
             pool.get(name)
                 .and_then(|value| value.as_u64())
@@ -112,12 +127,12 @@ impl CommitteePoolConfig {
             .and_then(|value| value.as_str())
             .and_then(|value| value.parse().ok())
             .ok_or(CommitteePoolConfigError::Field("seedHex"))?;
-        Ok(Some(Self {
+        Ok(Self {
             seed,
             pool_size,
             committee_size,
             ramp_blocks,
-        }))
+        })
     }
 }
 
@@ -778,5 +793,21 @@ mod tests {
             serde_json::from_value(serde_json::json!({"config": {"chainId": 1}, "alloc": {}}))
                 .unwrap();
         assert_eq!(CommitteePoolConfig::from_genesis(&plain).unwrap(), None);
+    }
+
+    #[test]
+    fn a_profile1_pool_is_always_on() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../n42-chainspec/testdata/profile1/V1/genesis_8s.json");
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let (spec, profile, _) = n42_chainspec::profile1::profile1_chain_spec(&raw).unwrap();
+        let config = CommitteePoolConfig::from_genesis(&spec.genesis)
+            .unwrap()
+            .expect("Profile 1 has no enabled flag and the pool is on");
+        assert_eq!(config.seed, profile.committee_pool.seed);
+        assert_eq!(config.pool_size as u64, profile.committee_pool.pool_size);
+        assert_eq!(config.committee_size as u64, profile.committee_pool.committee_size);
+        assert_eq!(config.ramp_blocks, profile.committee_pool.ramp_blocks);
     }
 }

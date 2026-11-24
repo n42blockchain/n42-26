@@ -278,11 +278,63 @@ fn bind_gov5_h2_header(
         block.header = native.header;
         return Ok(SealedBlock::new_unchecked(block, expected_hash));
     }
+    let legacy_hash = legacy.hash();
+    let block = legacy.into_block();
+    if let Some(header) = bind_profile1_header(&block, expected_hash) {
+        return Ok(SealedBlock::new_unchecked(
+            N42Block {
+                header,
+                body: block.body,
+            },
+            expected_hash,
+        ));
+    }
+    tracing::trace!(
+        target: "n42::engine_validator",
+        %expected_hash,
+        %legacy_hash,
+        number = block.header.number,
+        "payload binds to no gov5 header shape"
+    );
     Err(PayloadError::BlockHash {
         execution: current_hash,
         consensus: expected_hash,
     }
     .into())
+}
+
+/// Binds a payload-rebuilt block to the Profile-1 header `expected_hash`
+/// names (24 elements, mixed production standard B10-B12).
+///
+/// The Engine payload carries neither `slotNumber` (a V3 payload; reth's
+/// Amsterdam is off on a Profile-1 chain) nor `mobileRegistryRoot`, and its
+/// withdrawals root is Ethereum's while the header commits gov5's rewards
+/// root (B6). The block is completed from what the standard fixes
+/// (difficulty 0, `slotNumber` = number, the rewards root of the body's
+/// withdrawals) and the registry root of the remembered header (zero when
+/// none is remembered), and accepted only when the 24-element encoding
+/// hashes to `expected_hash`: every field, the remembered one included, is
+/// then the header's, which is returned.
+fn bind_profile1_header(block: &N42Block, expected_hash: B256) -> Option<alloy_consensus::Header> {
+    let mobile_registry_root = n42_consensus::remembered_profile1_header(&expected_hash)
+        .map_or(B256::ZERO, |header| header.mobile_registry_root);
+    let mut header = block.header.clone();
+    header.difficulty = U256::ZERO;
+    header.ommers_hash = B256::ZERO;
+    header.slot_number = Some(header.number);
+    header.block_access_list_hash = None;
+    let rewards = block
+        .body
+        .withdrawals
+        .as_deref()
+        .map(|withdrawals| gov5_withdrawals_to_rewards(withdrawals))
+        .unwrap_or_default();
+    header.withdrawals_root = Some(gov5_native_rewards_root(&rewards));
+    let candidate = n42_chainspec::profile1::Profile1Header {
+        header,
+        mobile_registry_root,
+    };
+    (candidate.hash() == expected_hash).then_some(candidate.header)
 }
 
 /// Rebuilds the block `payload` names around `body`, the already decoded body

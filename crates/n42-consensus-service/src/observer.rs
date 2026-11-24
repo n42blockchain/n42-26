@@ -12,7 +12,7 @@ use metrics::{counter, gauge};
 use n42_chainspec::ValidatorInfo;
 use n42_consensus::{ValidatorSet, validator_changes_hash, verify_commit_qc};
 use n42_network::{
-    BlockSyncResponse, NetworkEvent, NetworkHandle, PeerId, SyncBlock, decode_gov5_block_rlp,
+    BlockSyncResponse, NetworkEvent, NetworkHandle, PeerId, SyncBlock,
 };
 use n42_primitives::QuorumCertificate;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -275,6 +275,12 @@ pub struct ObserverOrchestrator {
 
     // Execution layer (import-only adapter; observers never build payloads).
     el: Arc<dyn ExecutionLayer>,
+    /// Profile 1: the header gate every imported block passes. `None` on
+    /// every other chain.
+    profile1: Option<crate::profile1_header::Profile1ImportGate>,
+    /// E14 fork-choice tags of a deferred-execution chain; `None` names the
+    /// followed block as safe and finalized.
+    fcu_tags: Option<crate::fcu_tags::ForkchoiceTags>,
     head_block_hash: B256,
 
     // CL state
@@ -361,6 +367,8 @@ impl ObserverOrchestrator {
             committed_blocks: VecDeque::new(),
             blob_store: None,
             exec_output_cache: None,
+            profile1: None,
+            fcu_tags: None,
             bad_blocks: BadBlockCache::default(),
             gov5_live_blocks: HashMap::new(),
             gov5_live_order: VecDeque::new(),
@@ -393,6 +401,34 @@ impl ObserverOrchestrator {
     pub fn with_blob_store(mut self, blob_store: Arc<dyn BlobStorePort>) -> Self {
         self.blob_store = Some(blob_store);
         self
+    }
+
+    /// Profile 1: reads gov5 block bodies with the 24-element header and
+    /// checks every header against its admitted parent before execution.
+    pub fn with_profile1_gate(mut self, gate: crate::profile1_header::Profile1ImportGate) -> Self {
+        self.profile1 = Some(gate);
+        self
+    }
+
+    /// E14: safe = the followed head's parent, finalized = a persisted
+    /// ancestor at or below safe.
+    pub fn with_fcu_tags(mut self, tags: crate::fcu_tags::ForkchoiceTags) -> Self {
+        self.fcu_tags = Some(tags);
+        self
+    }
+
+    fn fcu_state(&self, head: B256) -> ForkchoiceState {
+        crate::fcu_tags::forkchoice_state(self.fcu_tags.as_ref(), head, head)
+    }
+
+    /// Profile 1: admits the header of `hash`; `true` on every other chain.
+    fn profile1_admit(&mut self, hash: B256, raw: Option<&[u8]>, path: &'static str) -> bool {
+        let Some(gate) = self.profile1.as_mut() else {
+            return true;
+        };
+        gate.admit_known(hash, raw)
+            .map_err(|refusal| crate::profile1_header::log_profile1_refusal(hash, path, &refusal))
+            .is_ok()
     }
 
     pub fn with_exec_output_cache(mut self, cache: Arc<dyn ExecutionOutputCache>) -> Self {
@@ -641,7 +677,7 @@ impl ObserverOrchestrator {
         if let Some(requested_hash) = requested_hash {
             self.gov5_fetch_requested_at.remove(&requested_hash);
         }
-        let block = match decode_gov5_block_rlp(&rlp) {
+        let block = match n42_network::decode_block_rlp_for(&rlp, self.profile1.is_some()) {
             Ok(block) => block,
             Err(error) => {
                 counter!("n42_gov5_live_blocks_rejected_total", "stage" => "decode").increment(1);
@@ -1000,6 +1036,9 @@ impl ObserverOrchestrator {
                 {
                     return;
                 }
+                if !self.profile1_admit(entry.hash, None, "gov5_catchup") {
+                    return;
+                }
                 match self
                     .el
                     .new_payload_for(ExecutionPath::HISTORICAL_SEQUENTIAL, block.execution_data)
@@ -1033,11 +1072,7 @@ impl ObserverOrchestrator {
                 }
             }
 
-            let state = ForkchoiceState {
-                head_block_hash: entry.hash,
-                safe_block_hash: entry.hash,
-                finalized_block_hash: entry.hash,
-            };
+            let state = self.fcu_state(entry.hash);
             match self
                 .el
                 .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, state)
@@ -1096,6 +1131,9 @@ impl ObserverOrchestrator {
         for (_, hash) in candidates {
             if self.bad_blocks.should_skip(hash, "gov5_live_pre_submit") {
                 rejected.push(hash);
+                continue;
+            }
+            if !self.profile1_admit(hash, None, "gov5_live_import") {
                 continue;
             }
             let Some(payload) = self
@@ -1161,11 +1199,7 @@ impl ObserverOrchestrator {
             };
             let first_number = path.first().map(|(number, _)| *number).unwrap_or_default();
             let number = path.last().map(|(number, _)| *number).unwrap_or_default();
-            let state = ForkchoiceState {
-                head_block_hash: hash,
-                safe_block_hash: hash,
-                finalized_block_hash: hash,
-            };
+            let state = self.fcu_state(hash);
             let promoted = match self
                 .el
                 .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, state)
@@ -1224,6 +1258,9 @@ impl ObserverOrchestrator {
         let has_commit_proof = commit_qc.is_some();
 
         if self.bad_blocks.should_skip(hash, "observer_import") {
+            return false;
+        }
+        if !self.profile1_admit(hash, broadcast.native_header_rlp.as_deref(), "observer_import") {
             return false;
         }
 
@@ -1294,11 +1331,7 @@ impl ObserverOrchestrator {
                         return true;
                     }
 
-                    let fcu_state = ForkchoiceState {
-                        head_block_hash: hash,
-                        safe_block_hash: hash,
-                        finalized_block_hash: hash,
-                    };
+                    let fcu_state = self.fcu_state(hash);
                     let fcu_valid = match self
                         .el
                         .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, fcu_state)
@@ -2566,5 +2599,66 @@ mod tests {
                     && request.to_view == 40
                     && request.local_committed_view == 10
         ));
+    }
+
+    /// Profile 1: the observer's native import checks the header before
+    /// `new_payload`; every V1 import refusal is refused.
+    #[tokio::test]
+    async fn profile1_observer_import_refuses_every_v1_header_refusal() {
+        use alloy_primitives::hex;
+        use n42_chainspec::profile1::{Profile1Header, profile1_chain_spec};
+        let testdata = |file: &str| -> serde_json::Value {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../n42-chainspec/testdata/profile1/V1")
+                .join(file);
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        };
+        let vector = testdata("header_profile_v1.json");
+        let (_, config, genesis) = profile1_chain_spec(&testdata("genesis_8s.json")).unwrap();
+        let gate = crate::profile1_header::Profile1ImportGate::new(&config, genesis).unwrap();
+        let (observer, _command_rx, _priority_rx) = test_observer();
+        let mut observer = observer.with_profile1_gate(gate);
+        let broadcast = |raw: &[u8], view: u64| {
+            let hash = alloy_primitives::keccak256(raw);
+            let parent = Profile1Header::decode(raw)
+                .map(|header| header.header.parent_hash)
+                .unwrap_or_default();
+            BlockDataBroadcast {
+                block_hash: hash,
+                view,
+                payload_json: crate::orchestrator::compress_payload(
+                    &serde_json::to_vec(&test_execution_data(parent, hash, view)).unwrap(),
+                ),
+                timestamp: 1,
+                execution_output: None,
+                leader_ready_unix_ms: 0,
+                native_header_rlp: Some(raw.to_vec()),
+            }
+        };
+        let raw = |value: &serde_json::Value| hex::decode(value.as_str().unwrap()).unwrap();
+
+        let block1 = raw(&vector["headers"][0]["rlp"]);
+        observer.import_block_data(broadcast(&block1, 1), None).await;
+        let gate = observer.profile1.as_ref().unwrap();
+        assert!(gate.header(&alloy_primitives::keccak256(&block1)).is_some());
+
+        let mut refused = 0;
+        for refusal in vector["refusals"].as_array().unwrap() {
+            // AM25: requestsHash is a deferred field, refused by the
+            // engine's deferred check, not by the header gate.
+            if refusal["check"] != "import"
+                || refusal["name"].as_str().unwrap().starts_with("requestsHash")
+            {
+                continue;
+            }
+            let header = raw(&refusal["rlp"]);
+            assert!(
+                !observer.import_block_data(broadcast(&header, 2), None).await,
+                "{}",
+                refusal["name"]
+            );
+            refused += 1;
+        }
+        assert_eq!(refused, 21);
     }
 }

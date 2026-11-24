@@ -78,14 +78,14 @@ impl RangeDecodeLane {
 
     /// Decodes `rlps` on the blocking pool and queues the result, unless the
     /// round has been retired by then.
-    pub(super) fn decode(&self, source: PeerId, start: u64, rlps: Vec<Vec<u8>>) {
+    pub(super) fn decode(&self, source: PeerId, start: u64, rlps: Vec<Vec<u8>>, profile1: bool) {
         let lane = self.tx.clone();
         let round = self.round.clone();
         let started = *round
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         tokio::task::spawn_blocking(move || {
-            let reply = RangeReply::Blocks(rlps.into_iter().map(decode_range_block).collect());
+            let reply = RangeReply::Blocks(rlps.into_iter().map(|rlp| decode_range_block(rlp, profile1)).collect());
             let current = round
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -143,8 +143,8 @@ pub(super) fn range_qc_check(
     }
 }
 
-fn decode_range_block(rlp: Vec<u8>) -> Result<RangeBlock, String> {
-    let block = n42_network::decode_gov5_block_rlp(&rlp).map_err(|error| error.to_string())?;
+fn decode_range_block(rlp: Vec<u8>, profile1: bool) -> Result<RangeBlock, String> {
+    let block = n42_network::decode_block_rlp_for(&rlp, profile1).map_err(|error| error.to_string())?;
     let view = n42_network::gov5_header_view(&block.header).map_err(|error| error.to_string())?;
     Ok(RangeBlock {
         number: block.header.number,
@@ -245,7 +245,8 @@ impl ConsensusService {
         }
         let reply = match outcome {
             Gov5RangeOutcome::Blocks(rlps) => {
-                self.range_decoded.decode(source, start, rlps);
+                let profile1 = self.profile1.is_some();
+                self.range_decoded.decode(source, start, rlps, profile1);
                 return;
             }
             Gov5RangeOutcome::Refused { code, message } => {
@@ -336,7 +337,7 @@ impl ConsensusService {
             RANGE_IMPORT_BATCH,
         );
         for block in ready {
-            let decoded = match n42_network::decode_gov5_block_rlp(&block.rlp) {
+            let decoded = match self.decode_wire_block(&block.rlp) {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     warn!(target: "n42::interop::range", number = block.number, %error, "buffered range block failed repeat decoding");
@@ -369,6 +370,15 @@ impl ConsensusService {
                     view,
                     "range catch-up block was not executed"
                 );
+                // E12 on a deferred chain: a block below a strict (commit)
+                // anchor is committed. If this node refused it for carrying
+                // a result other than its own, it halts with the evidence.
+                if !block.loose_only
+                    && self.profile1.is_some()
+                    && self.profile1_check_committed(view, block.hash, None)
+                {
+                    return;
+                }
                 if let Some(reason) = self.range_catchup.import_failed(block.number, now) {
                     self.on_range_catchup_stopped(reason).await;
                 }
@@ -448,7 +458,7 @@ impl ConsensusService {
             if below <= self.head_block_number || self.h2_v4_catchup_blocks.contains_key(&below) {
                 continue;
             }
-            if let Ok(block) = n42_network::decode_gov5_block_rlp(rlp) {
+            if let Ok(block) = self.decode_wire_block(rlp) {
                 missing.push((*source, block.header.parent_hash));
             }
         }

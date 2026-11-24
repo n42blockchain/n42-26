@@ -7,7 +7,7 @@ use crate::el::{ExecutionLayer, ExecutionPath};
 use crate::exec_cache::ExecutionOutputCache;
 use crate::expected_validator_peer_ids_with_policy;
 use alloy_primitives::B256;
-use alloy_rpc_types_engine::{ForkchoiceState, PayloadStatusEnum};
+use alloy_rpc_types_engine::PayloadStatusEnum;
 use metrics::{counter, gauge, histogram};
 use n42_consensus::EngineOutput;
 use n42_primitives::{ConsensusMessage, QuorumCertificate};
@@ -139,6 +139,15 @@ impl ConsensusService {
     }
 
     pub(super) async fn handle_engine_output(&mut self, output: EngineOutput) {
+        // Profile 1, B4: the Round-1 vote leaves only for a header whose time
+        // is at most floor(now) + 2. The engine has recorded the vote for the
+        // view, so holding it back means this node does not vote in the view.
+        if let EngineOutput::SendToValidator(_, ConsensusMessage::Vote(vote))
+        | EngineOutput::BroadcastMessage(ConsensusMessage::Vote(vote)) = &output
+            && !self.profile1_vote_allowed(vote.block_hash)
+        {
+            return;
+        }
         match output {
             EngineOutput::BroadcastMessage(msg) => {
                 if self.h2_v4_identity.is_some() {
@@ -392,6 +401,11 @@ impl ConsensusService {
         commit_qc: QuorumCertificate,
         validator_changes: Option<Vec<n42_primitives::consensus::ValidatorChange>>,
     ) {
+        // E12: a commit that conflicts with this node's committed chain or
+        // execution halts the node before anything acts on it.
+        if self.profile1_check_committed(view, block_hash, Some(&commit_qc)) {
+            return;
+        }
         let commit_now = Instant::now();
         let pool_depth = self.pool_depth_snapshot();
         // The leader receives its own raw payload through a local feedback
@@ -1085,11 +1099,7 @@ impl ConsensusService {
             }
         };
 
-        let fcu_state = ForkchoiceState {
-            head_block_hash: self.finalize_head_for(block_hash),
-            safe_block_hash: block_hash,
-            finalized_block_hash: block_hash,
-        };
+        let fcu_state = self.fcu_state(self.finalize_head_for(block_hash), block_hash);
 
         if self.async_finalize_fcu {
             let done_tx = self.finalize_done_tx.clone();
@@ -1215,11 +1225,7 @@ impl ConsensusService {
                 }
                 info!(target: "n42::cl::consensus_loop", view, %block_hash, "eager import completed during FCU, retrying");
                 counter!("n42_eager_import_rescued_total").increment(1);
-                let retry_fcu = ForkchoiceState {
-                    head_block_hash: block_hash,
-                    safe_block_hash: block_hash,
-                    finalized_block_hash: block_hash,
-                };
+                let retry_fcu = self.fcu_state(block_hash, block_hash);
                 let retry_start = std::time::Instant::now();
                 match engine_handle
                     .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, retry_fcu)
@@ -1382,6 +1388,7 @@ impl ConsensusService {
         let exec_cache = self.exec_output_cache.clone();
         let bad_blocks = self.bad_blocks.clone();
         let finalized_mark = self.finalized_view_mark.clone();
+        let fcu_tags = self.fcu_tags.clone();
         info!(target: "n42::cl::consensus_loop", view, %block_hash, "spawning background import");
         tokio::spawn(async move {
             let (outcome, block_ts) = Self::background_import(
@@ -1391,6 +1398,7 @@ impl ConsensusService {
                 data.as_slice(),
                 block_hash,
                 Some((view, finalized_mark)),
+                fcu_tags,
             )
             .await;
             if done_tx
@@ -1412,6 +1420,7 @@ impl ConsensusService {
         data: &[u8],
         block_hash: B256,
         finalized: Option<(u64, Arc<std::sync::atomic::AtomicU64>)>,
+        fcu_tags: Option<crate::fcu_tags::ForkchoiceTags>,
     ) -> (ImportOutcome, u64) {
         if bad_blocks.should_skip(block_hash, "committed_import") {
             return (ImportOutcome::Invalid, 0);
@@ -1486,11 +1495,11 @@ impl ConsensusService {
             .await
         {
             Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
-                let fcu = ForkchoiceState {
-                    head_block_hash: block_hash,
-                    safe_block_hash: block_hash,
-                    finalized_block_hash: block_hash,
-                };
+                let fcu = crate::fcu_tags::forkchoice_state(
+                    fcu_tags.as_ref(),
+                    block_hash,
+                    block_hash,
+                );
                 match engine_handle
                     .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, fcu)
                     .await
@@ -1865,6 +1874,10 @@ impl ConsensusService {
                 .iter()
                 .any(|block| block.view == view && block.block_hash == hash);
             if committed && outcome == ImportOutcome::Invalid {
+                // E12: a committed block refused for its carried fields.
+                if self.profile1_check_committed(view, hash, None) {
+                    return;
+                }
                 error!(
                     target: "n42::cl::consensus_loop",
                     %hash,
