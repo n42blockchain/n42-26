@@ -20,7 +20,8 @@
 //!   layer keeps refusing), the reverse hash walk resumes from the staged
 //!   suffix. That walk is not governed by `N42_SYNC_ANCHOR`, so `enforce` is
 //!   not a security boundary yet.
-//! - While caught up the client does nothing: no per-block work, no timer.
+//! - While caught up the client does nothing: no per-block work, no timer,
+//!   and the decode lane is not polled.
 
 use super::ConsensusService;
 use crate::h2_finality::{H2V4AnchorVerdict, verify_h2_v4_sync_anchor};
@@ -31,10 +32,27 @@ use n42_consensus::{ConsensusEngine, ValidatorSet};
 use n42_network::h2_v4::H2V4ChainIdentity;
 use n42_network::h2_wire::H2QuorumCertificate;
 use n42_network::{Gov5RangeOutcome, PeerId};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 /// Blocks imported per wake-up; the loop yields to consensus between batches.
 const RANGE_IMPORT_BATCH: usize = 32;
+
+/// A range reply decoded off the orchestrator loop.
+pub(super) type RangeDecoded = (PeerId, u64, RangeReply);
+
+pub(super) struct RangeDecodeLane {
+    pub(super) tx: mpsc::UnboundedSender<RangeDecoded>,
+    pub(super) rx: mpsc::UnboundedReceiver<RangeDecoded>,
+}
+
+impl RangeDecodeLane {
+    pub(super) fn new() -> Self {
+        // Bounded by the client's requests in flight.
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self { tx, rx }
+    }
+}
 
 /// Strict header-QC check: the set of the QC's own epoch from the engine
 /// (current, staged next or historical) or an entry of the epoch schedule
@@ -110,6 +128,8 @@ impl ConsensusService {
         );
         self.range_catchup.note_loose_anchor(block.block_hash);
         if !was_active {
+            // Replies of an earlier round still in the lane are stale.
+            while self.range_decoded.rx.try_recv().is_ok() {}
             self.range_catchup
                 .note_strict_anchor(self.engine.last_committed_qc().block_hash);
             self.range_catchup
@@ -154,6 +174,8 @@ impl ConsensusService {
         }
     }
 
+    /// A network outcome. Blocks are decoded on the blocking pool (a reply
+    /// may hold 256 MiB); the result comes back through the decode lane.
     pub(super) async fn handle_range_reply(
         &mut self,
         source: PeerId,
@@ -165,7 +187,13 @@ impl ConsensusService {
         }
         let reply = match outcome {
             Gov5RangeOutcome::Blocks(rlps) => {
-                RangeReply::Blocks(rlps.into_iter().map(decode_range_block).collect())
+                let lane = self.range_decoded.tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let reply =
+                        RangeReply::Blocks(rlps.into_iter().map(decode_range_block).collect());
+                    let _ = lane.send((source, start, reply));
+                });
+                return;
             }
             Gov5RangeOutcome::Refused { code, message } => {
                 debug!(target: "n42::interop::range", %source, start, code, %message, "range request refused");

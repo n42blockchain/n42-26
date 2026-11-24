@@ -1194,6 +1194,9 @@ pub struct ConsensusService {
     /// Range catch-up client over gov5 bodies-by-range (`range_sync.rs`).
     /// Idle unless an authenticated block reveals a gap above its threshold.
     range_catchup: crate::range_catchup::RangeCatchup,
+    /// Range replies decoded off the loop (`spawn_blocking`), back in order
+    /// of completion. Polled only while the client is active.
+    range_decoded: range_sync::RangeDecodeLane,
     /// Peers that failed to serve an authenticated block hash during the
     /// current bounded retry round. A mixed Rust/Gov set may gossip a child
     /// from a Rust validator whose execution head is also behind; retrying
@@ -3327,6 +3330,7 @@ impl ConsensusService {
                 crate::range_catchup::RangeCatchupConfig::default(),
                 crate::range_catchup::AnchorMode::from_env(),
             ),
+            range_decoded: range_sync::RangeDecodeLane::new(),
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
             gov5_execution_pull_rounds: 0,
@@ -3591,6 +3595,7 @@ impl ConsensusService {
                 crate::range_catchup::RangeCatchupConfig::default(),
                 crate::range_catchup::AnchorMode::from_env(),
             ),
+            range_decoded: range_sync::RangeDecodeLane::new(),
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
             gov5_execution_pull_rounds: 0,
@@ -4083,6 +4088,12 @@ impl ConsensusService {
 
                 _ = &mut range_catchup_timer => {
                     self.drive_range_catchup().await;
+                }
+
+                decoded = self.range_decoded.rx.recv(), if self.range_catchup.is_active() => {
+                    if let Some((source, start, reply)) = decoded {
+                        self.on_range_reply_decoded(source, start, reply).await;
+                    }
                 }
 
                 // === Priority 3: Async finalize-FCU completion ===
@@ -10405,6 +10416,7 @@ mod tests {
         (orch, network, mock, peer, chain)
     }
 
+    /// A range reply through the decode lane, as the select loop does.
     async fn deliver_range_reply(
         orch: &mut ConsensusService,
         peer: n42_network::PeerId,
@@ -10413,6 +10425,8 @@ mod tests {
     ) {
         orch.handle_range_reply(peer, start, n42_network::Gov5RangeOutcome::Blocks(rlps))
             .await;
+        let (source, start, reply) = orch.range_decoded.rx.recv().await.expect("decoded reply");
+        orch.on_range_reply_decoded(source, start, reply).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
