@@ -300,6 +300,7 @@ impl ConsensusService {
         counter!("n42_range_catchup_stops_total", "reason" => match reason {
             Deactivation::CaughtUp => "caught_up",
             Deactivation::Stalled => "stalled",
+            Deactivation::Diverged => "diverged",
         })
         .increment(1);
         if self.h2_v4_catchup_active && self.release_ready_h2_v4_catchup_blocks().await {

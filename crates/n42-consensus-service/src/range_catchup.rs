@@ -7,35 +7,54 @@
 //! the network requests, the QC verification context and the import.
 //!
 //! - **Activation** happens only on a real gap: an authenticated block whose
-//!   parent is missing more than `activate_gap` blocks above the local
-//!   execution head. Advertised status heights only size how far to fetch
-//!   (the (f+1)-th highest, never one peer's maximum). While inactive no
-//!   per-block work is done.
+//!   parent is missing more than `activate_gap` (and at most `max_window`)
+//!   heights above the execution head. Advertised status heights only size
+//!   how far to fetch (the (f+1)-th highest, never one peer's maximum). While
+//!   inactive no per-block work is done.
+//! - **Planning is top-down.** Today's n42-26 headers carry no QC, so the
+//!   only anchors sit at the top of the gap (the bound block that revealed
+//!   it, Decides). Ranges are fetched from the top down: every reply links to
+//!   the already authenticated chain above it and is authenticated on
+//!   arrival, so each body is downloaded once. Ranges below the descent may
+//!   be fetched speculatively in parallel; until the descent reaches them
+//!   they count against the unanchored hold (`tail_blocks` / `tail_bytes`).
+//! - **Holding**: authenticated bodies are held up to `reorder_bytes`; above
+//!   it the highest go first and are fetched again when the importer gets
+//!   close (they stay authenticated by hash, so the refetch is checked on
+//!   arrival). Only a gap larger than the budget is downloaded partly twice.
 //! - **Screening** of every reply: numbers contiguous from the requested
 //!   start, parent links, a decodable body (tx and rewards roots are checked
-//!   by the decoder) and a well-formed header `Extra`.
+//!   by the decoder), a well-formed header `Extra`, and agreement with the
+//!   anchored chain at every height it covers.
 //! - **Anchoring**: a block is executed only when its hash lies on the parent
 //!   chain below an anchor. Strict anchors are commit-domain H2-v4 QCs
 //!   embedded in fetched headers (checked against their own epoch's set by the
-//!   caller, no fallback), live Decides and the engine's committed QC.
-//!   `N42_SYNC_ANCHOR=observe` (default) additionally accepts the looser
-//!   consensus bindings the reverse walk has always used (a PrepareQC or a TC
-//!   high QC) and counts what `enforce` would have refused; `enforce` accepts
-//!   strict anchors only; `off` disables the client.
-//! - **Unanchored tail**: blocks above the highest anchor are held, at most
-//!   `tail_blocks` / `tail_bytes`; on overflow the highest bodies are dropped
-//!   (no score) while their parent links are kept, so a later anchor can
-//!   authenticate them and they are fetched again.
+//!   caller, no fallback; at most one verification per reply), live Decides
+//!   and the engine's committed QC. `N42_SYNC_ANCHOR=observe` (default)
+//!   additionally accepts the looser consensus bindings the reverse walk has
+//!   always used (a PrepareQC or a TC high QC) and counts what `enforce`
+//!   would have refused; `enforce` executes strict anchors only; `off`
+//!   disables the client.
+//!
+//!   `enforce` is **not a security boundary yet**: when this client stops,
+//!   the reverse hash walk takes over and that path still executes blocks
+//!   bound by loose consensus messages.
+//! - **Progress** is the head advancing or the authenticated chain growing,
+//!   never bytes received. Without either for `stall_timeout` the client
+//!   stops. If the authenticated chain does not extend the local head (the
+//!   head sits on an abandoned branch) it stops at once and reports
+//!   [`Deactivation::Diverged`].
 //! - **Peers**: refusals, busy, empty or short replies and transport failures
 //!   back off without a score. Provable faults (broken link, wrong start,
 //!   undecodable block, malformed `Extra`, a QC that fails verification
-//!   against a known set, more blocks than requested) score; three within ten
-//!   minutes exclude the peer for an hour.
+//!   against a known set, more blocks than requested, a block that contradicts
+//!   a strict anchor) score; three within ten minutes exclude the peer for an
+//!   hour, across reconnects.
 
 use alloy_primitives::{B256, keccak256};
 use n42_network::PeerId;
 use n42_network::h2_wire::{H2QuorumCertificate, decode_h2_qc};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Environment switch for the anchor rule of the range client.
@@ -184,8 +203,13 @@ pub struct ReadyBlock {
 pub enum Deactivation {
     /// The head reached the target and stayed there.
     CaughtUp,
-    /// No block arrived for `stall_timeout`; the reverse walk takes over.
+    /// Neither the head nor the authenticated chain moved for
+    /// `stall_timeout`, or the importer kept failing.
     Stalled,
+    /// The authenticated chain does not extend the local head: the head is
+    /// on another branch (or the anchor is). The client cannot repair that;
+    /// it stops at once so an operator sees it.
+    Diverged,
 }
 
 #[derive(Clone, Debug)]
@@ -198,15 +222,19 @@ pub struct RangeCatchupConfig {
     pub max_in_flight: usize,
     pub per_peer_in_flight: usize,
     pub request_timeout: Duration,
-    /// Bytes of buffered blocks plus `reply_bytes_estimate` per request in
-    /// flight; no new request is sent above it (the reorder bound).
+    /// Bytes of buffered bodies. Above it the highest are dropped and fetched
+    /// again later; no refetch is started that would overflow it. Replies in
+    /// flight come on top (at most `max_in_flight` times the 256 MiB codec
+    /// cap of one reply).
     pub reorder_bytes: usize,
-    pub reply_bytes_estimate: usize,
-    /// Unanchored tail bound (standard section 3.4 step 6).
+    /// Bodies held without any anchor: replies that arrived before the range
+    /// above them, plus speculative requests still in flight.
     pub tail_blocks: usize,
     pub tail_bytes: usize,
-    /// Parent-link skeleton bound; also the farthest look-ahead above the head.
+    /// Parent-link skeleton bound for not yet anchored blocks.
     pub max_links: usize,
+    /// Largest gap the client takes on; above it the reverse walk keeps it.
+    pub max_window: u64,
     pub stall_timeout: Duration,
     /// After a stall, refuse to re-activate for this long.
     pub stall_cooldown: Duration,
@@ -221,10 +249,10 @@ impl Default for RangeCatchupConfig {
             per_peer_in_flight: 1,
             request_timeout: Duration::from_secs(35),
             reorder_bytes: 1 << 30,
-            reply_bytes_estimate: 128 << 20,
-            tail_blocks: 64,
+            tail_blocks: 1024,
             tail_bytes: 512 << 20,
             max_links: 1 << 16,
+            max_window: 1 << 20,
             stall_timeout: Duration::from_secs(90),
             stall_cooldown: Duration::from_secs(120),
         }
@@ -234,6 +262,7 @@ impl Default for RangeCatchupConfig {
 #[derive(Debug, Default)]
 struct PeerState {
     height: u64,
+    connected: bool,
     in_flight: usize,
     failures: u32,
     backoff_until: Option<Instant>,
@@ -245,8 +274,18 @@ struct PeerState {
 
 impl PeerState {
     fn available(&self, now: Instant) -> bool {
-        self.excluded_until.is_none_or(|until| now >= until)
+        self.connected
+            && self.excluded_until.is_none_or(|until| now >= until)
             && self.backoff_until.is_none_or(|until| now >= until)
+    }
+
+    /// Worth remembering after a disconnect (a score or an exclusion).
+    fn carries_a_score(&self, now: Instant) -> bool {
+        self.excluded_until.is_some_and(|until| now < until)
+            || self
+                .faults
+                .back()
+                .is_some_and(|at| now.saturating_duration_since(*at) <= FAULT_WINDOW)
     }
 }
 
@@ -257,6 +296,21 @@ struct Buffered {
     parent: B256,
     view: u64,
     rlp: Vec<u8>,
+}
+
+/// The authenticated hash at one height.
+#[derive(Clone, Copy, Debug)]
+struct Anchored {
+    hash: B256,
+    parent: B256,
+    strict: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InFlight {
+    count: u64,
+    sent: Instant,
+    speculative: bool,
 }
 
 /// A bounded insertion-ordered hash set.
@@ -298,7 +352,12 @@ pub struct RangeCatchupStats {
     pub faults: u64,
     pub soft_failures: u64,
     pub qc_verifications: u64,
+    /// Unanchored bodies dropped by the unanchored hold.
     pub tail_evicted: u64,
+    /// Authenticated bodies dropped by the byte budget (fetched again).
+    pub budget_evicted: u64,
+    /// Held bodies dropped because they contradict the anchored chain.
+    pub conflicts: u64,
     pub released: u64,
     /// Released in observe mode on a loose anchor only (enforce would hold).
     pub released_loose_only: u64,
@@ -319,20 +378,30 @@ pub struct RangeCatchup {
     mode: AnchorMode,
     active: bool,
     target: u64,
+    /// The importer's position: the external head, or a block this client
+    /// released and the caller reported imported, whichever is higher.
     head_number: u64,
+    head_hash: Option<B256>,
     peers: HashMap<PeerId, PeerState>,
-    /// Unassigned work: start -> count.
+    /// Heights still to fetch, as disjoint intervals: start -> end (excl.).
     work: BTreeMap<u64, u64>,
-    next_plan: u64,
-    in_flight: HashMap<(PeerId, u64), (u64, Instant)>,
+    planned_to: u64,
+    in_flight: HashMap<(PeerId, u64), InFlight>,
     buffer: BTreeMap<u64, Buffered>,
     buffer_bytes: usize,
+    /// Buffered heights whose body is not on the anchored chain (yet).
+    unanchored: BTreeMap<u64, usize>,
+    unanchored_bytes: usize,
     links: HashMap<B256, (B256, u64)>,
     link_order: VecDeque<B256>,
-    link_at: BTreeMap<u64, B256>,
+    /// Authenticated hash per height above the head.
+    anchored: BTreeMap<u64, Anchored>,
+    anchored_total: u64,
+    /// Heights touched by anchoring since the last conflict sweep.
+    touched: Option<(u64, u64)>,
+    /// Anchor hashes whose height is not known yet.
     strict: HashBook,
     loose: HashBook,
-    evicted: BTreeSet<u64>,
     qc_cache: HashMap<B256, QcCheck>,
     qc_cache_order: VecDeque<B256>,
     settled: u32,
@@ -342,7 +411,13 @@ pub struct RangeCatchup {
     /// Highest height the caller lets this client import (last poll).
     stop_at: Option<u64>,
     last_progress: Option<Instant>,
+    progress_head: u64,
+    progress_anchors: u64,
     cooldown_until: Option<Instant>,
+    stopped: Option<Deactivation>,
+    avg_block_bytes: usize,
+    /// Highest height handed to the importer by [`Self::take_ready`].
+    released_to: u64,
     stats: RangeCatchupStats,
 }
 
@@ -354,18 +429,22 @@ impl RangeCatchup {
             active: false,
             target: 0,
             head_number: 0,
+            head_hash: None,
             peers: HashMap::new(),
             work: BTreeMap::new(),
-            next_plan: 0,
+            planned_to: 0,
             in_flight: HashMap::new(),
             buffer: BTreeMap::new(),
             buffer_bytes: 0,
+            unanchored: BTreeMap::new(),
+            unanchored_bytes: 0,
             links: HashMap::new(),
             link_order: VecDeque::new(),
-            link_at: BTreeMap::new(),
+            anchored: BTreeMap::new(),
+            anchored_total: 0,
+            touched: None,
             strict: HashBook::default(),
             loose: HashBook::default(),
-            evicted: BTreeSet::new(),
             qc_cache: HashMap::new(),
             qc_cache_order: VecDeque::new(),
             settled: 0,
@@ -373,7 +452,12 @@ impl RangeCatchup {
             kick: false,
             stop_at: None,
             last_progress: None,
+            progress_head: 0,
+            progress_anchors: 0,
             cooldown_until: None,
+            stopped: None,
+            avg_block_bytes: 0,
+            released_to: 0,
             stats: RangeCatchupStats::default(),
         }
     }
@@ -402,14 +486,29 @@ impl RangeCatchup {
         self.buffer_bytes
     }
 
+    /// The importer position: the height and hash the next release builds
+    /// on (ahead of the execution head after imports without a forkchoice
+    /// update).
+    pub fn position(&self) -> (u64, Option<B256>) {
+        (self.head_number, self.head_hash)
+    }
+
+    /// Why the client stopped inside [`Self::take_ready`], once.
+    pub fn take_stop(&mut self) -> Option<Deactivation> {
+        self.stopped.take()
+    }
+
     /// A peer completed a status exchange on this genesis. Its height is a
     /// fetch-sizing hint only.
     pub fn note_peer_status(&mut self, peer: PeerId, height: u64) {
-        self.peers.entry(peer).or_default().height = height;
+        let state = self.peers.entry(peer).or_default();
+        state.height = height;
+        state.connected = true;
     }
 
+    /// Requeues the peer's requests. Its score and exclusion survive the
+    /// disconnect (a reconnect does not wash a fault away).
     pub fn peer_disconnected(&mut self, peer: &PeerId) {
-        self.peers.remove(peer);
         let lost: Vec<(PeerId, u64)> = self
             .in_flight
             .keys()
@@ -417,19 +516,33 @@ impl RangeCatchup {
             .copied()
             .collect();
         for key in lost {
-            if let Some((count, _)) = self.in_flight.remove(&key) {
-                self.requeue(key.1, count);
+            if let Some(flight) = self.in_flight.remove(&key) {
+                self.add_work(key.1, key.1.saturating_add(flight.count));
+            }
+        }
+        let now = Instant::now();
+        if let Some(state) = self.peers.get_mut(peer) {
+            if state.carries_a_score(now) {
+                state.connected = false;
+                state.in_flight = 0;
+            } else {
+                self.peers.remove(peer);
             }
         }
     }
 
-    /// The `k`-th highest advertised height (k = f+1), if that many peers
-    /// reported one. Never authenticates anything.
+    /// The `k`-th highest advertised height (k = f+1) among connected peers,
+    /// if that many reported one. Never authenticates anything.
     pub fn quorum_height(&self, k: usize) -> Option<u64> {
         if k == 0 {
             return None;
         }
-        let mut heights: Vec<u64> = self.peers.values().map(|peer| peer.height).collect();
+        let mut heights: Vec<u64> = self
+            .peers
+            .values()
+            .filter(|peer| peer.connected)
+            .map(|peer| peer.height)
+            .collect();
         if heights.len() < k {
             return None;
         }
@@ -438,7 +551,8 @@ impl RangeCatchup {
     }
 
     /// Start (or extend) catch-up toward `target`. Returns whether the client
-    /// is active afterwards. Inactive unless `target - head > activate_gap`.
+    /// is active afterwards. Inactive unless `activate_gap < target - head <=
+    /// max_window`.
     pub fn activate(&mut self, head_number: u64, target: u64, now: Instant) -> bool {
         if self.mode == AnchorMode::Off {
             return false;
@@ -450,15 +564,19 @@ impl RangeCatchup {
         if self.cooldown_until.is_some_and(|until| now < until) {
             return false;
         }
-        if target <= head_number.saturating_add(self.config.activate_gap) {
+        let gap = target.saturating_sub(head_number);
+        if gap <= self.config.activate_gap || gap > self.config.max_window {
             return false;
         }
-        self.reset_round();
+        self.deactivate();
         self.active = true;
         self.target = target;
         self.head_number = head_number;
-        self.next_plan = head_number.saturating_add(1);
+        self.head_hash = None;
+        self.planned_to = head_number;
         self.last_progress = Some(now);
+        self.progress_head = head_number;
+        self.progress_anchors = self.anchored_total;
         self.kick = true;
         true
     }
@@ -467,7 +585,7 @@ impl RangeCatchup {
     /// engine's committed QC, or a checked header QC).
     pub fn note_strict_anchor(&mut self, hash: B256) {
         if hash != B256::ZERO {
-            mark(&mut self.strict, &self.links, hash);
+            self.mark(hash, true);
         }
     }
 
@@ -475,7 +593,7 @@ impl RangeCatchup {
     /// or the parent of a bound block). Executable in observe mode only.
     pub fn note_loose_anchor(&mut self, hash: B256) {
         if hash != B256::ZERO {
-            mark(&mut self.loose, &self.links, hash);
+            self.mark(hash, false);
         }
     }
 
@@ -484,10 +602,19 @@ impl RangeCatchup {
     pub fn note_link(&mut self, hash: B256, parent: B256, number: u64) {
         self.record_link(hash, parent, number);
         if self.strict.contains(&hash) {
-            mark(&mut self.strict, &self.links, hash);
+            self.mark(hash, true);
         }
         if self.loose.contains(&hash) {
-            mark(&mut self.loose, &self.links, hash);
+            self.mark(hash, false);
+        }
+    }
+
+    /// The caller executed a released block (with or without moving its
+    /// execution head: a repeated header view imports without a forkchoice
+    /// update). The next release builds on it.
+    pub fn imported(&mut self, number: u64, hash: B256) {
+        if self.active && number > self.head_number {
+            self.advance_head(number, Some(hash));
         }
     }
 
@@ -497,8 +624,8 @@ impl RangeCatchup {
             return None;
         }
         let mut deadline = now + POLL_INTERVAL;
-        for (_, sent) in self.in_flight.values() {
-            deadline = deadline.min(*sent + self.config.request_timeout);
+        for flight in self.in_flight.values() {
+            deadline = deadline.min(flight.sent + self.config.request_timeout);
         }
         if self.kick || self.has_ready() {
             deadline = now;
@@ -512,7 +639,7 @@ impl RangeCatchup {
             && self
                 .buffer
                 .get(&next)
-                .is_some_and(|block| self.executable(&block.hash))
+                .is_some_and(|block| self.executable(next, &block.hash))
     }
 
     /// Expire timed-out requests, plan work and assign it to peers.
@@ -531,7 +658,7 @@ impl RangeCatchup {
         }
         self.kick = false;
         self.stop_at = stop_at;
-        self.advance_head(head_number);
+        self.advance_head(head_number, None);
         if let Some(height) = self.quorum_height(status_quorum) {
             self.target = self.target.max(height);
         }
@@ -539,23 +666,32 @@ impl RangeCatchup {
         let expired: Vec<(PeerId, u64)> = self
             .in_flight
             .iter()
-            .filter(|(_, (_, sent))| {
-                now.saturating_duration_since(*sent) >= self.config.request_timeout
+            .filter(|(_, flight)| {
+                now.saturating_duration_since(flight.sent) >= self.config.request_timeout
             })
             .map(|(key, _)| *key)
             .collect();
         for key in expired {
-            if let Some((count, _)) = self.in_flight.remove(&key) {
+            if let Some(flight) = self.in_flight.remove(&key) {
                 if let Some(state) = self.peers.get_mut(&key.0) {
                     state.in_flight = state.in_flight.saturating_sub(1);
                 }
                 self.soft_fail(&key.0, now, false);
-                self.requeue(key.1, count);
+                self.add_work(key.1, key.1.saturating_add(flight.count));
             }
         }
 
-        let goal = stop_at.map_or(self.target, |stop| stop.min(self.target));
-        if head_number >= goal.saturating_sub(2) && !self.has_ready() {
+        // Progress is the head moving or the authenticated chain growing.
+        if self.head_number > self.progress_head || self.anchored_total > self.progress_anchors {
+            self.progress_head = self.head_number;
+            self.progress_anchors = self.anchored_total;
+            self.last_progress = Some(now);
+        }
+
+        // The client fetches up to below the lowest staged block, whose hash is
+        // its top anchor. Nothing staged: the live path owns the chain.
+        let goal = stop_at.map_or(self.head_number, |stop| stop.min(self.target.max(stop)));
+        if self.head_number >= goal.saturating_sub(2) && !self.has_ready() {
             self.settled += 1;
             if self.settled >= 3 {
                 self.deactivate();
@@ -573,90 +709,89 @@ impl RangeCatchup {
             return (Vec::new(), Some(Deactivation::Stalled));
         }
 
-        self.plan(goal);
-        (self.assign(now), None)
+        if goal > self.planned_to {
+            self.add_work(self.planned_to.saturating_add(1), goal.saturating_add(1));
+            self.planned_to = goal;
+        }
+        (self.assign(now, goal), None)
     }
 
-    fn advance_head(&mut self, head_number: u64) {
-        if head_number <= self.head_number && self.head_number != 0 {
+    /// Moves the importer position up to `number` (never down) and drops
+    /// everything at or below it.
+    fn advance_head(&mut self, number: u64, hash: Option<B256>) {
+        if number < self.head_number {
             return;
         }
-        if head_number > self.head_number {
-            self.import_failures = 0;
+        if number == self.head_number {
+            if hash.is_some() {
+                self.head_hash = hash;
+            }
+            return;
         }
-        self.head_number = head_number;
-        while let Some((&number, _)) = self.buffer.first_key_value() {
-            if number > head_number {
+        self.head_number = number;
+        self.head_hash = hash;
+        self.import_failures = 0;
+        let keep = self.buffer.split_off(&number.saturating_add(1));
+        for block in self.buffer.values() {
+            self.buffer_bytes = self.buffer_bytes.saturating_sub(block.rlp.len());
+        }
+        self.buffer = keep;
+        let keep = self.unanchored.split_off(&number.saturating_add(1));
+        for bytes in self.unanchored.values() {
+            self.unanchored_bytes = self.unanchored_bytes.saturating_sub(*bytes);
+        }
+        self.unanchored = keep;
+        self.anchored = self.anchored.split_off(&number);
+        let stale: Vec<u64> = self.work.range(..=number).map(|(start, _)| *start).collect();
+        for start in stale {
+            if let Some(end) = self.work.remove(&start)
+                && end > number + 1
+            {
+                self.work.insert(number + 1, end);
+            }
+        }
+    }
+
+    /// Adds `[start, end)` to the work intervals, merged with any interval
+    /// it touches. Nothing is ever dropped or capped here.
+    fn add_work(&mut self, start: u64, end: u64) {
+        let mut start = start.max(self.head_number.saturating_add(1));
+        let mut end = end;
+        if start >= end {
+            return;
+        }
+        if let Some((&before, &before_end)) = self.work.range(..=start).next_back()
+            && before_end >= start
+        {
+            start = before;
+            end = end.max(before_end);
+            self.work.remove(&before);
+        }
+        while let Some((&next, &next_end)) = self.work.range(start..).next() {
+            if next > end {
                 break;
             }
-            if let Some(dropped) = self.buffer.remove(&number) {
-                self.buffer_bytes = self.buffer_bytes.saturating_sub(dropped.rlp.len());
-            }
+            end = end.max(next_end);
+            self.work.remove(&next);
         }
-        self.evicted = self.evicted.split_off(&head_number.saturating_add(1));
-        let stale: Vec<u64> = self
-            .work
-            .range(..=head_number)
-            .map(|(start, _)| *start)
-            .collect();
-        for start in stale {
-            if let Some(count) = self.work.remove(&start) {
-                let end = start.saturating_add(count);
-                if end > head_number + 1 {
-                    self.work.insert(head_number + 1, end - head_number - 1);
-                }
-            }
-        }
-        self.next_plan = self.next_plan.max(head_number.saturating_add(1));
+        self.work.insert(start, end);
     }
 
-    fn plan(&mut self, goal: u64) {
-        // Bodies dropped by the tail bound become fetchable once a later
-        // anchor authenticates the link recorded at their height.
-        let refetch: Vec<u64> = self
-            .evicted
-            .iter()
-            .copied()
-            .filter(|number| {
-                self.link_at
-                    .get(number)
-                    .is_some_and(|hash| self.executable(hash))
-            })
-            .collect();
-        for number in refetch.into_iter().rev() {
-            self.evicted.remove(&number);
-            self.requeue(number, 1);
-        }
-        let window_end = goal.min(
-            self.head_number
-                .saturating_add(self.config.max_links as u64),
-        );
-        let max_work = self.config.max_in_flight.saturating_mul(2).max(1);
-        while self.next_plan <= window_end && self.work.len() < max_work {
-            let count = self
-                .config
-                .request_blocks
-                .min(window_end - self.next_plan + 1)
-                .max(1);
-            self.work.insert(self.next_plan, count);
-            self.next_plan = self.next_plan.saturating_add(count);
-        }
-    }
-
-    /// Re-adds `[start, start+count)` as unassigned work, merged with an
-    /// adjacent following item so short replies do not fragment the queue.
-    fn requeue(&mut self, start: u64, count: u64) {
-        if count == 0 || start.saturating_add(count) <= self.head_number.saturating_add(1) {
+    /// Removes `[start, end)`, which lies inside one work interval.
+    fn take_work(&mut self, start: u64, end: u64) {
+        let Some((&from, &to)) = self.work.range(..=start).next_back() else {
+            return;
+        };
+        if to <= start {
             return;
         }
-        let start = start.max(self.head_number.saturating_add(1));
-        let mut count = count;
-        let end = start.saturating_add(count);
-        if let Some(next) = self.work.remove(&end) {
-            count = count.saturating_add(next).min(1024);
+        self.work.remove(&from);
+        if from < start {
+            self.work.insert(from, start);
         }
-        let existing = self.work.entry(start).or_insert(0);
-        *existing = (*existing).max(count);
+        if end < to {
+            self.work.insert(end, to);
+        }
     }
 
     /// First height above the head that is neither buffered nor executed.
@@ -668,32 +803,127 @@ impl RangeCatchup {
         number
     }
 
-    fn assign(&mut self, now: Instant) -> Vec<RangeRequest> {
-        let mut requests = Vec::new();
+    /// The hash the anchored chain requires at `number`, and whether a strict
+    /// anchor requires it.
+    fn expected_at(&self, number: u64) -> Option<(B256, bool)> {
+        self.anchored
+            .get(&number)
+            .map(|anchor| (anchor.hash, anchor.strict))
+            .or_else(|| {
+                self.anchored
+                    .get(&number.saturating_add(1))
+                    .map(|child| (child.parent, child.strict))
+            })
+    }
+
+    fn executable(&self, number: u64, hash: &B256) -> bool {
+        self.anchored.get(&number).is_some_and(|anchor| {
+            anchor.hash == *hash && (anchor.strict || self.mode == AnchorMode::Observe)
+        })
+    }
+
+    fn executable_height(&self, number: u64) -> bool {
+        self.anchored
+            .get(&number)
+            .is_some_and(|anchor| anchor.strict || self.mode == AnchorMode::Observe)
+    }
+
+    /// Blocks that still fit the byte budget, counting replies in flight at
+    /// the observed average body size (unbounded before the first reply).
+    fn room_blocks(&self) -> u64 {
+        if self.avg_block_bytes == 0 {
+            return u64::MAX;
+        }
+        let in_flight: u64 = self.in_flight.values().map(|flight| flight.count).sum();
+        let committed = self
+            .buffer_bytes
+            .saturating_add((in_flight as usize).saturating_mul(self.avg_block_bytes));
+        (self.config.reorder_bytes.saturating_sub(committed) / self.avg_block_bytes) as u64
+    }
+
+    /// The next range to request, by priority:
+    /// 1. the block the importer waits for, when its hash is known;
+    /// 2. the descent: the highest range right below the anchored chain;
+    /// 3. refetching dropped authenticated bodies, lowest first, in budget;
+    /// 4. a speculative range below the descent, within the unanchored hold.
+    fn choose(&self, goal: u64) -> Option<(u64, u64, bool)> {
+        let limit = goal.saturating_add(1);
+        let blocks = self.config.request_blocks.max(1);
         let first_missing = self.first_missing();
-        loop {
-            if self.in_flight.len() >= self.config.max_in_flight {
-                break;
+        let room = self.room_blocks();
+        // The importer's next block is fetched even over budget, but never
+        // more than fits: a refetch that overflows would only be dropped.
+        let importer_blocked = first_missing == self.head_number.saturating_add(1);
+        if first_missing < limit
+            && self.expected_at(first_missing).is_some()
+            && (importer_blocked || room > 0)
+            && let Some((_, &end)) = self.work.range(..=first_missing).next_back()
+            && end > first_missing
+        {
+            let count = blocks.min(room).max(1);
+            let end = end.min(limit).min(first_missing.saturating_add(count));
+            return Some((first_missing, end, false));
+        }
+        for (&start, &end) in self.work.range(..limit).rev() {
+            let end = end.min(limit);
+            if end <= start {
+                continue;
             }
-            let Some((&start, &count)) = self.work.first_key_value() else {
+            let top = end - 1;
+            if !self.anchored.contains_key(&top) && self.anchored.contains_key(&end) {
+                return Some((start.max(end.saturating_sub(blocks)), end, false));
+            }
+        }
+        if room > 0 {
+            for (&start, &end) in self.work.range(..limit) {
+                if self.executable_height(start) {
+                    let end = end.min(limit).min(start.saturating_add(blocks.min(room)));
+                    return Some((start, end, false));
+                }
+            }
+        }
+        let speculative: u64 = self
+            .in_flight
+            .values()
+            .filter(|flight| flight.speculative)
+            .map(|flight| flight.count)
+            .sum();
+        for (&start, &end) in self.work.range(..limit).rev() {
+            let end = end.min(limit);
+            if end <= start || self.anchored.contains_key(&(end - 1)) {
+                continue;
+            }
+            let from = start.max(end.saturating_sub(blocks));
+            let held = self.unanchored.len() as u64 + speculative + (end - from);
+            if held <= self.config.tail_blocks as u64
+                && self.unanchored_bytes <= self.config.tail_bytes
+            {
+                return Some((from, end, true));
+            }
+            break;
+        }
+        None
+    }
+
+    fn assign(&mut self, now: Instant, goal: u64) -> Vec<RangeRequest> {
+        let mut requests = Vec::new();
+        while self.in_flight.len() < self.config.max_in_flight {
+            let Some((start, end, speculative)) = self.choose(goal) else {
                 break;
             };
-            let inflight_bytes = self
-                .in_flight
-                .len()
-                .saturating_mul(self.config.reply_bytes_estimate);
-            // The reorder bound never blocks the block the importer waits for.
-            if start > first_missing
-                && self.buffer_bytes.saturating_add(inflight_bytes) >= self.config.reorder_bytes
-            {
-                break;
-            }
+            let count = end - start;
             let Some(peer) = self.pick_peer(start, count, now) else {
                 break;
             };
-            self.work.remove(&start);
-            let count = count.min(1024);
-            self.in_flight.insert((peer, start), (count, now));
+            self.take_work(start, end);
+            self.in_flight.insert(
+                (peer, start),
+                InFlight {
+                    count,
+                    sent: now,
+                    speculative,
+                },
+            );
             if let Some(state) = self.peers.get_mut(&peer) {
                 state.in_flight += 1;
             }
@@ -707,7 +937,7 @@ impl RangeCatchup {
     /// throughput. Peers advertising less are still used (status heights are
     /// only refreshed on connect).
     fn pick_peer(&self, start: u64, count: u64, now: Instant) -> Option<PeerId> {
-        let end = start.saturating_add(count - 1);
+        let end = start.saturating_add(count.saturating_sub(1));
         self.peers
             .iter()
             .filter(|(peer, state)| {
@@ -764,7 +994,8 @@ impl RangeCatchup {
     }
 
     /// Screens, anchors and buffers one reply. `verify` checks an embedded
-    /// QC strictly (commit domain, the set of the QC's own epoch).
+    /// QC strictly (commit domain, the set of the QC's own epoch); it runs at
+    /// most once per reply.
     pub fn on_reply(
         &mut self,
         peer: PeerId,
@@ -774,30 +1005,33 @@ impl RangeCatchup {
         verify: &mut dyn FnMut(&H2QuorumCertificate) -> QcCheck,
     ) -> ReplyReport {
         let mut report = ReplyReport::default();
-        let Some((count, sent)) = self.in_flight.remove(&(peer, start)) else {
+        let Some(flight) = self.in_flight.remove(&(peer, start)) else {
             return report;
         };
+        let (count, sent) = (flight.count, flight.sent);
         if let Some(state) = self.peers.get_mut(&peer) {
             state.in_flight = state.in_flight.saturating_sub(1);
         }
         if !self.active {
             return report;
         }
+        self.kick = true;
+        let end = start.saturating_add(count);
         let blocks = match reply {
             RangeReply::Refused => {
                 self.soft_fail(&peer, now, false);
-                self.requeue(start, count);
+                self.add_work(start, end);
                 return report;
             }
             RangeReply::Failed { unsupported } => {
                 self.soft_fail(&peer, now, unsupported);
-                self.requeue(start, count);
+                self.add_work(start, end);
                 return report;
             }
             RangeReply::Blocks(blocks) if blocks.is_empty() => {
                 // A clean empty reply: the peer does not hold the range.
                 self.soft_fail(&peer, now, false);
-                self.requeue(start, count);
+                self.add_work(start, end);
                 return report;
             }
             RangeReply::Blocks(blocks) => blocks,
@@ -805,8 +1039,7 @@ impl RangeCatchup {
 
         let enforce = self.mode == AnchorMode::Enforce;
         let mut fault = None;
-        let served = blocks.len();
-        let mut kept: Vec<RangeBlock> = Vec::with_capacity(served.min(count as usize));
+        let mut kept: Vec<RangeBlock> = Vec::with_capacity(blocks.len().min(count as usize));
         for (index, block) in blocks.into_iter().enumerate() {
             if index as u64 >= count {
                 fault = Some("more blocks than requested");
@@ -841,46 +1074,62 @@ impl RangeCatchup {
         }
         self.stats.blocks_received += kept.len() as u64;
 
-        // Harvest anchors before deciding: links first, so a QC naming any
-        // block of this reply authenticates everything below it.
+        // A block contradicting the anchored chain voids the reply: every
+        // block below it links up to it. Only a strict anchor makes it a
+        // fault (a loose binding may name an abandoned branch); otherwise the
+        // peer backs off.
+        let mut off_chain = false;
+        if let Some(index) = kept.iter().position(|block| {
+            self.expected_at(block.number)
+                .is_some_and(|(hash, _)| hash != block.hash)
+        }) {
+            let strict = self
+                .expected_at(kept[index].number)
+                .is_some_and(|(_, strict)| strict);
+            kept.clear();
+            self.stats.conflicts += 1;
+            if strict {
+                fault.get_or_insert("off the anchored chain");
+            } else {
+                off_chain = true;
+            }
+        }
+
+        // Links first, so an anchor naming any block of this reply
+        // authenticates everything below it.
         for block in &kept {
             self.record_link(block.hash, block.parent, block.number);
         }
-        for book in [&mut self.strict, &mut self.loose] {
+        for strict in [true, false] {
+            let book = if strict { &self.strict } else { &self.loose };
             if let Some(top) = kept.iter().rev().find(|block| book.contains(&block.hash)) {
-                mark(book, &self.links, top.hash);
+                let hash = top.hash;
+                self.mark(hash, strict);
             }
         }
+        // One embedded QC per reply: the highest one that would anchor
+        // something not anchored strictly yet.
         if fault.is_none() || !enforce {
-            for index in (0..kept.len()).rev() {
-                if kept
-                    .first()
-                    .is_some_and(|lowest| self.strict.contains(&lowest.hash))
-                {
-                    break;
+            let candidate = kept.iter().rev().find_map(|block| match &block.qc {
+                ExtraQc::Present(qc) => {
+                    let (_, number) = *self.links.get(&qc.block_hash)?;
+                    let useful = number > self.head_number
+                        && !self.anchored.get(&number).is_some_and(|anchor| {
+                            anchor.strict && anchor.hash == qc.block_hash
+                        });
+                    useful.then(|| qc.clone())
                 }
-                let ExtraQc::Present(qc) = &kept[index].qc else {
-                    continue;
-                };
-                let useful = self
-                    .links
-                    .get(&qc.block_hash)
-                    .is_some_and(|(_, number)| *number > self.head_number);
-                if self.strict.contains(&qc.block_hash) || !useful {
-                    // Already anchored, executed, or names nothing held here.
-                    continue;
-                }
-                match self.check_qc(qc, verify) {
+                _ => None,
+            });
+            if let Some(qc) = candidate {
+                match self.check_qc(&qc, verify) {
                     QcCheck::Verified => {
-                        mark(&mut self.strict, &self.links, qc.block_hash);
+                        self.mark(qc.block_hash, true);
                     }
                     QcCheck::PrepareDomain => self.stats.prepare_domain_qcs += 1,
                     QcCheck::UnknownEpoch => self.stats.unknown_epoch_qcs += 1,
                     QcCheck::Invalid => {
                         fault.get_or_insert("bad qc");
-                        if enforce {
-                            break;
-                        }
                     }
                 }
             }
@@ -892,63 +1141,173 @@ impl RangeCatchup {
             if enforce {
                 // The whole reply is dropped; its links stay (they are only
                 // ever authenticated from above by a verified anchor).
-                self.requeue(start, count);
+                self.add_work(start, end);
+                self.sweep_conflicts(now);
                 return report;
             }
+        } else if off_chain {
+            self.soft_fail(&peer, now, false);
         }
 
         let accepted = kept.len();
         report.accepted = accepted;
         let delivered_bytes: usize = kept.iter().map(|block| block.rlp.len()).sum();
+        if accepted > 0 {
+            let average = delivered_bytes / accepted;
+            self.avg_block_bytes = if self.avg_block_bytes == 0 {
+                average
+            } else {
+                (self.avg_block_bytes * 7 + average * 3) / 10
+            };
+        }
         for block in kept {
-            if block.number <= self.head_number {
-                continue;
-            }
-            self.evicted.remove(&block.number);
-            match self.buffer.get(&block.number) {
-                Some(existing) if existing.hash == block.hash => continue,
-                Some(existing) if self.executable(&existing.hash) => continue,
-                Some(_) if !self.executable(&block.hash) => continue,
-                _ => {}
-            }
-            self.buffer_bytes = self.buffer_bytes.saturating_add(block.rlp.len());
-            if let Some(replaced) = self.buffer.insert(
-                block.number,
-                Buffered {
-                    source: peer,
-                    hash: block.hash,
-                    parent: block.parent,
-                    view: block.view,
-                    rlp: block.rlp,
-                },
-            ) {
-                self.buffer_bytes = self.buffer_bytes.saturating_sub(replaced.rlp.len());
-            }
+            self.buffer_block(peer, block);
         }
         if (accepted as u64) < count {
             // A short reply is not a fault: ask again from the next number.
-            self.requeue(
-                start.saturating_add(accepted as u64),
-                count - accepted as u64,
-            );
+            self.add_work(start.saturating_add(accepted as u64), end);
         }
-        self.kick = true;
-        if accepted > 0 {
-            self.last_progress = Some(now);
-            if let Some(state) = self.peers.get_mut(&peer) {
-                state.failures = 0;
-                state.backoff_until = None;
-                let seconds = now.saturating_duration_since(sent).as_secs_f64().max(0.001);
-                let sample = delivered_bytes as f64 / seconds;
-                state.throughput = if state.throughput == 0.0 {
-                    sample
-                } else {
-                    0.7 * state.throughput + 0.3 * sample
-                };
+        if accepted > 0
+            && !off_chain
+            && report.fault.is_none()
+            && let Some(state) = self.peers.get_mut(&peer)
+        {
+            state.failures = 0;
+            state.backoff_until = None;
+            let seconds = now.saturating_duration_since(sent).as_secs_f64().max(0.001);
+            let sample = delivered_bytes as f64 / seconds;
+            state.throughput = if state.throughput == 0.0 {
+                sample
+            } else {
+                0.7 * state.throughput + 0.3 * sample
+            };
+        }
+        self.sweep_conflicts(now);
+        self.bound_buffer();
+        report
+    }
+
+    /// Buffers one screened block. At a taken height the body on the anchored
+    /// chain wins; between two unanchored bodies the first stays, and the
+    /// conflict sweep drops it if an anchor later names the other.
+    fn buffer_block(&mut self, source: PeerId, block: RangeBlock) {
+        let number = block.number;
+        if number <= self.head_number {
+            return;
+        }
+        let linked = self
+            .anchored
+            .get(&number)
+            .is_some_and(|anchor| anchor.hash == block.hash);
+        if let Some(existing) = self.buffer.get(&number) {
+            let existing_linked = self
+                .anchored
+                .get(&number)
+                .is_some_and(|anchor| anchor.hash == existing.hash);
+            if existing.hash == block.hash || existing_linked || !linked {
+                return;
+            }
+            self.drop_buffered(number);
+        }
+        self.buffer_bytes = self.buffer_bytes.saturating_add(block.rlp.len());
+        if !linked {
+            self.unanchored.insert(number, block.rlp.len());
+            self.unanchored_bytes = self.unanchored_bytes.saturating_add(block.rlp.len());
+        }
+        self.buffer.insert(
+            number,
+            Buffered {
+                source,
+                hash: block.hash,
+                parent: block.parent,
+                view: block.view,
+                rlp: block.rlp,
+            },
+        );
+    }
+
+    /// Drops the body at `number`, which contradicts the anchored chain, and
+    /// the unanchored bodies below it that link up to it (the same branch).
+    /// All of them are fetched again.
+    fn drop_branch(&mut self, number: u64) {
+        let mut next = number;
+        let mut parent = match self.drop_buffered(next) {
+            Some(dropped) => dropped.parent,
+            None => return,
+        };
+        self.stats.conflicts += 1;
+        let mut low = next;
+        while next > 0 {
+            next -= 1;
+            let linked = self.unanchored.contains_key(&next)
+                && self.buffer.get(&next).is_some_and(|block| block.hash == parent);
+            if !linked {
+                break;
+            }
+            if let Some(dropped) = self.drop_buffered(next) {
+                parent = dropped.parent;
+                low = next;
             }
         }
-        self.bound_tail();
-        report
+        self.add_work(low, number + 1);
+    }
+
+    fn drop_buffered(&mut self, number: u64) -> Option<Buffered> {
+        let dropped = self.buffer.remove(&number)?;
+        self.buffer_bytes = self.buffer_bytes.saturating_sub(dropped.rlp.len());
+        if let Some(bytes) = self.unanchored.remove(&number) {
+            self.unanchored_bytes = self.unanchored_bytes.saturating_sub(bytes);
+        }
+        Some(dropped)
+    }
+
+    /// Drops held bodies that contradict anchors set since the last sweep,
+    /// refetches their heights and scores their sources on strict anchors.
+    fn sweep_conflicts(&mut self, now: Instant) {
+        let Some((low, high)) = self.touched.take() else {
+            return;
+        };
+        let conflicts: Vec<(u64, PeerId, bool)> = self
+            .buffer
+            .range(low.saturating_sub(1)..=high)
+            .filter_map(|(number, block)| {
+                self.expected_at(*number)
+                    .filter(|(hash, _)| *hash != block.hash)
+                    .map(|(_, strict)| (*number, block.source, strict))
+            })
+            .collect();
+        let mut scored = HashSet::new();
+        for (number, source, strict) in conflicts.into_iter().rev() {
+            self.drop_branch(number);
+            if strict && scored.insert(source) {
+                self.fault(&source, now);
+            }
+        }
+    }
+
+    /// Holds at most `tail_blocks` / `tail_bytes` of unanchored bodies (the
+    /// lowest go first: the ones next to the descent are the next to be
+    /// authenticated) and at most `reorder_bytes` in all (the highest go
+    /// first: they are imported last). Every dropped height is fetched again.
+    fn bound_buffer(&mut self) {
+        while self.unanchored.len() > self.config.tail_blocks
+            || (self.unanchored.len() > 1 && self.unanchored_bytes > self.config.tail_bytes)
+        {
+            let Some((&number, _)) = self.unanchored.first_key_value() else {
+                break;
+            };
+            self.drop_buffered(number);
+            self.add_work(number, number + 1);
+            self.stats.tail_evicted += 1;
+        }
+        while self.buffer_bytes > self.config.reorder_bytes && self.buffer.len() > 1 {
+            let Some((&number, _)) = self.buffer.last_key_value() else {
+                break;
+            };
+            self.drop_buffered(number);
+            self.add_work(number, number + 1);
+            self.stats.budget_evicted += 1;
+        }
     }
 
     fn check_qc(
@@ -975,36 +1334,52 @@ impl RangeCatchup {
         verdict
     }
 
-    fn executable(&self, hash: &B256) -> bool {
-        self.strict.contains(hash)
-            || (self.mode == AnchorMode::Observe && self.loose.contains(hash))
-    }
-
-    /// Holds at most `tail_blocks` / `tail_bytes` of unauthenticated bodies;
-    /// the highest go first. Their links stay for a later anchor.
-    fn bound_tail(&mut self) {
-        let mut held_blocks = 0usize;
-        let mut held_bytes = 0usize;
-        let mut evict = Vec::new();
-        for (number, block) in &self.buffer {
-            if self.executable(&block.hash) {
-                continue;
-            }
-            if held_blocks < self.config.tail_blocks
-                && (held_blocks == 0 || held_bytes + block.rlp.len() <= self.config.tail_bytes)
-            {
-                held_blocks += 1;
-                held_bytes += block.rlp.len();
+    /// Authenticates `hash` and walks the parent links downward, recording
+    /// the anchored hash of every height it passes. Stops at a missing link,
+    /// the head, or a height already anchored at least as strongly. A strict
+    /// anchor replaces a loose one; otherwise the first anchor at a height
+    /// stays.
+    fn mark(&mut self, hash: B256, strict: bool) {
+        let mut current = hash;
+        loop {
+            if strict {
+                self.strict.insert(current, MAX_ANCHORS);
             } else {
-                evict.push(*number);
+                self.loose.insert(current, MAX_ANCHORS);
             }
-        }
-        for number in evict {
-            if let Some(dropped) = self.buffer.remove(&number) {
-                self.buffer_bytes = self.buffer_bytes.saturating_sub(dropped.rlp.len());
-                self.evicted.insert(number);
-                self.stats.tail_evicted += 1;
+            let Some(&(parent, number)) = self.links.get(&current) else {
+                return;
+            };
+            if number <= self.head_number {
+                return;
             }
+            let fresh = match self.anchored.get(&number) {
+                Some(anchor) if anchor.strict || !strict => return,
+                Some(_) => false,
+                None => true,
+            };
+            self.anchored.insert(
+                number,
+                Anchored {
+                    hash: current,
+                    parent,
+                    strict,
+                },
+            );
+            if fresh {
+                self.anchored_total += 1;
+            }
+            if let Some(block) = self.buffer.get(&number)
+                && block.hash == current
+                && let Some(bytes) = self.unanchored.remove(&number)
+            {
+                self.unanchored_bytes = self.unanchored_bytes.saturating_sub(bytes);
+            }
+            self.touched = Some(match self.touched {
+                Some((low, high)) => (low.min(number), high.max(number)),
+                None => (number, number),
+            });
+            current = parent;
         }
     }
 
@@ -1012,28 +1387,18 @@ impl RangeCatchup {
         if self.links.insert(hash, (parent, number)).is_none() {
             self.link_order.push_back(hash);
             while self.link_order.len() > self.config.max_links {
-                if let Some(oldest) = self.link_order.pop_front()
-                    && let Some((_, old_number)) = self.links.remove(&oldest)
-                    && self.link_at.get(&old_number) == Some(&oldest)
-                {
-                    self.link_at.remove(&old_number);
+                if let Some(oldest) = self.link_order.pop_front() {
+                    self.links.remove(&oldest);
                 }
             }
         }
-        // On a fork keep an executable link at the height, else the latest.
-        let keep = self
-            .link_at
-            .get(&number)
-            .is_some_and(|existing| *existing != hash && self.executable(existing));
-        if !keep {
-            self.link_at.insert(number, hash);
-        }
     }
 
-    /// Pops the authenticated blocks that extend `(head_number, head_hash)`,
-    /// in order, at most `max` and never above `stop_at`. A buffered block
-    /// that does not extend the head (another branch) is dropped and fetched
-    /// again.
+    /// Pops the authenticated blocks that extend the importer position, in
+    /// order, at most `max` and never above `stop_at`. A held body that
+    /// contradicts the anchored chain is dropped and fetched again. If the
+    /// authenticated block above the head does not extend it, the client
+    /// stops with [`Deactivation::Diverged`] (see [`Self::take_stop`]).
     pub fn take_ready(
         &mut self,
         head_number: u64,
@@ -1045,9 +1410,10 @@ impl RangeCatchup {
             return Vec::new();
         }
         self.stop_at = stop_at;
-        self.advance_head(head_number);
+        self.advance_head(head_number, Some(head_hash));
+        let mut hash = self.head_hash.unwrap_or(head_hash);
+        let mut number = self.head_number;
         let mut ready = Vec::new();
-        let (mut number, mut hash) = (head_number, head_hash);
         while ready.len() < max {
             let next = number.saturating_add(1);
             if stop_at.is_some_and(|stop| next > stop) {
@@ -1056,27 +1422,38 @@ impl RangeCatchup {
             let Some(block) = self.buffer.get(&next) else {
                 break;
             };
+            if self
+                .expected_at(next)
+                .is_some_and(|(expected, _)| expected != block.hash)
+            {
+                self.drop_branch(next);
+                break;
+            }
+            if !self.executable(next, &block.hash) {
+                break;
+            }
             if block.parent != hash {
-                if let Some(dropped) = self.buffer.remove(&next) {
-                    self.buffer_bytes = self.buffer_bytes.saturating_sub(dropped.rlp.len());
+                if ready.is_empty() {
+                    self.deactivate();
+                    self.cooldown_until = Some(Instant::now() + self.config.stall_cooldown);
+                    self.stopped = Some(Deactivation::Diverged);
                 }
-                self.requeue(next, 1);
                 break;
             }
-            if !self.executable(&block.hash) {
-                break;
-            }
-            let loose_only = !self.strict.contains(&block.hash);
-            let Some(block) = self.buffer.remove(&next) else {
+            let loose_only = !self
+                .anchored
+                .get(&next)
+                .is_some_and(|anchor| anchor.strict);
+            let Some(block) = self.drop_buffered(next) else {
                 break;
             };
-            self.buffer_bytes = self.buffer_bytes.saturating_sub(block.rlp.len());
             self.stats.released += 1;
             if loose_only {
                 self.stats.released_loose_only += 1;
             }
             number = next;
             hash = block.hash;
+            self.released_to = self.released_to.max(next);
             ready.push(ReadyBlock {
                 source: block.source,
                 number: next,
@@ -1090,21 +1467,18 @@ impl RangeCatchup {
         ready
     }
 
-    /// The importer could not execute the block at `number`: drop what is
-    /// buffered from there and fetch it again. Three failures without the
-    /// head moving stop the client (the reverse walk takes over).
+    /// The importer could not execute the block at `number`: it and the
+    /// rest of the released batch are fetched again (held bodies above stay).
+    /// Three failures without the head moving stop the client (the reverse
+    /// walk takes over).
     pub fn import_failed(&mut self, number: u64, now: Instant) -> Option<Deactivation> {
-        let dropped = self.buffer.split_off(&number);
-        for block in dropped.values() {
-            self.buffer_bytes = self.buffer_bytes.saturating_sub(block.rlp.len());
-        }
         self.import_failures += 1;
         if self.import_failures >= 3 {
             self.deactivate();
             self.cooldown_until = Some(now + self.config.stall_cooldown);
             return Some(Deactivation::Stalled);
         }
-        self.requeue(number, self.config.request_blocks);
+        self.add_work(number, self.released_to.max(number).saturating_add(1));
         None
     }
 
@@ -1116,9 +1490,12 @@ impl RangeCatchup {
         }
         self.buffer.clear();
         self.buffer_bytes = 0;
-        self.evicted.clear();
+        self.unanchored.clear();
+        self.unanchored_bytes = 0;
         self.settled = 0;
         self.import_failures = 0;
+        self.touched = None;
+        self.released_to = 0;
     }
 
     fn deactivate(&mut self) {
@@ -1126,26 +1503,9 @@ impl RangeCatchup {
         self.reset_round();
         self.links.clear();
         self.link_order.clear();
-        self.link_at.clear();
+        self.anchored.clear();
         self.strict.clear();
         self.loose.clear();
-    }
-}
-
-/// Authenticates `hash` and walks the parent links downward, stopping at a
-/// missing link or an already authenticated hash.
-fn mark(book: &mut HashBook, links: &HashMap<B256, (B256, u64)>, hash: B256) {
-    let mut current = hash;
-    let mut first = true;
-    loop {
-        if !book.insert(current, MAX_ANCHORS) && !first {
-            return;
-        }
-        first = false;
-        let Some((parent, _)) = links.get(&current) else {
-            return;
-        };
-        current = *parent;
     }
 }
 
@@ -1243,11 +1603,26 @@ mod tests {
         (client, now)
     }
 
-    fn request_for(requests: &[RangeRequest], peer: PeerId) -> RangeRequest {
-        *requests
-            .iter()
-            .find(|request| request.peer == peer)
-            .expect("request for peer")
+    /// The block that revealed the gap: linked and anchored.
+    fn bind(client: &mut RangeCatchup, block: &RangeBlock, strict: bool) {
+        client.note_link(block.hash, block.parent, block.number);
+        if strict {
+            client.note_strict_anchor(block.hash);
+        } else {
+            client.note_loose_anchor(block.hash);
+        }
+    }
+
+    fn expect(client: &mut RangeCatchup, peer: PeerId, start: u64, count: u64, now: Instant) {
+        client.in_flight.insert(
+            (peer, start),
+            InFlight {
+                count,
+                sent: now,
+                speculative: false,
+            },
+        );
+        client.peers.get_mut(&peer).unwrap().in_flight += 1;
     }
 
     #[test]
@@ -1323,6 +1698,10 @@ mod tests {
             None,
             "idle client schedules nothing"
         );
+        assert!(
+            !client.activate(0, (1 << 20) + 1, now),
+            "a gap beyond the window stays with the reverse walk"
+        );
         assert!(client.activate(100, 109, now));
         let mut off = RangeCatchup::new(config(), AnchorMode::Off);
         assert!(!off.activate(0, 1_000_000, now));
@@ -1342,53 +1721,53 @@ mod tests {
         );
         let now = Instant::now();
         assert!(client.activate(0, 20, now));
-        client.poll(now, 0, 2, None);
+        client.poll(now, 0, 2, Some(19));
         assert_eq!(client.target(), 50);
     }
 
     #[test]
-    fn short_replies_keep_the_prefix_and_refusals_are_not_scored() {
+    fn descent_is_top_down_and_short_replies_keep_the_prefix() {
         let peer = PeerId::random();
-        let (mut client, now) = active(AnchorMode::Enforce, &[peer], 40);
-        let blocks = with_parent_qcs(chain(1, GENESIS, 40, 1), VERIFIED);
-        let (requests, _) = client.poll(now, 0, 1, None);
+        let (mut client, now) = active(AnchorMode::Enforce, &[peer], 41);
+        let blocks = chain(1, GENESIS, 41, 1);
+        bind(&mut client, &blocks[40], true);
+        let (requests, _) = client.poll(now, 0, 1, Some(40));
         assert_eq!(
             requests,
             vec![RangeRequest {
                 peer,
-                start: 1,
+                start: 25,
                 count: 16
-            }]
+            }],
+            "the range right below the anchor first"
         );
         let mut calls = 0;
-        let report = client.on_reply(peer, 1, reply(&blocks[..4]), now, &mut verifier(&mut calls));
-        assert_eq!(
-            report,
-            ReplyReport {
-                accepted: 4,
-                fault: None,
-                peer_excluded: false
-            }
+        let report = client.on_reply(
+            peer,
+            25,
+            reply(&blocks[24..28]),
+            now,
+            &mut verifier(&mut calls),
         );
-        // Block 4's QC anchors 3: blocks 1..=3 execute, 4 waits for an anchor.
-        let ready = client.take_ready(0, GENESIS, None, 64);
+        assert_eq!(report.accepted, 4);
+        assert_eq!(report.fault, None);
+        let (requests, _) = client.poll(now, 0, 1, Some(40));
         assert_eq!(
-            ready.iter().map(|block| block.number).collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            (requests[0].start, requests[0].count),
+            (29, 12),
+            "the remainder is asked for again"
         );
-        let (requests, _) = client.poll(now, 3, 1, None);
-        assert_eq!(requests[0].start, 5, "the remainder is asked for again");
 
         for reply in [
             RangeReply::Refused,
             RangeReply::Blocks(Vec::new()),
             RangeReply::Failed { unsupported: false },
         ] {
-            client.in_flight.insert((peer, 5), (12, now));
-            client.peers.get_mut(&peer).unwrap().in_flight = 1;
-            let report = client.on_reply(peer, 5, reply, now, &mut verifier(&mut calls));
+            let report = client.on_reply(peer, 29, reply, now, &mut verifier(&mut calls));
             assert_eq!(report.fault, None);
-            assert!(client.work.contains_key(&5), "the range is asked for again");
+            assert_eq!(client.work.get(&29), Some(&41), "asked for again");
+            client.take_work(29, 41);
+            expect(&mut client, peer, 29, 12, now);
         }
         assert_eq!(
             client.stats().faults,
@@ -1411,7 +1790,7 @@ mod tests {
         for mode in [AnchorMode::Enforce, AnchorMode::Observe] {
             let peer = PeerId::random();
             let (mut client, now) = active(mode, &[peer], 40);
-            client.poll(now, 0, 1, None);
+            expect(&mut client, peer, 1, 16, now);
             let mut calls = 0;
             let report = client.on_reply(peer, 1, reply(&forged), now, &mut verifier(&mut calls));
             assert_eq!(report.fault, Some("broken link"));
@@ -1430,11 +1809,13 @@ mod tests {
         let bad = PeerId::random();
         let honest = PeerId::random();
         let (mut client, now) = active(AnchorMode::Enforce, &[bad], 400);
+        let top = chain(1, GENESIS, 400, 1);
+        bind(&mut client, &top[399], true);
         client.note_peer_status(honest, 0);
         let mut calls = 0;
         for round in 0..3u64 {
             let at = now + Duration::from_secs(round);
-            client.in_flight.insert((bad, 1), (16, at));
+            expect(&mut client, bad, 1, 16, at);
             let report = client.on_reply(
                 bad,
                 1,
@@ -1445,16 +1826,40 @@ mod tests {
             assert_eq!(report.fault, Some("wrong start"));
             assert_eq!(report.peer_excluded, round == 2);
         }
-        let (requests, _) = client.poll(now + Duration::from_secs(10), 0, 1, None);
+        let (requests, _) = client.poll(now + Duration::from_secs(10), 0, 1, Some(399));
         assert!(requests.iter().all(|request| request.peer != bad));
         assert!(requests.iter().any(|request| request.peer == honest));
+    }
+
+    #[test]
+    fn a_score_survives_a_reconnect() {
+        let bad = PeerId::random();
+        let (mut client, now) = active(AnchorMode::Observe, &[bad], 400);
+        let mut calls = 0;
+        for round in 0..3u64 {
+            let at = now + Duration::from_secs(round);
+            if round == 2 {
+                client.peer_disconnected(&bad);
+                assert_eq!(client.quorum_height(1), None, "gone from the status set");
+                client.note_peer_status(bad, 400);
+            }
+            expect(&mut client, bad, 1, 16, at);
+            let report = client.on_reply(
+                bad,
+                1,
+                reply(&chain(2, GENESIS, 3, 1)),
+                at,
+                &mut verifier(&mut calls),
+            );
+            assert_eq!(report.peer_excluded, round == 2);
+        }
     }
 
     #[test]
     fn forged_chain_with_a_copied_qc_is_never_released() {
         let peer = PeerId::random();
         let (mut client, now) = active(AnchorMode::Enforce, &[peer], 40);
-        client.poll(now, 0, 1, None);
+        expect(&mut client, peer, 1, 16, now);
         let real_hash = B256::repeat_byte(0x77);
         let mut fake = chain(1, GENESIS, 10, 5);
         for block in &mut fake {
@@ -1476,12 +1881,36 @@ mod tests {
     fn invalid_qc_is_a_fault_and_enforce_drops_the_reply() {
         let peer = PeerId::random();
         let (mut client, now) = active(AnchorMode::Enforce, &[peer], 40);
-        client.poll(now, 0, 1, None);
+        expect(&mut client, peer, 1, 16, now);
         let blocks = with_parent_qcs(chain(1, GENESIS, 5, 1), INVALID);
         let mut calls = 0;
         let report = client.on_reply(peer, 1, reply(&blocks), now, &mut verifier(&mut calls));
         assert_eq!(report.fault, Some("bad qc"));
         assert_eq!(client.buffered_blocks(), 0);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn one_qc_verification_per_reply_in_every_mode() {
+        for mode in [AnchorMode::Observe, AnchorMode::Enforce] {
+            let peer = PeerId::random();
+            let (mut client, now) = active(mode, &[peer], 600);
+            expect(&mut client, peer, 1, 256, now);
+            let blocks = with_parent_qcs(chain(1, GENESIS, 256, 1), INVALID);
+            let mut calls = 0;
+            let report = client.on_reply(peer, 1, reply(&blocks), now, &mut verifier(&mut calls));
+            assert_eq!(report.fault, Some("bad qc"));
+            assert_eq!(calls, 1, "{mode:?}: stops at the first invalid QC");
+        }
+        // A verified one anchors everything below it: still one check.
+        let peer = PeerId::random();
+        let (mut client, now) = active(AnchorMode::Enforce, &[peer], 600);
+        expect(&mut client, peer, 1, 256, now);
+        let blocks = with_parent_qcs(chain(1, GENESIS, 256, 1), VERIFIED);
+        let mut calls = 0;
+        client.on_reply(peer, 1, reply(&blocks), now, &mut verifier(&mut calls));
+        assert_eq!(calls, 1);
+        assert_eq!(client.take_ready(0, GENESIS, None, 1024).len(), 255);
     }
 
     #[test]
@@ -1489,20 +1918,20 @@ mod tests {
         for marker in [PREPARE, UNKNOWN] {
             let peer = PeerId::random();
             let (mut client, now) = active(AnchorMode::Enforce, &[peer], 40);
-            client.poll(now, 0, 1, None);
+            expect(&mut client, peer, 1, 16, now);
             let blocks = with_parent_qcs(chain(1, GENESIS, 5, 1), marker);
             let mut calls = 0;
             let report = client.on_reply(peer, 1, reply(&blocks), now, &mut verifier(&mut calls));
             assert_eq!(report.fault, None);
             assert!(client.take_ready(0, GENESIS, None, 64).is_empty());
             if marker == UNKNOWN {
-                assert_eq!(client.stats().unknown_epoch_qcs, 4);
+                assert_eq!(client.stats().unknown_epoch_qcs, 1);
                 assert!(
                     client.qc_cache.is_empty(),
                     "an unknown set may become known later"
                 );
             } else {
-                assert_eq!(client.stats().prepare_domain_qcs, 4);
+                assert_eq!(client.stats().prepare_domain_qcs, 1);
             }
         }
     }
@@ -1513,7 +1942,7 @@ mod tests {
         for mode in [AnchorMode::Observe, AnchorMode::Enforce] {
             let peer = PeerId::random();
             let (mut client, now) = active(mode, &[peer], 40);
-            client.poll(now, 0, 1, None);
+            expect(&mut client, peer, 1, 16, now);
             // A PrepareQC-style binding of block 10.
             client.note_loose_anchor(blocks[9].hash);
             let mut calls = 0;
@@ -1530,103 +1959,59 @@ mod tests {
     }
 
     #[test]
-    fn qc_less_stretch_is_held_within_the_tail_bound_then_anchored_and_refetched() {
+    fn enforce_holds_a_loose_linked_range_until_a_commit_anchor() {
         let peer = PeerId::random();
-        let mut config = config();
-        config.request_blocks = 100;
-        config.max_in_flight = 1;
-        let mut client = RangeCatchup::new(config, AnchorMode::Enforce);
-        client.note_peer_status(peer, 101);
-        let now = Instant::now();
-        assert!(client.activate(0, 101, now));
-        let (requests, _) = client.poll(now, 0, 1, None);
-        assert_eq!(
-            requests,
-            vec![RangeRequest {
-                peer,
-                start: 1,
-                count: 100
-            }]
-        );
-
-        // An n42-26-led stretch: 100 blocks, no embedded QC.
-        let stretch = chain(1, GENESIS, 100, 1);
+        let (mut client, now) = active(AnchorMode::Enforce, &[peer], 101);
+        let blocks = chain(1, GENESIS, 101, 1);
+        bind(&mut client, &blocks[100], false);
         let mut calls = 0;
-        client.on_reply(peer, 1, reply(&stretch), now, &mut verifier(&mut calls));
-        assert_eq!(client.buffered_blocks(), 64, "tail bound: 64 blocks");
-        assert_eq!(client.stats().tail_evicted, 36);
-        assert!(
-            client.take_ready(0, GENESIS, None, 128).is_empty(),
-            "nothing anchored yet"
-        );
-
-        // The next block (gov5-led) embeds a commit QC for block 100.
-        let (requests, _) = client.poll(now, 0, 1, None);
-        assert_eq!(
-            requests,
-            vec![RangeRequest {
-                peer,
-                start: 101,
-                count: 1
-            }]
-        );
-        let mut next = chain(101, stretch[99].hash, 1, 1);
-        next[0].qc = ExtraQc::Present(qc(101, stretch[99].hash, VERIFIED));
-        client.on_reply(peer, 101, reply(&next), now, &mut verifier(&mut calls));
-        assert_eq!(calls, 1, "one verification anchors the whole stretch");
-
-        let ready = client.take_ready(0, GENESIS, None, 128);
-        assert_eq!(ready.len(), 64);
+        let mut at = now;
+        // A QC-less stretch: fetched top-down, linked, not executable yet.
+        while client.buffered_blocks() < 100 {
+            let (requests, _) = client.poll(at, 0, 1, Some(100));
+            for request in requests {
+                let from = (request.start - 1) as usize;
+                let to = from + request.count as usize;
+                client.on_reply(
+                    request.peer,
+                    request.start,
+                    reply(&blocks[from..to]),
+                    at,
+                    &mut verifier(&mut calls),
+                );
+            }
+            at += Duration::from_secs(1);
+        }
+        assert!(client.take_ready(0, GENESIS, Some(100), 128).is_empty());
+        assert_eq!(client.stats().blocks_received, 100, "each body once");
+        // A Decide for the staged block.
+        client.note_strict_anchor(blocks[100].hash);
+        let ready = client.take_ready(0, GENESIS, Some(100), 128);
+        assert_eq!(ready.len(), 100);
         assert!(ready.iter().all(|block| !block.loose_only));
-        // The evicted bodies are now authenticated by their links: fetch again.
-        let (requests, _) = client.poll(now, 64, 1, None);
-        assert_eq!(
-            requests,
-            vec![RangeRequest {
-                peer,
-                start: 65,
-                count: 36
-            }]
-        );
-        client.on_reply(
-            peer,
-            65,
-            reply(&stretch[64..]),
-            now,
-            &mut verifier(&mut calls),
-        );
-        let ready = client.take_ready(64, stretch[63].hash, None, 128);
-        assert_eq!(ready.len(), 36);
-        assert_eq!(ready.last().unwrap().number, 100);
     }
 
     #[test]
     fn a_decide_above_the_range_anchors_through_the_bound_block_link() {
         let peer = PeerId::random();
-        let (mut client, now) = active(AnchorMode::Enforce, &[peer], 20);
+        let (mut client, now) = active(AnchorMode::Enforce, &[peer], 21);
         let blocks = chain(1, GENESIS, 21, 1);
         // Block 21 revealed the gap; a Decide (strict) names it.
-        client.note_link(blocks[20].hash, blocks[20].parent, 21);
-        client.note_strict_anchor(blocks[20].hash);
-        client.poll(now, 0, 1, None);
+        bind(&mut client, &blocks[20], true);
+        let (requests, _) = client.poll(now, 0, 1, Some(20));
+        assert_eq!((requests[0].start, requests[0].count), (5, 16));
         let mut calls = 0;
         client.on_reply(
             peer,
-            1,
-            reply(&blocks[..16]),
+            5,
+            reply(&blocks[4..20]),
             now,
             &mut verifier(&mut calls),
         );
-        assert!(client.take_ready(0, GENESIS, None, 64).is_empty());
-        let (requests, _) = client.poll(now, 0, 1, None);
-        assert_eq!(requests[0].start, 17);
-        client.on_reply(
-            peer,
-            17,
-            reply(&blocks[16..20]),
-            now,
-            &mut verifier(&mut calls),
-        );
+        assert!(client.take_ready(0, GENESIS, Some(20), 64).is_empty());
+        let (requests, _) = client.poll(now, 0, 1, Some(20));
+        assert_eq!((requests[0].start, requests[0].count), (1, 4));
+        client.on_reply(peer, 1, reply(&blocks[..4]), now, &mut verifier(&mut calls));
         // Handover: the range importer stops below the reverse-walk suffix.
         let ready = client.take_ready(0, GENESIS, Some(20), 64);
         assert_eq!(ready.len(), 20);
@@ -1638,28 +2023,18 @@ mod tests {
     fn parallel_ranges_from_two_peers_are_reordered_before_release() {
         let a = PeerId::random();
         let b = PeerId::random();
-        let (mut client, now) = active(AnchorMode::Enforce, &[a, b], 32);
-        let blocks = with_parent_qcs(chain(1, GENESIS, 33, 1), VERIFIED);
-        let (requests, _) = client.poll(now, 0, 1, None);
+        let (mut client, now) = active(AnchorMode::Enforce, &[a, b], 33);
+        let blocks = chain(1, GENESIS, 33, 1);
+        bind(&mut client, &blocks[32], true);
+        let (requests, _) = client.poll(now, 0, 1, Some(32));
         assert_eq!(requests.len(), 2, "two peers, two disjoint ranges");
         let low = *requests.iter().min_by_key(|request| request.start).unwrap();
         let high = *requests.iter().max_by_key(|request| request.start).unwrap();
         assert_eq!((low.start, high.start), (1, 17));
         assert_ne!(low.peer, high.peer);
-        let _ = request_for(&requests, a);
 
         let mut calls = 0;
-        client.on_reply(
-            high.peer,
-            17,
-            reply(&blocks[16..32]),
-            now,
-            &mut verifier(&mut calls),
-        );
-        assert!(
-            client.take_ready(0, GENESIS, None, 64).is_empty(),
-            "waits for the lower range"
-        );
+        // The lower range arrives first: held without an anchor.
         client.on_reply(
             low.peer,
             1,
@@ -1667,9 +2042,18 @@ mod tests {
             now,
             &mut verifier(&mut calls),
         );
-        let ready = client.take_ready(0, GENESIS, None, 64);
-        // 1..=31 are anchored by the QCs of their children; 32 waits.
-        assert_eq!(ready.len(), 31);
+        assert_eq!(client.unanchored.len(), 16);
+        assert!(client.take_ready(0, GENESIS, Some(32), 64).is_empty());
+        client.on_reply(
+            high.peer,
+            17,
+            reply(&blocks[16..32]),
+            now,
+            &mut verifier(&mut calls),
+        );
+        assert!(client.unanchored.is_empty());
+        let ready = client.take_ready(0, GENESIS, Some(32), 64);
+        assert_eq!(ready.len(), 32);
         assert!(ready.windows(2).all(|pair| pair[1].parent == pair[0].hash));
     }
 
@@ -1678,20 +2062,103 @@ mod tests {
         let peer = PeerId::random();
         let (mut client, now) = active(AnchorMode::Observe, &[peer], 20);
         for tick in 0..2 {
-            let (_, done) = client.poll(now + Duration::from_secs(tick), 19, 1, None);
+            let (_, done) = client.poll(now + Duration::from_secs(tick), 19, 1, Some(20));
             assert_eq!(done, None);
         }
-        let (_, done) = client.poll(now + Duration::from_secs(2), 19, 1, None);
+        let (_, done) = client.poll(now + Duration::from_secs(2), 19, 1, Some(20));
         assert_eq!(done, Some(Deactivation::CaughtUp));
         assert!(!client.is_active());
         assert_eq!(client.next_deadline(now), None);
 
         let (mut client, now) = active(AnchorMode::Observe, &[peer], 2000);
-        client.poll(now, 0, 1, None);
+        client.poll(now, 0, 1, Some(1999));
         let later = now + client.config.stall_timeout;
-        let (_, done) = client.poll(later, 0, 1, None);
+        let (_, done) = client.poll(later, 0, 1, Some(1999));
         assert_eq!(done, Some(Deactivation::Stalled));
         assert!(!client.activate(0, 5000, later), "cool-down after a stall");
+    }
+
+    #[test]
+    fn received_bodies_that_never_import_are_not_progress() {
+        // Blocks keep arriving but neither the head nor the anchored chain
+        // moves: the client stalls instead of fetching forever.
+        let peer = PeerId::random();
+        let (mut client, now) = active(AnchorMode::Observe, &[peer], 2000);
+        let mut calls = 0;
+        let mut at = now;
+        let mut done = None;
+        for _ in 0..200 {
+            let (requests, stopped) = client.poll(at, 0, 1, Some(1999));
+            if stopped.is_some() {
+                done = stopped;
+                break;
+            }
+            for request in requests {
+                let blocks = chain(request.start, B256::repeat_byte(1), request.count, 7);
+                client.on_reply(
+                    request.peer,
+                    request.start,
+                    reply(&blocks),
+                    at,
+                    &mut verifier(&mut calls),
+                );
+            }
+            at += Duration::from_secs(1);
+        }
+        assert_eq!(done, Some(Deactivation::Stalled));
+    }
+
+    #[test]
+    fn a_head_off_the_anchored_chain_stops_the_client_as_diverged() {
+        let peer = PeerId::random();
+        let mut client = RangeCatchup::new(config(), AnchorMode::Observe);
+        client.note_peer_status(peer, 101);
+        let now = Instant::now();
+        assert!(client.activate(10, 101, now));
+        let blocks = chain(1, GENESIS, 101, 1);
+        bind(&mut client, &blocks[100], true);
+        expect(&mut client, peer, 11, 90, now);
+        let mut calls = 0;
+        client.on_reply(
+            peer,
+            11,
+            reply(&blocks[10..100]),
+            now,
+            &mut verifier(&mut calls),
+        );
+        let abandoned = B256::repeat_byte(0x99);
+        assert!(
+            client
+                .take_ready(10, abandoned, Some(100), 64)
+                .is_empty()
+        );
+        assert_eq!(client.take_stop(), Some(Deactivation::Diverged));
+        assert!(!client.is_active());
+    }
+
+    #[test]
+    fn a_repeated_view_import_moves_the_release_position() {
+        let peer = PeerId::random();
+        let (mut client, now) = active(AnchorMode::Observe, &[peer], 40);
+        let blocks = chain(1, GENESIS, 40, 1);
+        bind(&mut client, &blocks[39], true);
+        expect(&mut client, peer, 1, 39, now);
+        let mut calls = 0;
+        client.on_reply(
+            peer,
+            1,
+            reply(&blocks[..39]),
+            now,
+            &mut verifier(&mut calls),
+        );
+        let first = client.take_ready(0, GENESIS, Some(39), 2);
+        assert_eq!(first.len(), 2);
+        // Block 2 imported without a forkchoice update: the head stays at 1.
+        client.imported(1, first[0].hash);
+        client.imported(2, first[1].hash);
+        let next = client.take_ready(1, first[0].hash, Some(39), 64);
+        assert_eq!(next.first().map(|block| block.number), Some(3));
+        assert_eq!(client.position(), (2, Some(first[1].hash)));
     }
 
     #[test]
@@ -1699,6 +2166,7 @@ mod tests {
         let peer = PeerId::random();
         let (mut client, now) = active(AnchorMode::Enforce, &[peer], 40);
         assert_eq!(client.import_failed(1, now), None);
+        assert!(client.work.contains_key(&1), "fetched again");
         assert_eq!(client.import_failed(1, now), None);
         assert_eq!(client.import_failed(1, now), Some(Deactivation::Stalled));
         assert!(!client.is_active());
@@ -1708,8 +2176,7 @@ mod tests {
     fn more_blocks_than_requested_is_a_fault() {
         let peer = PeerId::random();
         let (mut client, now) = active(AnchorMode::Observe, &[peer], 40);
-        client.in_flight.insert((peer, 1), (2, now));
-        client.peers.get_mut(&peer).unwrap().in_flight = 1;
+        expect(&mut client, peer, 1, 2, now);
         let mut calls = 0;
         let report = client.on_reply(
             peer,
@@ -1720,5 +2187,259 @@ mod tests {
         );
         assert_eq!(report.fault, Some("more blocks than requested"));
         assert_eq!(report.accepted, 2);
+    }
+
+    #[test]
+    fn work_intervals_merge_split_and_never_drop_heights() {
+        let (mut client, _) = active(AnchorMode::Observe, &[PeerId::random()], 40_000);
+        for height in (1..=5000u64).rev() {
+            client.add_work(height, height + 1);
+        }
+        assert_eq!(client.work.len(), 1);
+        assert_eq!(client.work.get(&1), Some(&5001), "no cap on a merged range");
+        client.take_work(100, 200);
+        assert_eq!(client.work.get(&1), Some(&100));
+        assert_eq!(client.work.get(&200), Some(&5001));
+        client.add_work(150, 250);
+        assert_eq!(client.work.get(&150), Some(&5001));
+    }
+
+    /// Simulations against honest and forging peers; written against the
+    /// public interface only, so they also run on the first version of the
+    /// client (where review items 1-4 make them fail).
+    mod regression {
+        use super::super::*;
+
+        const ROOT: B256 = B256::repeat_byte(0xab);
+
+        fn segment(first: u64, parent: B256, len: u64, salt: u8) -> Vec<RangeBlock> {
+            let mut parent = parent;
+            (first..first + len)
+                .map(|number| {
+                    let mut seed = number.to_le_bytes().to_vec();
+                    seed.extend_from_slice(parent.as_slice());
+                    seed.push(salt);
+                    let block = RangeBlock {
+                        number,
+                        hash: keccak256(seed),
+                        parent,
+                        view: number,
+                        qc: ExtraQc::Absent,
+                        rlp: vec![salt; 100],
+                    };
+                    parent = block.hash;
+                    block
+                })
+                .collect()
+        }
+
+        struct Net {
+            /// Block `n` at index `n - 1`; QC-less headers (n42-26 today).
+            chain: Vec<RangeBlock>,
+            served: u64,
+            forger: Option<PeerId>,
+        }
+
+        impl Net {
+            fn new(len: u64) -> Self {
+                Self {
+                    chain: segment(1, ROOT, len, 1),
+                    served: 0,
+                    forger: None,
+                }
+            }
+
+            fn serve(&mut self, request: RangeRequest) -> RangeReply {
+                let from = (request.start - 1) as usize;
+                let to = (from + request.count as usize).min(self.chain.len());
+                if from >= to {
+                    return RangeReply::Blocks(Vec::new());
+                }
+                self.served += (to - from) as u64;
+                let blocks = if Some(request.peer) == self.forger {
+                    let parent = if from == 0 {
+                        ROOT
+                    } else {
+                        self.chain[from - 1].hash
+                    };
+                    segment(request.start, parent, (to - from) as u64, 0xf0)
+                } else {
+                    self.chain[from..to].to_vec()
+                };
+                RangeReply::Blocks(blocks.into_iter().map(Ok).collect())
+            }
+        }
+
+        /// Activates the client for a gap closed by the last block of the
+        /// chain (the staged block that revealed it).
+        fn start(
+            net: &Net,
+            config: RangeCatchupConfig,
+            mode: AnchorMode,
+            peers: &[PeerId],
+            head: u64,
+            strict: bool,
+        ) -> (RangeCatchup, Instant) {
+            let mut client = RangeCatchup::new(config, mode);
+            let top = net.chain.last().unwrap().clone();
+            for peer in peers {
+                client.note_peer_status(*peer, top.number);
+            }
+            let now = Instant::now();
+            assert!(client.activate(head, top.number, now));
+            client.note_link(top.hash, top.parent, top.number);
+            if strict {
+                client.note_strict_anchor(top.hash);
+            } else {
+                client.note_loose_anchor(top.hash);
+            }
+            (client, now)
+        }
+
+        /// One poll, the replies in request order, one import per second.
+        fn run(
+            client: &mut RangeCatchup,
+            net: &mut Net,
+            head: &mut (u64, B256),
+            seconds: u64,
+            now: Instant,
+        ) {
+            let stop_at = net.chain.len() as u64 - 1;
+            for tick in 0..seconds {
+                let at = now + Duration::from_secs(tick);
+                let (requests, _) = client.poll(at, head.0, 1, Some(stop_at));
+                if !client.is_active() {
+                    return;
+                }
+                for request in requests {
+                    let reply = net.serve(request);
+                    client.on_reply(request.peer, request.start, reply, at, &mut |_| {
+                        QcCheck::UnknownEpoch
+                    });
+                }
+                for block in client.take_ready(head.0, head.1, Some(stop_at), usize::MAX) {
+                    assert_eq!(block.parent, head.1, "released in chain order");
+                    *head = (block.number, block.hash);
+                }
+                if !client.is_active() {
+                    return;
+                }
+            }
+        }
+
+        fn peers(count: usize) -> Vec<PeerId> {
+            let mut peers: Vec<PeerId> = (0..count).map(|_| PeerId::random()).collect();
+            peers.sort();
+            peers
+        }
+
+        /// Review item 1: a 5000-block QC-less gap with four honest peers
+        /// used to stop at 1088 (merged requeues capped at 1024 lost
+        /// heights) after downloading 6024 bodies.
+        #[test]
+        fn qc_less_gap_of_5000_catches_up_with_four_honest_peers() {
+            let mut net = Net::new(5001);
+            let (mut client, now) = start(
+                &net,
+                RangeCatchupConfig::default(),
+                AnchorMode::Enforce,
+                &peers(4),
+                0,
+                true,
+            );
+            let mut head = (0, ROOT);
+            run(&mut client, &mut net, &mut head, 600, now);
+            assert_eq!(head.0, 5000, "reaches the staged block");
+            assert_eq!(net.served, 5000, "every body downloaded once");
+        }
+
+        /// Review item 1 with a byte budget far below the gap: evicted
+        /// heights are fetched again, none is lost, nothing loops.
+        #[test]
+        fn a_small_budget_refetches_without_losing_heights() {
+            let mut net = Net::new(1001);
+            let config = RangeCatchupConfig {
+                reorder_bytes: 100 * 100,
+                ..RangeCatchupConfig::default()
+            };
+            let (mut client, now) =
+                start(&net, config, AnchorMode::Observe, &peers(4), 0, false);
+            let mut head = (0, ROOT);
+            run(&mut client, &mut net, &mut head, 600, now);
+            assert_eq!(head.0, 1000);
+            assert!(net.served <= 2000, "served {}", net.served);
+        }
+
+        /// Review item 2: QC-less headers anchor only at the top; a
+        /// bottom-up plan held 64 bodies and downloaded the rest twice, in
+        /// observe as well.
+        #[test]
+        fn a_qc_less_gap_downloads_each_body_once_in_observe() {
+            let mut net = Net::new(501);
+            let (mut client, now) = start(
+                &net,
+                RangeCatchupConfig::default(),
+                AnchorMode::Observe,
+                &peers(4),
+                0,
+                false,
+            );
+            let mut head = (0, ROOT);
+            run(&mut client, &mut net, &mut head, 600, now);
+            assert_eq!(head.0, 500);
+            assert_eq!(net.served, 500);
+        }
+
+        /// Review item 2: nothing above head + max_links used to import.
+        #[test]
+        fn a_gap_beyond_the_link_window_still_imports() {
+            let mut net = Net::new(3001);
+            let config = RangeCatchupConfig {
+                max_links: 1000,
+                ..RangeCatchupConfig::default()
+            };
+            let (mut client, now) =
+                start(&net, config, AnchorMode::Observe, &peers(4), 0, false);
+            let mut head = (0, ROOT);
+            run(&mut client, &mut net, &mut head, 600, now);
+            assert_eq!(head.0, 3000);
+        }
+
+        /// Review item 3: a head on an abandoned branch used to drop and
+        /// re-request head + 1 forever (received bytes counted as progress).
+        #[test]
+        fn a_head_on_an_abandoned_branch_stops_the_client() {
+            let mut net = Net::new(101);
+            let (mut client, now) = start(
+                &net,
+                RangeCatchupConfig::default(),
+                AnchorMode::Observe,
+                &peers(2),
+                10,
+                false,
+            );
+            let mut head = (10, B256::repeat_byte(0x99));
+            run(&mut client, &mut net, &mut head, 300, now);
+            assert!(!client.is_active(), "stops instead of refetching forever");
+            assert_eq!(head.0, 10);
+        }
+
+        /// Review item 4: one forged head + 1 reply from a same-genesis peer
+        /// used to hold the head until the client stalled.
+        #[test]
+        fn a_forging_peer_cannot_wedge_the_importer() {
+            let mut net = Net::new(1001);
+            let all = peers(5);
+            net.forger = Some(all[0]);
+            let config = RangeCatchupConfig {
+                request_blocks: 64,
+                ..RangeCatchupConfig::default()
+            };
+            let (mut client, now) = start(&net, config, AnchorMode::Observe, &all, 0, true);
+            let mut head = (0, ROOT);
+            run(&mut client, &mut net, &mut head, 60, now);
+            assert_eq!(head.0, 1000, "honest peers finish the gap");
+            assert!(client.stats().faults >= 1, "the forger is scored");
+        }
     }
 }
