@@ -10,11 +10,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 所有 git 提交不要包含 "Claude" 或 "Co-Authored-By: Claude" 等字样。
 
-提交命令模板：
-```
-GIT_COMMITTER_NAME="Nyxen" GIT_COMMITTER_EMAIL="40690755+MiraWells@users.noreply.github.com" \
-  git commit --author="Nyxen <40690755+MiraWells@users.noreply.github.com>" -m "message"
-```
+提交使用提交人自己的 git 身份（本机 `user.name` / `user.email`），直接 `git commit`。
+不要用 `--author` 或 `GIT_COMMITTER_NAME` / `GIT_COMMITTER_EMAIL` 把提交记到别人名下：
+那样 GitHub 会把改动显示在别人的账号下，谁改了什么就查不清了。
 
 ## 项目上下文
 
