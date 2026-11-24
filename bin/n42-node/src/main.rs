@@ -475,7 +475,16 @@ fn load_profile1_execution_base(
         branch_state_path.to_path_buf(),
     )
     .map_err(|error| eyre::eyre!("failed to initialize the Profile-1 QMDB store: {error}"))?;
-    info!(target: "n42::profile1", %genesis_hash, %root, "QMDB execution base: the genesis alloc");
+    // A10/AM25: header N carries N−1's execution result; the registry of
+    // results lives beside the QMDB state, genesis seeded with its own fields.
+    let executed_fields_log = branch_state_path.with_file_name("executed_fields.log");
+    let loaded = n42_consensus::install_executed_fields_log(
+        &executed_fields_log,
+        genesis_hash,
+        &genesis_header,
+    )
+    .map_err(|error| eyre::eyre!("refusing to start: {error}"))?;
+    info!(target: "n42::profile1", %genesis_hash, %root, executed_fields_loaded = loaded, "QMDB execution base: the genesis alloc");
     Ok(QmdbExecutionBootstrap {
         store: Arc::new(store),
         checkpoint,

@@ -19,6 +19,7 @@ pub mod rotor;
 pub mod validator;
 pub mod vote_log;
 pub mod deferred_depth;
+pub mod executed_fields;
 pub mod vote_rules;
 
 pub use adapter::{
@@ -32,6 +33,10 @@ pub use committee_pool::{
     ConsensusEvidence as CommitteeConsensusEvidence, SimulatedCommitteePool, shared_committee_pool,
 };
 pub use error::ConsensusError as N42ConsensusError;
+pub use executed_fields::{
+    ExecutedFields, ExecutedFieldsError, executed_fields, install_executed_fields_log,
+    remember_executed_fields, wait_for_executed_fields,
+};
 pub use gov5_native_header::{
     Gov5NativeHeader, Gov5NativeHeaderError, gov5_native_header_rlp, remember_gov5_native_header,
     remembered_gov5_native_header, remembered_profile1_header,
