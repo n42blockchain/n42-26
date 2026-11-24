@@ -21,7 +21,7 @@ pub use config::{
     PROFILE_1, Profile1CommitteePool, Profile1Config, Profile1Validator, parse_dev_block_reward,
 };
 pub use header::{
-    PROFILE1_EXTRA_MAGIC, PROFILE1_MAX_EXTRA_LEN, PROFILE1_SEAL_LEN, Profile1Extra,
+    PROFILE1_EXTRA_MAGIC, PROFILE1_MAX_EXTRA_LEN, PROFILE1_REQUESTS_HASH, PROFILE1_SEAL_LEN, Profile1Extra,
     Profile1ExtraError, Profile1Header, Profile1HeaderError, Profile1SealError, profile1_extra,
 };
 
@@ -278,7 +278,8 @@ fn check_profile1_header_fields(
 
 /// The Profile-1 genesis header (A6, V1): the fields of the genesis file;
 /// `stateRoot` the QMDB root of the alloc (A5); empty-trie transactions,
-/// receipts, withdrawals and requests roots (AM3); zero ommers hash (B3);
+/// receipts and withdrawals roots; EIP-7685's empty requests hash (AM24);
+/// zero ommers hash (B3);
 /// zero blob gas, parent beacon root and mobile-registry root; element 22
 /// the gap; slot number 0.
 pub fn profile1_genesis_header(
@@ -312,7 +313,7 @@ pub fn profile1_genesis_header(
             blob_gas_used: Some(0),
             excess_blob_gas: Some(0),
             parent_beacon_block_root: Some(B256::ZERO),
-            requests_hash: Some(EMPTY_ROOT_HASH),
+            requests_hash: Some(PROFILE1_REQUESTS_HASH),
             block_access_list_hash: None,
             slot_number: Some(0),
         },

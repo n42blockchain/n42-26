@@ -24,7 +24,3 @@ Test validator keys (gov5 fixture, reused when genesis.json is cut):
 BLS secret i (i = 0..3) = 0x00 || sha256("n42-profile1-test-validator-<i>")[1:]
 (top byte zeroed so it is below the BLS12-381 group order), public key = the
 48-byte compressed G1 point, address = last 20 bytes of keccak256(pubkey).
-
-Update: refused/ now has 33 cases (19 added at gov5 feat/profile1 0b9b9293, the
-equivalents of n42-rs refused_*.json; n42-rs cases themselves are in gov5
-internal/testdata/profile1/vectors/V8/refused-n42rs, checked by TestProfile1RefusedGenesisN42rs).

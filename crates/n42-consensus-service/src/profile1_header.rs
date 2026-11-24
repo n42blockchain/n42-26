@@ -1,5 +1,5 @@
 //! Static header validity on a Profile-1 chain (mixed production standard
-//! B1-B4, B8-B14, A23, AM3, AM4), checked against the parent header.
+//! B1-B4, B8-B14, A23, AM4, AM24), checked against the parent header.
 //!
 //! [`validate_profile1_header`] is the import-time check: it depends only on
 //! the header, its parent, the genesis validator set and leader schedule, and
@@ -59,7 +59,7 @@ pub enum Profile1HeaderInvalid {
     TimeBeforeParent { time: u64, parent: u64 },
     #[error("profile 1 (B4): timestamp too far ahead of the local clock: {time} > floor(now) + 2 = {bound}")]
     TimeFuture { time: u64, bound: u64 },
-    #[error("profile 1 (B8): requestsHash is not the empty-trie root: {0:?}")]
+    #[error("profile 1 (B8, AM24): requestsHash is not sha256(\"\") of EIP-7685: {0:?}")]
     RequestsHash(Option<B256>),
     #[error("profile 1 (B9): blob gas fields are not zero: blobGasUsed {used:?}, excessBlobGas {excess:?}")]
     BlobGas {
@@ -163,8 +163,8 @@ pub fn validate_profile1_header(
             parent: p.timestamp,
         });
     }
-    // B8 (AM3).
-    if h.requests_hash != Some(alloy_consensus::EMPTY_ROOT_HASH) {
+    // B8 (AM24): EIP-7685's empty requests hash; the empty-trie root is refused.
+    if h.requests_hash != Some(n42_chainspec::profile1::PROFILE1_REQUESTS_HASH) {
         return Err(Profile1HeaderInvalid::RequestsHash(h.requests_hash));
     }
     // B9.
@@ -388,6 +388,10 @@ mod tests {
                         });
                     let error = result.expect_err(name);
                     eprintln!("{name}: {error}  [gov5: {}]", refusal["gov5Message"]);
+                    if name.starts_with("requestsHash") {
+                        // AM24: the empty-trie root is refused by B8 itself.
+                        assert!(error.contains("(B8, AM24)"), "{name}: {error}");
+                    }
                     checked += 1;
                 }
                 "vote" => {

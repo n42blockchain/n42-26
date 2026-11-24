@@ -86,7 +86,7 @@ fn genesis_8s_loads_to_the_v1_genesis_header() {
     let expected = Profile1Header::decode(&bytes(&vector["genesis"]["rlp"])).unwrap();
     assert_eq!(header.header.state_root, expected.header.state_root, "stateRoot (A5)");
     assert_eq!(header.header.ommers_hash, B256::ZERO, "ommersHash (B3)");
-    assert_eq!(header.header.requests_hash, expected.header.requests_hash, "requestsHash (AM3)");
+    assert_eq!(header.header.requests_hash, expected.header.requests_hash, "requestsHash (AM24)");
     assert_eq!(header.mobile_registry_root, expected.mobile_registry_root);
     assert_eq!(header, expected);
 
@@ -96,6 +96,17 @@ fn genesis_8s_loads_to_the_v1_genesis_header() {
     assert_eq!(hash(&vector["genesis"]["hash"]), genesis_hash);
     assert_eq!(spec.genesis_hash(), genesis_hash);
     assert_eq!(spec.chain().id(), 1144);
+    // AM24: EIP-7685's sha256("") in requestsHash gives this genesis hash.
+    assert_eq!(
+        header.header.requests_hash,
+        Some(n42_chainspec::profile1::PROFILE1_REQUESTS_HASH)
+    );
+    assert_eq!(
+        genesis_hash,
+        "0x188e9d930cfd43317416b0f65e8f98240ae686407ba806b854e98428c3b490dc"
+            .parse::<B256>()
+            .unwrap()
+    );
 
     // The cause of the earlier mismatch: reth's own genesis header of the
     // same file carries the Ethereum MPT root of the alloc (0xac68dc35…),
@@ -172,7 +183,7 @@ fn every_v8_refused_genesis_is_refused() {
         .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
         .collect();
     cases.sort();
-    assert!(cases.len() >= 33, "V8 has {} refused cases", cases.len());
+    assert_eq!(cases.len(), 14, "V8 has {} refused cases", cases.len());
     for path in cases {
         let case = read_json(&path);
         let name = case["case"].as_str().unwrap();

@@ -59,7 +59,7 @@ mod tests {
         let spec = N42ChainSpecParser::parse(v1_genesis().to_str().unwrap()).unwrap();
         assert_eq!(
             spec.genesis_hash(),
-            "0x6f733745517957b421dcea37f6c879db89501aac0715f769fbc76ec54efe7e4f"
+            "0x188e9d930cfd43317416b0f65e8f98240ae686407ba806b854e98428c3b490dc"
                 .parse::<alloy_primitives::B256>()
                 .unwrap()
         );

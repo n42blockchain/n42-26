@@ -81,3 +81,28 @@
 3. Amsterdam 执行集合（AM1）、延迟执行 k=1（A10/B13）、AM2 去掉 8 MiB 上限。
 4. 后续向量可参考 n42-rs 现成的测试骨架：`crates/n42/engine-types/src/profile1_vectors.rs`（V3/V4）与
    `crates/n42/h2-consensus/tests/profile1_v6.rs`（V6）；移植清单见 n42-rs `docs/PORT_PROFILE1_TO_N42_26.md`。
+
+## 6. AM24：requestsHash 改为 EIP-7685 的 sha256("")（2026-11-24 追加）
+
+**设计决策。** 标准 AM24（owner 决定，n42-rs main，冻结文本 `docs/MIXED_PRODUCTION_STANDARD_V1_RC.md` v1.0-rc2）：
+Profile 1 的每个头（含创世）`requestsHash = sha256("") = 0xe3b0c442…b855`，空 trie 根 `0x56e81f17…b421`
+改为**拒绝**。原 AM3 的空 trie 根写法作废。
+
+**实施。**
+- `n42-chainspec/src/profile1/header.rs`：新常量 `PROFILE1_REQUESTS_HASH`（sha256("")），从 `profile1` 模块导出。
+- `profile1_genesis_header`：创世 `requests_hash = Some(PROFILE1_REQUESTS_HASH)`。
+- `n42-consensus-service/src/profile1_header.rs`：B8 只接受 `PROFILE1_REQUESTS_HASH`，错误信息带 `(B8, AM24)`；
+  V1 拒绝用例 `requestsHash empty-trie root` 的测试断言它由 B8 拒绝。
+- 测试数据换成 n42-rs origin/main（f6c2fd6aa）带 SHA-256 清单的版本，逐个核对清单一致：
+  V1 取自 `crates/n42/h2-consensus/testdata/profile1/`（README `c69c8fc2…`、genesis_8s `effc8f8a…`（未变）、
+  header_profile_v1 `4d5d78bb…`）；V8 取自 `crates/n42/qmdb-reth/testdata/profile1/gov5/V8/`（allowed-keys
+  `d4994e7b…`（未变）、README `7a0d47d2…`、14 个拒绝创世）。
+- 新创世哈希 `0x188e9d930cfd43317416b0f65e8f98240ae686407ba806b854e98428c3b490dc`，在
+  `genesis_8s_loads_to_the_v1_genesis_header` 与 `chainspec_parser` 测试里显式断言。
+
+**问题。** n42-rs 清单里的 V8 只有 14 个拒绝用例（gov5 feat/profile1 015bd9f6），是此前 qs-scratch 副本
+33 个的子集（14 个文件逐字节相同）。按要求以清单为准替换，另外 19 个（extra_data、nonzero_fork、profile_2、
+three_validators 等）从 testdata 删除；`every_v8_refused_genesis_is_refused` 改为恰好 14 个。代码中对应的拒绝
+规则未删，仍生效。qs-scratch 目录仍是旧向量，不再使用。
+
+**状态。** `n42-chainspec` profile1_vectors 11 个、`profile1_header` 3 个、`chainspec_parser` 3 个测试通过。

@@ -35,6 +35,14 @@ pub const PROFILE1_MAX_EXTRA_LEN: usize = 4096;
 /// Number of RLP elements of a Profile-1 header.
 pub const PROFILE1_HEADER_ELEMENTS: usize = 24;
 
+/// AM24: every Profile-1 header, genesis included, carries EIP-7685's
+/// requests hash of an empty request list, `sha256("")`. The empty-trie root
+/// is refused (B8).
+pub const PROFILE1_REQUESTS_HASH: B256 = B256::new([
+    0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+    0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+]);
+
 /// Why bytes are not a Profile-1 header.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Profile1HeaderError {
