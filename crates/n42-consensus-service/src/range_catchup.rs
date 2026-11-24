@@ -742,7 +742,11 @@ impl RangeCatchup {
         }
         self.unanchored = keep;
         self.anchored = self.anchored.split_off(&number);
-        let stale: Vec<u64> = self.work.range(..=number).map(|(start, _)| *start).collect();
+        let stale: Vec<u64> = self
+            .work
+            .range(..=number)
+            .map(|(start, _)| *start)
+            .collect();
         for start in stale {
             if let Some(end) = self.work.remove(&start)
                 && end > number + 1
@@ -831,14 +835,15 @@ impl RangeCatchup {
     /// Blocks that still fit the byte budget, counting replies in flight at
     /// the observed average body size (unbounded before the first reply).
     fn room_blocks(&self) -> u64 {
-        if self.avg_block_bytes == 0 {
-            return u64::MAX;
-        }
         let in_flight: u64 = self.in_flight.values().map(|flight| flight.count).sum();
         let committed = self
             .buffer_bytes
             .saturating_add((in_flight as usize).saturating_mul(self.avg_block_bytes));
-        (self.config.reorder_bytes.saturating_sub(committed) / self.avg_block_bytes) as u64
+        self.config
+            .reorder_bytes
+            .saturating_sub(committed)
+            .checked_div(self.avg_block_bytes)
+            .map_or(u64::MAX, |blocks| blocks as u64)
     }
 
     /// The next range to request, by priority:
@@ -1114,9 +1119,10 @@ impl RangeCatchup {
                 ExtraQc::Present(qc) => {
                     let (_, number) = *self.links.get(&qc.block_hash)?;
                     let useful = number > self.head_number
-                        && !self.anchored.get(&number).is_some_and(|anchor| {
-                            anchor.strict && anchor.hash == qc.block_hash
-                        });
+                        && !self
+                            .anchored
+                            .get(&number)
+                            .is_some_and(|anchor| anchor.strict && anchor.hash == qc.block_hash);
                     useful.then(|| qc.clone())
                 }
                 _ => None,
@@ -1152,8 +1158,7 @@ impl RangeCatchup {
         let accepted = kept.len();
         report.accepted = accepted;
         let delivered_bytes: usize = kept.iter().map(|block| block.rlp.len()).sum();
-        if accepted > 0 {
-            let average = delivered_bytes / accepted;
+        if let Some(average) = delivered_bytes.checked_div(accepted) {
             self.avg_block_bytes = if self.avg_block_bytes == 0 {
                 average
             } else {
@@ -1240,7 +1245,10 @@ impl RangeCatchup {
         while next > 0 {
             next -= 1;
             let linked = self.unanchored.contains_key(&next)
-                && self.buffer.get(&next).is_some_and(|block| block.hash == parent);
+                && self
+                    .buffer
+                    .get(&next)
+                    .is_some_and(|block| block.hash == parent);
             if !linked {
                 break;
             }
@@ -1440,10 +1448,7 @@ impl RangeCatchup {
                 }
                 break;
             }
-            let loose_only = !self
-                .anchored
-                .get(&next)
-                .is_some_and(|anchor| anchor.strict);
+            let loose_only = !self.anchored.get(&next).is_some_and(|anchor| anchor.strict);
             let Some(block) = self.drop_buffered(next) else {
                 break;
             };
@@ -2127,11 +2132,7 @@ mod tests {
             &mut verifier(&mut calls),
         );
         let abandoned = B256::repeat_byte(0x99);
-        assert!(
-            client
-                .take_ready(10, abandoned, Some(100), 64)
-                .is_empty()
-        );
+        assert!(client.take_ready(10, abandoned, Some(100), 64).is_empty());
         assert_eq!(client.take_stop(), Some(Deactivation::Diverged));
         assert!(!client.is_active());
     }
@@ -2362,8 +2363,7 @@ mod tests {
                 reorder_bytes: 100 * 100,
                 ..RangeCatchupConfig::default()
             };
-            let (mut client, now) =
-                start(&net, config, AnchorMode::Observe, &peers(4), 0, false);
+            let (mut client, now) = start(&net, config, AnchorMode::Observe, &peers(4), 0, false);
             let mut head = (0, ROOT);
             run(&mut client, &mut net, &mut head, 600, now);
             assert_eq!(head.0, 1000);
@@ -2398,8 +2398,7 @@ mod tests {
                 max_links: 1000,
                 ..RangeCatchupConfig::default()
             };
-            let (mut client, now) =
-                start(&net, config, AnchorMode::Observe, &peers(4), 0, false);
+            let (mut client, now) = start(&net, config, AnchorMode::Observe, &peers(4), 0, false);
             let mut head = (0, ROOT);
             run(&mut client, &mut net, &mut head, 600, now);
             assert_eq!(head.0, 3000);
