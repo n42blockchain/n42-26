@@ -201,6 +201,11 @@ pub fn expand_frame_ref_payload(payload: &[u8], store: &FrameStore) -> Result<Ve
     if run_count > tx_count {
         return Err(FrameRefError::Malformed("more runs than transactions"));
     }
+    // A run is twelve bytes: refuse a count the payload cannot hold before
+    // reserving for it.
+    if run_count as usize > reader.0.len() / 12 {
+        return Err(FrameRefError::Malformed("runs truncated"));
+    }
     let mut runs = Vec::with_capacity(run_count as usize);
     for _ in 0..run_count {
         runs.push((reader.u32()?, reader.u32()?, reader.u32()?));
@@ -246,6 +251,12 @@ pub fn expand_frame_ref_payload(payload: &[u8], store: &FrameStore) -> Result<Ve
     }
     if loose_count > reader.0.len() as u64 / 4 {
         return Err(FrameRefError::Malformed("loose transactions truncated"));
+    }
+    // Runs may name the same stored transactions again and again, so a
+    // small payload can stand for an arbitrarily large one. Hold the result
+    // to the bound a compressed payload expands under.
+    if header.len() + referenced_bytes + reader.0.len() > super::MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE {
+        return Err(FrameRefError::Malformed("expanded payload too large"));
     }
 
     let mut out = Vec::with_capacity(
@@ -337,6 +348,44 @@ mod tests {
         assert_eq!(
             expand_frame_ref_payload(&encoded.bytes, &partial),
             Err(FrameRefError::Missing { missing: 1, frames: 2 })
+        );
+    }
+
+    /// One stored megabyte named 600 times stands for 600 MiB in about 7 KB.
+    #[test]
+    fn runs_that_repeat_a_frame_past_the_size_bound_are_refused() {
+        let store = FrameStore::new(8);
+        let transaction = Bytes::from(vec![0x50; 1024 * 1024]);
+        let root = B256::repeat_byte(9);
+        store.insert(root, vec![transaction.clone()], vec![alloy_primitives::keccak256(&transaction)]);
+        let payload = |repeats: u32| {
+            let mut bytes = EXECUTION_PAYLOAD_FRAME_REF_MAGIC.to_vec();
+            bytes.extend_from_slice(&2u32.to_le_bytes());
+            bytes.extend_from_slice(&repeats.to_le_bytes());
+            bytes.extend_from_slice(b"{}");
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(root.as_slice());
+            bytes.extend_from_slice(&repeats.to_le_bytes());
+            for _ in 0..repeats {
+                for field in [0u32, 0, 1] {
+                    bytes.extend_from_slice(&field.to_le_bytes());
+                }
+            }
+            bytes
+        };
+        assert_eq!(
+            expand_frame_ref_payload(&payload(600), &store),
+            Err(FrameRefError::Malformed("expanded payload too large"))
+        );
+        // Under the bound the same shape still expands.
+        assert_eq!(expand_frame_ref_payload(&payload(2), &store).unwrap().len(), 16 + 2 + 2 * (4 + 1024 * 1024));
+
+        // A run count the payload cannot hold is refused before reserving.
+        let mut short = payload(600);
+        short.truncate(short.len() - 12);
+        assert_eq!(
+            expand_frame_ref_payload(&short, &store),
+            Err(FrameRefError::Malformed("runs truncated"))
         );
     }
 

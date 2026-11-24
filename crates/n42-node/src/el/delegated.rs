@@ -64,10 +64,17 @@ impl DelegatedExecutionLayer {
             body.len(),
         );
         let failed = |error: std::io::Error| ElError(format!("execution owner: {error}"));
-        let mut stream = tokio::net::TcpStream::connect(self.owner).await.map_err(failed)?;
-        stream.write_all(request.as_bytes()).await.map_err(failed)?;
         let mut response = Vec::with_capacity(2048);
-        stream.read_to_end(&mut response).await.map_err(failed)?;
+        // An owner that accepts the connection and then stalls must not hold
+        // this key's engine calls open: one exchange gets the whole wait.
+        tokio::time::timeout(self.wait, async {
+            let mut stream = tokio::net::TcpStream::connect(self.owner).await?;
+            stream.write_all(request.as_bytes()).await?;
+            stream.read_to_end(&mut response).await
+        })
+        .await
+        .map_err(|_| ElError(format!("execution owner: no answer in {:?}", self.wait)))?
+        .map_err(failed)?;
         let response = String::from_utf8_lossy(&response);
         let Some((_, answer)) = response.split_once("\r\n\r\n") else {
             return Err(ElError("execution owner: malformed HTTP response".into()));
@@ -152,5 +159,37 @@ impl ExecutionLayer for DelegatedExecutionLayer {
         _kind: ResolveKind,
     ) -> Option<Result<BuiltBlock, ElError>> {
         None
+    }
+}
+
+#[cfg(test)]
+mod stalled_owner_tests {
+    use super::*;
+
+    /// An owner that accepts the connection and never answers ends the
+    /// exchange with an error once the wait has passed.
+    #[tokio::test]
+    async fn an_owner_that_accepts_and_stalls_is_given_up_on() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let owner = listener.local_addr().unwrap();
+        // Hold accepted connections open without reading or writing.
+        let held = tokio::spawn(async move {
+            let mut open = Vec::new();
+            loop {
+                if let Ok((stream, _)) = listener.accept().await {
+                    open.push(stream);
+                }
+            }
+        });
+        let layer = DelegatedExecutionLayer {
+            owner,
+            wait: Duration::from_millis(100),
+            committed: None,
+        };
+        let answer = tokio::time::timeout(Duration::from_secs(5), layer.owner_holds(B256::ZERO))
+            .await
+            .expect("the exchange must end on its own");
+        assert!(answer.unwrap_err().0.contains("no answer"));
+        held.abort();
     }
 }

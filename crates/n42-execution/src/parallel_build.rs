@@ -1399,6 +1399,8 @@ mod tests {
         direct_equals_evm2("a recipient that sends later", &chained, 4);
         direct_equals_evm2("zero value to an empty account mid-run", &[transfer(1, 0, addr(2), 1), transfer(1, 1, addr(FRESH), 0)], 1);
         direct_equals_evm2("to a precompile after a transfer", &[transfer(1, 0, addr(2), 1), transfer(1, 1, Address::with_last_byte(4), 1)], 1);
+        // The N42 randomness precompile sits above the Ethereum range.
+        direct_equals_evm2("to the randomness precompile after a transfer", &[transfer(1, 0, addr(2), 1), transfer(1, 1, alloy_primitives::address!("0000000000000000000000000000000000000302"), 1)], 1);
         // The created account spends in its payer's group, after the credit.
         direct_equals_evm2("a creating transfer then the created spending", &[transfer(1, 0, addr(FRESH), 1_000_000_000_000_000), transfer(FRESH, 0, addr(5), 1)], 2);
     }

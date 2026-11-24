@@ -12,7 +12,7 @@ use std::borrow::Cow;
 use crate::precompile_random;
 
 /// Address of the N42 randomness precompile: `0x0302`.
-const RANDOMNESS_PRECOMPILE_ADDR: alloy_primitives::Address =
+pub(crate) const RANDOMNESS_PRECOMPILE_ADDR: alloy_primitives::Address =
     address!("0000000000000000000000000000000000000302");
 
 /// Build precompiles for a given spec, adding the N42 randomness precompile.

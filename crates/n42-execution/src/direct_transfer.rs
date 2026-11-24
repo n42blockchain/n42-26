@@ -521,11 +521,13 @@ pub fn refusal(spec: SpecId, version: &Version) -> Option<&'static str> {
     None
 }
 
-/// Whether `address` is at or below 0x1ff: every precompile of Prague and
-/// Osaka (0x01-0x11, P256VERIFY at 0x100) is, and a transfer to that range
-/// is left to evm2.
+/// Whether `address` is at or below 0x1ff or is the N42 randomness
+/// precompile: every precompile of Prague and Osaka (0x01-0x11, P256VERIFY at
+/// 0x100) is in that range, the randomness precompile (0x0302) sits above it,
+/// and a transfer to any of them is left to evm2.
 fn in_precompile_range(address: &Address) -> bool {
-    address.0[..18].iter().all(|b| *b == 0) && address.0[18] <= 1
+    (address.0[..18].iter().all(|b| *b == 0) && address.0[18] <= 1)
+        || *address == crate::evm_factory::RANDOMNESS_PRECOMPILE_ADDR
 }
 
 #[cfg(test)]
@@ -540,5 +542,7 @@ mod tests {
         assert!(in_precompile_range(&Address::left_padding_from(&[0x01, 0xff])));
         assert!(!in_precompile_range(&Address::left_padding_from(&[0x02, 0x00])));
         assert!(!in_precompile_range(&Address::left_padding_from(&[0x01, 0x00, 0x01])));
+        assert!(in_precompile_range(&Address::left_padding_from(&[0x03, 0x02])));
+        assert!(!in_precompile_range(&Address::left_padding_from(&[0x03, 0x01])));
     }
 }

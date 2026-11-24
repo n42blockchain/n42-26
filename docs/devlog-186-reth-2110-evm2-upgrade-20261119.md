@@ -1326,3 +1326,36 @@ n42-rs 的做法（`docs/PERSISTENCE_COST_STUDY.md`）：fleet 用 `--prune.tran
 - 交易哈希排序使 rocksdb 提交降到约三分之一；静态文件并行落盘在机群上只省约 18%。
 - run186 rocksdb 写阶段中账户历史 28.4 s，交易哈希 2.2 s：下一个瓶颈是账户历史索引（关闭/推迟需用户决定，见续九）。
 - 机器占用：BP 约 4 分钟、BQ 约 4 分钟，前后均自动释放。
+
+## 进度记录（2026-11-24）：PR #31 评审发现的三处修复
+
+PR #31（本分支合入 main）评审中确认的三处缺陷，各附回归测试。
+
+### 1. 直接转账路径漏掉随机数预编译 0x0302
+
+- **缺陷**：`direct_transfer.rs` 的 `in_precompile_range` 按"地址 ≤ 0x01ff"排除预编译，N42 随机数预编译在 0x0302（`evm_factory.rs`），不在范围内。该账户无代码，其余检查全部通过，转账被直接应用。
+- **后果**：一笔空 input、转 1 wei 到 0x0302、gas 上限 21000 的交易，evm2 判预编译 gas 不足（需 100）、status 0、金额不动；直接路径 status 1、金额到账。gas 上限 ≥ 21100 时两边用气为 21100 对 21000。收据根与状态根不同。直接路径默认开启（`N42_BATCH_DIRECT_TRANSFER`），出块与导入都用。
+- **修复**：`in_precompile_range` 同时排除 `RANDOMNESS_PRECOMPILE_ADDR`（改为 `pub(crate)`），交给 evm2。`fast_transfer.rs` 原本就用 `host.precompiles().contains`，不受影响。
+- **测试**：`the_direct_path_equals_evm2_on_sender_runs` 增加"转给随机数预编译"一例（修复前失败：直接命中 2 对预期 1）；`the_precompile_range_ends_at_0x1ff` 增加 0x0302 / 0x0301。
+- **考虑过的替代**：让 `DirectTransfers` 查工厂的真实预编译表。更通用，但要把 spec 传进直接路径；当前只有一个自定义预编译，先按地址排除。
+
+### 2. frame 引用 payload 展开没有大小上限
+
+- **缺陷**：`expand_frame_ref_payload` 允许多个 run 重复引用同一段 frame，只限制 `tx_count ≤ 8,000,000` 与 `run_count ≤ tx_count`，展开发生在哈希校验之前。约 96 KB 的信封可展开为 1 GB 以上。另外 `Vec::with_capacity(run_count)` 在读到任何 run 之前按声明数量预留。
+- **修复**：展开前按已算出的 `header + referenced_bytes + 剩余字节` 与 `MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE`（512 MiB，与 zstd 路径相同）比较，超出即 `Malformed("expanded payload too large")`；预留前检查 `run_count ≤ 剩余字节 / 12`，否则 `Malformed("runs truncated")`。
+- **测试**：`runs_that_repeat_a_frame_past_the_size_bound_are_refused`（1 MiB 交易被引用 600 次被拒；引用 2 次照常展开；截断的 run 表被拒）。
+- **未做**：没有禁止 run 之间重叠。合法块不会重复引用同一笔交易，但重叠检查要排序或位图，上限已经封住内存问题。仅在 `N42_FRAME_REF_BLOCKS=1` 且本地 frame store 有对应 frame 时可达。
+
+### 3. 委托执行层的请求没有超时
+
+- **缺陷**：`DelegatedExecutionLayer::owner_holds` 的 connect、write、read_to_end 都没有超时，`N42_EL_OWNER_WAIT_MS` 只在两次轮询之间检查。owner 卡住但仍接受连接时，该 key 的 `new_payload` / `fork_choice_updated` 永不返回。
+- **修复**：一次请求整体包在 `tokio::time::timeout(self.wait, ..)` 里，超时返回 `ElError("execution owner: no answer in ..")`，与连接失败同一条错误路径。
+- **测试**：`an_owner_that_accepts_and_stalls_is_given_up_on`（监听端只 accept 不应答）。
+
+### 状态
+
+- clippy（n42-execution、n42-consensus-service、n42-node，`--all-targets -D warnings`）通过。
+- 单元测试：n42-execution 156 通过；n42-consensus-service 267 通过；n42-node 310 通过、1 失败（`memory_watch::tests::resident_memory_is_read` 读 `/proc/self/statm`，在 macOS 上失败，与本次改动无关，未在 Linux 复核）。
+- 未跑完整 workspace 测试与 E2E。
+- 评审中其余发现（64 MiB 推送在授权前解码、未验证的块数据缓存、共享执行下未修改条目不受根约束、网关担保帧的验签、两个 crate 移出 workspace）未在本次处理，需维护者决定。
+- 附带：`scripts/apply-reth-patches.sh`（`declare -A`）与 `scripts/check-reth-source.sh`（`mapfile`）在 macOS 自带 bash 3.2 上不能运行。
