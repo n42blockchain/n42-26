@@ -7,8 +7,8 @@ use n42_execution::{N42EvmConfig, read_log::ReadLogDatabase};
 use n42_mobile::code_cache::{CacheSyncMessage, encode_cache_sync};
 use n42_mobile::packet::{StreamPacket, encode_stream_packet};
 use n42_network::ShardedStarHubHandle;
+use n42_tx_types::N42Primitives;
 use reth_chainspec::ChainSpec;
-use reth_ethereum_primitives::EthPrimitives;
 use reth_evm::{ConfigureEvm, execute::Executor};
 use reth_primitives_traits::{BlockBody, NodePrimitives};
 use reth_provider::BlockHashReader;
@@ -122,7 +122,7 @@ pub async fn mobile_packet_loop<P>(
     mut phone_connected_rx: mpsc::Receiver<u64>,
     dispatched_block_tx: Option<mpsc::Sender<DispatchedBlockRoot>>,
 ) where
-    P: BlockReader<Block = <EthPrimitives as NodePrimitives>::Block>
+    P: BlockReader<Block = <N42Primitives as NodePrimitives>::Block>
         + StateProviderFactory
         + BlockHashReader
         + Clone
@@ -146,6 +146,14 @@ pub async fn mobile_packet_loop<P>(
                         %block_hash,
                         "mobile packet suppressed while Twig sidecar is unhealthy"
                     );
+                    continue;
+                }
+                // A packet costs a state replay and compression on every node; with
+                // no phone attached here nobody would receive it. A phone that joins
+                // later starts from the next block, and its cache sync carries the
+                // codes sent so far.
+                if hub_handle.active_sessions().await == 0 {
+                    metrics::counter!("n42_mobile_packet_skipped_no_phones_total").increment(1);
                     continue;
                 }
                 debug!(%block_hash, "generating mobile stream packet");
@@ -337,7 +345,7 @@ async fn generate_and_broadcast_v2<P>(
     dispatched_block_tx: Option<&mpsc::Sender<DispatchedBlockRoot>>,
 ) -> Result<usize, MobilePacketError>
 where
-    P: BlockReader<Block = <EthPrimitives as NodePrimitives>::Block>
+    P: BlockReader<Block = <N42Primitives as NodePrimitives>::Block>
         + StateProviderFactory
         + BlockHashReader
         + 'static,
@@ -354,7 +362,7 @@ where
         let parent_hash = recovered_block.header().parent_hash();
         let (state_provider, state_source) = parent_state_provider(provider, parent_hash)?;
 
-        let inner_db = reth_revm::database::StateProviderDatabase::new(
+        let inner_db = reth_evm::database::StateProviderDatabase::new(
             (&*state_provider).into_evm_state_provider(),
         );
         let logged_db = ReadLogDatabase::new(inner_db);
@@ -514,19 +522,20 @@ mod tests {
     #[test]
     fn witness_state_source_uses_the_tip_only_for_the_canonical_head() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-        use reth_provider::test_utils::MockEthProvider;
+        use reth_provider::test_utils::MockEthProvider as EthMock;
+        type MockEthProvider = EthMock<N42Primitives>;
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let _guard = metrics::set_default_local_recorder(&recorder);
 
-        let provider = MockEthProvider::default();
+        let provider = MockEthProvider::new();
         let older = B256::repeat_byte(0x11);
         let head = B256::repeat_byte(0x22);
         for (number, hash) in [(6u64, older), (7, head)] {
             provider.add_block(
                 hash,
-                reth_ethereum_primitives::Block {
+                n42_tx_types::Block {
                     header: alloy_consensus::Header {
                         number,
                         ..Default::default()
@@ -573,7 +582,8 @@ mod tests {
     #[test]
     fn witness_state_source_falls_back_when_the_tip_state_is_ahead_of_the_head() {
         use alloy_eips::{BlockNumHash, BlockNumberOrTag};
-        use reth_provider::test_utils::MockEthProvider;
+        use reth_provider::test_utils::MockEthProvider as EthMock;
+        type MockEthProvider = EthMock<N42Primitives>;
         use reth_storage_api::{BlockIdReader, StateProviderBox};
 
         /// `head` answers the chain-info questions, `tip` serves `latest()`.
@@ -679,16 +689,16 @@ mod tests {
 
         let parent = B256::repeat_byte(0x22);
         let child = B256::repeat_byte(0x33);
-        let block = |number: u64| reth_ethereum_primitives::Block {
+        let block = |number: u64| n42_tx_types::Block {
             header: alloy_consensus::Header {
                 number,
                 ..Default::default()
             },
             body: Default::default(),
         };
-        let head = MockEthProvider::default();
+        let head = MockEthProvider::new();
         head.add_block(parent, block(7));
-        let tip = MockEthProvider::default();
+        let tip = MockEthProvider::new();
         tip.add_block(parent, block(7));
         tip.add_block(child, block(8));
         let provider = LaggingHead { head, tip };

@@ -1,0 +1,184 @@
+diff --git a/crates/consensus/consensus/src/lib.rs b/crates/consensus/consensus/src/lib.rs
+index 68c1e4415..841dbde36 100644
+--- a/crates/consensus/consensus/src/lib.rs
++++ b/crates/consensus/consensus/src/lib.rs
+@@ -88,6 +88,15 @@ pub trait FullConsensus<N: NodePrimitives>: Consensus<N::Block> {
+         receipt_root_bloom: Option<ReceiptRootBloom>,
+         block_access_list_hash: Option<B256>,
+     ) -> Result<(), ConsensusError>;
++
++    /// Whether [`Self::validate_block_post_execution`] uses a pre-computed receipt trie root.
++    ///
++    /// An implementation whose headers commit to receipts in another form returns `false`. The
++    /// caller then skips the receipt trie and passes `None`, and the implementation derives the
++    /// logs bloom itself.
++    fn uses_receipt_root(&self) -> bool {
++        true
++    }
+ }
+ 
+ /// Consensus is a protocol that chooses canonical chain.
+diff --git a/crates/engine/tree/src/tree/mod.rs b/crates/engine/tree/src/tree/mod.rs
+index 318f47082..98d898015 100644
+--- a/crates/engine/tree/src/tree/mod.rs
++++ b/crates/engine/tree/src/tree/mod.rs
+@@ -259,6 +259,35 @@ pub enum TreeAction {
+     },
+ }
+ 
++/// Whether canonical-state notifications for plain chain extensions are built
++/// and sent by a worker instead of the engine thread (`N42_CANON_NOTIFY_LATE=1`).
++fn canon_notify_late() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("N42_CANON_NOTIFY_LATE").is_ok_and(|v| v == "1"))
++}
++
++/// Runs `job` on a single worker thread, in the order the jobs were handed over.
++fn run_in_commit_order(job: Box<dyn FnOnce() + Send>) {
++    static WORKER: std::sync::OnceLock<std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>> =
++        std::sync::OnceLock::new();
++    let sender = WORKER.get_or_init(|| {
++        let (sender, receiver) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
++        std::thread::Builder::new()
++            .name("canon-notify".into())
++            .spawn(move || {
++                for job in receiver {
++                    job();
++                }
++            })
++            .expect("spawn canon-notify worker");
++        sender
++    });
++    // The worker only stops when the process does; run inline if it is gone.
++    if let Err(std::sync::mpsc::SendError(job)) = sender.send(job) {
++        job();
++    }
++}
++
+ /// The engine API tree handler implementation.
+ ///
+ /// This type is responsible for processing engine API requests, maintaining the canonical state and
+@@ -2909,7 +2938,17 @@ where
+         self.state.tree_state.set_canonical_head(chain_update.tip().num_hash());
+ 
+         let tip = chain_update.tip().clone_sealed_header();
+-        let notification = chain_update.to_chain_notification();
++        // Building the notification deep-copies each block's execution output.
++        // For a plain extension that copy can be made off the engine thread;
++        // one ordered worker keeps the notifications in commit order.
++        let late_notification = match &chain_update {
++            NewCanonicalChain::Commit { new } if canon_notify_late() => {
++                Some(NewCanonicalChain::Commit { new: new.clone() })
++            }
++            _ => None,
++        };
++        let notification =
++            late_notification.is_none().then(|| chain_update.to_chain_notification());
+ 
+         // reinsert any missing reorged blocks
+         if let NewCanonicalChain::Reorg { new, old } = &chain_update {
+@@ -2932,7 +2971,14 @@ where
+         self.metrics.tree.canonical_chain_height.set(tip.number() as f64);
+ 
+         // sends an event to all active listeners about the new canonical chain
+-        self.canonical_in_memory_state.notify_canon_state(notification);
++        if let Some(notification) = notification {
++            self.canonical_in_memory_state.notify_canon_state(notification);
++        } else if let Some(chain) = late_notification {
++            let state = self.canonical_in_memory_state.clone();
++            run_in_commit_order(Box::new(move || {
++                state.notify_canon_state(chain.to_chain_notification());
++            }));
++        }
+ 
+         // emit event
+         self.emit_event(ConsensusEngineEvent::CanonicalChainCommitted(
+diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
+index 496d03917..632317059 100644
+--- a/crates/engine/tree/src/tree/payload_validator.rs
++++ b/crates/engine/tree/src/tree/payload_validator.rs
+@@ -797,11 +797,14 @@ where
+                 }
+             });
+ 
++        let convert_wait_start = Instant::now();
+         let block = validated_block.try_into_inner().expect("sole handle")?;
+         let block = block.with_senders(senders);
++        metrics::histogram!("n42_import_stage_ms", "stage" => "await_convert")
++            .record(convert_wait_start.elapsed().as_secs_f64() * 1000.0);
+ 
+         // Wait for the receipt root computation to complete.
+-        let receipt_root_bloom = {
++        let receipt_root_bloom = if self.consensus.uses_receipt_root() {
+             let _enter = debug_span!(
+                 target: "engine::tree::payload_validator",
+                 "wait_receipt_root",
+@@ -817,6 +820,8 @@ where
+                     );
+                 })
+                 .ok()
++        } else {
++            None
+         };
+ 
+         if let Err(e) = self.validate_post_execution(
+@@ -984,10 +989,15 @@ where
+                 "convert_and_validate",
+             )
+             .entered();
+-            let block = match input {
+-                BlockOrPayload::Block(block) => block.split().0,
++            // A payload has no transactions root of its own: the conversion derives the header's
++            // root from the body and checks the block hash over it, so the pre-execution check
++            // can take that root instead of hashing the body a second time.
++            let (block, transaction_root) = match input {
++                BlockOrPayload::Block(block) => (block.split().0, None),
+                 BlockOrPayload::Payload(payload) => {
+-                    validator.convert_payload_to_block(payload)?
++                    let block = validator.convert_payload_to_block(payload)?;
++                    let transaction_root = block.header().transactions_root();
++                    (block, Some(transaction_root))
+                 }
+             };
+ 
+@@ -1006,7 +1016,7 @@ where
+             drop(_enter);
+ 
+             if let Err(e) =
+-                consensus.validate_block_pre_execution_with_tx_root(&block, None)
++                consensus.validate_block_pre_execution_with_tx_root(&block, transaction_root)
+             {
+                 error!(target: "engine::tree::payload_validator", block = ?block.block_with_parent(), %e, "Failed to validate block");
+                 return Err(InsertBlockError::consensus_error(e, block).into())
+@@ -1227,8 +1237,13 @@ where
+         // Unbounded channel is used since tx count bounds capacity anyway.
+         let (receipt_tx, receipt_rx) = crossbeam_channel::unbounded();
+         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+-        let task_handle = ReceiptRootTaskHandle::new(receipt_rx, result_tx);
+-        self.runtime.spawn_blocking_named("receipt-root", move || task_handle.run(receipts_len));
++        // Without the task both receivers are gone: receipts sent by the executor are dropped
++        // and the result is never awaited.
++        if self.consensus.uses_receipt_root() {
++            let task_handle = ReceiptRootTaskHandle::new(receipt_rx, result_tx);
++            self.runtime
++                .spawn_blocking_named("receipt-root", move || task_handle.run(receipts_len));
++        }
+ 
+         (receipt_tx, result_rx)
+     }
+diff --git a/crates/evm/evm/src/payload_cache.rs b/crates/evm/evm/src/payload_cache.rs
+index 1a2a1c18c..a3efac303 100644
+--- a/crates/evm/evm/src/payload_cache.rs
++++ b/crates/evm/evm/src/payload_cache.rs
+@@ -73,7 +73,10 @@ pub fn take_broadcast_execution<T: 'static>(block_hash: &B256) -> Option<T> {
+     take(&BROADCAST_CACHE, block_hash)
+ }
+ 
+-/// Store the transaction root belonging to a locally built or compact payload.
++/// Store the transaction root this node computed from the body of a locally built payload.
++///
++/// The engine takes the header's root as the body's root once a payload is converted, so a root
++/// received from a peer must never be stored here.
+ pub fn store_payload_transactions_root(block_hash: B256, transactions_root: B256) {
+     let cache = TRANSACTION_ROOT_CACHE.get_or_init(|| Mutex::new(None));
+     let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());

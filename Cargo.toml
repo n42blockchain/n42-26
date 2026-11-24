@@ -5,7 +5,6 @@ members = [
     "bin/n42-consensus-standalone",
     "bin/n42-mobile-sim",
     "bin/n42-stress",
-    "bin/n42-evm-bench",
     "crates/n42-primitives",
     "crates/n42-tx-types",
     "crates/n42-chainspec",
@@ -17,7 +16,6 @@ members = [
     "crates/n42-mobile-ffi",
     "crates/n42-network",
     "crates/n42-node",
-    "crates/n42-parallel-evm",
     "crates/n42-jmt",
     "crates/n42-bmt-core",
     "crates/n42-twig-core",
@@ -25,6 +23,9 @@ members = [
     "tests/e2e",
 ]
 exclude = [
+    # Block-STM prototype and its benchmark: revm-only, parked at the evm2 migration (devlog-186).
+    "crates/n42-parallel-evm",
+    "bin/n42-evm-bench",
     "crates/n42-zkproof-guest",  # Built with SP1 RISC-V toolchain, not host toolchain
 ]
 resolver = "2"
@@ -48,13 +49,12 @@ n42-mobile = { path = "crates/n42-mobile" }
 n42-mobile-ffi = { path = "crates/n42-mobile-ffi" }
 n42-network = { path = "crates/n42-network" }
 n42-node = { path = "crates/n42-node" }
-n42-parallel-evm = { path = "crates/n42-parallel-evm" }
 n42-jmt = { path = "crates/n42-jmt" }
 n42-bmt-core = { path = "crates/n42-bmt-core" }
 n42-twig-core = { path = "crates/n42-twig-core" }
 n42-zkproof = { path = "crates/n42-zkproof" }
 
-# Reth 2.7.0 dependencies (upstream base 3d592ece6de8c4559987416a544fc215fd6d6921 + N42 patch series)
+# Reth 2.11.0 dependencies (upstream base b9abbcc1b982755baa9021e6874e2e58936ca65f + N42 patch series)
 reth-chainspec = { path = "../reth/crates/chainspec" }
 reth-consensus = { path = "../reth/crates/consensus/consensus" }
 reth-consensus-common = { path = "../reth/crates/consensus/common" }
@@ -80,7 +80,6 @@ reth-node-types = { path = "../reth/crates/node/types" }
 reth-payload-builder = { path = "../reth/crates/payload/builder" }
 reth-primitives-traits = { version = "0.8.2", default-features = false }
 reth-provider = { path = "../reth/crates/storage/provider" }
-reth-revm = { path = "../reth/crates/revm" }
 reth-tasks = { path = "../reth/crates/tasks" }
 reth-transaction-pool = { path = "../reth/crates/transaction-pool" }
 reth-tracing = { path = "../reth/crates/tracing" }
@@ -102,11 +101,16 @@ reth-libmdbx = { path = "../reth/crates/storage/libmdbx-rs" }
 reth-storage-api = { path = "../reth/crates/storage/storage-api" }
 reth-rpc-builder = { path = "../reth/crates/rpc/rpc-builder" }
 reth-rpc-server-types = { path = "../reth/crates/rpc/rpc-server-types" }
+reth-rpc = { path = "../reth/crates/rpc/rpc" }
+reth-rpc-convert = { path = "../reth/crates/rpc/rpc-convert" }
+reth-rpc-eth-api = { path = "../reth/crates/rpc/rpc-eth-api" }
+reth-rpc-eth-types = { path = "../reth/crates/rpc/rpc-eth-types" }
 reth-node-core = { path = "../reth/crates/node/core" }
 
-# Alloy (aligned with Reth v2.7.0)
+# Alloy (aligned with Reth v2.11.0)
 alloy-consensus = { version = "2.5.0", default-features = false, features = ["serde"] }
 alloy-eips = { version = "2.5.0", default-features = false, features = ["serde"] }
+alloy-eip7928 = { version = "0.4.10", default-features = false, features = ["rlp"] }
 alloy-primitives = { version = "1.7.3", default-features = false, features = ["serde"] }
 alloy-rlp = { version = "0.3.16", default-features = false }
 alloy-genesis = { version = "2.5.0", default-features = false }
@@ -119,9 +123,10 @@ alloy-network = { version = "2.5.0", default-features = false }
 alloy-rpc-types-eth = { version = "2.5.0", default-features = false }
 alloy-sol-types = { version = "1.7.3", default-features = false }
 
-# EVM — aligned with Reth v2.7.0.
-alloy-evm = { version = "0.39.0", default-features = false }
-revm = { version = "43.0.3", default-features = false, features = ["std", "serde"] }
+# EVM: evm2 replaced revm in Reth v2.9.0; pinned by git rev as Reth v2.11.0 does.
+evm2 = { git = "https://github.com/alloy-rs/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475", default-features = false, features = ["std", "serde"] }
+# The `#[instruction]` macro, for the SSTORE instruction that reports restored slots.
+evm2-macros = { git = "https://github.com/alloy-rs/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
 
 # Testing
 reth-testing-utils = { path = "../reth/testing/testing-utils" }
@@ -143,6 +148,7 @@ toml = "1.1"
 # bincode 1.x is protocol-pinned: consensus/network/snapshot bytes are deployed.
 # Moving to bincode 3 requires an explicit versioned wire migration.
 bincode = "1.3"
+rmp-serde = "1.3"
 
 # Async
 tokio = { version = "1.53.2", features = ["full"] }
@@ -215,7 +221,7 @@ blst.opt-level = 3
 blake3.opt-level = 3
 sha2.opt-level = 3
 zstd-sys.opt-level = 3
-revm.opt-level = 3
+evm2.opt-level = 3
 
 [profile.release]
 opt-level = 3
@@ -228,8 +234,23 @@ inherits = "release"
 debug = true
 strip = false
 
+[patch."https://github.com/alloy-rs/evm2"]
+# Fee-disabled traceCall must retain the Geth beneficiary prestate
+# (vendor/dependency-repairs/evm2-inspectors-0.1.0/N42-PROVENANCE.md).
+evm2-inspectors = { path = "vendor/dependency-repairs/evm2-inspectors-0.1.0" }
+# As Reth v2.11.0 does: reth-core (rev 275ce4cf) still pins an older evm2, so
+# without this the graph carries two evm2 copies. The patch goes through the
+# pre-transfer URL because Cargo rejects a patch from the same source.
+evm2 = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+evm2-jit = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+evm2-macros = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+
 [patch.crates-io]
-# Fee-disabled traceCall must retain the Geth beneficiary prestate.
-revm-inspectors = { path = "vendor/dependency-repairs/revm-inspectors-0.44.3" }
+# reth-core at the revision Reth v2.9.0 through v2.11.0 patch in.
+reth-codecs = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-codecs-derive = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-rpc-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-zstd-compressors = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
 # TestRng trait compatibility with proptest 1.11 / rand 0.10.
 proptest-arbitrary-interop = { path = "vendor/dependency-repairs/proptest-arbitrary-interop-0.1.0" }

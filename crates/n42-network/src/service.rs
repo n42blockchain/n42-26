@@ -89,6 +89,11 @@ const GOV5_BLOCK_REQUEST_COOLDOWN: Duration = Duration::from_millis(750);
 // are redundant and safely ignored after their request id is reaped.
 const GOV5_BLOCK_REQUEST_STALE_AFTER: Duration = Duration::from_millis(1500);
 const MAX_SERVED_GOV5_BLOCKS: usize = 1024;
+/// Bytes of block bodies the serve cache holds. A body is retained with only
+/// its header read and may be 64 MiB, so the entry count alone lets peers pin
+/// 64 GiB; this holds sixteen blocks of the largest size and every block of
+/// an ordinary one.
+const MAX_SERVED_GOV5_BLOCK_BYTES: usize = 1024 * 1024 * 1024;
 const GOV5_RANGE_BLOCKS_PER_SECOND: f64 = 1024.0;
 const GOV5_RANGE_BLOCKS_BURST: f64 = 4096.0;
 const MAX_PENDING_GOV5_RANGES: usize = 8;
@@ -98,10 +103,19 @@ const BLOCK_DIRECT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BLOCK_DIRECT_QUEUE_DEPTH: usize = 64;
 const MAX_BLOCK_DIRECT_RETRIES: u8 = 2;
 
+/// A Gov5 block body kept for block-by-hash requests.
+#[derive(Debug)]
+struct ServedGov5Block {
+    rlp: Vec<u8>,
+    /// Whether the body was decoded and checked against its header. Bodies
+    /// observed on the hot path are checked only when a peer asks for them.
+    verified: bool,
+}
+
 /// Check the requested hash before touching the serve cache. Only byte-identical
-/// cached bodies can bypass transaction decoding and root verification.
+/// verified bodies can bypass transaction decoding and root verification.
 fn cache_gov5_served_block(
-    blocks: &mut HashMap<B256, Vec<u8>>,
+    blocks: &mut HashMap<B256, ServedGov5Block>,
     order: &mut VecDeque<B256>,
     rlp: &[u8],
     expected_hash: Option<B256>,
@@ -115,10 +129,68 @@ fn cache_gov5_served_block(
             actual: hash,
         });
     }
-    if blocks.get(&hash).is_some_and(|cached| cached == rlp) {
+    if blocks
+        .get(&hash)
+        .is_some_and(|cached| cached.verified && cached.rlp == rlp)
+    {
         return Ok(hash);
     }
     decode_gov5_block_rlp(rlp)?;
+    insert_served_gov5_block(
+        blocks,
+        order,
+        hash,
+        ServedGov5Block {
+            rlp: rlp.to_vec(),
+            verified: true,
+        },
+    );
+    Ok(hash)
+}
+
+/// Retain a block seen on gossip, a direct push or the local broadcast without
+/// decoding its transactions: the node imports it through its own path, and
+/// the body is checked by [`servable_gov5_block`] only if a peer requests it.
+/// The first body retained for a hash is kept while it is the only one seen.
+/// A different body for the same hash settles the matter at once: the held
+/// one is decoded, kept if it passes and replaced by the new unchecked copy if
+/// it does not, so a corrupt body that arrived first cannot keep the honest
+/// one out. Identical copies, the usual case, cost one comparison.
+fn cache_gov5_served_block_unverified(
+    blocks: &mut HashMap<B256, ServedGov5Block>,
+    order: &mut VecDeque<B256>,
+    rlp: &[u8],
+) -> Result<B256, Gov5BlockError> {
+    let hash = attributable_hash(rlp).ok_or(Gov5BlockError::InvalidRlp)?;
+    match blocks.get_mut(&hash) {
+        None => insert_served_gov5_block(
+            blocks,
+            order,
+            hash,
+            ServedGov5Block {
+                rlp: rlp.to_vec(),
+                verified: false,
+            },
+        ),
+        Some(held) if !held.verified && held.rlp != rlp => {
+            if decode_gov5_block_rlp(&held.rlp).is_ok() {
+                held.verified = true;
+            } else {
+                held.rlp = rlp.to_vec();
+                evict_served_gov5_blocks_over(blocks, order, MAX_SERVED_GOV5_BLOCK_BYTES);
+            }
+        }
+        Some(_) => {}
+    }
+    Ok(hash)
+}
+
+fn insert_served_gov5_block(
+    blocks: &mut HashMap<B256, ServedGov5Block>,
+    order: &mut VecDeque<B256>,
+    hash: B256,
+    block: ServedGov5Block,
+) {
     if !blocks.contains_key(&hash) {
         if blocks.len() >= MAX_SERVED_GOV5_BLOCKS
             && let Some(oldest) = order.pop_front()
@@ -127,8 +199,45 @@ fn cache_gov5_served_block(
         }
         order.push_back(hash);
     }
-    blocks.insert(hash, rlp.to_vec());
-    Ok(hash)
+    blocks.insert(hash, block);
+    evict_served_gov5_blocks_over(blocks, order, MAX_SERVED_GOV5_BLOCK_BYTES);
+}
+
+/// Drops the oldest retained blocks until the bodies held fit in `budget`,
+/// always leaving the newest.
+fn evict_served_gov5_blocks_over(
+    blocks: &mut HashMap<B256, ServedGov5Block>,
+    order: &mut VecDeque<B256>,
+    budget: usize,
+) {
+    let mut held: usize = blocks.values().map(|block| block.rlp.len()).sum();
+    while held > budget && order.len() > 1 {
+        let Some(oldest) = order.pop_front() else { break };
+        if let Some(dropped) = blocks.remove(&oldest) {
+            held -= dropped.rlp.len();
+        }
+    }
+}
+
+/// The body to answer a block-by-hash request with, or empty. An unchecked
+/// body is decoded first; one that fails is dropped so it is never served.
+fn servable_gov5_block(
+    blocks: &mut HashMap<B256, ServedGov5Block>,
+    order: &mut VecDeque<B256>,
+    hash: &B256,
+) -> Vec<u8> {
+    let Some(block) = blocks.get_mut(hash) else {
+        return Vec::new();
+    };
+    if !block.verified {
+        if decode_gov5_block_rlp(&block.rlp).is_err() {
+            blocks.remove(hash);
+            order.retain(|retained| retained != hash);
+            return Vec::new();
+        }
+        block.verified = true;
+    }
+    block.rlp.clone()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -996,7 +1105,7 @@ pub struct NetworkService {
     /// Recently broadcast canonical Gov5 blocks, retained so followers that
     /// receive the proposal before the block can recover through Gov5's native
     /// block-by-hash RPC.
-    gov5_served_blocks: HashMap<B256, Vec<u8>>,
+    gov5_served_blocks: HashMap<B256, ServedGov5Block>,
     /// Insertion order for `gov5_served_blocks` eviction. HashMap iteration
     /// order is arbitrary, and evicting an arbitrary entry preferentially
     /// drops exactly the fresh blocks followers are most likely to fetch.
@@ -1985,6 +2094,14 @@ impl NetworkService {
         )
     }
 
+    fn retain_gov5_served_block_unverified(&mut self, rlp: &[u8]) -> Result<B256, Gov5BlockError> {
+        cache_gov5_served_block_unverified(
+            &mut self.gov5_served_blocks,
+            &mut self.gov5_served_block_order,
+            rlp,
+        )
+    }
+
     fn handle_gossipsub_message(&mut self, source: PeerId, message: gossipsub::Message) {
         metrics::counter!("n42_gossipsub_messages_received").increment(1);
         tracing::info!(target: "n42::net", %source, topic = %message.topic, bytes = message.data.len(), "gossipsub message received");
@@ -2029,7 +2146,7 @@ impl NetworkService {
                 match crate::snappy_pool::raw_decompress(&message.data) {
                     Ok(rlp) if rlp.len() == decoded_len => {
                         metrics::counter!("n42_gov5_blocks_observed_total").increment(1);
-                        if let Err(error) = self.retain_gov5_served_block(&rlp, None) {
+                        if let Err(error) = self.retain_gov5_served_block_unverified(&rlp) {
                             tracing::warn!(
                                 target: "n42::interop::block",
                                 %source,
@@ -2962,7 +3079,7 @@ impl NetworkService {
                     return;
                 }
                 metrics::counter!("n42_gov5_block_push_received_total").increment(1);
-                if let Err(error) = self.retain_gov5_served_block(&request.rlp, None) {
+                if let Err(error) = self.retain_gov5_served_block_unverified(&request.rlp) {
                     tracing::warn!(
                         target: "n42::interop::block",
                         %peer,
@@ -3101,11 +3218,11 @@ impl NetworkService {
                     },
                 ..
             } => {
-                let response = self
-                    .gov5_served_blocks
-                    .get(&request.block_hash)
-                    .cloned()
-                    .unwrap_or_default();
+                let response = servable_gov5_block(
+                    &mut self.gov5_served_blocks,
+                    &mut self.gov5_served_block_order,
+                    &request.block_hash,
+                );
                 let found = !response.is_empty();
                 let has_storage = !found && self.gov5_canonical_blocks.is_some();
                 if self
@@ -3810,7 +3927,7 @@ impl NetworkService {
                     return;
                 };
 
-                if let Err(error) = self.retain_gov5_served_block(&rlp, None) {
+                if let Err(error) = self.retain_gov5_served_block_unverified(&rlp) {
                     tracing::warn!(
                         target: "n42::interop::h2v4",
                         %error,
@@ -4200,7 +4317,7 @@ mod tests {
             ));
         }
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[&hash], rlp);
+        assert_eq!(blocks[&hash].rlp, rlp);
         assert_eq!(order, VecDeque::from([hash]));
     }
 
@@ -4210,18 +4327,80 @@ mod tests {
         let mut order = VecDeque::new();
         let rlp = served_block_fixture(1);
         let hash = cache_gov5_served_block(&mut blocks, &mut order, &rlp, None).unwrap();
-        let allocation = blocks[&hash].as_ptr();
+        let allocation = blocks[&hash].rlp.as_ptr();
         assert_eq!(
             cache_gov5_served_block(&mut blocks, &mut order, &rlp, Some(hash)).unwrap(),
             hash
         );
-        assert_eq!(blocks[&hash].as_ptr(), allocation);
+        assert_eq!(blocks[&hash].rlp.as_ptr(), allocation);
         let mut corrupt = rlp.clone();
         *corrupt.last_mut().unwrap() = 0x80;
         assert_eq!(attributable_hash(&corrupt), Some(hash));
         assert!(cache_gov5_served_block(&mut blocks, &mut order, &corrupt, Some(hash)).is_err());
-        assert_eq!(blocks[&hash], rlp);
+        assert_eq!(blocks[&hash].rlp, rlp);
         assert_eq!(order, VecDeque::from([hash]));
+    }
+
+    #[test]
+    fn gov5_unverified_body_is_checked_when_served() {
+        let mut blocks = HashMap::new();
+        let mut order = VecDeque::new();
+        let rlp = served_block_fixture(1);
+        let mut corrupt = rlp.clone();
+        *corrupt.last_mut().unwrap() = 0x80;
+        // A corrupt body with an honest header is retained unchecked and
+        // dropped instead of served.
+        let hash = cache_gov5_served_block_unverified(&mut blocks, &mut order, &corrupt).unwrap();
+        assert!(!blocks[&hash].verified);
+        assert!(servable_gov5_block(&mut blocks, &mut order, &hash).is_empty());
+        assert!(blocks.is_empty() && order.is_empty());
+        // A corrupt body that arrived first gives way to a different copy,
+        // and that copy, once it is the one held, is not displaced in turn.
+        cache_gov5_served_block_unverified(&mut blocks, &mut order, &corrupt).unwrap();
+        cache_gov5_served_block_unverified(&mut blocks, &mut order, &rlp).unwrap();
+        assert_eq!(blocks[&hash].rlp, rlp);
+        cache_gov5_served_block_unverified(&mut blocks, &mut order, &corrupt).unwrap();
+        assert_eq!(blocks[&hash].rlp, rlp);
+        assert!(blocks[&hash].verified);
+        assert_eq!(order, VecDeque::from([hash]));
+        assert_eq!(servable_gov5_block(&mut blocks, &mut order, &hash), rlp);
+        blocks.clear();
+        order.clear();
+        // A good body is served once checked and stays verified.
+        cache_gov5_served_block_unverified(&mut blocks, &mut order, &rlp).unwrap();
+        assert_eq!(servable_gov5_block(&mut blocks, &mut order, &hash), rlp);
+        assert!(blocks[&hash].verified);
+        // A checked fetch response replaces an unchecked body.
+        let other = served_block_fixture(2);
+        let other_hash =
+            cache_gov5_served_block_unverified(&mut blocks, &mut order, &other).unwrap();
+        assert_eq!(
+            cache_gov5_served_block(&mut blocks, &mut order, &other, Some(other_hash)).unwrap(),
+            other_hash
+        );
+        assert!(blocks[&other_hash].verified);
+        assert_eq!(order, VecDeque::from([hash, other_hash]));
+    }
+
+    #[test]
+    fn gov5_serve_cache_drops_the_oldest_bodies_over_its_byte_budget() {
+        let mut blocks = HashMap::new();
+        let mut order = VecDeque::new();
+        let hashes: Vec<_> = (1..=4u64)
+            .map(|number| {
+                cache_gov5_served_block(&mut blocks, &mut order, &served_block_fixture(number), None)
+                    .unwrap()
+            })
+            .collect();
+        let size = blocks[&hashes[0]].rlp.len();
+        // Room for two and a half: the two oldest go.
+        evict_served_gov5_blocks_over(&mut blocks, &mut order, size * 5 / 2);
+        assert_eq!(order, VecDeque::from([hashes[2], hashes[3]]));
+        assert_eq!(blocks.len(), 2);
+        // The newest stays even when it alone is over the budget.
+        evict_served_gov5_blocks_over(&mut blocks, &mut order, 0);
+        assert_eq!(order, VecDeque::from([hashes[3]]));
+        assert!(blocks.contains_key(&hashes[3]));
     }
 
     #[test]

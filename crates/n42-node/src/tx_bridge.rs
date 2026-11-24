@@ -1,7 +1,9 @@
+use crate::native_pool::N42PooledTransaction;
+use alloy_consensus::transaction::TxHashRef as _;
 use alloy_primitives::B256;
-use reth_ethereum_primitives::TransactionSigned;
+use n42_tx_types::N42TxEnvelope;
 use reth_primitives_traits::SignedTransaction;
-use reth_transaction_pool::{EthPooledTransaction, PoolTransaction, TransactionPool};
+use reth_transaction_pool::{PoolTransaction, TransactionPool};
 use std::collections::{HashSet, VecDeque};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -30,7 +32,7 @@ pub struct TxPoolBridge<Pool> {
 
 impl<Pool> TxPoolBridge<Pool>
 where
-    Pool: TransactionPool<Transaction = EthPooledTransaction> + Clone + 'static,
+    Pool: TransactionPool<Transaction = N42PooledTransaction> + Clone + 'static,
 {
     pub fn new(
         pool: Pool,
@@ -59,7 +61,7 @@ where
                                 continue;
                             }
                             if let Some(pooled_tx) = self.pool.get(&tx_hash) {
-                                let tx: &TransactionSigned = pooled_tx.transaction.transaction();
+                                let tx: &N42TxEnvelope = pooled_tx.transaction.transaction();
                                 let encoded = alloy_rlp::encode(tx);
                                 debug!(%tx_hash, bytes = encoded.len(), "broadcasting local transaction");
                                 match self.broadcast_tx.try_send(encoded) {
@@ -105,8 +107,7 @@ where
         let mut tx_hashes = Vec::with_capacity(tx_batch.len());
 
         for tx_bytes in tx_batch {
-            let tx: TransactionSigned = match alloy_rlp::Decodable::decode(&mut tx_bytes.as_slice())
-            {
+            let tx: N42TxEnvelope = match alloy_rlp::Decodable::decode(&mut tx_bytes.as_slice()) {
                 Ok(tx) => tx,
                 Err(e) => {
                     warn!(error = %e, "failed to decode network transaction");
@@ -127,7 +128,7 @@ where
                 }
             };
 
-            let pooled = match EthPooledTransaction::try_from_consensus(recovered) {
+            let pooled = match N42PooledTransaction::try_from_consensus(recovered) {
                 Ok(p) => p,
                 Err(e) => {
                     debug!(%tx_hash, error = %e, "failed to convert network transaction for pool");

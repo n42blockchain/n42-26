@@ -57,12 +57,13 @@ reth-cli-runner.workspace = true
 reth-stages-types.workspace = true
 reth-static-file-types.workspace = true
 reth-ethereum-primitives.workspace = true
+n42-tx-types.workspace = true
 reth-transaction-pool.workspace = true
 reth-tasks.workspace = true
 reth-primitives-traits.workspace = true
 reth-evm.workspace = true
-reth-revm.workspace = true
-revm.workspace = true
+evm2.workspace = true
+reth-trie-common.workspace = true
 blake3.workspace = true
 
 alloy-consensus.workspace = true
@@ -90,11 +91,19 @@ rand.workspace = true
 # jemalloc is unix-only; on Windows the default feature is a no-op for the allocator.
 [target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { version = "0.7", optional = true }
+# Allocator counters for the `N42_MEM` line; "stats" builds jemalloc with them.
+tikv-jemalloc-sys = { version = "0.7.1", optional = true, features = ["stats"] }
+# pprof
+pprof = { version = "0.15", default-features = false, optional = true }
 
 [features]
-default = ["jemalloc"]
-jemalloc = ["dep:tikv-jemallocator"]
+default = ["jemalloc", "asm-keccak"]
+# Assembly Keccak-f (keccak-asm) instead of the portable Rust permutation.
+asm-keccak = ["alloy-primitives/asm-keccak"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys"]
 sp1 = ["n42-zkproof/sp1"]
+# Unprivileged on-demand CPU profiles (`pprof_capture.rs`); build with `--profile profiling`.
+pprof = ["dep:pprof"]
 
 [dev-dependencies]
 tempfile.workspace = true

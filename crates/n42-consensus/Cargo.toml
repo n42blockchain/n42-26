@@ -9,6 +9,7 @@ description = "N42 HotStuff-2 consensus implementation"
 [dependencies]
 n42-primitives.workspace = true
 n42-chainspec.workspace = true
+n42-tx-types.workspace = true
 n42-jmt.workspace = true
 
 reth-chainspec.workspace = true

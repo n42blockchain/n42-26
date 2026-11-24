@@ -31,6 +31,12 @@ pub trait ExecutionOutputCache: Send + Sync {
         None
     }
 
+    /// The transaction root this adapter holds for a locally built payload,
+    /// so normalization need not recompute it. `None` when unknown.
+    fn built_transactions_root(&self, _hash: B256) -> Option<B256> {
+        None
+    }
+
     /// Move a locally built execution result to the normalized block hash only
     /// when the adapter can prove the EVM inputs are unchanged. A miss returns
     /// false and the leader validates through ordinary execution.
@@ -42,10 +48,30 @@ pub trait ExecutionOutputCache: Send + Sync {
         false
     }
 
+    /// [`Self::rekey_gov5_normalized`] by hash, for a caller that has already
+    /// established that the normalization preserved the EVM inputs
+    /// (`n42_network::normalize_built_payload_for_gov5_h2`).
+    fn rekey_gov5_built(&self, _original: B256, _normalized: B256) -> bool {
+        false
+    }
+
     /// Inject a received compact-block wire blob into the payload cache so the
     /// next `new_payload` hits the cache and skips EVM re-execution. Returns
     /// whether the inject succeeded.
     fn inject(&self, hash: B256, compressed: &[u8], source: &'static str) -> bool;
+
+    /// Like [`Self::inject`], for a caller that holds the decoded payload the
+    /// output belongs to. An adapter needs the payload when the output carries
+    /// data keyed by the block's execution inputs (shared execution on the
+    /// QMDB route); the default only uses the block hash.
+    fn inject_for_payload(
+        &self,
+        execution: &alloy_rpc_types_engine::ExecutionData,
+        compressed: &[u8],
+        source: &'static str,
+    ) -> bool {
+        self.inject(execution.block_hash(), compressed, source)
+    }
 
     /// Remove a previously injected execution output. Every caller that
     /// injects untrusted bytes must evict them when `new_payload` does not

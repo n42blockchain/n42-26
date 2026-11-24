@@ -315,7 +315,8 @@ fn verify_leader(
             set_size,
         });
     }
-    let expected = (view % u64::from(set_size)) as u32;
+    let expected =
+        n42_consensus::leader_index(view, u64::from(set_size), n42_consensus::leader_tenure());
     if actual != expected {
         return Err(H2V4ShadowError::WrongLeader {
             kind,

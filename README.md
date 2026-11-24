@@ -57,7 +57,7 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 
 - **HotStuff-2 Consensus**: 2-round optimistic commit with 3-round timeout recovery
 - **BLS12-381 Signatures**: Aggregated signatures for compact quorum certificates
-- **reth v2.8.1 Integration**: Uses upstream commit `d763342fa185e4e90ee79dc65f6a5706168b0bcb` plus the six checked-in N42 integration patches; aligned with Alloy 2.5.0 / REVM 43.0.3. LLVM JIT remains explicit opt-in.
+- **reth v2.11.0 Integration**: Uses upstream commit `b9abbcc1b982755baa9021e6874e2e58936ca65f` plus the nineteen checked-in N42 integration patches; aligned with Alloy 2.5.0 and evm2 (git rev `66687c18b34d3bdbb899f5eb7605070615c03475`, which replaced REVM in reth v2.9.0). The evm2 JIT is not enabled.
 - **Reserve SBMT Path**: `N42_JMT=1` explicitly selects the legacy-compatible 16-shard sparse binary backend and RPC surface
 - **Compact Block Propagation**: Leader caches execution output; the default follower path skips duplicate EVM execution (cache hit ~3ms)
 - **QMDB Binary Twig Backend**: The QMDB-style 16-shard binary twig tree is the default N42 state-proof backend (`N42_TWIG` defaults on)
@@ -74,7 +74,7 @@ A high-performance blockchain system combining **HotStuff-2** BFT consensus with
 - **Mobile Simulator**: `n42-mobile-sim` binary for load testing with deterministic BLS key generation
 - **libp2p GossipSub**: QUIC transport with content-based message deduplication
 - **QUIC Star-Hub**: High-concurrency mobile connections (up to 10,000 per node)
-- **Parallel EVM**: Optimistic parallel EVM execution (`n42-parallel-evm`) for higher throughput
+- **Parallel EVM (parked)**: The optimistic parallel EVM prototype (`n42-parallel-evm`) is REVM-only and excluded from the workspace since the evm2 migration
 - **ZK Sidecar Proof System**: Asynchronous ZK proof generation with SP1 zkVM backend, phones verify proofs instead of re-executing EVM
 
 ## Project Structure
@@ -85,18 +85,18 @@ n42-26/
 │   ├── n42-node/                  # CLI entry point (reth NodeBuilder)
 │   ├── n42-stress/                # High-throughput stress testing tool
 │   ├── n42-mobile-sim/            # Mobile verifier simulator for load testing
-│   └── n42-evm-bench/             # EVM benchmarking utility
+│   └── n42-evm-bench/             # EVM benchmarking utility (REVM-only, parked, not in the workspace)
 ├── crates/
 │   ├── n42-primitives/            # BLS keys, consensus message types
 │   ├── n42-chainspec/             # Chain config, ValidatorInfo
 │   ├── n42-consensus/             # HotStuff-2 state machine + reth adapter
 │   ├── n42-execution/             # EVM config wrapper, witness & state diff
-│   ├── n42-parallel-evm/          # Optimistic parallel EVM execution
+│   ├── n42-parallel-evm/          # Optimistic parallel EVM execution (REVM-only, parked, not in the workspace)
 │   ├── n42-jmt/                   # Jellyfish Merkle Tree (Blake3, 16-shard parallel)
 │   ├── n42-zkproof/               # ZK sidecar proof system (SP1 + MockProver)
 │   ├── n42-zkproof-guest/         # SP1 zkVM guest program (RISC-V ELF)
 │   ├── n42-network/               # libp2p GossipSub + QUIC StarHub
-│   ├── n42-mobile/                # Mobile verification protocol (no reth deps)
+│   ├── n42-mobile/                # Mobile verification protocol (re-executes with reth-evm + evm2)
 │   ├── n42-mobile-ffi/            # C/JNI FFI bindings for Android & iOS
 │   └── n42-node/                  # Node type assembly + ConsensusOrchestrator
 ├── docs/                          # Development logs (devlog-01 through devlog-53)
@@ -291,7 +291,7 @@ Both configurations are well within the **8-second slot target**.
 ### Prerequisites
 
 - Rust 1.97+ (development and CI are pinned to Rust 1.97.1)
-- N42 `reth` v2.8.1 source checked out at `../reth` (`d763342fa185e4e90ee79dc65f6a5706168b0bcb`), with the pinned N42 patch set applied
+- N42 `reth` v2.11.0 source checked out at `../reth` (`b9abbcc1b982755baa9021e6874e2e58936ca65f`), with the pinned N42 patch set applied
 - Android local builds: JDK 17 recommended for Gradle/Kotlin
 - SP1 toolchain v4.2.1 (optional, for ZK proof guest build): `curl -L https://sp1up.succinct.xyz | bash && sp1up --version v4.2.1`
 
@@ -299,13 +299,14 @@ Both configurations are well within the **8-second slot target**.
 
 ```bash
 git clone https://github.com/paradigmxyz/reth.git ../reth
-git -C ../reth checkout d763342fa185e4e90ee79dc65f6a5706168b0bcb
+git -C ../reth checkout b9abbcc1b982755baa9021e6874e2e58936ca65f
 bash scripts/apply-reth-patches.sh ../reth
 bash scripts/check-reth-source.sh ../reth
 ```
 
 The patch series restores N42's QMDB provider integration, execution cache,
-transaction-root reuse, import batching and state-root job accessors. The adapted
+transaction-root reuse, the native import path, the executed-block inbox and
+state-root job accessors. The adapted
 source identity is recorded in [`reth-source.lock`](reth-source.lock). CI and
 Docker apply the same patch set.
 Re-running the script on an already patched checkout is safe; an incompatible
@@ -436,7 +437,7 @@ JAVA_HOME=$(/usr/libexec/java_home -v 17) \
 
 ```bash
 git -C ../reth fetch origin
-git -C ../reth checkout d763342fa185e4e90ee79dc65f6a5706168b0bcb
+git -C ../reth checkout b9abbcc1b982755baa9021e6874e2e58936ca65f
 bash scripts/apply-reth-patches.sh ../reth
 bash scripts/check-reth-source.sh ../reth
 ```
@@ -551,16 +552,16 @@ Additional lanes introduced in this branch:
 
 ```
 bin/n42-node                    bin/n42-stress           bin/n42-mobile-sim
-  └── n42-node                    └── reth, alloy          └── n42-mobile ─── ed25519-dalek
+  └── n42-node                    └── reth, alloy          └── n42-mobile ─── reth-evm, evm2
       ├── n42-consensus ──┬── n42-primitives ── blst (BLS12-381)
       │                   └── n42-chainspec ──── n42-primitives
-      ├── n42-execution ──┬── reth-evm, reth-revm
+      ├── n42-execution ──┬── reth-evm, evm2
       │                   └── n42-chainspec
       ├── n42-jmt ────────── jmt, blake3, rayon (16-shard parallel)
       ├── n42-zkproof ──── alloy-primitives, serde, tokio, sp1-sdk (optional)
       │     └── n42-zkproof-guest (SP1 RISC-V, built separately)
       ├── n42-network ────┬── n42-primitives
-      │                   ├── n42-mobile ─── ed25519-dalek
+      │                   ├── n42-mobile ─── reth-evm, evm2
       │                   └── libp2p (gossipsub, quic)
       └── reth-node-builder, reth-ethereum-*
 
@@ -571,7 +572,7 @@ n42-mobile-ffi (Android/iOS SDK)
   └── n42-execution
 ```
 
-Key design: **n42-mobile** has zero reth dependencies — only `alloy-primitives`, `ed25519-dalek`, `lru`, `serde`.
+Key design: **n42-mobile** re-executes blocks with the same engine as the nodes, so it depends on `reth-evm`, `reth-chainspec`, `reth-primitives-traits`, `reth-ethereum-primitives` and `evm2` (it has no direct `ed25519-dalek` dependency; signatures use BLS from `n42-primitives`).
 **n42-mobile-ffi** compiles as `staticlib` + `cdylib`, exposing a C ABI and JNI bridge for Android.
 **n42-jmt** provides Jellyfish Merkle Tree with Blake3 hashing and 16-shard parallelism for state proofs.
 **n42-zkproof** provides backend-agnostic ZK proof generation (`trait ZkProver`) with `MockProver` for testing and `Sp1Prover` for real SP1 zkVM proofs.

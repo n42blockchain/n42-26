@@ -5,7 +5,7 @@
 //! The concrete adapters over reth handles / libp2p / state trees live in
 //! `n42-node`. This crate carries NO hard reth dependency (no reth-node-builder /
 //! reth-evm / reth-payload-* / reth-transaction-pool / reth-execution-types); it
-//! uses `revm` / `reth-ethereum-primitives::Receipt` / `n42-execution` only as
+//! uses `evm2` / `reth-ethereum-primitives::Receipt` / `n42-execution` only as
 //! execution-domain type deps. See `docs/task-caplin-stage6-clean-extraction.md`.
 
 pub mod blob_port;

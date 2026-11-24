@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: paradigmxyz/reth
-          ref: d763342fa185e4e90ee79dc65f6a5706168b0bcb
+          ref: b9abbcc1b982755baa9021e6874e2e58936ca65f # v2.11.0
           path: reth
 
       - name: Apply N42 reth patches

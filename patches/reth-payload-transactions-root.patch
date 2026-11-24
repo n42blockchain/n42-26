@@ -1,39 +1,63 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index ff0ba1c39..0b0e06c14 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -9168,6 +9168,7 @@ dependencies = [
+  "alloy-primitives",
+  "alloy-rlp",
+  "alloy-rpc-types-engine",
++ "rayon",
+  "reth-basic-payload-builder",
+  "reth-chainspec",
+  "reth-consensus-common",
 diff --git a/crates/ethereum/payload/Cargo.toml b/crates/ethereum/payload/Cargo.toml
-index b19a384fc..a447d242b 100644
+index 39f9145ff..cd0b6d5a2 100644
 --- a/crates/ethereum/payload/Cargo.toml
 +++ b/crates/ethereum/payload/Cargo.toml
-@@ -41,4 +41,5 @@ alloy-consensus.workspace = true
+@@ -39,4 +39,5 @@ alloy-eips.workspace = true
+ alloy-consensus.workspace = true
  alloy-primitives.workspace = true
  
- # misc
 +rayon.workspace = true
  tracing.workspace = true
 diff --git a/crates/ethereum/payload/src/lib.rs b/crates/ethereum/payload/src/lib.rs
-index ec28b52ff..61e1696a0 100644
+index 5569483d1..f347be231 100644
 --- a/crates/ethereum/payload/src/lib.rs
 +++ b/crates/ethereum/payload/src/lib.rs
-@@ -22,7 +22,7 @@ use reth_errors::{BlockExecutionError, BlockValidationError, ConsensusError};
- use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
+@@ -23,7 +23,8 @@ use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
  use reth_evm::{
-     block::TxResult,
--    execute::{BlockBuilder, BlockBuilderOutcome},
-+    execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput},
-     ConfigureEvm, Evm, NextBlockEnvAttributes,
+     database::StateProviderDatabase,
+     execute::{
+-        BlockBuilder, BlockBuilderOutcome, BlockExecutionError, BlockExecutor, BlockValidationError,
++        BlockBuilder, BlockBuilderOutcome, BlockExecutionError, BlockExecutionOutput, BlockExecutor,
++        BlockValidationError,
+     },
+     ConfigureEvm, EvmEnv, NextBlockEnvAttributes, OnStateHook,
  };
- use reth_evm_ethereum::EthEvmConfig;
-@@ -492,7 +492,20 @@ where
+@@ -450,7 +451,8 @@ where
+         return Ok(BuildOutcome::Aborted { fees: total_fees, cached_reads })
+     }
+ 
+-    let BlockBuilderOutcome { execution_result, block, block_access_list, .. } = if skip_state_root
++    let BlockBuilderOutcome { execution_result, execution_state, block, block_access_list, .. } =
++        if skip_state_root
+     {
+         debug!(
+             target: "payload_builder",
+@@ -489,7 +491,21 @@ where
  
      let requests = chain_spec
-         .is_prague_active_at_timestamp(attributes.timestamp)
+         .is_prague_active_at_timestamp(attributes.timestamp())
 -        .then_some(execution_result.requests);
 +        .then(|| execution_result.requests.clone());
 +
 +    // Retain the transaction root and execution output so compact followers
 +    // can reuse work already authenticated by the leader's sealed block hash.
 +    let block_hash = block.hash();
-+    let transactions_root = block.header().transactions_root();
++    let transactions_root = block.header().transactions_root;
 +    let senders = block.senders().to_vec();
-+    let execution_output = BlockExecutionOutput { state: db.take_bundle(), result: execution_result };
++    let execution_output =
++        BlockExecutionOutput { state: execution_state, result: execution_result };
 +    reth_evm::payload_cache::store_payload_transactions_root(block_hash, transactions_root);
 +    reth_evm::payload_cache::store_broadcast_execution(
 +        block_hash,
@@ -41,8 +65,8 @@ index ec28b52ff..61e1696a0 100644
 +    );
 +    reth_evm::payload_cache::store_payload_execution(block_hash, (execution_output, senders));
  
-     debug!(target: "payload_builder", id=%payload_id, sealed_block_header = ?block.sealed_header(), "sealed built block");
- 
+     debug!(
+         target: "payload_builder",
 diff --git a/crates/ethereum/payload/src/validator.rs b/crates/ethereum/payload/src/validator.rs
 index 84f8ccecf..b2d1b0733 100644
 --- a/crates/ethereum/payload/src/validator.rs

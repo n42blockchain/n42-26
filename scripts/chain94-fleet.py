@@ -196,7 +196,15 @@ def owned_process(runtime, index):
     pid = record["pid"]
     if process_identity(pid) != record["starttime"]:
         return None
-    command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\x00")
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except FileNotFoundError:
+        return None
+    # An exiting process (a zombie, or one whose memory is already released)
+    # reads an empty command line: it is the node shutting down.
+    if not raw:
+        return None
+    command = raw.split(b"\x00")
     if str(runtime / f"node{index}/reth").encode() not in command:
         raise ValueError(f"PID {pid} no longer belongs to this datadir; refusing to signal it")
     return pid
@@ -337,13 +345,28 @@ def _start(args, children, cancelled):
     low_memory = not fresh
     disable_forward = bool(getattr(args, "disable_tx_forward", False))
     single_flight = bool(getattr(args, "import_single_flight", False))
+    # Explicit per-run node settings (e.g. the 0x50 frame gateways); the
+    # inherited environment's N42_* variables are still dropped below.
+    extra_node_args = list(getattr(args, "node_arg", None) or [])
+    for item in extra_node_args:
+        if not item.startswith("--"):
+            raise ValueError(f"--node-arg takes a node flag such as --cpu-cores=32, got {item!r}")
+    extra_env = {}
+    for item in getattr(args, "env", None) or []:
+        key, sep, value = item.partition("=")
+        if not sep or not key.startswith("N42_"):
+            raise ValueError(f"--env takes N42_NAME=value, got {item!r}")
+        extra_env[key] = value
+    execution_owner = getattr(args, "execution_owner", None)
+    if execution_owner is not None and not 0 <= execution_owner < count:
+        raise ValueError(f"--execution-owner must name one of the {count} nodes")
     gov5_reuse = os.environ.get("N42_GOV5_REUSE_BUILDER_EXECUTION", "1")
     if gov5_reuse not in {"0", "1"}:
         raise ValueError("N42_GOV5_REUSE_BUILDER_EXECUTION must be 0 or 1")
     run = dict(foreground=bool(getattr(args, "foreground", False)), low_memory=low_memory, disable_tx_forward=disable_forward, max_txs_per_block=max_txs, build_budget_ms=build_budget, rpc_max_response_mb=rpc_max_response_mb, binary=str(binary), sha256=digest(binary), started=time.time(),
                block_interval_ms=consensus_config["slot_time_ms"],
                immediate_persistence=dict(persistence_threshold=0, state_masking_blocks=0, memory_block_buffer_target=0),
-               import_single_flight=single_flight, fast_transfers=args.fast_transfers, parallel_build=args.parallel_build, parallel_import=args.parallel_import, qmdb_reads=args.qmdb_reads, gov5_reuse_builder_execution=gov5_reuse,
+               import_single_flight=single_flight, extra_env=extra_env, execution_owner=execution_owner, extra_node_args=extra_node_args, fast_transfers=args.fast_transfers, parallel_build=args.parallel_build, parallel_import=args.parallel_import, qmdb_reads=args.qmdb_reads, gov5_reuse_builder_execution=gov5_reuse,
                log_offsets={str(i): (runtime / f"logs/node{i}.log").stat().st_size
                             if (runtime / f"logs/node{i}.log").exists() else 0 for i in range(count)})
     write_json(runtime / "run.json", run)
@@ -385,6 +408,10 @@ def _start(args, children, cancelled):
             "RAYON_NUM_THREADS": "8", "TOKIO_WORKER_THREADS": "8",
             "RUST_LOG": "info",
         })
+        env.update(extra_env)
+        if execution_owner is not None and index != execution_owner:
+            # Import once per host: this key asks the owner's node instead of executing.
+            env["N42_EL_OWNER_RPC"] = f"127.0.0.1:{ports['http'] + execution_owner}"
         if "max_txs_per_block" in manifest or getattr(args, "max_txs_per_block", None) is not None:
             env["N42_MAX_TXS_PER_BLOCK"] = str(max_txs)
         if "build_budget_ms" in manifest or getattr(args, "build_budget_ms", None) is not None:
@@ -410,6 +437,7 @@ def _start(args, children, cancelled):
         if fresh:
             command.extend(["--builder.gaslimit", str(manifest["gas_limit"]),
                             "--builder.interval", "50ms", "--builder.max-tasks", "1"])
+        command.extend(extra_node_args)
         with open(runtime / f"logs/node{index}.log", "ab", buffering=0) as log:
             child = subprocess.Popen(command, cwd=REPO, env=env, stdin=subprocess.DEVNULL,
                                      stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -450,18 +478,25 @@ def sample(runtime):
     manifest = read_json(runtime / "manifest.json")
     count = fleet_size(manifest)
     ports = [manifest["ports"]["http"] + i for i in range(count)]
+    # With one execution owner only its node holds blocks: every key's
+    # committed hash is looked up on the owner, and the roots compared are
+    # the owner's alone.
+    run_file = runtime / "run.json"
+    owner = read_json(run_file).get("execution_owner") if run_file.exists() else None
+    executing = ports if owner is None else [ports[owner]]
     with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
-        heads = list(pool.map(lambda p: int(rpc(p, "eth_blockNumber", []), 16), ports))
+        heads = list(pool.map(lambda p: int(rpc(p, "eth_blockNumber", []), 16), executing))
         consensus = list(pool.map(lambda p: rpc(p, "n42_consensusStatus", []), ports))
         if not all(s["hasCommittedQc"] and s["validatorCount"] == count for s in consensus):
             raise ValueError(f"all {count} nodes must report a committed QC and matching validator count")
-        commits = list(pool.map(committed_block, zip(ports, consensus)))
+        lookups = ports if owner is None else [ports[owner]] * count
+        commits = list(pool.map(committed_block, zip(lookups, consensus)))
         committed_heights = [int(block["number"], 16) for block in commits]
         number = min(heads + committed_heights)
-        blocks = list(pool.map(lambda p: rpc(p, "eth_getBlockByNumber", [hex(number), False]), ports))
+        blocks = list(pool.map(lambda p: rpc(p, "eth_getBlockByNumber", [hex(number), False]), executing))
     fields = ("hash", "stateRoot", "receiptsRoot", "transactionsRoot")
     identical = all(len({block[field] for block in blocks}) == 1 for field in fields)
-    return dict(at=time.time(), heads=heads, comparison_height=number, identical=identical,
+    return dict(at=time.time(), heads=heads, execution_owner=owner, comparison_height=number, identical=identical,
                 committed_heights=committed_heights, committed_views=[s["latestCommittedView"] for s in consensus],
                 **{field: blocks[0][field] for field in fields})
 
@@ -502,14 +537,21 @@ def verify(args):
     result = dict(status="PASS" if advanced >= args.min_blocks and all(s["identical"] for s in samples) and (not rotation_required or producers == expected) else "FAIL",
                   advanced=advanced, snapshot=manifest["snapshot"], samples=samples,
                   producers=sorted(producers), all_validators_produced=producers == expected,
-                  scope=f"{fleet_size(manifest)} committed-QC RPCs; matching block/state/receipt/transaction roots, progress" + (" and full producer rotation" if rotation_required else ""))
+                  execution_owner=baseline["execution_owner"],
+                  scope=(f"{fleet_size(manifest)} committed-QC RPCs; matching block/state/receipt/transaction roots, progress" if baseline["execution_owner"] is None
+                         else f"{fleet_size(manifest)} committed-QC RPCs over ONE execution layer (node{baseline['execution_owner']}); every key's committed block is on the owner's chain, progress")
+                        + (" and full producer rotation" if rotation_required else ""))
     if fleet_size(manifest) == 7:
         result["all_seven_produced"] = producers == expected
     write_json(args.runtime / "verification.json", result)
     write_json(args.runtime / f"verification-{int(time.time())}.json", result)
     if result["status"] != "PASS":
         raise RuntimeError("insufficient common committed progress or incomplete producer rotation")
-    print(f"PASS: {advanced} common blocks, all {fleet_size(manifest)} roots/hashes agree")
+    if baseline["execution_owner"] is None:
+        print(f"PASS: {advanced} common blocks, all {fleet_size(manifest)} roots/hashes agree")
+    else:
+        print(f"PASS: {advanced} common blocks on one execution layer (node{baseline['execution_owner']}); "
+              f"all {fleet_size(manifest)} keys committed blocks of its chain")
 
 
 def main():
@@ -532,6 +574,9 @@ def main():
     start_parser.add_argument("--rpc-max-response-mb", type=int, default=160, help="bounded JSON-RPC response limit in MiB (16..512)")
     start_parser.add_argument("--max-txs-per-block", type=int, help="explicit block transaction cap; defaults to the fleet manifest")
     start_parser.add_argument("--build-budget-ms", type=int, help="explicit payload build time budget; defaults to the fleet manifest")
+    start_parser.add_argument("--node-arg", action="append", metavar="--FLAG[=VALUE]", help="extra node command-line flag, repeatable (use --node-arg=--flag=value); recorded in run.json")
+    start_parser.add_argument("--env", action="append", metavar="N42_NAME=VALUE", help="extra node setting, repeatable; recorded in run.json and applied after the fleet's own")
+    start_parser.add_argument("--execution-owner", type=int, metavar="INDEX", help="import once per host: only this node executes; the other keys report its result (recorded in run.json). Leadership must stay with this node")
     start_parser.add_argument("--qmdb-reads", choices=("off", "verify", "on", "only"), default="off", help="explicit state-reader mode, recorded in run.json and passed to every node")
     sub.add_parser("stop")
     sub.add_parser("status")

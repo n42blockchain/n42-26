@@ -3,7 +3,7 @@ use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_rlp::Encodable;
 use n42_execution::witness::ExecutionWitness;
 use n42_mobile::{VerificationPacket, WitnessAccount};
-use reth_ethereum_primitives::EthPrimitives;
+use n42_tx_types::N42Primitives;
 use reth_primitives_traits::{BlockBody, NodePrimitives, SealedBlock};
 use std::collections::HashMap;
 
@@ -31,7 +31,7 @@ pub enum PacketBuildError {
 /// 6. Assemble the final `VerificationPacket`
 pub fn build_verification_packet(
     witness: &ExecutionWitness,
-    block: &SealedBlock<<EthPrimitives as NodePrimitives>::Block>,
+    block: &SealedBlock<<N42Primitives as NodePrimitives>::Block>,
     block_hashes: &[(u64, B256)],
 ) -> Result<VerificationPacket, PacketBuildError> {
     // Build preimage mappings from witness.keys.

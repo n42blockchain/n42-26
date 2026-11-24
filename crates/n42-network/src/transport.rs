@@ -48,6 +48,8 @@ const DEFAULT_QUIC_MAX_CONNECTION_DATA: u32 = 96 * 1024 * 1024;
 const DEFAULT_QUIC_MAX_CONCURRENT_STREAMS: u32 = 256;
 const DEFAULT_QUIC_UDP_SOCKET_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_BLOCK_DIRECT_REQUEST_TIMEOUT_MS: u64 = 10_000;
+/// Concurrent block-push streams, in and out, on one connection.
+const GOV5_BLOCK_PUSH_MAX_STREAMS: usize = 8;
 const MIN_QUIC_FLOW_WINDOW: u32 = 1024 * 1024;
 const MAX_QUIC_FLOW_WINDOW: u32 = 512 * 1024 * 1024;
 
@@ -525,8 +527,13 @@ fn build_swarm_with_transports(
                 libp2p::StreamProtocol::new(GOV5_BLOCK_PUSH_PROTOCOL),
                 libp2p::request_response::ProtocolSupport::Full,
             )],
+            // A push is read and decompressed, up to 64 MiB, before the
+            // handler can check who sent it. A sender pushes one block a
+            // view, so a few streams a connection serve it; the default of
+            // 100 would let any connected peer hold 6.4 GiB of them open.
             libp2p::request_response::Config::default()
-                .with_request_timeout(Duration::from_secs(10)),
+                .with_request_timeout(Duration::from_secs(10))
+                .with_max_concurrent_streams(GOV5_BLOCK_PUSH_MAX_STREAMS),
         );
 
         let gov5_block_by_hash = libp2p::request_response::Behaviour::new(

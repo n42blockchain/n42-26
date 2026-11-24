@@ -1,5 +1,6 @@
 //! Conversion from reth execution changes to gov5 replay-v2 QMDB mutations.
 
+use alloy_consensus::transaction::TxHashRef as _;
 use alloy_eips::{
     eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE},
     eip4788::{BEACON_ROOTS_ADDRESS, BEACON_ROOTS_CODE},
@@ -13,10 +14,10 @@ use n42_twig_core::qmdb_compat::{
     QmdbCompatTree, QmdbOperation, QmdbOperationError, encode_gov5_account_value, gov5_account_key,
     gov5_storage_key,
 };
-use reth_ethereum_primitives::{Block, Receipt};
+use n42_tx_types::{Block, Receipt};
 use reth_execution_types::BlockExecutionOutput;
 use reth_primitives_traits::SealedBlock;
-use revm::database::states::BundleState;
+use reth_trie_common::bundle_state::BundleState;
 use std::collections::HashSet;
 
 /// Apply the additional state that Gov5 replay-v2 inserts after sealing the source block-zero
@@ -129,43 +130,78 @@ pub fn gov5_unchanged_account_rule_active_from_genesis(genesis: &Genesis) -> boo
 /// write changes every later slot and the root. Reth preserves the same distinction in
 /// `BundleAccount::status`: loaded accounts are reads, while every other status is dirty.
 ///
-/// A destroyed account has complete storage in the revm bundle, so every known slot is emitted:
+/// The evm2 block state commits only the accounts a transaction changed; the accounts one touched
+/// and left as they were (the existing recipient of a zero-value transfer, a beneficiary credited
+/// a zero tip) are put back into the bundle by `n42_execution::TrackingExecutor`, with a dirty
+/// status, so they get their leaf here.
+///
+/// A destroyed account has complete storage in the bundle, so every known slot is emitted:
 /// this preserves the storage wipe even when a slot's `present_value` still equals its original
 /// value. Other accounts emit only changed slots. Ordering is deliberately left to
 /// `QmdbCompatTree::apply_sorted_ops`, which rejects duplicates and sorts by hashed key exactly
 /// once immediately before mutation.
 pub fn gov5_qmdb_operations(state: &BundleState) -> Vec<QmdbOperation> {
+    // Every operation hashes its key. A full native block changes about 190k
+    // accounts, which took about 25 ms on the importing thread; the order of
+    // the result is not significant (callers sort by key), so large changes
+    // are derived on the rayon pool.
+    if state.state.len() >= PARALLEL_OPERATIONS_FROM {
+        use rayon::prelude::*;
+        let accounts: Vec<_> = state.state.iter().collect();
+        return accounts
+            .par_iter()
+            .with_min_len(1024)
+            .fold(Vec::new, |mut operations, (address, account)| {
+                push_account_operations(&mut operations, address, account);
+                operations
+            })
+            .reduce(Vec::new, |mut left, mut right| {
+                left.append(&mut right);
+                left
+            });
+    }
     let mut operations = Vec::with_capacity(state.state_size);
     for (address, account) in &state.state {
-        let address = address.into_array();
-        if !account.status.is_not_modified() {
-            operations.push(QmdbOperation {
-                key: gov5_account_key(&address),
-                value: account.info.as_ref().map(|info| {
-                    encode_gov5_account_value(
-                        info.nonce,
-                        &info.balance.to_be_bytes(),
-                        &info.code_hash.0,
-                    )
-                }),
-            });
-        }
-
-        for (slot, value) in &account.storage {
-            if !account.was_destroyed() && !value.is_changed() {
-                continue;
-            }
-            let present = value.present_value();
-            operations.push(QmdbOperation {
-                key: gov5_storage_key(&address, &slot.to_be_bytes()),
-                value: (!account.was_destroyed() || account.info.is_some())
-                    .then_some(present)
-                    .filter(|present| !present.is_zero())
-                    .map(|present| present.to_be_bytes::<32>().to_vec()),
-            });
-        }
+        push_account_operations(&mut operations, address, account);
     }
     operations
+}
+
+/// Accounts from which [`gov5_qmdb_operations`] derives in parallel.
+const PARALLEL_OPERATIONS_FROM: usize = 4096;
+
+fn push_account_operations(
+    operations: &mut Vec<QmdbOperation>,
+    address: &alloy_primitives::Address,
+    account: &reth_trie_common::bundle_state::BundleAccount,
+) {
+    let address = address.into_array();
+    if !account.status.is_not_modified() {
+        operations.push(QmdbOperation {
+            key: gov5_account_key(&address),
+            value: account.info.as_ref().map(|info| {
+                encode_gov5_account_value(
+                    info.nonce,
+                    &info.balance.to_be_bytes(),
+                    &info.code_hash.0,
+                )
+            }),
+        });
+    }
+
+    for (slot, value) in &account.storage {
+        if !account.was_destroyed() && !value.is_changed() {
+            continue;
+        }
+        let present = value.present_value();
+        operations.push(QmdbOperation {
+            key: gov5_storage_key(&address, &slot.to_be_bytes()),
+            value: (!account.was_destroyed() || account.info.is_some())
+                .then_some(present)
+                .filter(|present| !present.is_zero())
+                .map(|present| present.to_be_bytes::<32>().to_vec()),
+        });
+    }
 }
 
 /// Convenience boundary used by a state-root job, keeping the receipt type localized to the
@@ -199,7 +235,7 @@ pub fn gov5_restored_slots_key(block: &SealedBlock<Block>, env_key: B256) -> B25
 pub const GOV5_PRAGUE_SYSTEM_CALLER: alloy_primitives::Address =
     address!("fffffffffffffffffffffffffffffffffffffffe");
 
-/// The leaf a Prague block writes that revm's bundle cannot show: the system
+/// The leaf a Prague block writes that the bundle cannot show: the system
 /// caller of the EIP-7002/7251 end-of-block calls.
 ///
 /// gov5 executes those calls as messages from `SYSTEM_ADDRESS`
@@ -227,7 +263,7 @@ pub fn with_gov5_prague_system_caller(operations: &mut Vec<QmdbOperation>) {
 }
 
 /// [`gov5_qmdb_operations`] plus the rewrites gov5 makes for the slots the block changed and
-/// restored to their value at the block's start, which revm drops from the bundle (see
+/// restored to their value at the block's start, which the bundle drops (see
 /// `n42_execution::restored_slots`). A rewrite is a leaf with the value the slot already has;
 /// QMDB records it as a fresh slot, and the root moves exactly as gov5's does.
 ///
@@ -299,11 +335,49 @@ mod tests {
     }
 
     use alloy_primitives::{Address, U256};
-    use revm::{
-        database::states::{AccountStatus, BundleAccount, StorageSlot},
-        state::AccountInfo,
-    };
+    use evm2::evm::AccountInfo;
+    use reth_trie_common::bundle_state::{AccountStatus, BundleAccount, StorageSlot};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn a_large_change_set_derives_the_same_operations_as_one_account_at_a_time() {
+        let mut state = BundleState::default();
+        for index in 0..(PARALLEL_OPERATIONS_FROM as u64 + 37) {
+            let address = Address::from_word(B256::from(U256::from(index + 1)));
+            let info = AccountInfo {
+                nonce: index,
+                balance: U256::from(index * 3),
+                ..Default::default()
+            };
+            let storage = (index % 5 == 0)
+                .then(|| {
+                    (
+                        U256::from(index),
+                        StorageSlot::new_changed(U256::ZERO, U256::from(index + 9)),
+                    )
+                })
+                .into_iter()
+                .collect();
+            let status = if index % 11 == 0 {
+                AccountStatus::Loaded
+            } else {
+                AccountStatus::Changed
+            };
+            state.state.insert(
+                address,
+                BundleAccount::new(None, Some(info), storage, status),
+            );
+        }
+        let mut serial = Vec::new();
+        for (address, account) in &state.state {
+            push_account_operations(&mut serial, address, account);
+        }
+        let mut parallel = gov5_qmdb_operations(&state);
+        assert!(parallel.len() > PARALLEL_OPERATIONS_FROM);
+        serial.sort_unstable_by_key(|operation| operation.key);
+        parallel.sort_unstable_by_key(|operation| operation.key);
+        assert_eq!(parallel, serial);
+    }
 
     #[test]
     fn converts_changed_account_and_storage_to_gov5_leaf_format() {

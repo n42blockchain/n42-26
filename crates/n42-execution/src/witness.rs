@@ -1,6 +1,7 @@
 use alloy_primitives::{B256, Bytes};
+use evm2::evm::CacheDB;
+use reth_primitives_traits::Account;
 use reth_trie_common::{HashedPostState, HashedStorage};
-use revm::database::State;
 use std::collections::HashSet;
 use tracing::debug;
 
@@ -19,31 +20,35 @@ pub struct ExecutionWitness {
 }
 
 impl ExecutionWitness {
-    /// Records the execution witness from EVM state after block execution.
-    ///
-    /// This should be called while the `State<DB>` is still available,
-    /// before `take_bundle()` consumes the state changes.
-    pub fn from_state<DB>(state: &State<DB>) -> Self {
-        // `Legacy` preserves the pre-reth-v2 witness shape that the N42 mobile
-        // verifier already consumes (no dedup / sort). Switching to `Canonical`
-        // would break the existing mobile packet format.
+    /// Records the execution witness from the cache the block was executed
+    /// over, once the block's output has been committed into it: every
+    /// account and slot the block read, with its value after the block.
+    pub fn from_state<DB>(state: &CacheDB<DB>) -> Self {
+        // The pre-reth-v2 witness shape that the N42 mobile verifier already
+        // consumes (no dedup / sort), not reth's canonical witness with trie
+        // proofs (`reth_evm::witness`), which would break the existing mobile
+        // packet format.
         let mut hashed_state = HashedPostState::default();
-        let codes = state
-            .cache
+        let cache = &state.cache;
+        // The cache always holds the empty code under the empty code hash.
+        let codes = cache
             .contracts
             .values()
+            .filter(|code| !code.is_empty())
             .map(|code| code.original_bytes())
             .collect();
         let mut keys = Vec::new();
 
-        for (address, cached_account) in &state.cache.accounts {
+        for (address, account) in &cache.accounts {
             let hashed_address = alloy_primitives::keccak256(address);
             hashed_state.accounts.insert(
                 hashed_address,
-                cached_account
-                    .account
-                    .as_ref()
-                    .map(|account| (&account.info).into()),
+                account.as_ref().map(|info| Account {
+                    nonce: info.nonce,
+                    balance: info.balance,
+                    bytecode_hash: (!info.code_hash.is_zero() && !info.is_empty_code_hash())
+                        .then_some(info.code_hash),
+                }),
             );
 
             let storage = hashed_state
@@ -51,9 +56,10 @@ impl ExecutionWitness {
                 .entry(hashed_address)
                 .or_insert_with(HashedStorage::default);
 
-            if let Some(account) = &cached_account.account {
+            if account.is_some() {
                 keys.push(address.to_vec().into());
-                for (slot, value) in &account.storage {
+                let slots = cache.storage.get(address).map(|storage| &storage.slots);
+                for (slot, value) in slots.into_iter().flatten() {
                     let slot = B256::from(*slot);
                     storage
                         .storage
@@ -66,7 +72,11 @@ impl ExecutionWitness {
             hashed_state,
             codes,
             keys,
-            lowest_block_number: state.block_hashes.lowest().map(|(number, _)| number),
+            lowest_block_number: cache
+                .block_hashes
+                .keys()
+                .map(|number| number.saturating_to::<u64>())
+                .min(),
         }
     }
 
@@ -144,16 +154,20 @@ mod tests {
     #[test]
     fn test_execution_witness_reads_cached_state_without_reth_record_helper() {
         let address = alloy_primitives::Address::with_last_byte(0x42);
-        let mut state = State::builder()
-            .with_database(revm::database::EmptyDB::default())
-            .build();
-        state.cache.insert_account(
-            address,
-            revm::state::AccountInfo {
+        let mut state = CacheDB::new(evm2::evm::EmptyDB::default());
+        state.insert_account_info(
+            &address,
+            evm2::evm::AccountInfo {
                 balance: alloy_primitives::U256::from(9),
                 ..Default::default()
             },
         );
+        state.insert_account_storage(
+            &address,
+            &alloy_primitives::U256::from(1),
+            &alloy_primitives::U256::from(2),
+        );
+        state.insert_block_hash(&alloy_primitives::U256::from(7), &B256::repeat_byte(7));
 
         let witness = ExecutionWitness::from_state(&state);
         let hashed_address = keccak256(address);
@@ -164,8 +178,13 @@ mod tests {
                 .keys
                 .contains(&Bytes::copy_from_slice(address.as_slice()))
         );
+        assert_eq!(
+            witness.hashed_state.storages[&hashed_address].storage
+                [&keccak256(B256::from(alloy_primitives::U256::from(1)))],
+            alloy_primitives::U256::from(2)
+        );
         assert!(witness.codes.is_empty());
-        assert_eq!(witness.lowest_block_number, None);
+        assert_eq!(witness.lowest_block_number, Some(7));
     }
 
     #[test]

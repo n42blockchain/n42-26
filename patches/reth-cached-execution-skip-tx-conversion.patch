@@ -1,0 +1,20 @@
+diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
+index 30efe77d1..a4fc632b8 100644
+--- a/crates/engine/tree/src/tree/payload_validator.rs
++++ b/crates/engine/tree/src/tree/payload_validator.rs
+@@ -649,8 +649,14 @@ where
+         metrics::histogram!("n42_import_stage_ms", "stage" => "pre_spawn_processor")
+             .record(n42_validate_start.elapsed().as_secs_f64() * 1000.0);
+         // Spawn transaction conversion and prewarming.
++        // A cached output leaves no transaction to execute or prewarm: the processor is told
++        // the block has none, so it does not decode and recover every one of them for nothing.
++        let mut processor_env = env.clone();
++        if is_cache_hit {
++            processor_env.transaction_count = 0;
++        }
+         let mut handle = ensure_ok!(self.spawn_payload_processor(
+-            env.clone(),
++            processor_env,
+             txs,
+             state_provider_factory.clone(),
+             hint_stream,

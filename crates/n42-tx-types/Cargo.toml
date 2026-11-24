@@ -7,8 +7,7 @@ license.workspace = true
 description = "N42 native Ed25519 transactions, blocks, receipts and authenticated frames"
 
 [dependencies]
-alloy-evm = { version = "0.39.0", default-features = false }
-revm = { version = "43.0.3", default-features = false, features = ["std", "serde"] }
+evm2.workspace = true
 alloy-consensus = { version = "2.5.0", default-features = false, features = ["std", "serde", "secp256k1"] }
 alloy-eips = { version = "2.5.0", default-features = false, features = ["std", "serde"] }
 alloy-primitives = { workspace = true, features = ["std", "serde", "rlp"] }
@@ -25,6 +24,13 @@ sha2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 bytes.workspace = true
 thiserror.workspace = true
+# RPC request conversions and the 0x50 receipt response (`rpc.rs`); foreign
+# traits, so they can only be implemented where the envelope lives.
+alloy-rpc-types-eth = { workspace = true, features = ["std", "serde"] }
+alloy-network.workspace = true
+reth-rpc-traits = "0.8.2"
+# The fixed-size cache reth's sender-recovery cache is built on (`sender_cache.rs`).
+fixed-cache = "0.1.11"
 
 [dev-dependencies]
 serde_json.workspace = true

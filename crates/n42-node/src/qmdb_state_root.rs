@@ -20,12 +20,12 @@ use n42_twig_core::qmdb_compat::{
 use n42_twig_core::qmdb_leaf_tree::{
     QmdbLeafFormHeader, QmdbLeafFormIoError, QmdbLeafTree, QmdbLeafTreeError,
 };
+use n42_tx_types::{N42Primitives, Receipt};
 use reth_engine_tree::tree::state_root_strategy::{
     LazyHashedPostState, PreparedStateRootJob, StateRootJob, StateRootJobContext,
     StateRootJobOutcome, StateRootStrategy,
 };
 use reth_engine_tree::tree::{BasicEngineValidator, TreeConfig};
-use reth_ethereum_primitives::{EthPrimitives, Receipt};
 use reth_evm::{ConfigureEngineEvm, ConfigureEvm};
 use reth_node_api::FullNodeComponents;
 use reth_node_builder::rpc::{BasicEngineValidatorBuilder, EngineValidatorBuilder};
@@ -216,6 +216,9 @@ struct AppliedUndo {
 /// `tree_at` still names its parent until the exact operations are admitted.
 struct PreparedCandidate {
     parent_hash: B256,
+    /// Names the parent, block environment and ordered transactions the
+    /// operations were derived from, when the builder supplied it.
+    binding: Option<B256>,
     root: B256,
     operations: Vec<QmdbOperation>,
     undo: BlockUndo,
@@ -395,13 +398,29 @@ pub struct Gov5QmdbStateRootStore {
     read_spawn_failure: AtomicBool,
 }
 
+/// Read views [`Gov5QmdbStateRootStore::enable_read_views`] keeps whatever
+/// the byte budget: the newest block, its parent and the two before, which a
+/// build on an own block's output may read.
+const MIN_READ_VIEWS: usize = 4;
+
 #[derive(Debug)]
 struct QmdbReadViewCache {
     capacity: usize,
     byte_budget: usize,
+    /// Views kept even past the byte budget.
+    min_views: usize,
     logical_bytes: usize,
     views: HashMap<B256, Arc<QmdbReadView>>,
     order: VecDeque<B256>,
+}
+
+/// Frees displaced read views off the calling thread: the last owner of a
+/// view walks every node it does not share with a newer one, tens of
+/// thousands for a full block.
+fn release_read_views(views: Vec<Arc<QmdbReadView>>) {
+    if !views.is_empty() {
+        rayon::spawn(move || drop(views));
+    }
 }
 
 impl QmdbReadViewCache {
@@ -414,34 +433,50 @@ impl QmdbReadViewCache {
         Some(view)
     }
 
-    fn insert(&mut self, view: Arc<QmdbReadView>) {
+    /// Adds `view` and returns the views it displaced. Freeing one walks
+    /// every node only it still owns, so the caller releases them outside
+    /// the cache lock, see [`release_read_views`].
+    #[must_use]
+    fn insert(&mut self, view: Arc<QmdbReadView>) -> Vec<Arc<QmdbReadView>> {
+        let mut displaced = Vec::new();
         let hash = view.block_hash();
         self.logical_bytes += view.logical_bytes();
         if let Some(previous) = self.views.insert(hash, view) {
             self.logical_bytes -= previous.logical_bytes();
+            displaced.push(previous);
         } else {
             self.order.push_back(hash);
         }
-        // Keep the newest view even when it alone exceeds the budget: dropping
-        // it would force a full reconstruction for every execution provider.
+        // Keep the most recent views even when they exceed the budget:
+        // dropping one would force a full reconstruction (hundreds of
+        // milliseconds on a large state) for every execution provider that
+        // reads it. A leader building on its own sealed block reads the block
+        // before it, which is not the newest view; and consecutive views
+        // share all but their changed nodes, which the logical bytes charge
+        // once per view.
         while self.order.len() > 1
-            && (self.order.len() > self.capacity || self.logical_bytes > self.byte_budget)
+            && (self.order.len() > self.capacity
+                || (self.order.len() > self.min_views && self.logical_bytes > self.byte_budget))
         {
             if let Some(hash) = self.order.pop_front()
                 && let Some(view) = self.views.remove(&hash)
             {
                 self.logical_bytes -= view.logical_bytes();
+                displaced.push(view);
             }
         }
         metrics::gauge!("n42_qmdb_read_cache_views").set(self.views.len() as f64);
         metrics::gauge!("n42_qmdb_read_cache_logical_bytes").set(self.logical_bytes as f64);
         metrics::gauge!("n42_qmdb_read_cache_over_budget_bytes")
             .set(self.logical_bytes.saturating_sub(self.byte_budget) as f64);
+        displaced
     }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Gov5QmdbStateRootError {
+    #[error("QMDB holds no prepared candidate for the requested execution")]
+    NoBoundCandidate,
     #[error("QMDB base snapshot is invalid: {0}")]
     InvalidBaseSnapshot(#[from] QmdbSnapshotError),
     #[error("QMDB base leaf form is invalid: {0}")]
@@ -801,9 +836,10 @@ impl Gov5QmdbStateRootStore {
         &self,
         capacity: std::num::NonZeroUsize,
     ) -> Result<(), Gov5QmdbStateRootError> {
-        self.enable_read_views_with_budget(
+        self.enable_read_views_with_minimum(
             capacity,
             std::num::NonZeroUsize::new(512 * 1024 * 1024).unwrap(),
+            MIN_READ_VIEWS,
         )
     }
 
@@ -815,6 +851,17 @@ impl Gov5QmdbStateRootStore {
         &self,
         capacity: std::num::NonZeroUsize,
         byte_budget: std::num::NonZeroUsize,
+    ) -> Result<(), Gov5QmdbStateRootError> {
+        self.enable_read_views_with_minimum(capacity, byte_budget, 1)
+    }
+
+    /// [`Self::enable_read_views_with_budget`], keeping the `min_views` most
+    /// recently used views past the byte budget (at least the newest one).
+    pub fn enable_read_views_with_minimum(
+        &self,
+        capacity: std::num::NonZeroUsize,
+        byte_budget: std::num::NonZeroUsize,
+        min_views: usize,
     ) -> Result<(), Gov5QmdbStateRootError> {
         let _commit = self
             .commit
@@ -828,6 +875,7 @@ impl Gov5QmdbStateRootStore {
             *views = Some(QmdbReadViewCache {
                 capacity: capacity.get(),
                 byte_budget: byte_budget.get(),
+                min_views: min_views.max(1),
                 logical_bytes: 0,
                 views: HashMap::new(),
                 order: VecDeque::new(),
@@ -890,7 +938,7 @@ impl Gov5QmdbStateRootStore {
             .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?
             .as_mut()
         {
-            cache.insert(Arc::clone(&view));
+            release_read_views(cache.insert(Arc::clone(&view)));
         }
         Ok(Some(view))
     }
@@ -1003,7 +1051,61 @@ impl Gov5QmdbStateRootStore {
         parent_hash: B256,
         operations: Vec<QmdbOperation>,
     ) -> Result<B256, Gov5QmdbStateRootError> {
-        self.prepare_candidate_with_limit(parent_hash, operations, PREPARED_CANDIDATE_BYTES)
+        self.prepare_candidate_with_limit(parent_hash, operations, PREPARED_CANDIDATE_BYTES, None)
+    }
+
+    /// [`Self::prepare_candidate`] for operations the caller derived from the
+    /// execution named by `binding`: its parent, block environment and
+    /// ordered transactions. An import of exactly that execution may then
+    /// commit the candidate without deriving the operations again.
+    pub fn prepare_bound_candidate(
+        &self,
+        parent_hash: B256,
+        operations: Vec<QmdbOperation>,
+        binding: B256,
+    ) -> Result<B256, Gov5QmdbStateRootError> {
+        self.prepare_candidate_with_limit(
+            parent_hash,
+            operations,
+            PREPARED_CANDIDATE_BYTES,
+            Some(binding),
+        )
+    }
+
+    /// Commit the prepared candidate if it was derived from the execution
+    /// named by `binding`. Returns `None` when no such candidate is held; the
+    /// caller then derives the operations itself.
+    pub fn commit_bound_candidate(
+        &self,
+        parent_hash: B256,
+        block_hash: B256,
+        expected_root: B256,
+        binding: B256,
+    ) -> Result<Option<B256>, Gov5QmdbStateRootError> {
+        match self.commit_operations(parent_hash, block_hash, expected_root, Err(binding)) {
+            Ok(root) => Ok(Some(root)),
+            Err(Gov5QmdbStateRootError::NoBoundCandidate) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The binding of the prepared candidate, if one stands on `parent_hash`
+    /// and produced `root`. A builder that sealed `root` into its own block
+    /// uses it to commit that block with [`Self::commit_bound_candidate`].
+    pub fn prepared_binding(
+        &self,
+        parent_hash: B256,
+        root: B256,
+    ) -> Result<Option<B256>, Gov5QmdbStateRootError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?;
+        Ok(state
+            .prepared
+            .as_ref()
+            .filter(|prepared| prepared.parent_hash == parent_hash && prepared.root == root)
+            .and_then(|prepared| prepared.binding))
     }
 
     fn prepare_candidate_with_limit(
@@ -1011,6 +1113,7 @@ impl Gov5QmdbStateRootStore {
         parent_hash: B256,
         operations: Vec<QmdbOperation>,
         byte_limit: usize,
+        binding: Option<B256>,
     ) -> Result<B256, Gov5QmdbStateRootError> {
         let started = std::time::Instant::now();
         let mut state = self
@@ -1034,7 +1137,7 @@ impl Gov5QmdbStateRootStore {
                         + operations.iter().filter_map(|op| op.value.as_ref()).map(Vec::capacity).sum::<usize>()
                         + undo_heap_bytes(&undo) + heap_bytes;
                     if bytes <= byte_limit {
-                        state.prepared = Some(PreparedCandidate { parent_hash, root, operations, undo });
+                        state.prepared = Some(PreparedCandidate { parent_hash, binding, root, operations, undo });
                         metrics::gauge!("n42_qmdb_prepared_candidate_bytes").set(bytes as f64);
                         metrics::counter!("n42_qmdb_prepared_candidates_total", "outcome" => "retained").increment(1);
                     } else {
@@ -1076,7 +1179,18 @@ impl Gov5QmdbStateRootStore {
         expected_root: B256,
         operations: Vec<QmdbOperation>,
     ) -> Result<B256, Gov5QmdbStateRootError> {
-        let operation_count = operations.len();
+        self.commit_operations(parent_hash, block_hash, expected_root, Ok(operations))
+    }
+
+    /// `source` is the block's operations, or the binding of the prepared
+    /// candidate whose operations are to be used.
+    fn commit_operations(
+        &self,
+        parent_hash: B256,
+        block_hash: B256,
+        expected_root: B256,
+        source: Result<Vec<QmdbOperation>, B256>,
+    ) -> Result<B256, Gov5QmdbStateRootError> {
         let _commit = self
             .commit
             .lock()
@@ -1089,6 +1203,28 @@ impl Gov5QmdbStateRootStore {
         let lock_acquired = std::time::Instant::now();
         metrics::histogram!("n42_qmdb_lock_wait_ms", "operation" => "commit")
             .record(lock_acquired.duration_since(lock_started).as_secs_f64() * 1_000.0);
+        let (operations, bound) = match source {
+            Ok(operations) => (operations, false),
+            Err(binding) => {
+                // A block already known is left to the ordinary path, which
+                // compares its operations with the stored ones.
+                let known =
+                    block_hash == self.base_block_hash || state.blocks.contains_key(&block_hash);
+                match state.prepared.as_mut() {
+                    Some(prepared)
+                        if !known
+                            && prepared.parent_hash == parent_hash
+                            && prepared.binding == Some(binding) =>
+                    {
+                        // The candidate is consumed below without another
+                        // comparison, so its operations can move out here.
+                        (std::mem::take(&mut prepared.operations), true)
+                    }
+                    _ => return Err(Gov5QmdbStateRootError::NoBoundCandidate),
+                }
+            }
+        };
+        let operation_count = operations.len();
         metrics::histogram!("n42_qmdb_operations_per_block").record(operation_count as f64);
         if block_hash == self.base_block_hash {
             metrics::counter!("n42_qmdb_commit_outcomes_total", "outcome" => "cache_conflict")
@@ -1121,10 +1257,11 @@ impl Gov5QmdbStateRootStore {
         // Keep the existing candidate metric inclusive of exact delta matching
         // and coordinator setup, but exclude waiting for the read-view worker.
         let compute_started = std::time::Instant::now();
-        let prepared_matches = state.prepared.as_ref().is_some_and(|prepared| {
-            prepared.parent_hash == parent_hash
-                && same_operations(&prepared.operations, &operations)
-        });
+        let prepared_matches = bound
+            || state.prepared.as_ref().is_some_and(|prepared| {
+                prepared.parent_hash == parent_hash
+                    && same_operations(&prepared.operations, &operations)
+            });
         // A cached immutable parent needs no forest access. Its derived index
         // may be built concurrently, but remains private until the actual tree
         // root matches the header and the WAL is durable. Never use the EVM
@@ -1350,7 +1487,7 @@ impl Gov5QmdbStateRootStore {
                 .map_err(|_| Gov5QmdbStateRootError::LockPoisoned)?
                 .as_mut()
         {
-            cache.insert(view);
+            release_read_views(cache.insert(view));
         }
         lock_hold += publish_started.elapsed();
         drop(state);
@@ -1823,7 +1960,8 @@ impl Gov5QmdbStateRootStore {
                 return;
             }
         };
-        let rolling = rolling_checkpoint_path(self.persistence_path.as_ref().expect("checked above"));
+        let rolling =
+            rolling_checkpoint_path(self.persistence_path.as_ref().expect("checked above"));
         let identity = self.identity;
         let in_flight = self.rebase_in_flight.clone();
         let block_number = identity.block_number.saturating_add(depth as u64);
@@ -2067,7 +2205,10 @@ fn base_extends_retained_lineage(
     base_root: B256,
     ancestor: B256,
 ) -> bool {
-    if blocks.get(&base).is_none_or(|block| block.root != base_root) {
+    if blocks
+        .get(&base)
+        .is_none_or(|block| block.root != base_root)
+    {
         return false;
     }
     let mut cursor = base;
@@ -2388,9 +2529,9 @@ impl Gov5QmdbStateRootStrategy {
     }
 }
 
-impl<P, Evm> StateRootStrategy<EthPrimitives, P, Evm> for Gov5QmdbStateRootStrategy
+impl<P, Evm> StateRootStrategy<N42Primitives, P, Evm> for Gov5QmdbStateRootStrategy
 where
-    Evm: ConfigureEvm<Primitives = EthPrimitives>,
+    Evm: ConfigureEvm<Primitives = N42Primitives>,
 {
     fn supports_cached_output(&self) -> bool {
         true
@@ -2398,16 +2539,35 @@ where
 
     fn prepare(
         &self,
-        ctx: StateRootJobContext<'_, EthPrimitives, P, Evm>,
-    ) -> ProviderResult<PreparedStateRootJob<EthPrimitives>> {
+        ctx: StateRootJobContext<'_, N42Primitives, P, Evm>,
+    ) -> ProviderResult<PreparedStateRootJob<N42Primitives>> {
         Ok(PreparedStateRootJob::new(
             Box::new(Gov5QmdbStateRootJob {
                 store: self.store.clone(),
                 chain_spec: self.chain_spec.clone(),
-                env_key: n42_execution::restored_slots_env_key(&ctx.env().evm_env.block_env),
+                env_key: n42_execution::restored_slots_env_key(reth_evm::EvmEnv::block_env(
+                    &ctx.env().evm_env,
+                )),
             }),
             None,
         ))
+    }
+}
+
+/// Whether an import commits the builder's operations for the same execution
+/// instead of deriving them again (`N42_QMDB_ADOPT_BUILT=1`).
+fn adopt_built_operations() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("N42_QMDB_ADOPT_BUILT").is_ok_and(|v| v == "1"))
+}
+
+/// Records the store commit's share of the root job when dropped.
+struct CommitStageTimer(std::time::Instant);
+
+impl Drop for CommitStageTimer {
+    fn drop(&mut self) {
+        metrics::histogram!("n42_qmdb_root_job_ms", "stage" => "commit")
+            .record(self.0.elapsed().as_secs_f64() * 1000.0);
     }
 }
 
@@ -2418,24 +2578,54 @@ struct Gov5QmdbStateRootJob {
     env_key: B256,
 }
 
-impl StateRootJob<EthPrimitives> for Gov5QmdbStateRootJob {
+impl StateRootJob<N42Primitives> for Gov5QmdbStateRootJob {
     fn name(&self) -> &'static str {
         "gov5-qmdb"
     }
 
     fn finish(
         &mut self,
-        block: &RecoveredBlock<reth_ethereum_primitives::Block>,
+        block: &RecoveredBlock<n42_tx_types::Block>,
         output: Arc<BlockExecutionOutput<Receipt>>,
         _hashed_state: &LazyHashedPostState,
     ) -> ProviderResult<StateRootJobOutcome> {
         // gov5 rewrites every slot the block's journal marked dirty, including
-        // one changed and restored within the block, which revm drops from
+        // one changed and restored within the block, which is dropped from
         // the bundle; the executor wrapper recorded those for this block.
-        let restored =
-            n42_execution::restored_slots_for(gov5_restored_slots_key(block, self.env_key))
-                .unwrap_or_default();
+        let key_started = std::time::Instant::now();
+        let key = gov5_restored_slots_key(block, self.env_key);
+        metrics::histogram!("n42_qmdb_root_job_ms", "stage" => "key")
+            .record(key_started.elapsed().as_secs_f64() * 1000.0);
+        // The builder derived this exact execution's operations already; the
+        // key names its parent, environment and ordered transactions.
+        if adopt_built_operations() {
+            let started = std::time::Instant::now();
+            let adopted = self.store.commit_bound_candidate(
+                block.parent_hash,
+                block.hash(),
+                block.state_root,
+                key,
+            );
+            let root = match adopted {
+                Ok(Some(root)) => Some(root),
+                Ok(None) => None,
+                Err(Gov5QmdbStateRootError::RootMismatch { got, .. }) => Some(got),
+                Err(error) => return Err(ProviderError::other(error)),
+            };
+            if let Some(root) = root {
+                metrics::histogram!("n42_qmdb_root_job_ms", "stage" => "bound_commit")
+                    .record(started.elapsed().as_secs_f64() * 1000.0);
+                return Ok(StateRootJobOutcome::new(
+                    root,
+                    Arc::new(TrieUpdates::default()),
+                ));
+            }
+        }
+        let derive_started = std::time::Instant::now();
+        let restored = n42_execution::restored_slots_for(key).unwrap_or_default();
         let mut operations = gov5_qmdb_operations_with_restored(&output.state, &restored);
+        metrics::histogram!("n42_qmdb_root_job_ms", "stage" => "derive")
+            .record(derive_started.elapsed().as_secs_f64() * 1000.0);
         if std::env::var_os("N42_QMDB_DEBUG_ROOT").is_some() {
             eprintln!(
                 "DEBUG QMDB block={} operations={}",
@@ -2471,7 +2661,15 @@ impl StateRootJob<EthPrimitives> for Gov5QmdbStateRootJob {
         }
         // Sort our existing buffer before entering the store lock. The tree
         // borrows it; WAL and read-view publication retain the same operations.
-        operations.sort_unstable_by_key(|operation| operation.key);
+        let sort_started = std::time::Instant::now();
+        rayon::slice::ParallelSliceMut::par_sort_unstable_by_key(
+            operations.as_mut_slice(),
+            |operation| operation.key,
+        );
+        metrics::histogram!("n42_qmdb_root_job_ms", "stage" => "sort")
+            .record(sort_started.elapsed().as_secs_f64() * 1000.0);
+        let commit_started = std::time::Instant::now();
+        let _commit_time = CommitStageTimer(commit_started);
         let root = match self.store.compute_and_commit(
             block.parent_hash,
             block.hash(),
@@ -2504,9 +2702,9 @@ impl StateRootJob<EthPrimitives> for Gov5QmdbStateRootJob {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Gov5TrustedStateRootStrategy;
 
-impl<P, Evm> StateRootStrategy<EthPrimitives, P, Evm> for Gov5TrustedStateRootStrategy
+impl<P, Evm> StateRootStrategy<N42Primitives, P, Evm> for Gov5TrustedStateRootStrategy
 where
-    Evm: ConfigureEvm<Primitives = EthPrimitives>,
+    Evm: ConfigureEvm<Primitives = N42Primitives>,
 {
     fn supports_cached_output(&self) -> bool {
         true
@@ -2514,8 +2712,8 @@ where
 
     fn prepare(
         &self,
-        _ctx: StateRootJobContext<'_, EthPrimitives, P, Evm>,
-    ) -> ProviderResult<PreparedStateRootJob<EthPrimitives>> {
+        _ctx: StateRootJobContext<'_, N42Primitives, P, Evm>,
+    ) -> ProviderResult<PreparedStateRootJob<N42Primitives>> {
         Ok(PreparedStateRootJob::new(
             Box::new(Gov5TrustedStateRootJob),
             None,
@@ -2526,14 +2724,14 @@ where
 #[derive(Debug)]
 struct Gov5TrustedStateRootJob;
 
-impl StateRootJob<EthPrimitives> for Gov5TrustedStateRootJob {
+impl StateRootJob<N42Primitives> for Gov5TrustedStateRootJob {
     fn name(&self) -> &'static str {
         "gov5-trusted"
     }
 
     fn finish(
         &mut self,
-        block: &RecoveredBlock<reth_ethereum_primitives::Block>,
+        block: &RecoveredBlock<n42_tx_types::Block>,
         _output: Arc<BlockExecutionOutput<Receipt>>,
         _hashed_state: &LazyHashedPostState,
     ) -> ProviderResult<StateRootJobOutcome> {
@@ -2607,13 +2805,13 @@ where
         self,
         ctx: &reth_node_api::AddOnsContext<'_, Node>,
         tree_config: TreeConfig,
-        overlay_manager: OverlayManager<EthPrimitives>,
+        overlay_manager: OverlayManager<N42Primitives>,
     ) -> eyre::Result<Self::EngineValidator> {
         let validator = self
             .inner
             .build_tree_validator(ctx, tree_config, overlay_manager)
             .await?;
-        let guard = |strategy: Arc<dyn StateRootStrategy<EthPrimitives, Node::Provider, Node::Evm>>| -> Arc<dyn StateRootStrategy<EthPrimitives, Node::Provider, Node::Evm>> {
+        let guard = |strategy: Arc<dyn StateRootStrategy<N42Primitives, Node::Provider, Node::Evm>>| -> Arc<dyn StateRootStrategy<N42Primitives, Node::Provider, Node::Evm>> {
             if self.eof_guard {
                 Arc::new(crate::eof_guard::EofGuardedStateRootStrategy::new(strategy))
             } else {
@@ -2870,6 +3068,58 @@ mod tests {
     }
 
     #[test]
+    fn bound_candidate_commits_only_for_its_own_execution() {
+        let (store, snapshot) = store();
+        let parent = store.base_block_hash();
+        let ops = vec![operation(1, 9), operation(2, 8)];
+        let root = expected_root(&snapshot, std::slice::from_ref(&ops));
+        let binding = B256::repeat_byte(0x71);
+        let hash = B256::repeat_byte(0x42);
+        assert_eq!(
+            store
+                .prepare_bound_candidate(parent, ops.clone(), binding)
+                .unwrap(),
+            root
+        );
+        // Another execution, or another parent, leaves the candidate alone.
+        assert_eq!(
+            store
+                .commit_bound_candidate(parent, hash, root, B256::repeat_byte(0x72))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .commit_bound_candidate(hash, hash, root, binding)
+                .unwrap(),
+            None
+        );
+        assert!(store.state.lock().unwrap().prepared.is_some());
+        // A header naming another root is still refused and nothing is kept.
+        assert!(matches!(
+            store.commit_bound_candidate(parent, hash, B256::ZERO, binding),
+            Err(Gov5QmdbStateRootError::RootMismatch { got, .. }) if got == root
+        ));
+        assert!(store.state.lock().unwrap().prepared.is_none());
+        assert!(!store.contains(hash).unwrap());
+        store
+            .prepare_bound_candidate(parent, ops.clone(), binding)
+            .unwrap();
+        assert_eq!(
+            store
+                .commit_bound_candidate(parent, hash, root, binding)
+                .unwrap(),
+            Some(root)
+        );
+        assert_eq!(store.root_for(hash).unwrap(), Some(root));
+        // The stored block carries the operations the candidate was built from.
+        assert_eq!(
+            store.compute_and_commit(parent, hash, root, ops).unwrap(),
+            root
+        );
+    }
+
+    #[test]
     fn prepared_candidate_adopts_only_the_complete_delta_and_checks_header_root() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         let recorder = DebuggingRecorder::new();
@@ -3056,7 +3306,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .prepare_candidate_with_limit(store.base_block_hash(), ops, 512 * 1024)
+                .prepare_candidate_with_limit(store.base_block_hash(), ops, 512 * 1024, None)
                 .unwrap(),
             expected
         );
@@ -3070,9 +3320,10 @@ mod tests {
     }
 
     /// Restart reads whatever `.base.qmdb` holds, as bin/n42-node does.
-    fn reopen_from_base_file(path: &Path) -> Result<Gov5QmdbStateRootStore, Gov5QmdbStateRootError> {
-        let (tree, header) =
-            Gov5QmdbStateRootStore::read_base_file(&base_file_path(path)).unwrap();
+    fn reopen_from_base_file(
+        path: &Path,
+    ) -> Result<Gov5QmdbStateRootStore, Gov5QmdbStateRootError> {
+        let (tree, header) = Gov5QmdbStateRootStore::read_base_file(&base_file_path(path)).unwrap();
         Gov5QmdbStateRootStore::persistent_from_leaf_tree(
             B256::from(header.block_hash),
             B256::from(header.root),
@@ -3082,10 +3333,7 @@ mod tests {
         )
     }
 
-    fn commit_chain(
-        store: &Gov5QmdbStateRootStore,
-        snapshot: &QmdbSnapshot,
-    ) -> Vec<(B256, B256)> {
+    fn commit_chain(store: &Gov5QmdbStateRootStore, snapshot: &QmdbSnapshot) -> Vec<(B256, B256)> {
         let mut parent = store.base_block_hash();
         let mut history = Vec::new();
         let mut chain = Vec::new();
@@ -4102,13 +4350,11 @@ mod tests {
     fn root_job_rejects_conflicting_execution_for_an_already_stored_hash() {
         use alloy_primitives::{Address, U256};
         use reth_primitives_traits::Block;
-        use revm::{
-            database::states::{AccountStatus, BundleAccount},
-            state::AccountInfo,
-        };
+        use evm2::evm::AccountInfo;
+        use reth_trie_common::bundle_state::{AccountStatus, BundleAccount};
         let (store, _) = store();
         let store = Arc::new(store);
-        let mut block = reth_ethereum_primitives::Block::default();
+        let mut block = n42_tx_types::Block::default();
         block.header.parent_hash = store.base_block_hash();
         block.header.state_root = store.base_root();
         block.header.number = 1;
@@ -4235,7 +4481,7 @@ mod tests {
         use reth_primitives_traits::Block;
         let (store, _) = store();
         let store = Arc::new(store);
-        let mut block = reth_ethereum_primitives::Block::default();
+        let mut block = n42_tx_types::Block::default();
         block.header.parent_hash = store.base_block_hash();
         block.header.state_root = B256::ZERO;
         block.header.number = 1;
@@ -4291,6 +4537,33 @@ mod tests {
         );
         assert!(store.read_view_for(B256::repeat_byte(1)).unwrap().is_none());
         assert!(store.read_view_for(parent).unwrap().is_some());
+    }
+
+    #[test]
+    fn read_cache_keeps_the_recent_views_past_the_byte_budget() {
+        let (store, _) = store();
+        store
+            .enable_read_views_with_minimum(
+                std::num::NonZeroUsize::new(64).unwrap(),
+                std::num::NonZeroUsize::new(1).unwrap(),
+                4,
+            )
+            .unwrap();
+        let mut parent = store.base_block_hash();
+        for number in 1..=8 {
+            let hash = B256::repeat_byte(number);
+            store
+                .compute_and_commit(parent, hash, store.base_root(), Vec::new())
+                .unwrap();
+            parent = hash;
+        }
+        // Every view alone exceeds the budget; the four newest stay.
+        for number in 1..=4 {
+            assert!(store.read_view_for(B256::repeat_byte(number)).unwrap().is_none());
+        }
+        for number in 5..=8 {
+            assert!(store.read_view_for(B256::repeat_byte(number)).unwrap().is_some());
+        }
     }
 
     #[test]

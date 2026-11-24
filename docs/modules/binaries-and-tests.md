@@ -47,6 +47,9 @@ Useful for:
 
 ### `bin/n42-evm-bench`
 
+> Parked: REVM-only and excluded from the workspace since the evm2 migration
+> (devlog-186). The commands below no longer build from the workspace root.
+
 Benchmark/support utility for execution-focused investigations.
 
 Use it when you need a CPU-only EVM control measurement instead of a full-chain

@@ -1,0 +1,170 @@
+diff --git a/crates/engine/tree/src/tree/mod.rs b/crates/engine/tree/src/tree/mod.rs
+index 750b4962c..318f47082 100644
+--- a/crates/engine/tree/src/tree/mod.rs
++++ b/crates/engine/tree/src/tree/mod.rs
+@@ -3340,7 +3340,13 @@ where
+ 
+         // keep track of the invalid header unless the consensus impl considers it transient
+         let is_transient = match &validation_err {
+-            InsertBlockValidationError::Consensus(err) => self.consensus.is_transient_error(err),
++            // A refused cached execution output leaves the block itself unjudged.
++            InsertBlockValidationError::Consensus(err) => {
++                self.consensus.is_transient_error(err) ||
++                    err.as_other().is_some_and(|other| {
++                        other.is::<reth_evm::payload_cache::CachedExecutionRefused>()
++                    })
++            }
+             _ => false,
+         };
+         if is_transient {
+diff --git a/crates/engine/tree/src/tree/payload_validator.rs b/crates/engine/tree/src/tree/payload_validator.rs
+index 802bb957d..496d03917 100644
+--- a/crates/engine/tree/src/tree/payload_validator.rs
++++ b/crates/engine/tree/src/tree/payload_validator.rs
+@@ -517,20 +517,6 @@ where
+             };
+         }
+ 
+-        /// A helper macro for handling errors after the input has been converted to a block
+-        macro_rules! ensure_ok_post_block {
+-            ($expr:expr, $block:expr) => {
+-                match $expr {
+-                    Ok(val) => val,
+-                    Err(e) => {
+-                        return Err(
+-                            InsertBlockError::new($block.into_sealed_block(), e.into()).into()
+-                        )
+-                    }
+-                }
+-            };
+-        }
+-
+         // If the gas limit is multiple times higher than the parent's, be cautious and block on
+         // pre-execution checks of the block.
+         if input.gas_limit() >
+@@ -606,6 +592,18 @@ where
+             )
+         };
+         let is_cache_hit = cached_execution.is_some();
++        // A validation failure against a cached output is a failure of that
++        // output, not of the block: report it as one the tree does not remember.
++        let cached_refusal = |kind: InsertBlockErrorKind| -> InsertBlockErrorKind {
++            if is_cache_hit && kind.is_validation_error() {
++                ConsensusError::other(reth_evm::payload_cache::CachedExecutionRefused(
++                    kind.to_string(),
++                ))
++                .into()
++            } else {
++                kind
++            }
++        };
+ 
+         let parallel_bal_execution = ensure_ok!(self.bal_path_eligible(env.decoded_bal.as_deref()));
+ 
+@@ -821,17 +819,16 @@ where
+                 .ok()
+         };
+ 
+-        ensure_ok_post_block!(
+-            self.validate_post_execution(
+-                &block,
+-                &parent_block,
+-                &output,
+-                &mut ctx,
+-                receipt_root_bloom,
+-                built_bal
+-            ),
+-            block
+-        );
++        if let Err(e) = self.validate_post_execution(
++            &block,
++            &parent_block,
++            &output,
++            &mut ctx,
++            receipt_root_bloom,
++            built_bal,
++        ) {
++            return Err(InsertBlockError::new(block.into_sealed_block(), cached_refusal(e)).into())
++        }
+ 
+         let mut hashed_state_validate_result = debug_span!(
+             target: "engine::tree::payload_validator",
+@@ -851,10 +848,16 @@ where
+         });
+ 
+         let root_start = Instant::now();
+-        let root_outcome = ensure_ok_post_block!(
+-            state_root_job.finish(&block, output.clone(), &hashed_state),
+-            block
+-        );
++        let root_outcome = match state_root_job.finish(&block, output.clone(), &hashed_state) {
++            Ok(outcome) => outcome,
++            Err(e) => {
++                return Err(InsertBlockError::new(
++                    block.into_sealed_block(),
++                    cached_refusal(e.into()),
++                )
++                .into())
++            }
++        };
+         let root_elapsed = root_start.elapsed();
+ 
+         info!(
+@@ -895,7 +898,11 @@ where
+             if err.is_validation_error() {
+                 self.on_invalid_block(&parent_block, &block, &output, None, ctx.state_mut());
+             }
+-            return Err(InsertBlockError::new(block.into_sealed_block(), err).into())
++            return Err(InsertBlockError::new(
++                block.into_sealed_block(),
++                cached_refusal(err),
++            )
++            .into())
+         }
+ 
+         self.metrics.block_validation.record_state_root(&trie_output, root_elapsed.as_secs_f64());
+@@ -916,10 +923,12 @@ where
+             let block_state_root = block.header().state_root();
+             return Err(InsertBlockError::new(
+                 block.into_sealed_block(),
+-                ConsensusError::BodyStateRootDiff(
+-                    GotExpected { got: state_root, expected: block_state_root }.into(),
+-                )
+-                .into(),
++                cached_refusal(
++                    ConsensusError::BodyStateRootDiff(
++                        GotExpected { got: state_root, expected: block_state_root }.into(),
++                    )
++                    .into(),
++                ),
+             )
+             .into())
+         }
+diff --git a/crates/evm/evm/src/payload_cache.rs b/crates/evm/evm/src/payload_cache.rs
+index 10ab99ee4..1a2a1c18c 100644
+--- a/crates/evm/evm/src/payload_cache.rs
++++ b/crates/evm/evm/src/payload_cache.rs
+@@ -10,6 +10,23 @@ use std::{
+     sync::{Mutex, OnceLock},
+ };
+ 
++/// A payload was validated against a cached execution output and failed.
++///
++/// The output came from outside the block (a peer, or a builder result moved
++/// to another hash), so the failure says nothing about the block itself. The
++/// engine reports the payload invalid without remembering its hash, and the
++/// caller may submit it again to have it executed.
++#[derive(Debug)]
++pub struct CachedExecutionRefused(pub String);
++
++impl core::fmt::Display for CachedExecutionRefused {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
++        write!(f, "cached execution output refused: {}", self.0)
++    }
++}
++
++impl core::error::Error for CachedExecutionRefused {}
++
+ struct CachedPayload {
+     block_hash: B256,
+     data: Box<dyn Any + Send + Sync>,

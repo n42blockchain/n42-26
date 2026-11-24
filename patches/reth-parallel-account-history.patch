@@ -1,0 +1,186 @@
+diff --git a/crates/storage/provider/src/providers/mod.rs b/crates/storage/provider/src/providers/mod.rs
+index 756245863..1e93bb71f 100644
+--- a/crates/storage/provider/src/providers/mod.rs
++++ b/crates/storage/provider/src/providers/mod.rs
+@@ -28,9 +28,9 @@ pub use consistent::ConsistentProvider;
+ pub(crate) mod rocksdb;
+ 
+ pub use rocksdb::{
+-    OwnedRocksReadSnapshot, PruneShardOutcome, PrunedIndices, RocksDBBatch, RocksDBBuilder,
+-    RocksDBIter, RocksDBProvider, RocksDBRawIter, RocksDBStats, RocksDBTableStats,
+-    RocksReadSnapshot, RocksTx,
++    parallel_account_history, OwnedRocksReadSnapshot, PruneShardOutcome, PrunedIndices,
++    RocksDBBatch, RocksDBBuilder, RocksDBIter, RocksDBProvider, RocksDBRawIter, RocksDBStats,
++    RocksDBTableStats, RocksReadSnapshot, RocksTx,
+ };
+ 
+ /// Helper trait to bound [`NodeTypes`] so that combined with database they satisfy
+diff --git a/crates/storage/provider/src/providers/rocksdb/mod.rs b/crates/storage/provider/src/providers/rocksdb/mod.rs
+index 7a5c4f93e..f40520a30 100644
+--- a/crates/storage/provider/src/providers/rocksdb/mod.rs
++++ b/crates/storage/provider/src/providers/rocksdb/mod.rs
+@@ -5,8 +5,8 @@ mod metrics;
+ mod provider;
+ 
+ pub use provider::{
+-    OwnedRocksReadSnapshot, PruneShardOutcome, PrunedIndices, RocksDBBatch, RocksDBBuilder,
+-    RocksDBIter, RocksDBProvider, RocksDBRawIter, RocksDBStats, RocksDBTableStats,
+-    RocksReadSnapshot, RocksTx,
++    parallel_account_history, OwnedRocksReadSnapshot, PruneShardOutcome, PrunedIndices,
++    RocksDBBatch, RocksDBBuilder, RocksDBIter, RocksDBProvider, RocksDBRawIter, RocksDBStats,
++    RocksDBTableStats, RocksReadSnapshot, RocksTx,
+ };
+ pub(crate) use provider::{PendingRocksDBBatches, RocksDBWriteCtx};
+diff --git a/crates/storage/provider/src/providers/rocksdb/provider.rs b/crates/storage/provider/src/providers/rocksdb/provider.rs
+index 7584f15e0..b794ce357 100644
+--- a/crates/storage/provider/src/providers/rocksdb/provider.rs
++++ b/crates/storage/provider/src/providers/rocksdb/provider.rs
+@@ -46,6 +46,14 @@ fn synced_write_options() -> WriteOptions {
+     opts
+ }
+ 
++/// `N42_PARALLEL_ACCOUNT_HISTORY=1`: a block's account history shards are
++/// read and extended on the worker pool, as storage history shards are, instead
++/// of one account after another. The batch written is the same.
++pub fn parallel_account_history() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("N42_PARALLEL_ACCOUNT_HISTORY").is_ok_and(|v| v == "1"))
++}
++
+ /// Pending `RocksDB` batches type alias.
+ pub(crate) type PendingRocksDBBatches = Arc<Mutex<Vec<WriteBatchWithTransaction<true>>>>;
+ 
+@@ -1572,8 +1580,12 @@ impl RocksDBProvider {
+         }
+ 
+         // Write account history using proper shard append logic
+-        for (address, indices) in account_history {
+-            batch.append_account_history_shard(address, indices)?;
++        if parallel_account_history() {
++            batch.append_account_history_shards(account_history)?;
++        } else {
++            for (address, indices) in account_history {
++                batch.append_account_history_shard(address, indices)?;
++            }
+         }
+         ctx.pending_batches.lock().push(batch.into_inner());
+         Ok(())
+@@ -1674,6 +1686,44 @@ impl RocksDBProvider {
+     }
+ }
+ 
++/// The account history shards that appending `indices` to `address`'s last
++/// shard gives, as [`RocksDBBatch::append_account_history_shard`] puts them.
++fn account_history_shards_to_put(
++    provider: &RocksDBProvider,
++    address: Address,
++    indices: Vec<u64>,
++) -> ProviderResult<Vec<(ShardedKey<Address>, BlockNumberList)>> {
++    if indices.is_empty() {
++        return Ok(Vec::new());
++    }
++    debug_assert!(
++        indices.windows(2).all(|w| w[0] < w[1]),
++        "indices must be strictly increasing: {:?}",
++        indices
++    );
++    let last_key = ShardedKey::new(address, u64::MAX);
++    let mut last_shard = provider
++        .get::<tables::AccountsHistory>(last_key.clone())?
++        .unwrap_or_else(BlockNumberList::empty);
++    last_shard.append(indices).map_err(ProviderError::other)?;
++    if last_shard.len() <= NUM_OF_INDICES_IN_SHARD as u64 {
++        return Ok(vec![(last_key, last_shard)]);
++    }
++    let chunks = last_shard.iter().chunks(NUM_OF_INDICES_IN_SHARD);
++    let mut chunks_peekable = chunks.into_iter().peekable();
++    let mut shards = Vec::new();
++    while let Some(chunk) = chunks_peekable.next() {
++        let shard = BlockNumberList::new_pre_sorted(chunk);
++        let highest_block_number = if chunks_peekable.peek().is_some() {
++            shard.iter().next_back().expect("`chunks` does not return empty list")
++        } else {
++            u64::MAX
++        };
++        shards.push((ShardedKey::new(address, highest_block_number), shard));
++    }
++    Ok(shards)
++}
++
+ /// A point-in-time read snapshot of the `RocksDB` database.
+ ///
+ /// All reads through this snapshot see a consistent view of the database at the point
+@@ -2124,6 +2174,26 @@ impl<'a> RocksDBBatch<'a> {
+         self.provider.get::<T>(key)
+     }
+ 
++    /// [`Self::append_account_history_shard`] for every `(address, indices)`
++    /// of `entries`, with the shards read and extended in parallel and put in
++    /// `entries`' order. Each address must appear once.
++    pub fn append_account_history_shards(
++        &mut self,
++        entries: BTreeMap<Address, Vec<u64>>,
++    ) -> ProviderResult<()> {
++        let provider = self.provider;
++        let shard_puts = entries
++            .into_par_iter()
++            .map(|(address, indices)| account_history_shards_to_put(provider, address, indices))
++            .collect::<ProviderResult<Vec<_>>>()?;
++        for shards in shard_puts {
++            for (key, shard) in shards {
++                self.put::<tables::AccountsHistory>(key, &shard)?;
++            }
++        }
++        Ok(())
++    }
++
+     /// Appends indices to an account history shard with proper shard management.
+     ///
+     /// Loads the existing shard (if any), appends new indices, and rechunks into
+@@ -3954,6 +4024,46 @@ mod tests {
+         assert_eq!(sentinel_shard.len(), 1, "sentinel shard should have 1 element");
+     }
+ 
++    #[test]
++    fn test_parallel_account_history_shards_match_serial() {
++        let limit = NUM_OF_INDICES_IN_SHARD as u64;
++        // Accounts with no shard, a partly filled one, and one that splits.
++        let entries = |round: u64| -> BTreeMap<Address, Vec<u64>> {
++            (0..64u8)
++                .map(|n| {
++                    let count = if n % 3 == 0 { limit + 5 } else { 1 + n as u64 };
++                    let first = round * 10 * limit;
++                    (Address::repeat_byte(n), (first..first + count).collect())
++                })
++                .collect()
++        };
++        let dump = |provider: &RocksDBProvider| -> Vec<(ShardedKey<Address>, BlockNumberList)> {
++            provider
++                .iter::<tables::AccountsHistory>()
++                .unwrap()
++                .map(|entry| entry.unwrap())
++                .collect()
++        };
++        let serial_dir = TempDir::new().unwrap();
++        let serial = RocksDBBuilder::new(serial_dir.path()).with_default_tables().build().unwrap();
++        let parallel_dir = TempDir::new().unwrap();
++        let parallel =
++            RocksDBBuilder::new(parallel_dir.path()).with_default_tables().build().unwrap();
++        for round in 0..3 {
++            let mut batch = serial.batch();
++            for (address, indices) in entries(round) {
++                batch.append_account_history_shard(address, indices).unwrap();
++            }
++            batch.commit().unwrap();
++            let mut batch = parallel.batch();
++            batch.append_account_history_shards(entries(round)).unwrap();
++            batch.commit().unwrap();
++        }
++        let written = dump(&serial);
++        assert!(written.len() > 64, "some accounts split into several shards");
++        assert_eq!(written, dump(&parallel));
++    }
++
+     #[test]
+     fn test_account_history_multiple_shard_splits() {
+         let temp_dir = TempDir::new().unwrap();

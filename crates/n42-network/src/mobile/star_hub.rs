@@ -107,9 +107,16 @@ impl Default for StarHubConfig {
 #[derive(Clone, Debug)]
 pub struct StarHubHandle {
     command_tx: mpsc::Sender<HubCommand>,
+    /// The hub's session table, read for [`Self::active_sessions`].
+    sessions: Arc<RwLock<HashMap<u64, Arc<MobileSession>>>>,
 }
 
 impl StarHubHandle {
+    /// Phones that completed the handshake and are still connected.
+    pub async fn active_sessions(&self) -> usize {
+        self.sessions.read().await.len()
+    }
+
     /// Sends a command to the hub, waiting for bounded-channel capacity instead of
     /// dropping mobile traffic under load.
     async fn send_command(
@@ -196,8 +203,9 @@ impl StarHub {
         let (command_tx, command_rx) = mpsc::channel(4096);
         let (event_tx, event_rx) = mpsc::channel(4096);
 
+        let sessions = Arc::new(RwLock::new(HashMap::new()));
         let hub = Self {
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            sessions: sessions.clone(),
             config,
             command_rx,
             event_tx,
@@ -206,7 +214,11 @@ impl StarHub {
             shared_session_id_gen: None,
         };
 
-        (hub, StarHubHandle { command_tx }, event_rx)
+        let handle = StarHubHandle {
+            command_tx,
+            sessions,
+        };
+        (hub, handle, event_rx)
     }
 
     /// Creates a hub with a shared session ID generator for multi-shard uniqueness.
@@ -879,6 +891,7 @@ mod tests {
         let (command_tx, mut command_rx) = mpsc::channel(1);
         let handle = StarHubHandle {
             command_tx: command_tx.clone(),
+            sessions: Default::default(),
         };
 
         command_tx

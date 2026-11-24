@@ -1,24 +1,32 @@
 pub mod attestation_store;
 pub mod blob_port;
+pub mod build_on_output;
 mod components;
 pub mod el;
+pub mod engine_types;
 pub mod engine_validator;
 pub mod eof_guard;
 pub mod exec_cache;
+pub mod frame_order;
+pub mod frame_queue;
 pub mod ingest;
+pub mod memory_watch;
 pub mod mobile_bridge;
 pub mod mobile_evidence;
 pub mod mobile_packet;
 pub mod mobile_reward;
+pub mod native_payload;
+pub mod native_pool;
+pub mod native_rpc;
 pub use n42_consensus_service::net_port;
 mod node;
 pub mod packet_builder;
-pub mod payload;
 mod parallel_payload;
+pub mod payload;
 pub mod pool;
-pub mod qmdb_state;
-pub mod qmdb_read_view;
 pub mod qmdb_read_status;
+pub mod qmdb_read_view;
+pub mod qmdb_state;
 pub mod qmdb_state_reader;
 pub mod qmdb_state_root;
 pub mod rpc;
@@ -110,6 +118,12 @@ pub fn validate_state_root_bypass_flags(
     }
     Ok(())
 }
+
+#[cfg(all(test, unix))]
+mod exec_cost_bench;
+
+#[cfg(test)]
+mod persist_cost_bench;
 
 #[cfg(test)]
 mod state_root_flag_tests {

@@ -19,15 +19,36 @@
 //!                               [u32 LE pool_pending] [u32 LE consumed_count]
 //!                               [u32 LE credit_available]
 //!   num_txs = 0 → close connection gracefully.
+//!
+//! Native frame (0x50 route; `num_txs | NATIVE_FRAME`):
+//!   Client → Server: [u32 LE num_txs | 0x4000_0000] [u32 LE tx_len, tx_bytes] × num_txs
+//!                    [u8 n (0..=16)] [32-byte gateway key, 64-byte Ed25519 signature] × n
+//!   Server → Client: the same ack as a batch.
+//!   A native frame carries only 0x50 transactions and no claimed senders. It is
+//!   authenticated by [`AdmittedFrame::authenticate`]: when at least
+//!   `N42_FRAME_ATTEST_MIN` of the `N42_FRAME_GATEWAYS` keys signed the frame
+//!   root, the senders come from the transactions' own public keys without a
+//!   signature check; otherwise every signature is batch-verified here. A frame
+//!   is admitted whole or not at all, since its root covers all of it. Unlike a
+//!   batch, a native frame never trusts the wire for a sender.
 
+use crate::native_pool::N42PooledTransaction;
 use crate::now_unix_ms;
 use alloy_consensus::{Transaction, transaction::Recovered};
+use alloy_primitives::Bytes;
 use alloy_primitives::{Address, U256};
-use reth_ethereum_primitives::TransactionSigned;
+use n42_tx_types::{
+    AltSigSenderCache, FRAME_ATTESTATION_LEN, FrameAttestation, FrameGateways,
+    MAX_FRAME_ATTESTATIONS, N42TxEnvelope,
+    admission::{AdmittedFrame, FrameAuthentication, FrameLimits},
+};
 use reth_transaction_pool::{
-    AddedTransactionOutcome, CoinbaseTipOrdering, EthPooledTransaction, Pool, PoolResult,
-    PoolTransaction, TransactionOrigin, TransactionPool, TransactionValidationOutcome,
-    TransactionValidator, blobstore::BlobStore, validate::ValidTransaction,
+    AddedTransactionOutcome, CoinbaseTipOrdering, Pool, PoolResult, PoolTransaction,
+    TransactionOrigin, TransactionPool, TransactionValidationOutcome, TransactionValidator,
+    ValidPoolTransaction,
+    blobstore::BlobStore,
+    identifier::{SenderId, TransactionId},
+    validate::ValidTransaction,
 };
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -63,11 +84,23 @@ const DEFAULT_INGEST_TARGET_PENDING: usize = 82_000;
 const DEFAULT_INGEST_VIRTUAL_BLOCK_CREDIT_MS: u64 = 0;
 const DEFAULT_POOL_MAX_TXS: usize = 100_000;
 
+/// Header bit marking a native (0x50, optionally gateway-attested) frame.
+///
+/// Free because [`MAX_INGEST_BATCH_TXS`] bounds the count far below it; a server
+/// that predates it classifies the header as oversized and closes the
+/// connection instead of misreading the stream.
+const NATIVE_FRAME: u32 = 0x4000_0000;
+/// Framing bytes accompanying each native-frame transaction: u32 length.
+const NATIVE_TX_FRAME_OVERHEAD: usize = 4;
+
+const _: () = assert!(MAX_INGEST_BATCH_TXS < NATIVE_FRAME as usize);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IngestFrameHeader {
     Close,
     CreditProbe,
     Batch(usize),
+    Native(usize),
     Oversized,
 }
 
@@ -76,6 +109,11 @@ fn classify_ingest_header(header: u32) -> IngestFrameHeader {
     match header {
         0 => IngestFrameHeader::Close,
         CREDIT_WAIT_SENTINEL => IngestFrameHeader::CreditProbe,
+        header if header & NATIVE_FRAME != 0 => match (header & !NATIVE_FRAME) as usize {
+            0 => IngestFrameHeader::Oversized,
+            count if count > MAX_INGEST_BATCH_TXS => IngestFrameHeader::Oversized,
+            count => IngestFrameHeader::Native(count),
+        },
         count if count as usize > MAX_INGEST_BATCH_TXS => IngestFrameHeader::Oversized,
         count => IngestFrameHeader::Batch(count as usize),
     }
@@ -123,22 +161,22 @@ pub trait DirectPoolIngest: Send + Sync + 'static {
     /// Skips TransactionValidationTaskExecutor entirely.
     fn add_prevalidated(
         &self,
-        txs: Vec<EthPooledTransaction>,
+        txs: Vec<N42PooledTransaction>,
     ) -> Vec<PoolResult<AddedTransactionOutcome>>;
 
     /// Returns the current number of transactions in the pending sub-pool.
     fn pending_count(&self) -> usize;
 }
 
-/// Implement DirectPoolIngest for any reth Pool with EthPooledTransaction.
-impl<V, S> DirectPoolIngest for Pool<V, CoinbaseTipOrdering<EthPooledTransaction>, S>
+/// Implement DirectPoolIngest for any reth Pool with N42PooledTransaction.
+impl<V, S> DirectPoolIngest for Pool<V, CoinbaseTipOrdering<N42PooledTransaction>, S>
 where
-    V: TransactionValidator<Transaction = EthPooledTransaction> + 'static,
+    V: TransactionValidator<Transaction = N42PooledTransaction> + 'static,
     S: BlobStore + Clone + 'static,
 {
     fn add_prevalidated(
         &self,
-        txs: Vec<EthPooledTransaction>,
+        txs: Vec<N42PooledTransaction>,
     ) -> Vec<PoolResult<AddedTransactionOutcome>> {
         let outcomes = txs.into_iter().map(|tx| {
             // Use tx nonce as state_nonce so the pool sees NO nonce gap.
@@ -158,7 +196,12 @@ where
     }
 
     fn pending_count(&self) -> usize {
-        self.pool_size().pending
+        let queued = if crate::frame_queue::frame_queue_enabled() {
+            crate::frame_queue::FrameQueue::global().pending()
+        } else {
+            0
+        };
+        self.pool_size().pending + queued
     }
 }
 
@@ -364,10 +407,20 @@ fn reserve_credit_probe_allowance(base_high_water: usize, pending: usize) -> (us
 /// **any** account. It therefore binds loopback by default. Set
 /// `N42_INGEST_BIND` to an explicit address to widen that, and only on a
 /// network you control.
-pub async fn run_ingest_server<P>(pool: P)
+///
+/// Native frames ([`NATIVE_FRAME`]) are authenticated for `chain_id` and are
+/// accepted only on a chain whose genesis enables 0x50 transactions.
+pub async fn run_ingest_server<P>(pool: P, chain_id: u64)
 where
     P: DirectPoolIngest + Clone,
 {
+    let native = match NativeIngest::from_env(chain_id) {
+        Ok(native) => Arc::new(native),
+        Err(error) => {
+            error!(target: "n42::ingest", %error, "invalid native frame gateway configuration; ingest server not started");
+            return;
+        }
+    };
     let port: u16 = std::env::var("N42_INGEST_PORT")
         .or_else(|_| std::env::var("N42_INJECT_PORT"))
         .ok()
@@ -406,6 +459,9 @@ where
         target_pending,
         pool_limit_txs = adaptive_pool_limit_txs(),
         block_cap = configured_block_cap(),
+        native_frames = native.enabled,
+        frame_gateways = native.gateways.as_ref().map_or(0, |g| g.keys().len()),
+        frame_attest_min = native.gateways.as_ref().map_or(0, |g| g.min()),
         "binary TCP ingest server listening"
     );
 
@@ -440,8 +496,9 @@ where
                 info!(target: "n42::ingest", %addr, "client connected");
                 let pool = pool.clone();
                 let stats = stats.clone();
+                let native = native.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, pool, &stats).await {
+                    if let Err(e) = handle_client(stream, pool, &stats, &native).await {
                         debug!(target: "n42::ingest", %addr, error = %e, "client disconnected");
                     }
                 });
@@ -636,6 +693,7 @@ async fn handle_client<P>(
     mut stream: TcpStream,
     pool: P,
     stats: &Arc<IngestStats>,
+    native: &Arc<NativeIngest>,
 ) -> eyre::Result<()>
 where
     P: DirectPoolIngest,
@@ -693,6 +751,66 @@ where
                 pending,
                 0,
                 credit,
+                extended_ack_enabled,
+                credit_probe_enabled,
+            )
+            .await?;
+            continue;
+        }
+        if let IngestFrameHeader::Native(num_txs) = frame_header {
+            stats.received.fetch_add(num_txs as u64, Ordering::Relaxed);
+            let Some(frame) = read_native_frame(&mut stream, num_txs).await? else {
+                return Ok(());
+            };
+            let pending_before = pool.pending_count();
+            let dynamic_high_water = effective_high_water(base_high_water, credit_probe_enabled);
+            // A frame's root covers all of it, so it is admitted whole or deferred whole.
+            let room = if credit_probe_enabled {
+                leased_credit_remaining >= num_txs
+            } else {
+                pending_before < dynamic_high_water
+            };
+            if !room {
+                metrics::counter!("n42_ingest_batches_total", "outcome" => "native_gate")
+                    .increment(1);
+                stats.deferred.fetch_add(num_txs as u64, Ordering::Relaxed);
+                // A block that refers to its frames can be built by a leader
+                // whose queue had room for this one. Keep the frame for that
+                // block even though it is not queued here: a node that cannot
+                // put the block together stops importing, its queue never
+                // drains, and the gate never opens again.
+                // The extended ack reports a frame now held as consumed
+                // (with none accepted): sending it again would only hold it
+                // again until this node's queue has room.
+                let held = if crate::frame_queue::frame_queue_enabled()
+                    && n42_tx_types::frame_ref_blocks_enabled()
+                {
+                    admit_native_frame(&pool, stats, native, frame, true).await
+                } else {
+                    0
+                };
+                write_ack(
+                    &mut stream,
+                    0,
+                    pending_before,
+                    held,
+                    leased_credit_remaining,
+                    extended_ack_enabled,
+                    credit_probe_enabled,
+                )
+                .await?;
+                continue;
+            }
+            let accepted = admit_native_frame(&pool, stats, native, frame, false).await;
+            if credit_probe_enabled {
+                leased_credit_remaining = leased_credit_remaining.saturating_sub(num_txs);
+            }
+            write_ack(
+                &mut stream,
+                accepted,
+                pool.pending_count(),
+                num_txs,
+                leased_credit_remaining,
                 extended_ack_enabled,
                 credit_probe_enabled,
             )
@@ -839,7 +957,7 @@ where
         let mut batch_decode_errors = 0u64;
         for (range, sender) in raw_txs.iter().take(take_limit) {
             let tx_bytes = &batch_data[range.clone()];
-            let tx: TransactionSigned =
+            let tx: N42TxEnvelope =
                 match alloy_eips::eip2718::Decodable2718::decode_2718(&mut &tx_bytes[..]) {
                     Ok(tx) => tx,
                     Err(_) => {
@@ -849,7 +967,7 @@ where
                 };
 
             let recovered = Recovered::new_unchecked(tx, *sender);
-            match EthPooledTransaction::try_from_consensus(recovered) {
+            match N42PooledTransaction::try_from_consensus(recovered) {
                 Ok(pooled) => pooled_txs.push(pooled),
                 Err(_) => batch_decode_errors += 1,
             }
@@ -913,6 +1031,262 @@ where
     }
 
     Ok(())
+}
+
+/// Native frame admission settings, fixed for the server's lifetime.
+struct NativeIngest {
+    /// The genesis enables 0x50 transactions; frames are refused otherwise.
+    enabled: bool,
+    chain_id: u64,
+    /// `N42_FRAME_GATEWAYS` / `N42_FRAME_ATTEST_MIN`; `None` verifies every frame.
+    gateways: Option<FrameGateways>,
+}
+
+impl NativeIngest {
+    fn from_env(chain_id: u64) -> Result<Self, String> {
+        Ok(Self {
+            enabled: n42_tx_types::alt_sig_enabled(),
+            chain_id,
+            gateways: FrameGateways::from_env()?,
+        })
+    }
+}
+
+/// A native frame as read off the wire, before authentication.
+struct NativeFrameWire {
+    transactions: Vec<Bytes>,
+    attestations: Vec<FrameAttestation>,
+}
+
+/// Reads one native frame body. `Ok(None)` means the frame broke a bound and the
+/// connection should be closed.
+async fn read_native_frame(
+    stream: &mut TcpStream,
+    num_txs: usize,
+) -> eyre::Result<Option<NativeFrameWire>> {
+    let read_start = Instant::now();
+    let mut transactions = Vec::with_capacity(num_txs);
+    let mut frame_bytes = 0usize;
+    for _ in 0..num_txs {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await?;
+        let tx_len = u32::from_le_bytes(len_buf) as usize;
+        frame_bytes = frame_bytes.saturating_add(tx_len + NATIVE_TX_FRAME_OVERHEAD);
+        if frame_bytes > MAX_INGEST_BATCH_BYTES {
+            warn!(
+                target: "n42::ingest",
+                frame_bytes,
+                max = MAX_INGEST_BATCH_BYTES,
+                "native frame exceeds byte ceiling; dropping connection"
+            );
+            return Ok(None);
+        }
+        let mut tx = vec![0u8; tx_len];
+        stream.read_exact(&mut tx).await?;
+        transactions.push(Bytes::from(tx));
+    }
+    let mut count = [0u8; 1];
+    stream.read_exact(&mut count).await?;
+    if count[0] as usize > MAX_FRAME_ATTESTATIONS {
+        warn!(
+            target: "n42::ingest",
+            attestations = count[0],
+            max = MAX_FRAME_ATTESTATIONS,
+            "native frame carries too many attestations; dropping connection"
+        );
+        return Ok(None);
+    }
+    let mut attestations = Vec::with_capacity(count[0] as usize);
+    for _ in 0..count[0] {
+        let mut raw = [0u8; FRAME_ATTESTATION_LEN];
+        stream.read_exact(&mut raw).await?;
+        attestations.push(FrameAttestation::from_bytes(&raw));
+    }
+    metrics::histogram!("n42_ingest_batch_duration_ms", "phase" => "native_socket_read")
+        .record(read_start.elapsed().as_secs_f64() * 1_000.0);
+    Ok(Some(NativeFrameWire {
+        transactions,
+        attestations,
+    }))
+}
+
+/// Authenticates one native frame and hands its transactions to the pool.
+/// Returns the number the pool accepted; a frame that fails authentication
+/// is rejected whole and counted as decode errors.
+/// Roots of frames held for block rebuilding while the gate was closed. The
+/// sender offers such a frame again, and that time it is queued.
+static HELD_FRAMES: std::sync::LazyLock<std::sync::Mutex<alloy_primitives::map::B256HashSet>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Most held roots remembered; past it the oldest knowledge is dropped and
+/// those frames are simply not queued when offered again.
+const MAX_HELD_FRAMES: usize = 1 << 16;
+
+/// Authenticates a native frame and admits it. With `hold_only` the frame is
+/// kept for blocks that refer to it but is not offered to this node's builder;
+/// the result is then the frame's size if the store holds it (none of it is
+/// accepted: the caller reports it as consumed), else 0.
+async fn admit_native_frame<P>(
+    pool: &P,
+    stats: &IngestStats,
+    native: &Arc<NativeIngest>,
+    frame: NativeFrameWire,
+    hold_only: bool,
+) -> usize
+where
+    P: DirectPoolIngest,
+{
+    let num_txs = frame.transactions.len();
+    if !native.enabled {
+        metrics::counter!("n42_ingest_native_frames_total", "outcome" => "disabled").increment(1);
+        stats
+            .decode_errors
+            .fetch_add(num_txs as u64, Ordering::Relaxed);
+        warn!(target: "n42::ingest", "native frame refused: genesis does not enable 0x50 transactions");
+        return 0;
+    }
+    let auth_start = Instant::now();
+    let auth_native = native.clone();
+    let admitted = tokio::task::spawn_blocking(move || {
+        let mut stored = false;
+        let admitted = AdmittedFrame::authenticate(
+            auth_native.chain_id,
+            &frame.transactions,
+            &frame.attestations,
+            auth_native.gateways.as_ref(),
+            FrameLimits {
+                max_transactions: MAX_INGEST_BATCH_TXS,
+                max_encoded_bytes: MAX_INGEST_BATCH_BYTES,
+            },
+        )?;
+        // Keep the authenticated frame's exact bytes so a block built from it
+        // can be sent, and put back together, by reference.
+        if n42_tx_types::frame_ref_blocks_enabled() {
+            let (hashes, senders) = admitted
+                .transactions()
+                .iter()
+                .map(|tx| (*tx.transaction().hash(), tx.sender()))
+                .unzip();
+            stored = n42_tx_types::FrameStore::global().insert_with_senders(
+                admitted.root(),
+                frame.transactions,
+                hashes,
+                senders,
+            );
+        }
+        Ok((admitted, stored))
+    })
+    .await;
+    let (frame, stored) = match admitted {
+        Ok(Ok(admitted)) => admitted,
+        Ok(Err::<_, n42_tx_types::admission::FrameAdmissionError>(error)) => {
+            metrics::counter!("n42_ingest_native_frames_total", "outcome" => "rejected")
+                .increment(1);
+            stats
+                .decode_errors
+                .fetch_add(num_txs as u64, Ordering::Relaxed);
+            debug!(target: "n42::ingest", %error, "native frame rejected");
+            return 0;
+        }
+        Err(error) => {
+            stats
+                .decode_errors
+                .fetch_add(num_txs as u64, Ordering::Relaxed);
+            error!(target: "n42::ingest", %error, "native frame authentication task failed");
+            return 0;
+        }
+    };
+    let outcome = match frame.authentication() {
+        FrameAuthentication::TrustedGateways => "attested",
+        FrameAuthentication::TransactionSignatures => "verified",
+    };
+    metrics::histogram!("n42_ingest_batch_duration_ms", "phase" => "native_authenticate", "auth" => outcome)
+        .record(auth_start.elapsed().as_secs_f64() * 1_000.0);
+    if hold_only {
+        let held = stored || n42_tx_types::FrameStore::global().get(&frame.root()).is_some();
+        if stored {
+            let mut held = HELD_FRAMES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if held.len() >= MAX_HELD_FRAMES {
+                held.clear();
+            }
+            held.insert(frame.root());
+        }
+        metrics::counter!("n42_ingest_native_frames_total", "outcome" => "held").increment(1);
+        return if held { num_txs } else { 0 };
+    }
+    metrics::counter!("n42_ingest_native_frames_total", "outcome" => outcome).increment(1);
+    let held_before = HELD_FRAMES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&frame.root());
+
+    // The sender is now authenticated: record it so this node's own payload
+    // building and import do not verify the signature again.
+    let cache = AltSigSenderCache::global();
+    let mut pooled = Vec::with_capacity(num_txs);
+    for admitted in frame.transactions() {
+        let tx = admitted.transaction();
+        cache.insert(*tx.hash(), admitted.sender());
+        let recovered =
+            Recovered::new_unchecked(N42TxEnvelope::AltSig(tx.clone()), admitted.sender());
+        match N42PooledTransaction::try_from_consensus(recovered) {
+            Ok(tx) => pooled.push(tx),
+            Err(_) => {
+                stats.decode_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let batch_size = pooled.len();
+    let accepted = if crate::frame_queue::frame_queue_enabled() {
+        // The frame waits for the builder outside the pool. One the store
+        // already held was queued when it first arrived, unless it arrived
+        // while the gate was closed.
+        if stored || held_before {
+            let now = std::time::Instant::now();
+            let queued = pooled
+                .into_iter()
+                .map(|transaction| {
+                    let sender = transaction.sender();
+                    let nonce = transaction.nonce();
+                    // The pool's sender numbering is not involved; the id
+                    // only has to tell senders apart.
+                    let sender_id = u64::from_be_bytes(
+                        sender.0[12..20]
+                            .try_into()
+                            .expect("an address has 20 bytes"),
+                    );
+                    Arc::new(ValidPoolTransaction {
+                        transaction,
+                        transaction_id: TransactionId::new(SenderId::from(sender_id), nonce),
+                        propagate: false,
+                        timestamp: now,
+                        origin: TransactionOrigin::External,
+                        authority_ids: None,
+                    })
+                })
+                .collect();
+            crate::frame_queue::FrameQueue::global().push(
+                n42_tx_types::FrameStore::global(),
+                frame.root(),
+                queued,
+            );
+        }
+        batch_size
+    } else {
+        pool.add_prevalidated(pooled)
+            .iter()
+            .filter(|r| r.is_ok())
+            .count()
+    };
+    stats.accepted.fetch_add(accepted as u64, Ordering::Relaxed);
+    if accepted < batch_size {
+        stats
+            .pool_errors
+            .fetch_add((batch_size - accepted) as u64, Ordering::Relaxed);
+    }
+    metrics::counter!("n42_ingest_transactions_total", "outcome" => "accepted")
+        .increment(accepted as u64);
+    accepted
 }
 
 #[cfg(test)]
@@ -1002,7 +1376,7 @@ mod tests {
     impl DirectPoolIngest for NoopPool {
         fn add_prevalidated(
             &self,
-            txs: Vec<EthPooledTransaction>,
+            txs: Vec<N42PooledTransaction>,
         ) -> Vec<PoolResult<AddedTransactionOutcome>> {
             assert!(txs.is_empty(), "test never submits transactions");
             Vec::new()
@@ -1026,7 +1400,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_client(stream, NoopPool, &server_stats).await
+            handle_client(stream, NoopPool, &server_stats, &native_ingest(None)).await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1060,7 +1434,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_client(stream, NoopPool, &server_stats).await
+            handle_client(stream, NoopPool, &server_stats, &native_ingest(None)).await
         });
 
         let mut client = TcpStream::connect(addr).await.unwrap();
@@ -1084,5 +1458,196 @@ mod tests {
             .expect("handler hung on an over-ceiling batch")
             .expect("handler task panicked");
         assert!(result.is_ok(), "handler should close cleanly: {result:?}");
+    }
+
+    fn native_ingest(gateways: Option<FrameGateways>) -> Arc<NativeIngest> {
+        Arc::new(NativeIngest {
+            enabled: true,
+            chain_id: NATIVE_CHAIN_ID,
+            gateways,
+        })
+    }
+
+    const NATIVE_CHAIN_ID: u64 = 4242;
+
+    #[test]
+    fn native_header_is_classified_apart_from_batches_and_control_frames() {
+        assert_eq!(
+            classify_ingest_header(NATIVE_FRAME | 3),
+            IngestFrameHeader::Native(3)
+        );
+        assert_eq!(
+            classify_ingest_header(NATIVE_FRAME),
+            IngestFrameHeader::Oversized
+        );
+        assert_eq!(
+            classify_ingest_header(NATIVE_FRAME | (MAX_INGEST_BATCH_TXS as u32 + 1)),
+            IngestFrameHeader::Oversized
+        );
+        // The credit-probe sentinel has the native bit set and keeps its meaning.
+        assert_eq!(
+            classify_ingest_header(CREDIT_WAIT_SENTINEL),
+            IngestFrameHeader::CreditProbe
+        );
+    }
+
+    /// Pool stub that keeps what it is given.
+    #[derive(Clone, Default)]
+    struct RecordingPool(Arc<std::sync::Mutex<Vec<N42PooledTransaction>>>);
+
+    impl DirectPoolIngest for RecordingPool {
+        fn add_prevalidated(
+            &self,
+            txs: Vec<N42PooledTransaction>,
+        ) -> Vec<PoolResult<AddedTransactionOutcome>> {
+            let outcomes = txs
+                .iter()
+                .map(|tx| {
+                    Ok(AddedTransactionOutcome {
+                        hash: *tx.hash(),
+                        state: reth_transaction_pool::pool::AddedTransactionState::Pending,
+                    })
+                })
+                .collect();
+            self.0.lock().unwrap().extend(txs);
+            outcomes
+        }
+
+        fn pending_count(&self) -> usize {
+            self.0.lock().unwrap().len()
+        }
+    }
+
+    fn native_frame(seed: u8, count: u64) -> (Vec<Bytes>, Vec<alloy_primitives::B256>) {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let pubkey = Bytes::copy_from_slice(key.verifying_key().as_bytes());
+        (0..count)
+            .map(|nonce| {
+                let tx = n42_tx_types::TxAltSig {
+                    chain_id: NATIVE_CHAIN_ID,
+                    nonce,
+                    max_priority_fee_per_gas: 1,
+                    max_fee_per_gas: 2,
+                    gas_limit: 21_000,
+                    to: Address::repeat_byte(0x22),
+                    value: U256::from(1),
+                    input: Bytes::new(),
+                    access_list: Default::default(),
+                    alg_type: n42_tx_types::ALG_ED25519,
+                    pubkey: pubkey.clone(),
+                }
+                .sign_ed25519(&key);
+                let encoded = alloy_eips::eip2718::Encodable2718::encoded_2718(&tx);
+                (Bytes::from(encoded), *tx.hash())
+            })
+            .unzip()
+    }
+
+    #[tokio::test]
+    async fn attested_native_frame_is_pooled_with_senders_from_public_keys() {
+        let gateway = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let gateways = FrameGateways::new(vec![gateway.verifying_key()], 1);
+        let (transactions, hashes) = native_frame(7, 4);
+        let root = n42_tx_types::frame_root(&hashes);
+        let attestations = vec![FrameAttestation::sign(&gateway, NATIVE_CHAIN_ID, root)];
+        let pool = RecordingPool::default();
+        let stats = IngestStats::new();
+        let accepted = admit_native_frame(
+            &pool,
+            &stats,
+            &native_ingest(Some(gateways)),
+            NativeFrameWire {
+                transactions,
+                attestations,
+            },
+            false,
+        )
+        .await;
+        assert_eq!(accepted, 4);
+        let pooled = pool.0.lock().unwrap();
+        let expected = n42_tx_types::alt_sig::sender_of(
+            n42_tx_types::ALG_ED25519,
+            ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+                .verifying_key()
+                .as_bytes(),
+        );
+        assert!(pooled.iter().all(|tx| tx.sender() == expected));
+        assert!(
+            hashes
+                .iter()
+                .all(|hash| AltSigSenderCache::global().get(hash) == Some(expected))
+        );
+    }
+
+    #[tokio::test]
+    async fn unattested_native_frame_with_a_bad_signature_is_rejected_whole() {
+        let (mut transactions, _) = native_frame(8, 3);
+        // Flip the last signature byte of the second transaction.
+        let mut bad = transactions[1].to_vec();
+        *bad.last_mut().unwrap() ^= 1;
+        transactions[1] = Bytes::from(bad);
+        let pool = RecordingPool::default();
+        let stats = IngestStats::new();
+        let accepted = admit_native_frame(
+            &pool,
+            &stats,
+            &native_ingest(None),
+            NativeFrameWire {
+                transactions,
+                attestations: Vec::new(),
+            },
+            false,
+        )
+        .await;
+        assert_eq!(accepted, 0);
+        assert!(pool.0.lock().unwrap().is_empty());
+        assert_eq!(stats.decode_errors.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn native_frame_with_a_foreign_gateway_attestation_is_verified_instead() {
+        let trusted = ed25519_dalek::SigningKey::from_bytes(&[10; 32]);
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let gateways = FrameGateways::new(vec![trusted.verifying_key()], 1);
+        let (transactions, hashes) = native_frame(12, 2);
+        let root = n42_tx_types::frame_root(&hashes);
+        let attestations = vec![FrameAttestation::sign(&stranger, NATIVE_CHAIN_ID, root)];
+        let pool = RecordingPool::default();
+        let accepted = admit_native_frame(
+            &pool,
+            &IngestStats::new(),
+            &native_ingest(Some(gateways)),
+            NativeFrameWire {
+                transactions,
+                attestations,
+            },
+            false,
+        )
+        .await;
+        // Valid signatures: admitted through verification, not through the stranger.
+        assert_eq!(accepted, 2);
+    }
+
+    #[tokio::test]
+    async fn native_frame_is_refused_when_genesis_disables_0x50() {
+        let (transactions, _) = native_frame(13, 1);
+        let pool = RecordingPool::default();
+        let native = Arc::new(NativeIngest {
+            enabled: false,
+            chain_id: NATIVE_CHAIN_ID,
+            gateways: None,
+        });
+        let accepted = admit_native_frame(
+            &pool,
+            &IngestStats::new(),
+            &native,
+            NativeFrameWire {
+                transactions,
+                attestations: Vec::new(),
+            },
+            false,
+        )
+        .await;
+        assert_eq!(accepted, 0);
     }
 }

@@ -9,25 +9,26 @@
 static NODE_TEST_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use super::*;
-use alloy_consensus::{Header, TxLegacy};
+use alloy_consensus::{BlockBody, Header, TxLegacy};
 use alloy_primitives::{Bytes, TxKind};
 use n42_execution::{N42EvmConfig, restored_slots_for};
 use n42_twig_core::{
     qmdb_compat::{QmdbOperation, encode_gov5_account_value, gov5_account_key},
     qmdb_leaf_tree::QmdbLeafTree,
 };
-use reth_ethereum_primitives::{Block, BlockBody, Transaction};
+use n42_tx_types::{Block, N42TxEnvelope};
+use reth_ethereum_primitives::Transaction;
 use reth_evm::{
     ConfigureEvm,
     execute::{BasicBlockExecutor, Executor},
 };
 use reth_primitives_traits::{
-    RecoveredBlock, SignedTransaction, crypto::secp256k1::public_key_to_address,
+    RecoveredBlock, SignedTransaction,
 };
 use reth_provider::test_utils::MockEthProvider;
 use reth_storage_api::{StateProvider, StateProviderFactory};
 use reth_testing_utils::generators::sign_tx_with_key_pair;
-use secp256k1::{Keypair, Secp256k1, SecretKey};
+use secp256k1::{Keypair, SecretKey};
 use std::{collections::HashSet, time::Instant};
 
 fn address(domain: u8, n: u64) -> Address {
@@ -46,6 +47,11 @@ fn account(address: Address, nonce: u64, balance: U256) -> QmdbOperation {
             &B256::ZERO.0,
         )),
     }
+}
+
+/// Transfers the fast path executed.
+fn fast_transfer_hits() -> u64 {
+    n42_execution::fast_transfer::hits()
 }
 
 fn run(accounts: u64, transactions: u64, blocks: u64) {
@@ -103,13 +109,12 @@ fn run_fork(
     let gas_price = 9u128;
     let base_fee = 7u64;
     let beneficiary = address(0xc0, 0);
-    let secp = Secp256k1::new();
     let keys: Vec<_> = (1..=transactions)
         .map(|n| {
             let mut secret = [0u8; 32];
             secret[24..].copy_from_slice(&n.to_be_bytes());
-            let key = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&secret).unwrap());
-            let sender = public_key_to_address(key.public_key());
+            let key = Keypair::from_secret_key(&SecretKey::from_secret_bytes(secret).unwrap());
+            let sender = Address::from_raw_public_key(&key.public_key().serialize_uncompressed()[1..]);
             (key, sender)
         })
         .collect();
@@ -195,7 +200,7 @@ fn run_fork(
                     * U256::from(gas_price - u128::from(base_fee)),
         ));
         let expected_root = B256::from(oracle.apply_sorted_ops(expected).unwrap());
-        let signed: Vec<_> = keys
+        let signed: Vec<N42TxEnvelope> = keys
             .iter()
             .enumerate()
             .map(|(n, (key, _))| {
@@ -211,6 +216,7 @@ fn run_fork(
                         input: Bytes::new(),
                     }),
                 )
+                .into()
             })
             .collect();
         let recovery_started = Instant::now();
@@ -254,21 +260,16 @@ fn run_fork(
         let started = Instant::now();
         let provider = adapter.wrap(parent, fallback.latest().unwrap()).unwrap();
         let database =
-            reth_revm::database::StateProviderDatabase::new(provider.into_evm_state_provider());
+            reth_evm::database::StateProviderDatabase::new(provider.into_evm_state_provider());
         let output = if parallel {
-            n42_execution::parallel_block::try_execute_transfer_block(
-                &config,
-                database,
-                &block,
-                &|| {
-                    let provider = adapter.wrap(parent, fallback.latest().ok()?).ok()?;
-                    Some(reth_revm::database::StateProviderDatabase::new(
-                        provider.into_evm_state_provider(),
-                    ))
-                },
-            )
-            .expect("parallel complete block execution")
+            n42_execution::parallel_build::import_block(&config, &block, database, &|| {
+                let provider = adapter.wrap(parent, fallback.latest().ok()?).ok()?;
+                Some(reth_evm::database::StateProviderDatabase::new(
+                    provider.into_evm_state_provider(),
+                ))
+            })
             .expect("qualified transfer block")
+            .0
         } else {
             BasicBlockExecutor::new(config.clone(), database)
                 .execute(&block)
@@ -282,7 +283,7 @@ fn run_fork(
                 &config
                     .evm_env(block.header())
                     .expect("valid benchmark environment")
-                    .block_env,
+                    .block,
             ),
         ))
         .expect("canonical tracking executor recorded this block");
@@ -405,9 +406,9 @@ fn bench_canonical_qmdb_execution_and_commit() {
 #[test]
 fn canonical_qmdb_fast_transfer_matches_prague_interpreter_and_restart() {
     let slow = run_case(160, 32, 3, Some(false));
-    let before = n42_execution::fast_transfer::hits();
+    let before = fast_transfer_hits();
     let fast = run_case(160, 32, 3, Some(true));
-    assert!(n42_execution::fast_transfer::hits() - before >= 96);
+    assert!(fast_transfer_hits() - before >= 96);
     assert_eq!(fast, slow, "all consecutive durable QMDB roots must match");
 }
 
@@ -424,9 +425,9 @@ fn parallel_qmdb_transfer_blocks_match_interpreter_and_restart() {
 #[test]
 fn default_cancun_qmdb_fast_and_parallel_match_interpreter_and_restart() {
     let serial = run_fork(8_200, 4_096, 3, false, false, false);
-    let before = n42_execution::fast_transfer::hits();
+    let before = fast_transfer_hits();
     let fast = run_fork(8_200, 4_096, 3, true, false, false);
-    assert!(n42_execution::fast_transfer::hits() - before >= 12_288);
+    assert!(fast_transfer_hits() - before >= 12_288);
     let parallel = run_fork(8_200, 4_096, 3, true, true, false);
     assert_eq!(serial, fast);
     assert_eq!(serial, parallel);

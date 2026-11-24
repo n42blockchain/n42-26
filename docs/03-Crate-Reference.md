@@ -14,7 +14,7 @@
 | `n42-mobile` | phone-side protocol and verification | packets, receipts, attestation builder | primitives | ✅ Active |
 | `n42-mobile-ffi` | mobile SDK bindings | C/JNI exported functions | mobile, chainspec | ✅ Active |
 | `n42-node` | orchestration and product assembly | `ConsensusOrchestrator`, RPC, persistence | consensus, network, mobile, JMT, ZK | ✅ Active |
-| `n42-parallel-evm` | parallel execution engine | `parallel_execute` | revm | **❌ Dead code** |
+| `n42-parallel-evm` | parallel execution engine | `parallel_execute` | revm | **❌ Parked** (REVM-only, excluded from the workspace since the evm2 migration) |
 | `n42-jmt` | merkle tree and proof serving | `ShardedJmt`, proofs, snapshots | jmt, blake3 | **❌ Not wired** |
 | `n42-zkproof` | proof scheduling and storage | `ProofScheduler`, `ProofStore` | SP1/mock backend | ✅ Active (conditional) |
 
@@ -69,7 +69,7 @@
 | `n42-node` | primary node bootstrap and runtime host |
 | `n42-mobile-sim` | simulated phone swarm for mobile verification load |
 | `n42-stress` | transaction injection and stress benchmarking |
-| `n42-evm-bench` | execution benchmarking / profiling |
+| `n42-evm-bench` | execution benchmarking / profiling (REVM-only; parked, excluded from the workspace) |
 
 ## Cross-cutting state surfaces
 

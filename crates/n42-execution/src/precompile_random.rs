@@ -1,4 +1,4 @@
-//! N42 randomness precompile — pure logic + revm adapter.
+//! N42 randomness precompile — pure logic + evm2 adapter.
 //!
 //! Three function selectors (first byte of input):
 //! - `0x00`: `getRandom()` → `keccak256(prevrandao)` (32 bytes, 100 gas)
@@ -6,55 +6,37 @@
 //! - `0x02`: `getRandomWithSeed(seed)` → `keccak256(prevrandao || seed)` (32 bytes, 100 gas)
 
 use alloy_primitives::{B256, Bytes, U256, keccak256};
-use revm::precompile::{PrecompileHalt, PrecompileOutput, PrecompileResult};
-use std::cell::Cell;
+use evm2::{
+    BaseEvmTypes, Evm,
+    evm::precompile::PrecompileOutput,
+    interpreter::{GasTracker, Message},
+    precompiles::{PrecompileHalt, PrecompileResult},
+};
 
-thread_local! {
-    /// Block's prevrandao, injected before EVM execution.
-    /// Used by the randomness precompile since revm's precompile function signature
-    /// does not provide access to the block environment.
-    static BLOCK_PREVRANDAO: Cell<B256> = const { Cell::new(B256::ZERO) };
-}
-
-/// Set the block's prevrandao for the randomness precompile.
-/// Must be called before each block's EVM execution.
-pub fn set_block_randomness(prevrandao: B256) {
-    BLOCK_PREVRANDAO.set(prevrandao);
-}
-
-/// Get the current block's prevrandao.
-fn get_block_randomness() -> B256 {
-    BLOCK_PREVRANDAO.get()
-}
-
-/// Adapter for revm precompile registration.
-/// Reads prevrandao from thread-local storage set by [`set_block_randomness()`].
+/// Adapter for evm2 precompile registration.
 ///
-/// The `reservoir` parameter (added in revm 38 / EIP-8037) tracks the remaining
-/// state-gas reservoir for this call; precompiles that do not touch state pass
-/// it through unchanged.
-pub fn revm_precompile_fn(input: &[u8], gas_limit: u64, reservoir: u64) -> PrecompileResult {
-    let prevrandao = get_block_randomness();
-    match execute_randomness(input, gas_limit, prevrandao) {
-        Ok(result) => Ok(PrecompileOutput::new(
-            result.gas_used,
-            Bytes::from(result.output),
-            reservoir,
-        )),
-        // revm 38 split fatal vs non-fatal: input-shape / out-of-gas issues
-        // become `PrecompileOutput::halt(...)` (non-fatal) instead of `Err`
-        // (which would abort the entire EVM transaction).
-        Err(PrecompileCallError::OutOfGas) => {
-            Ok(PrecompileOutput::halt(PrecompileHalt::OutOfGas, reservoir))
+/// The block's prevrandao is read from the block environment of the EVM that
+/// runs the call, so no state outside the EVM is involved.
+pub fn evm2_precompile_fn(
+    evm: &mut Evm<'_, BaseEvmTypes>,
+    message: &Message<BaseEvmTypes>,
+    gas: &mut GasTracker,
+) -> PrecompileResult {
+    let prevrandao = B256::from(evm.block().prevrandao);
+    let result = execute_randomness(evm.message_input(message), gas.remaining(), prevrandao);
+    match result {
+        Ok(result) => {
+            gas.spend(result.gas_used)?;
+            Ok(PrecompileOutput::new(Bytes::from(result.output)))
         }
-        Err(e) => Ok(PrecompileOutput::halt(
-            PrecompileHalt::other(e.to_string()),
-            reservoir,
-        )),
+        // Input-shape and out-of-gas issues halt the call (non-fatal): the
+        // call fails and the transaction goes on.
+        Err(PrecompileCallError::OutOfGas) => Err(PrecompileHalt::OutOfGas.into()),
+        Err(e) => Err(PrecompileHalt::Other(e.to_string().into()).into()),
     }
 }
 
-/// N42 randomness precompile address (for future EVM registration).
+/// N42 randomness precompile address.
 pub const RANDOMNESS_ADDRESS: [u8; 20] = {
     let mut addr = [0u8; 20];
     addr[18] = 0x03;

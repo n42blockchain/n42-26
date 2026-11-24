@@ -1,7 +1,7 @@
 // Copyright (c) 2017-2025 N42 Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! N42 native transaction, block, receipt and authenticated frame primitives.
-//! Ported from n42-rs; node admission/build integration is a separate step.
+//! Ported from n42-rs (tag fleet7-x22-5.2M-20261024); see PORT.md.
 extern crate alloc;
 pub mod admission;
 pub mod alt_sig;
@@ -9,8 +9,10 @@ mod compact;
 pub mod envelope;
 pub mod execution;
 pub mod frame;
-mod key_cache;
+pub mod frame_store;
 pub mod primitives;
+pub mod rpc;
+pub mod sender_cache;
 pub use alt_sig::{
     ALG_ED25519, ALT_SIG_TX_TYPE_ID, AltSigError, AltSigTx, ED25519_PUBKEY_LEN,
     ED25519_SIGNATURE_LEN, TxAltSig, verify_batch,
@@ -21,7 +23,14 @@ pub use frame::{
     binary_merkle_root, frame_attest_message, frame_blocks_requested, frame_root, frame_tree_root,
     frame_tree_root_of,
 };
+pub use frame_store::{FrameStore, StoredFrame, frame_ref_blocks_enabled};
 pub use primitives::{Block, BlockBody, N42Primitives, Receipt};
+pub use rpc::{AltSigRpcReceipt, N42RpcReceipt};
+pub use sender_cache::{
+    AltSigSenderCache, IngestVerify, alt_sig_enabled, bench_unsafe_acknowledged,
+    ed25519_batch_size, ingest_shard, ingest_verify_mode, parse_ingest_verify,
+    senders_claimed_at_ingest, set_alt_sig_enabled, shard_owner, trusting_ingest_refusal,
+};
 
 #[cfg(test)]
 mod tests {

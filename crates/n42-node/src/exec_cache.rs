@@ -19,6 +19,7 @@ pub struct RethExecutionOutputCache {
     qmdb_store: Option<Arc<crate::qmdb_state_root::Gov5QmdbStateRootStore>>,
     chain_spec: Arc<reth_chainspec::ChainSpec>,
     accept_peer_outputs: bool,
+    shared_execution: bool,
 }
 
 impl RethExecutionOutputCache {
@@ -30,7 +31,18 @@ impl RethExecutionOutputCache {
             qmdb_store,
             chain_spec,
             accept_peer_outputs: true,
+            shared_execution: false,
         }
+    }
+
+    /// Lets this node take the execution output of a co-located leader on the
+    /// QMDB route (`N42_SHARED_EXECUTION`). The output's QMDB root and receipts
+    /// root are still compared with the header; see
+    /// `n42_consensus_service::orchestrator::shared_execution_enabled`. It has
+    /// no effect without a QMDB store: the trusted-root mode compares no root.
+    pub fn with_shared_execution(mut self, shared: bool) -> Self {
+        self.shared_execution = shared;
+        self
     }
 
     /// Controls whether peer-supplied compact outputs may enter the payload cache.
@@ -50,6 +62,33 @@ impl ExecutionOutputCache for RethExecutionOutputCache {
         take_and_serialize_execution_output(&hash)
     }
 
+    fn inject_for_payload(
+        &self,
+        execution: &alloy_rpc_types_engine::ExecutionData,
+        compressed: &[u8],
+        source: &'static str,
+    ) -> bool {
+        if self.qmdb_store.is_none() {
+            return self.inject(execution.block_hash(), compressed, source);
+        }
+        if !self.shared_execution {
+            metrics::counter!("n42_compact_block_peer_output_refused_total").increment(1);
+            return false;
+        }
+        let chain_spec = &self.chain_spec;
+        inject_compact_block_with(&execution.block_hash(), compressed, source, |slots| {
+            // The key is derived from the payload in hand, never taken from
+            // the wire, so a list can only be filed for the block it came with.
+            let Some(slots) = slots else {
+                return Err("shared execution output without restored slots");
+            };
+            let key = gov5_restored_slots_key_for_payload(execution, chain_spec, None)
+                .ok_or("payload has no execution environment")?;
+            n42_execution::record_restored_slots(key, slots);
+            Ok(())
+        })
+    }
+
     fn take_gov5_normalization(
         &self,
         execution: &alloy_rpc_types_engine::ExecutionData,
@@ -57,16 +96,20 @@ impl ExecutionOutputCache for RethExecutionOutputCache {
         take_gov5_normalization_roots(execution, self.qmdb_store.as_deref(), &self.chain_spec)
     }
 
+    fn built_transactions_root(&self, hash: B256) -> Option<B256> {
+        reth_evm::payload_cache::payload_transactions_root(&hash)
+    }
+
     fn rekey_gov5_normalized(
         &self,
         original: &alloy_rpc_types_engine::ExecutionData,
         normalized: &alloy_rpc_types_engine::ExecutionData,
     ) -> bool {
-        if !n42_network::gov5_normalization_preserves_execution_input(original, normalized) {
-            return false;
-        }
-        let old_hash = original.block_hash();
-        let new_hash = normalized.block_hash();
+        n42_network::gov5_normalization_preserves_execution_input(original, normalized)
+            && self.rekey_gov5_built(original.block_hash(), normalized.block_hash())
+    }
+
+    fn rekey_gov5_built(&self, old_hash: B256, new_hash: B256) -> bool {
         if old_hash == new_hash {
             return true;
         }
@@ -81,6 +124,21 @@ impl ExecutionOutputCache for RethExecutionOutputCache {
             reth_evm::payload_cache::store_payload_transactions_root(new_hash, root);
         }
         reth_evm::payload_cache::store_payload_execution(new_hash, output);
+        // Shared execution keeps a broadcast copy under the builder's hash;
+        // followers know the block by its normalized hash.
+        if let Some(shared) =
+            reth_evm::payload_cache::take_broadcast_execution::<CachedPayloadData>(&old_hash)
+        {
+            reth_evm::payload_cache::store_broadcast_execution(new_hash, shared);
+            let mut restored = SHARED_RESTORED_SLOTS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((hash, _)) = restored.as_mut()
+                && *hash == old_hash
+            {
+                *hash = new_hash;
+            }
+        }
         metrics::counter!("n42_gov5_normalized_execution_cache_rekeys_total").increment(1);
         true
     }
@@ -112,10 +170,7 @@ impl ExecutionOutputCache for RethExecutionOutputCache {
     }
 }
 
-type CachedPayloadData = (
-    BlockExecutionOutput<reth_ethereum_primitives::Receipt>,
-    Vec<Address>,
-);
+type CachedPayloadData = (BlockExecutionOutput<n42_tx_types::Receipt>, Vec<Address>);
 
 #[derive(Default)]
 struct CompactInjectTracker {
@@ -166,11 +221,16 @@ pub(crate) fn take_and_serialize_execution_output(hash: &B256) -> Option<Vec<u8>
 
 fn serialize_execution_output(
     hash: &B256,
-    output: BlockExecutionOutput<reth_ethereum_primitives::Receipt>,
+    output: BlockExecutionOutput<n42_tx_types::Receipt>,
     senders: Vec<Address>,
 ) -> Option<Vec<u8>> {
     let ser_start = std::time::Instant::now();
     let transactions_root = reth_evm::payload_cache::payload_transactions_root(hash);
+    let restored_slots = SHARED_RESTORED_SLOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take_if(|(shared_hash, _)| shared_hash == hash)
+        .map(|(_, slots)| slots);
     let compact = CompactBlockExecution {
         bundle_state: output.state,
         receipts: output.result.receipts,
@@ -179,8 +239,9 @@ fn serialize_execution_output(
         blob_gas_used: output.result.blob_gas_used,
         senders,
         transactions_root,
+        restored_slots,
     };
-    match serde_json::to_vec(&compact) {
+    match compact.encode() {
         Ok(serialized) => {
             let compressed = compress_payload(&serialized);
             let ser_ms = ser_start.elapsed().as_millis() as u64;
@@ -203,47 +264,157 @@ fn serialize_execution_output(
     }
 }
 
+/// The restored slots of the block whose shared execution output is waiting
+/// to be serialized, by block hash. One entry, like reth's broadcast slot.
+static SHARED_RESTORED_SLOTS: Mutex<Option<(B256, Vec<n42_execution::RestoredSlot>)>> =
+    Mutex::new(None);
+
+/// The restored-slots registry key of a payload: parent, execution
+/// environment, beacon root, withdrawals and ordered transaction hashes.
+/// `tx_hashes` saves hashing when the caller already has them.
+fn gov5_restored_slots_key_for_payload(
+    execution: &alloy_rpc_types_engine::ExecutionData,
+    chain_spec: &Arc<reth_chainspec::ChainSpec>,
+    tx_hashes: Option<Vec<B256>>,
+) -> Option<B256> {
+    use reth_evm::ConfigureEngineEvm;
+    let config = n42_execution::N42EvmConfig::new(Arc::clone(chain_spec));
+    let env = config.evm_env_for_payload(execution).ok()?;
+    let ctx = config.context_for_payload(execution).ok()?;
+    let context = n42_execution::restored_slots_execution_key(
+        execution.parent_hash(),
+        n42_execution::restored_slots_env_key(&env.block),
+        ctx.parent_beacon_block_root,
+        ctx.withdrawals.as_deref(),
+        [],
+    );
+    let tx_hashes = tx_hashes.unwrap_or_else(|| {
+        use rayon::prelude::*;
+        execution
+            .payload
+            .as_v1()
+            .transactions
+            .par_iter()
+            .map(alloy_primitives::keccak256)
+            .collect()
+    });
+    Some(n42_execution::restored_slots_key(context, tx_hashes))
+}
+
 /// Consume the builder's broadcast copy once and bind Gov5's native receipt
-/// commitment to exactly that execution output. The normalized H2 payload is
-/// subsequently re-executed; no compact execution blob is used on this path.
+/// commitment to exactly that execution output. Followers execute the
+/// normalized H2 payload themselves unless shared execution is on, in which
+/// case the copy is kept for `take_serialized` together with the block's
+/// restored slots.
 fn take_gov5_normalization_roots(
     execution: &alloy_rpc_types_engine::ExecutionData,
     qmdb_store: Option<&crate::qmdb_state_root::Gov5QmdbStateRootStore>,
     chain_spec: &Arc<reth_chainspec::ChainSpec>,
 ) -> Option<(B256, B256)> {
     let hash = &execution.block_hash();
-    let parent_hash = execution.parent_hash();
-    let (output, _senders) =
-        reth_evm::payload_cache::take_broadcast_execution::<CachedPayloadData>(hash)?;
-    let receipts_root = n42_network::gov5_native_receipts_root(&output.result.receipts);
-    let payload = execution.payload.as_v1();
-    use reth_evm::ConfigureEngineEvm;
-    let config = n42_execution::N42EvmConfig::new(Arc::clone(chain_spec));
-    let env = config.evm_env_for_payload(execution).ok()?;
-    let ctx = config.context_for_payload(execution).ok()?;
-    let context = n42_execution::restored_slots_execution_key(
-        parent_hash,
-        n42_execution::restored_slots_env_key(&env.block_env),
-        ctx.parent_beacon_block_root,
-        ctx.withdrawals.as_deref(),
-        [],
-    );
-    let key = n42_execution::restored_slots_key(
-        context,
-        payload.transactions.iter().map(alloy_primitives::keccak256),
-    );
-    let restored = n42_execution::restored_slots_for(key).unwrap_or_default();
-    let mut operations =
-        crate::qmdb_state::gov5_qmdb_operations_with_restored(&output.state, &restored);
-    if reth_chainspec::EthereumHardforks::is_prague_active_at_timestamp(
-        chain_spec,
-        payload.timestamp,
-    ) {
+    // The builder derives both roots itself when it holds the store; shared
+    // execution also needs the restored slots filed below, so it does not.
+    if !n42_consensus_service::orchestrator::shared_execution_enabled()
+        && let Some(roots) = take_built_gov5_roots(hash)
+    {
+        return Some(roots);
+    }
+    // The builder keeps a separate broadcast copy only when the output is
+    // sent to peers. Without one, the copy kept for this node's own import is
+    // borrowed and put back.
+    if let Some((output, senders)) =
+        reth_evm::payload_cache::take_broadcast_execution::<CachedPayloadData>(hash)
+    {
+        let roots = gov5_normalization_roots(execution, &output, qmdb_store, chain_spec);
+        if roots.is_some() && n42_consensus_service::orchestrator::shared_execution_enabled() {
+            reth_evm::payload_cache::store_broadcast_execution(*hash, (output, senders));
+        }
+        return roots;
+    }
+    let (output, senders) =
+        reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(hash)?;
+    let roots = gov5_normalization_roots(execution, &output, qmdb_store, chain_spec);
+    reth_evm::payload_cache::store_payload_execution(*hash, (output, senders));
+    roots
+}
+
+/// The roots the builder derived for the block it just assembled, by the
+/// builder's block hash. One entry: a node proposes one block at a time.
+static BUILT_GOV5_ROOTS: Mutex<Option<(B256, (B256, B256))>> = Mutex::new(None);
+
+/// Files the QMDB state root and native receipts root the builder derived
+/// for its block `hash`, for the normalization that follows.
+pub(crate) fn store_built_gov5_roots(hash: B256, roots: (B256, B256)) {
+    *BUILT_GOV5_ROOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((hash, roots));
+}
+
+fn take_built_gov5_roots(hash: &B256) -> Option<(B256, B256)> {
+    BUILT_GOV5_ROOTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take_if(|(built, _)| built == hash)
+        .map(|(_, roots)| roots)
+}
+
+/// The QMDB operations of a block's state changes in the tree's canonical
+/// order. The ordering buffer is owned here, before the tree lock is taken.
+pub(crate) fn gov5_sorted_operations(
+    state: &reth_trie_common::bundle_state::BundleState,
+    restored: &[n42_execution::RestoredSlot],
+    prague: bool,
+) -> Vec<n42_twig_core::qmdb_compat::QmdbOperation> {
+    let mut operations = crate::qmdb_state::gov5_qmdb_operations_with_restored(state, restored);
+    if prague {
         crate::qmdb_state::with_gov5_prague_system_caller(&mut operations);
     }
-    // Own the ordering buffer here, before entering the tree lock. The tree
-    // can borrow this canonical sequence while the operations remain ours.
-    operations.sort_unstable_by_key(|operation| operation.key);
+    rayon::slice::ParallelSliceMut::par_sort_unstable_by_key(
+        operations.as_mut_slice(),
+        |operation| operation.key,
+    );
+    operations
+}
+
+/// The QMDB state root and native receipts root of a locally built payload,
+/// from the builder's own execution output.
+fn gov5_normalization_roots(
+    execution: &alloy_rpc_types_engine::ExecutionData,
+    output: &BlockExecutionOutput<n42_tx_types::Receipt>,
+    qmdb_store: Option<&crate::qmdb_state_root::Gov5QmdbStateRootStore>,
+    chain_spec: &Arc<reth_chainspec::ChainSpec>,
+) -> Option<(B256, B256)> {
+    let hash = &execution.block_hash();
+    let parent_hash = execution.parent_hash();
+    let started = std::time::Instant::now();
+    let payload = execution.payload.as_v1();
+    // The receipts root and the transaction hashes are independent of each
+    // other and of the tree; on a full block they are the serial part of this
+    // step, so they run side by side on the rayon pool.
+    let (receipts_root, tx_hashes) = rayon::join(
+        || n42_network::gov5_native_receipts_root(&output.result.receipts),
+        || {
+            use rayon::prelude::*;
+            payload
+                .transactions
+                .par_iter()
+                .map(alloy_primitives::keccak256)
+                .collect::<Vec<_>>()
+        },
+    );
+    let hashed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let key = gov5_restored_slots_key_for_payload(execution, chain_spec, Some(tx_hashes))?;
+    let restored = n42_execution::restored_slots_for(key).unwrap_or_default();
+    let operations = gov5_sorted_operations(
+        &output.state,
+        &restored,
+        reth_chainspec::EthereumHardforks::is_prague_active_at_timestamp(
+            chain_spec,
+            payload.timestamp,
+        ),
+    );
+    let operations_ms = started.elapsed().as_secs_f64() * 1000.0 - hashed_ms;
+    let operation_count = operations.len();
     let state_root = match qmdb_store {
         Some(store) => match store.prepare_candidate(parent_hash, operations) {
             Ok(root) => root,
@@ -267,6 +438,25 @@ fn take_gov5_normalization_roots(
             return None;
         }
     };
+    if n42_consensus_service::orchestrator::shared_execution_enabled() {
+        *SHARED_RESTORED_SLOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((*hash, restored.as_ref().clone()));
+    }
+    let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+    metrics::histogram!("n42_gov5_normalization_roots_ms").record(total_ms);
+    tracing::info!(
+        target: "n42::interop::h2v4",
+        %hash,
+        tx_count = payload.transactions.len(),
+        operation_count,
+        hashed_ms,
+        operations_ms,
+        root_ms = total_ms - hashed_ms - operations_ms,
+        total_ms,
+        "N42_GOV5_NORMALIZATION_ROOTS: leader roots for the built payload"
+    );
     Some((state_root, receipts_root))
 }
 
@@ -291,8 +481,48 @@ fn validate_compact_structure(compact: &CompactBlockExecution) -> Result<(), &'s
     Ok(())
 }
 
+/// Drops what a peer's bundle carries beyond the block's changes. The QMDB
+/// root is derived from changed accounts and changed slots only
+/// (`push_account_operations`), while reth writes every account and slot of
+/// the bundle to its hashed state, so an entry marked unchanged would be
+/// persisted with whatever value the peer gave it and no root would notice.
+/// An honest bundle loses nothing: its unchanged entries repeat what the
+/// database holds. An account marked unmodified that still claims changed
+/// slots is refused.
+fn keep_only_changes(
+    bundle: &mut reth_trie_common::bundle_state::BundleState,
+) -> Result<(), &'static str> {
+    let mut inconsistent = false;
+    bundle.state.retain(|_, account| {
+        if !account.was_destroyed() {
+            account.storage.retain(|_, slot| slot.is_changed());
+        }
+        if !account.status.is_not_modified() {
+            return true;
+        }
+        inconsistent |= !account.storage.is_empty();
+        false
+    });
+    if inconsistent {
+        return Err("unmodified account carries changed storage");
+    }
+    Ok(())
+}
+
 /// Deserialize compact block execution output and load it into the payload cache.
 pub(crate) fn inject_compact_block(hash: &B256, compressed: &[u8], source: &'static str) -> bool {
+    inject_compact_block_with(hash, compressed, source, |_| Ok(()))
+}
+
+/// [`inject_compact_block`], handing the output's restored slots to
+/// `restored` once the structure checks passed and before anything is stored.
+/// A refusal from `restored` refuses the whole output.
+fn inject_compact_block_with(
+    hash: &B256,
+    compressed: &[u8],
+    source: &'static str,
+    restored: impl FnOnce(Option<Vec<n42_execution::RestoredSlot>>) -> Result<(), &'static str>,
+) -> bool {
     let duplicate_attempt = observe_compact_inject_attempt(*hash, source);
     let inject_start = std::time::Instant::now();
 
@@ -307,7 +537,7 @@ pub(crate) fn inject_compact_block(hash: &B256, compressed: &[u8], source: &'sta
     let decompress_ms = decompress_start.elapsed().as_millis() as u64;
 
     let deser_start = std::time::Instant::now();
-    let compact: CompactBlockExecution = match serde_json::from_slice(&decompressed) {
+    let mut compact = match CompactBlockExecution::decode(&decompressed) {
         Ok(c) => c,
         Err(e) => {
             warn!(target: "n42::cl::exec_bridge", %hash, error = %e, "compact block: failed to deserialize");
@@ -317,6 +547,18 @@ pub(crate) fn inject_compact_block(hash: &B256, compressed: &[u8], source: &'sta
     let deser_ms = deser_start.elapsed().as_millis() as u64;
 
     if let Err(reason) = validate_compact_structure(&compact) {
+        metrics::counter!("n42_compact_block_structure_rejects_total").increment(1);
+        warn!(target: "n42::cl::exec_bridge", %hash, source, reason, "compact block: refusing peer output");
+        return false;
+    }
+
+    if let Err(reason) = keep_only_changes(&mut compact.bundle_state) {
+        metrics::counter!("n42_compact_block_structure_rejects_total").increment(1);
+        warn!(target: "n42::cl::exec_bridge", %hash, source, reason, "compact block: refusing peer output");
+        return false;
+    }
+
+    if let Err(reason) = restored(compact.restored_slots) {
         metrics::counter!("n42_compact_block_structure_rejects_total").increment(1);
         warn!(target: "n42::cl::exec_bridge", %hash, source, reason, "compact block: refusing peer output");
         return false;
@@ -332,9 +574,8 @@ pub(crate) fn inject_compact_block(hash: &B256, compressed: &[u8], source: &'sta
             blob_gas_used: compact.blob_gas_used,
         },
     };
-    if let Some(transactions_root) = compact.transactions_root {
-        reth_evm::payload_cache::store_payload_transactions_root(*hash, transactions_root);
-    }
+    // The peer's transactions root is not cached: the engine trusts a cached
+    // root to be the body's root, so this node derives it from the body.
     reth_evm::payload_cache::store_payload_execution(*hash, (output, compact.senders));
     let store_ms = store_start.elapsed().as_millis() as u64;
 
@@ -355,11 +596,132 @@ pub(crate) fn inject_compact_block(hash: &B256, compressed: &[u8], source: &'sta
 mod tests {
     use super::*;
 
+    /// What reth would persist from a peer's bundle beyond the block's
+    /// changes is dropped: an unmodified account (here with a balance the
+    /// peer invented, and one marked absent, which would delete it) and a
+    /// slot whose value did not change. A destroyed account keeps its slots.
+    #[test]
+    fn a_peer_bundle_keeps_only_what_the_root_covers() {
+        use alloy_primitives::U256;
+        use evm2::evm::AccountInfo;
+        use reth_trie_common::bundle_state::{
+            AccountStatus, BundleAccount, BundleState, StorageSlot,
+        };
+        let info = |balance: u64| {
+            Some(AccountInfo { balance: U256::from(balance), ..Default::default() })
+        };
+        let slots = |slots: &[(u64, u64, u64)]| {
+            slots
+                .iter()
+                .map(|(key, was, is)| {
+                    (U256::from(*key), StorageSlot::new_changed(U256::from(*was), U256::from(*is)))
+                })
+                .collect()
+        };
+        let (changed, invented, absent, destroyed) = (
+            Address::repeat_byte(1),
+            Address::repeat_byte(2),
+            Address::repeat_byte(3),
+            Address::repeat_byte(4),
+        );
+        let mut bundle = BundleState::default();
+        bundle.state.insert(
+            changed,
+            BundleAccount::new(info(1), info(2), slots(&[(1, 5, 6), (2, 9, 9)]), AccountStatus::Changed),
+        );
+        bundle.state.insert(
+            invented,
+            BundleAccount::new(info(u64::MAX), info(u64::MAX), slots(&[(1, 7, 7)]), AccountStatus::Loaded),
+        );
+        bundle.state.insert(
+            absent,
+            BundleAccount::new(None, None, Default::default(), AccountStatus::LoadedNotExisting),
+        );
+        bundle.state.insert(
+            destroyed,
+            BundleAccount::new(info(3), None, slots(&[(1, 4, 4)]), AccountStatus::Destroyed),
+        );
+        keep_only_changes(&mut bundle).unwrap();
+        let mut kept: Vec<_> = bundle.state.keys().copied().collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec![changed, destroyed]);
+        assert_eq!(bundle.state[&changed].storage.keys().copied().collect::<Vec<_>>(), vec![U256::from(1)]);
+        assert_eq!(bundle.state[&destroyed].storage.len(), 1);
+
+        // Unmodified, yet claiming a changed slot: the two cannot both hold.
+        let mut bundle = BundleState::default();
+        bundle.state.insert(
+            invented,
+            BundleAccount::new(info(1), info(1), slots(&[(1, 7, 8)]), AccountStatus::Loaded),
+        );
+        assert!(keep_only_changes(&mut bundle).is_err());
+    }
+
     // Reth's broadcast cache is one process-global slot.
     static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn transaction_root_survives_compact_round_trip_and_is_evicted_by_hash() {
+    fn shared_output_carries_restored_slots_to_the_follower_or_is_refused() {
+        let _lock = CACHE_TEST_LOCK.lock().unwrap();
+        let hash = B256::repeat_byte(0x61);
+        let slots = vec![(
+            Address::repeat_byte(7),
+            alloy_primitives::U256::from(1),
+            alloy_primitives::U256::from(2),
+        )];
+        let output = || {
+            (
+                BlockExecutionOutput::<n42_tx_types::Receipt>::default(),
+                Vec::<Address>::new(),
+            )
+        };
+
+        // Leader: a list filed for another block is not attached.
+        *SHARED_RESTORED_SLOTS.lock().unwrap() = Some((B256::repeat_byte(0x62), slots.clone()));
+        reth_evm::payload_cache::store_broadcast_execution(hash, output());
+        let other = take_and_serialize_execution_output(&hash).unwrap();
+        let other = CompactBlockExecution::decode(&decompress_payload(&other).unwrap()).unwrap();
+        assert_eq!(other.restored_slots, None);
+
+        // Leader: the block's own list travels with its output, once.
+        *SHARED_RESTORED_SLOTS.lock().unwrap() = Some((hash, slots.clone()));
+        reth_evm::payload_cache::store_broadcast_execution(hash, output());
+        let shared = take_and_serialize_execution_output(&hash).unwrap();
+        assert!(SHARED_RESTORED_SLOTS.lock().unwrap().is_none());
+
+        // Follower: the list reaches the caller before the output is stored,
+        // and a refusal there keeps the output out of the payload cache.
+        reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&hash);
+        assert!(!inject_compact_block_with(&hash, &shared, "test", |_| Err(
+            "refused"
+        )));
+        assert!(
+            reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&hash).is_none()
+        );
+        let mut seen = None;
+        assert!(inject_compact_block_with(
+            &hash,
+            &shared,
+            "test",
+            |restored| {
+                seen = restored;
+                Ok(())
+            }
+        ));
+        assert_eq!(seen, Some(slots));
+        assert!(
+            reth_evm::payload_cache::take_payload_execution::<CachedPayloadData>(&hash).is_some()
+        );
+
+        // Without a QMDB store the payload-aware entry point is the plain one.
+        let cache = RethExecutionOutputCache::new(None, reth_chainspec::MAINNET.clone())
+            .with_peer_outputs(false)
+            .with_shared_execution(true);
+        assert!(!cache.inject(hash, &shared, "test"));
+    }
+
+    #[test]
+    fn peer_transaction_root_is_not_cached_and_a_local_root_is_evicted_by_hash() {
         let _lock = CACHE_TEST_LOCK.lock().unwrap();
         let hash = B256::repeat_byte(0x42);
         let other_hash = B256::repeat_byte(0x43);
@@ -370,23 +732,28 @@ mod tests {
         reth_evm::payload_cache::store_broadcast_execution(
             hash,
             (
-                BlockExecutionOutput::<reth_ethereum_primitives::Receipt>::default(),
+                BlockExecutionOutput::<n42_tx_types::Receipt>::default(),
                 Vec::<Address>::new(),
             ),
         );
         let compressed = cache
             .take_serialized(hash)
             .expect("cached execution output");
-        let compact: CompactBlockExecution =
-            serde_json::from_slice(&decompress_payload(&compressed).unwrap()).unwrap();
+        let compact =
+            CompactBlockExecution::decode(&decompress_payload(&compressed).unwrap()).unwrap();
         assert_eq!(compact.transactions_root, Some(root));
 
+        // A root received from a peer never enters the cache: the engine
+        // takes a cached root as the root of the body.
         reth_evm::payload_cache::remove_payload_transactions_root(&hash);
         assert!(cache.inject(hash, &compressed, "test"));
         assert_eq!(
             reth_evm::payload_cache::payload_transactions_root(&hash),
-            Some(root)
+            None
         );
+
+        // A root this node computed stays until its own hash is evicted.
+        reth_evm::payload_cache::store_payload_transactions_root(hash, root);
         assert_eq!(
             reth_evm::payload_cache::payload_transactions_root(&other_hash),
             None
@@ -421,6 +788,7 @@ mod tests {
                 blob_gas_used: 0,
                 senders: Vec::new(),
                 transactions_root: Some(root),
+                restored_slots: None,
             })
             .unwrap(),
         );
@@ -444,7 +812,8 @@ mod tests {
     #[test]
     fn compact_output_with_unbound_bytecode_or_senders_is_refused() {
         use alloy_primitives::{Bytes, keccak256};
-        use revm::{bytecode::Bytecode, database::BundleState};
+        use evm2::bytecode::Bytecode;
+        use reth_trie_common::bundle_state::BundleState;
 
         let _lock = CACHE_TEST_LOCK.lock().unwrap();
         let hash = B256::repeat_byte(0x47);
@@ -463,6 +832,7 @@ mod tests {
                     blob_gas_used: 0,
                     senders,
                     transactions_root: None,
+                    restored_slots: None,
                 })
                 .unwrap(),
             )
@@ -512,7 +882,7 @@ mod tests {
             mobile_registry_root: None,
         };
         let parent_hash = n42_consensus::remember_gov5_native_header(&parent.encode());
-        let mut block = reth_ethereum_primitives::Block::default();
+        let mut block = n42_tx_types::Block::default();
         block.header.parent_hash = parent_hash;
         block.header.number = 1;
         block.header.base_fee_per_gas = Some(0);
@@ -530,7 +900,7 @@ mod tests {
             &original,
             1,
             B256::repeat_byte(0xa1),
-            n42_network::gov5_native_receipts_root(&[]),
+            n42_network::gov5_native_receipts_root::<alloy_consensus::TxType>(&[]),
         )
         .unwrap();
         let new_hash = normalized.block_hash();
@@ -542,7 +912,7 @@ mod tests {
         reth_evm::payload_cache::store_payload_execution(
             old_hash,
             (
-                BlockExecutionOutput::<reth_ethereum_primitives::Receipt>::default(),
+                BlockExecutionOutput::<n42_tx_types::Receipt>::default(),
                 Vec::<Address>::new(),
             ),
         );
@@ -567,7 +937,7 @@ mod tests {
         reth_evm::payload_cache::store_payload_execution(
             old_hash,
             (
-                BlockExecutionOutput::<reth_ethereum_primitives::Receipt>::default(),
+                BlockExecutionOutput::<n42_tx_types::Receipt>::default(),
                 Vec::<Address>::new(),
             ),
         );
@@ -587,10 +957,8 @@ mod tests {
         use n42_twig_core::qmdb_compat::{
             QmdbCompatTree, encode_gov5_account_value, gov5_account_key,
         };
-        use revm::{
-            database::states::{AccountStatus, BundleAccount},
-            state::AccountInfo,
-        };
+        use evm2::evm::AccountInfo;
+        use reth_trie_common::bundle_state::{AccountStatus, BundleAccount};
         let _lock = CACHE_TEST_LOCK.lock().unwrap();
         let base = QmdbCompatTree::new();
         let base_hash = B256::repeat_byte(0x61);
@@ -599,13 +967,13 @@ mod tests {
             Arc::new(Gov5QmdbStateRootStore::new(base_hash, base_root, base.snapshot()).unwrap());
         let cache =
             RethExecutionOutputCache::new(Some(store.clone()), reth_chainspec::MAINNET.clone());
-        let mut block = reth_ethereum_primitives::Block::default();
+        let mut block = n42_tx_types::Block::default();
         block.header.parent_hash = base_hash;
         block.header.number = 1;
         let hash = block.header.hash_slow();
         let execution = alloy_rpc_types_engine::ExecutionData::from_block_unchecked(hash, &block);
         let address = Address::repeat_byte(0x62);
-        let mut output = BlockExecutionOutput::<reth_ethereum_primitives::Receipt>::default();
+        let mut output = BlockExecutionOutput::<n42_tx_types::Receipt>::default();
         output.state.state.insert(
             address,
             BundleAccount::new(

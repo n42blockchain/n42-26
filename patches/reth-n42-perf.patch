@@ -1,11 +1,11 @@
 diff --git a/crates/evm/evm/src/lib.rs b/crates/evm/evm/src/lib.rs
-index d6ed4cc95..ab85a36c1 100644
+index a1b473b0d..8889307f7 100644
 --- a/crates/evm/evm/src/lib.rs
 +++ b/crates/evm/evm/src/lib.rs
-@@ -50,6 +50,20 @@ pub use sender_recovery::SenderRecoveryCache;
- #[cfg(feature = "metrics")]
- pub mod metrics;
- pub mod noop;
+@@ -179,6 +179,20 @@ pub mod noop;
+ /// Helper types for execution witness generation.
+ #[cfg(feature = "witness")]
+ pub mod witness;
 +#[cfg(feature = "std")]
 +pub mod payload_cache;
 +
@@ -20,9 +20,9 @@ index d6ed4cc95..ab85a36c1 100644
 +pub fn n42_defer_state_root() -> bool {
 +    payload_cache::n42_defer_state_root()
 +}
- #[cfg(any(test, feature = "test-utils"))]
- /// test helpers for mocking executor
- pub mod test_utils;
+ 
+ /// A complete configuration of EVM for Reth.
+ ///
 diff --git a/crates/evm/evm/src/payload_cache.rs b/crates/evm/evm/src/payload_cache.rs
 new file mode 100644
 index 000000000..10ab99ee4

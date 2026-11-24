@@ -1,7 +1,9 @@
+mod ahead;
 pub(crate) mod bad_block_cache;
 mod consensus_loop;
 mod execution_bridge;
-pub use execution_bridge::compact_block_enabled;
+pub mod frame_ref;
+pub use execution_bridge::{compact_block_enabled, shared_execution_enabled};
 mod state_mgmt;
 mod view_jump_throttle;
 
@@ -195,20 +197,32 @@ pub fn decompress_payload(data: &[u8]) -> std::io::Result<Vec<u8>> {
                 // same frame with an independent context before declaring a
                 // committed block unexecutable. A genuinely damaged frame is
                 // still rejected by both decoders.
-                let independent = zstd::bulk::decompress(
-                    data,
-                    MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE,
-                );
+                // The pooled context is dropped whether or not the retry
+                // succeeds: a context that failed once must not decode the
+                // next frame on this thread.
+                ZSTD_DECOMPRESSOR.with(|slot| *slot.borrow_mut() = None);
+                let independent =
+                    zstd::bulk::decompress(data, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE);
                 if independent.is_ok() {
-                    ZSTD_DECOMPRESSOR.with(|slot| *slot.borrow_mut() = None);
                     tracing::warn!(target: "n42::cl", error = %pooled_error,
                         "pooled zstd decompression failed; independent retry succeeded");
                 }
-                independent.map_err(|error| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-                })
+                independent
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
             }
         }
+    } else {
+        Ok(data.to_vec())
+    }
+}
+
+/// Decompress with a context of its own, bypassing this thread's pooled one.
+/// Used to decode a payload a second time after the first decode failed.
+pub(super) fn decompress_payload_independent(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
+        ZSTD_DECOMPRESSOR.with(|slot| *slot.borrow_mut() = None);
+        zstd::bulk::decompress(data, MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     } else {
         Ok(data.to_vec())
     }
@@ -514,14 +528,112 @@ pub(super) struct PayloadBuildContext {
 pub(super) struct PayloadBuildReady {
     context: PayloadBuildContext,
     block_hash: B256,
+    kind: ReadyKind,
+}
+
+/// What a [`PayloadBuildReady`] reports about its block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReadyKind {
+    /// The block may be proposed.
+    Payload,
+    /// Not a proposal release: the leader's own block is sealed and its
+    /// output published, so a child can be built on that output
+    /// (`N42_BUILD_ON_OUTPUT`).
+    OwnBlockSealed,
+    /// Not a proposal release: the leader's own execution layer has accepted
+    /// the block, so a child can be built on it (`N42_BUILD_ON_SEAL`).
+    OwnBlockValidated,
+}
+
+/// A child build started on an own block's output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct OutputBuild {
+    context: PayloadBuildContext,
+    /// The build released a payload.
+    produced: bool,
+    /// The parent's validation, kept to build the child the usual way if
+    /// this build produces nothing.
+    validated: Option<PayloadBuildReady>,
+}
+
+/// What a leader does with an own block's sealed or validated report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AheadStep {
+    /// The block's view has not started: wait for it.
+    Hold,
+    /// Nothing to build.
+    Skip,
+    /// Build the child on the block's output.
+    BuildOnOutput(PayloadBuildContext),
+    /// The child is built on the output already: make the block the
+    /// execution layer's head.
+    AnnounceHead,
+    /// Build the child through a forkchoice update.
+    Build(PayloadBuildContext),
+}
+
+/// What an own block's sealed or validated report records before its
+/// child build starts: the block's own build context, so that its view does
+/// not start a second build on its parent while the block is on its way to
+/// its proposal (the child build takes over `ahead_building`); and, once the
+/// execution layer has accepted the block, `(tip, parent)`, so that a
+/// finalize of its parent leaves the block as the head.
+pub(super) fn own_block_guards(
+    ready: &PayloadBuildReady,
+    current_view: u64,
+) -> (Option<PayloadBuildContext>, Option<(B256, B256)>) {
+    if ready.context.view < current_view {
+        return (None, None);
+    }
+    let tip = (ready.kind == ReadyKind::OwnBlockValidated)
+        .then_some((ready.block_hash, ready.context.parent_hash));
+    (Some(ready.context), tip)
+}
+
+/// The step for `ready` while `current_view` is current. `depth`: how many
+/// views past the current one a leader builds (`N42_BUILD_AHEAD_DEPTH`);
+/// the child of a block `depth - 1` views ahead may be built on its output.
+/// `leads_next`: this node leads the view after the block's.
+/// `child_covered`: a build of the block's child exists already.
+pub(super) fn ahead_step(
+    ready: &PayloadBuildReady,
+    current_view: u64,
+    depth: u64,
+    leads_next: bool,
+    output_enabled: bool,
+    child_covered: bool,
+) -> AheadStep {
+    if ready.context.view >= current_view + depth.max(1) {
+        // `depth` blocks ahead at most: wait for a later view.
+        return AheadStep::Hold;
+    }
+    if ready.context.view < current_view || !leads_next {
+        return AheadStep::Skip;
+    }
+    let child = PayloadBuildContext {
+        view: ready.context.view + 1,
+        parent_hash: ready.block_hash,
+    };
+    match ready.kind {
+        ReadyKind::Payload => AheadStep::Skip,
+        ReadyKind::OwnBlockSealed if output_enabled && !child_covered => {
+            AheadStep::BuildOnOutput(child)
+        }
+        ReadyKind::OwnBlockSealed => AheadStep::Skip,
+        ReadyKind::OwnBlockValidated if child_covered => AheadStep::AnnounceHead,
+        // A forkchoice build of a block two views ahead waits for its
+        // parent's view, as with one block ahead.
+        ReadyKind::OwnBlockValidated if ready.context.view > current_view => AheadStep::Hold,
+        ReadyKind::OwnBlockValidated => AheadStep::Build(child),
+    }
 }
 
 /// Serializable proxy for `(BlockExecutionOutput<Receipt>, Vec<Address>)`.
-/// `BlockExecutionResult` from alloy-evm doesn't derive serde, so we flatten it.
+/// `BlockExecutionResult` from reth-evm doesn't derive serde, so we flatten it.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct CompactBlockExecution {
-    pub bundle_state: revm::database::states::BundleState,
-    pub receipts: Vec<reth_ethereum_primitives::Receipt>,
+    pub bundle_state: evm2::block::bundle_state::BundleState,
+    pub receipts: Vec<n42_tx_types::Receipt>,
     pub requests: alloy_eips::eip7685::Requests,
     pub gas_used: u64,
     pub blob_gas_used: u64,
@@ -532,6 +644,264 @@ pub struct CompactBlockExecution {
     /// standard full-root computation.
     #[serde(default)]
     pub transactions_root: Option<B256>,
+    /// Storage slots the block changed and then set back to their parent
+    /// value, as (address, slot, value). The QMDB root counts them as writes,
+    /// and only a node that executed the block knows them, so a shared
+    /// execution output carries the list. `None` outside shared execution.
+    #[serde(default)]
+    pub restored_slots: Option<Vec<(Address, alloy_primitives::U256, alloy_primitives::U256)>>,
+}
+
+/// First byte of a MessagePack compact execution blob. A JSON blob starts with
+/// `{`, so the decoder tells the two apart and still reads the JSON that older
+/// leaders send.
+const COMPACT_EXECUTION_MSGPACK: u8 = 0x01;
+
+/// The MessagePack body. Receipts get their own plain form: the receipt's serde
+/// writes quantities that do not read back in a binary format.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CompactExecutionWire<B> {
+    bundle_state: B,
+    receipts: Vec<ReceiptWire>,
+    requests: alloy_eips::eip7685::Requests,
+    gas_used: u64,
+    blob_gas_used: u64,
+    senders: Vec<Address>,
+    transactions_root: Option<B256>,
+    #[serde(default)]
+    restored_slots: Option<Vec<(Address, alloy_primitives::U256, alloy_primitives::U256)>>,
+}
+
+/// One receipt: EIP-2718 type byte, status, cumulative gas, and each log as
+/// (address, topics, data).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReceiptWire(
+    u8,
+    bool,
+    u64,
+    Vec<(Address, Vec<B256>, alloy_primitives::Bytes)>,
+);
+
+impl From<&n42_tx_types::Receipt> for ReceiptWire {
+    fn from(receipt: &n42_tx_types::Receipt) -> Self {
+        Self(
+            u8::from(receipt.tx_type),
+            receipt.success,
+            receipt.cumulative_gas_used,
+            receipt
+                .logs
+                .iter()
+                .map(|log| {
+                    (
+                        log.address,
+                        log.data.topics().to_vec(),
+                        log.data.data.clone(),
+                    )
+                })
+                .collect(),
+        )
+    }
+}
+
+impl TryFrom<ReceiptWire> for n42_tx_types::Receipt {
+    type Error = String;
+
+    fn try_from(
+        ReceiptWire(ty, success, cumulative_gas_used, logs): ReceiptWire,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            tx_type: n42_tx_types::N42TxType::try_from(ty)
+                .map_err(|_| format!("unknown receipt type {ty:#x}"))?,
+            success,
+            cumulative_gas_used,
+            logs: logs
+                .into_iter()
+                .map(|(address, topics, data)| alloy_primitives::Log {
+                    address,
+                    data: alloy_primitives::LogData::new_unchecked(topics, data),
+                })
+                .collect(),
+        })
+    }
+}
+
+impl CompactBlockExecution {
+    /// The uncompressed wire form: [`COMPACT_EXECUTION_MSGPACK`], then
+    /// [`CompactExecutionWire`] as positional MessagePack. Hashes,
+    /// balances and addresses stay raw bytes instead of JSON's hex strings,
+    /// which is where JSON spent its time.
+    pub fn encode(&self) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+        let wire = CompactExecutionWire {
+            bundle_state: &self.bundle_state,
+            receipts: self.receipts.iter().map(ReceiptWire::from).collect(),
+            requests: self.requests.clone(),
+            gas_used: self.gas_used,
+            blob_gas_used: self.blob_gas_used,
+            senders: self.senders.clone(),
+            transactions_root: self.transactions_root,
+            restored_slots: self.restored_slots.clone(),
+        };
+        let mut out = vec![COMPACT_EXECUTION_MSGPACK];
+        rmp_serde::encode::write(&mut out, &wire)?;
+        Ok(out)
+    }
+
+    /// Reads either form of [`Self::encode`]: MessagePack, or legacy JSON.
+    pub fn decode(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let Some((&COMPACT_EXECUTION_MSGPACK, body)) = bytes.split_first() else {
+            return Ok(serde_json::from_slice(bytes)?);
+        };
+        let wire: CompactExecutionWire<evm2::block::bundle_state::BundleState> =
+            rmp_serde::from_slice(body)?;
+        Ok(Self {
+            bundle_state: wire.bundle_state,
+            receipts: wire
+                .receipts
+                .into_iter()
+                .map(n42_tx_types::Receipt::try_from)
+                .collect::<Result<_, _>>()?,
+            requests: wire.requests,
+            gas_used: wire.gas_used,
+            blob_gas_used: wire.blob_gas_used,
+            senders: wire.senders,
+            transactions_root: wire.transactions_root,
+            restored_slots: wire.restored_slots,
+        })
+    }
+}
+
+#[cfg(test)]
+mod compact_execution_codec_tests {
+    use super::CompactBlockExecution;
+    use alloy_primitives::{Address, B256, Bytes, Log, LogData, U256};
+    use evm2::{block::bundle_state::BundleState, bytecode::Bytecode, evm::AccountInfo};
+
+    fn sample(accounts: usize) -> CompactBlockExecution {
+        let code = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xf3]));
+        let code_hash = code.hash_slow();
+        let state = (0..accounts).map(|i| {
+            let address = Address::with_last_byte(i as u8).create(i as u64);
+            let info = |nonce: u64| AccountInfo {
+                balance: U256::from(10u128.pow(20)) - U256::from(i),
+                nonce,
+                code_hash: if i == 0 {
+                    code_hash
+                } else {
+                    alloy_primitives::KECCAK256_EMPTY
+                },
+                code: None,
+                ..Default::default()
+            };
+            let storage = if i % 10 == 0 {
+                [(U256::from(i), (U256::ZERO, U256::from(i + 1)))]
+                    .into_iter()
+                    .collect()
+            } else {
+                Default::default()
+            };
+            (
+                address,
+                Some(info(i as u64)),
+                Some(info(i as u64 + 1)),
+                storage,
+            )
+        });
+        let bundle = BundleState::new(
+            state,
+            Vec::<Vec<(Address, Option<Option<AccountInfo>>, Vec<(U256, U256)>)>>::new(),
+            [(code_hash, code)],
+        );
+        let receipts = (0..accounts)
+            .map(|i| n42_tx_types::Receipt {
+                tx_type: if i % 2 == 0 {
+                    n42_tx_types::N42TxType::AltSig
+                } else {
+                    n42_tx_types::N42TxType::Eth(alloy_consensus::TxType::Eip1559)
+                },
+                success: true,
+                cumulative_gas_used: 21_000 * (i as u64 + 1),
+                logs: if i % 50 == 0 {
+                    vec![Log {
+                        address: Address::repeat_byte(7),
+                        data: LogData::new_unchecked(
+                            vec![B256::repeat_byte(1)],
+                            Bytes::from_static(b"data"),
+                        ),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect();
+        CompactBlockExecution {
+            bundle_state: bundle,
+            receipts,
+            requests: Default::default(),
+            gas_used: 21_000 * accounts as u64,
+            blob_gas_used: 0,
+            senders: (0..accounts)
+                .map(|i| Address::with_last_byte(i as u8))
+                .collect(),
+            transactions_root: Some(B256::repeat_byte(9)),
+            restored_slots: Some(vec![(
+                Address::with_last_byte(7),
+                U256::from(1),
+                U256::from(2),
+            )]),
+        }
+    }
+
+    fn same(a: &CompactBlockExecution, b: &CompactBlockExecution) {
+        assert_eq!(a.bundle_state, b.bundle_state);
+        assert_eq!(a.receipts, b.receipts);
+        assert_eq!(a.requests, b.requests);
+        assert_eq!((a.gas_used, a.blob_gas_used), (b.gas_used, b.blob_gas_used));
+        assert_eq!(a.senders, b.senders);
+        assert_eq!(a.transactions_root, b.transactions_root);
+        assert_eq!(a.restored_slots, b.restored_slots);
+    }
+
+    #[test]
+    fn msgpack_round_trips_and_json_still_decodes() {
+        let compact = sample(200);
+        same(
+            &compact,
+            &CompactBlockExecution::decode(&compact.encode().unwrap()).unwrap(),
+        );
+        same(
+            &compact,
+            &CompactBlockExecution::decode(&serde_json::to_vec(&compact).unwrap()).unwrap(),
+        );
+        assert!(CompactBlockExecution::decode(&[0x01, 0xff]).is_err());
+        assert!(CompactBlockExecution::decode(&[]).is_err());
+    }
+
+    /// `cargo test -p n42-consensus-service --release compact_codec_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn compact_codec_speed() {
+        let compact = sample(95_238);
+        let time = |label: &str, f: &dyn Fn() -> usize| {
+            let start = std::time::Instant::now();
+            let len = f();
+            println!("{label}: {:?} ({len} bytes)", start.elapsed());
+        };
+        let json = serde_json::to_vec(&compact).unwrap();
+        let msgpack = compact.encode().unwrap();
+        time("json encode", &|| {
+            serde_json::to_vec(&compact).unwrap().len()
+        });
+        time("msgpack encode", &|| compact.encode().unwrap().len());
+        time("json decode", &|| {
+            CompactBlockExecution::decode(&json).unwrap().receipts.len()
+        });
+        time("msgpack decode", &|| {
+            CompactBlockExecution::decode(&msgpack)
+                .unwrap()
+                .receipts
+                .len()
+        });
+    }
 }
 
 /// Blob sidecar broadcast via /n42/blobs/1 GossipSub topic.
@@ -698,6 +1068,34 @@ enum ImportOutcome {
 type ImportDone = (B256, u64, ImportOutcome, u64);
 type SidecarDiffWork = (u64, B256, n42_execution::state_diff::StateDiff);
 type SharedBlockData = Arc<Vec<u8>>;
+
+/// Removes a hash from the in-flight eager import set when the import task
+/// ends, whatever its outcome.
+struct EagerImportInFlight {
+    set: Arc<std::sync::Mutex<HashSet<B256>>>,
+    hash: B256,
+}
+
+impl EagerImportInFlight {
+    fn enter(set: &Arc<std::sync::Mutex<HashSet<B256>>>, hash: B256) -> Self {
+        set.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(hash);
+        Self {
+            set: Arc::clone(set),
+            hash,
+        }
+    }
+}
+
+impl Drop for EagerImportInFlight {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.hash);
+    }
+}
 type StateDiffReady = (B256, n42_execution::state_diff::StateDiff);
 type CommitExecutionTimeout = (u64, B256);
 type EagerImportDone = (
@@ -939,6 +1337,11 @@ pub struct ConsensusService {
     /// Tuple: (view, block_hash, commit_qc, finalized).
     finalize_done_rx: mpsc::Receiver<FinalizeDone>,
     finalize_done_tx: mpsc::Sender<FinalizeDone>,
+    /// Highest view whose committed block the execution layer has finalized.
+    /// Finalize tasks finish out of order; one that arrives after a later
+    /// committed block was finalized is refused as a reorg and reads this to
+    /// tell that case from a real failure.
+    finalized_view_mark: Arc<std::sync::atomic::AtomicU64>,
     blob_store: Option<Arc<dyn BlobStorePort>>,
     /// Compact-block execution-output cache behind the [`ExecutionOutputCache`]
     /// port. `None` ⇒ compact-block inject/take are no-ops (tests / EL-less).
@@ -969,6 +1372,9 @@ pub struct ConsensusService {
     /// Set when build is triggered by eager import (before consensus commit).
     /// Cleared on ViewChanged or when finalize confirms the block.
     speculative_build_hash: Option<B256>,
+    /// Blocks this leader builds ahead of their views: held payloads and
+    /// reports, child builds, guards and execution-layer tips, per view.
+    ahead: ahead::AheadState,
     /// View and parent hash for which a payload build task is currently running.
     /// Prevents duplicate builds based on the same parent, which produce different
     /// blocks at the same height and overwhelm reth with conflicting `new_payload` calls
@@ -1047,6 +1453,17 @@ pub struct ConsensusService {
     /// `new_payload(Valid)` verdict. Non-Valid attempts never advance it, so an
     /// out-of-order child cannot suppress the missing parents needed for catch-up.
     eager_import_block_guard: Arc<std::sync::atomic::AtomicU64>,
+    /// Hashes whose follower eager import is still executing. The
+    /// execution-ready deadline must not start a second import of a block
+    /// that is already being executed: both would run the same block at once.
+    eager_imports_in_flight: Arc<std::sync::Mutex<HashSet<B256>>>,
+    /// Hashes whose cached block data an eager import task found not to be
+    /// that block: bytes that do not decompress or decode, a payload of
+    /// another hash, or one the engine called invalid. The envelope's hash is
+    /// only claimed until then, so the loop drops such an entry
+    /// ([`Self::drop_rejected_block_data`]) before it lets the entry stand in
+    /// for the block.
+    rejected_block_data: Arc<std::sync::Mutex<HashSet<B256>>>,
     /// Fast propose mode: skip slot boundary alignment, build immediately after
     /// ViewChanged/BlockCommitted. Consensus voting naturally paces block production.
     /// Enabled by `N42_FAST_PROPOSE=1`. Default: false (grid-aligned slots).
@@ -1115,6 +1532,7 @@ impl ConsensusService {
 
     fn request_h2_v4_gov5_block(&mut self, peer: PeerId, block_hash: B256) {
         let now = Instant::now();
+        self.drop_rejected_block_data();
         if block_hash == B256::ZERO || self.h2_v4_fetch_fulfilled_recently(block_hash, now) {
             return;
         }
@@ -1276,7 +1694,8 @@ impl ConsensusService {
 
     fn remember_h2_v4_block_number(&mut self, hash: B256, number: u64) {
         self.h2_v4_block_numbers.insert(hash, number);
-        let limit = self.h2_v4_catchup_buffer_blocks
+        let limit = self
+            .h2_v4_catchup_buffer_blocks
             .saturating_add(DEFAULT_H2_V4_CATCHUP_BUFFER_BLOCKS);
         while self.h2_v4_block_numbers.len() > limit {
             self.h2_v4_block_numbers.pop_first();
@@ -1442,6 +1861,20 @@ impl ConsensusService {
         requested_hash: Option<B256>,
     ) {
         const MAX_H2_V4_UNBOUND_BLOCKS: usize = 512;
+        self.drop_rejected_block_data();
+        // The leader sends each block as native block data and as a Gov5
+        // block; the native copy usually arrives first. Hashing the header is
+        // enough to recognise it, before the full decode (every transaction
+        // and the transaction root) runs on the consensus loop. A requested
+        // body keeps the full path: its fetch bookkeeping needs the decode.
+        if requested_hash.is_none()
+            && let Some(hash) = n42_network::gov5_attributable_hash(&rlp)
+            && self.pending_block_data.contains_key(&hash)
+        {
+            counter!("n42_h2_v4_gov5_block_already_cached_total").increment(1);
+            self.retire_h2_v4_fetch_satisfied_elsewhere(hash).await;
+            return;
+        }
         let block = match n42_network::decode_gov5_block_rlp(&rlp) {
             Ok(block) => block,
             Err(error) => {
@@ -1490,7 +1923,11 @@ impl ConsensusService {
         // in successive views. The verified H2 binding, when present, orders
         // these executions; the immutable header view is only its lower bound.
         // Transitively authenticated parents have no certificate binding yet.
-        let view = if bound_view == 0 { header_view } else { bound_view };
+        let view = if bound_view == 0 {
+            header_view
+        } else {
+            bound_view
+        };
         self.remember_h2_v4_block_view(block.block_hash, view);
         if block.header.number <= self.head_block_number {
             self.prune_executed_h2_v4_catchup_history();
@@ -1691,6 +2128,18 @@ impl ConsensusService {
         block: n42_network::Gov5GossipBlock,
         view: u64,
     ) {
+        // The leader sends each block twice: as native block data and as a Gov5
+        // block. When the native copy is already cached, the envelope built
+        // below is dropped by `handle_block_data` as a duplicate of this hash;
+        // skip building it. Rebuilding the payload (a transactions root over
+        // the whole body), encoding, compressing and decoding it again ran on
+        // the consensus loop and delayed this node's vote by ~300 ms per full
+        // block.
+        if self.pending_block_data.contains_key(&block.block_hash) {
+            counter!("n42_h2_v4_gov5_block_already_cached_total").increment(1);
+            debug!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, "native block data already cached; Gov5 copy not converted");
+            return;
+        }
         let mut execution_data = match crate::replay_import::build_gov5_gossip_execution_data(
             &block,
         ) {
@@ -1946,6 +2395,45 @@ impl ConsensusService {
         true
     }
 
+    /// Forgets cached block data that an eager import task rejected, so the
+    /// next copy of the block is taken and a fetch for it is not held back:
+    /// the rejected bytes may be a forgery under an honest block's hash.
+    fn drop_rejected_block_data(&mut self) {
+        let rejected = std::mem::take(
+            &mut *self
+                .rejected_block_data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if rejected.is_empty() {
+            return;
+        }
+        counter!("n42_block_data_rejected_dropped_total").increment(rejected.len() as u64);
+        self.pending_block_data
+            .retain(|hash, _| !rejected.contains(hash));
+        self.recent_block_data
+            .retain(|entry| !rejected.contains(&entry.block_hash));
+    }
+
+    /// Drops cached proposal data up to and including `view`, keeping blocks
+    /// of later views. A leader that builds ahead delivers the next block
+    /// before this member finalizes the current one; wiping the whole cache
+    /// then throws that block away and the member has to wait for a second
+    /// full copy before it can vote.
+    fn prune_pending_block_data_through(&mut self, view: u64) {
+        if self.pending_block_data.is_empty() {
+            return;
+        }
+        let later: HashSet<B256> = self
+            .recent_block_data
+            .iter()
+            .filter(|entry| entry.view > view)
+            .map(|entry| entry.block_hash)
+            .collect();
+        self.pending_block_data
+            .retain(|hash, _| later.contains(hash));
+    }
+
     fn remember_recent_block_data(
         &mut self,
         hash: B256,
@@ -2017,12 +2505,35 @@ impl ConsensusService {
         }
     }
 
+    /// The execution parent and number of the block a serialized broadcast
+    /// carries. Finding them decodes the whole payload, tens of milliseconds
+    /// for a full block, and the consensus loop asks several times per
+    /// block: the answer is remembered per broadcast.
     fn execution_parent_and_number(data: &[u8]) -> Option<(B256, u64)> {
+        /// Identifies a broadcast by its length and the hash of its bytes,
+        /// so two broadcasts naming the same block cannot share an answer.
+        type Key = (usize, [u8; 32]);
+        const REMEMBERED: usize = 256;
+        static KNOWN: std::sync::Mutex<VecDeque<(Key, (B256, u64))>> =
+            std::sync::Mutex::new(VecDeque::new());
+        let key: Key = (data.len(), *blake3::hash(data).as_bytes());
+        if let Ok(known) = KNOWN.lock()
+            && let Some((_, found)) = known.iter().rev().find(|(candidate, _)| *candidate == key)
+        {
+            return Some(*found);
+        }
         let broadcast = bincode::deserialize::<BlockDataBroadcast>(data).ok()?;
         let payload = decompress_payload(&broadcast.payload_json).ok()?;
         let execution = decode_execution_payload_owned(payload).ok()?;
-        (execution.block_hash() == broadcast.block_hash)
-            .then(|| (execution.parent_hash(), execution.block_number()))
+        let found = (execution.block_hash() == broadcast.block_hash)
+            .then(|| (execution.parent_hash(), execution.block_number()))?;
+        if let Ok(mut known) = KNOWN.lock() {
+            if known.len() == REMEMBERED {
+                known.pop_front();
+            }
+            known.push_back((key, found));
+        }
+        Some(found)
     }
 
     fn execution_parent_and_number_from_payload(payload_json: &[u8]) -> Option<(B256, u64)> {
@@ -2267,10 +2778,29 @@ impl ConsensusService {
     /// when its build began. A view change must never wrap an old child of B in
     /// a new Proposal justified by LockedQC(A).
     fn handle_payload_build_ready(&mut self, ready: PayloadBuildReady) -> bool {
+        if let Some(build) = self.ahead.output_build_mut(ready.context) {
+            build.produced = true;
+        }
         let current_context = self.required_payload_build_context();
         let owns_guard = self.building_on_parent == Some(ready.context);
         if owns_guard {
             self.building_on_parent = None;
+        }
+        self.ahead.end_building(ready.context);
+        self.ahead.end_emitting(ready.context);
+
+        // Built ahead for a later view: consensus takes it when that view
+        // starts, if the LockedQC then names the block it was built on.
+        let current_view = self.engine.current_view();
+        let depth = execution_bridge::build_ahead_depth();
+        if execution_bridge::build_on_seal_enabled()
+            && ready.context.view > current_view
+            && ready.context.view <= current_view + depth
+        {
+            debug!(target: "n42::cl::orchestrator", built_view = ready.context.view,
+                block_hash = %ready.block_hash, "holding a payload built ahead of its view");
+            self.ahead.hold_payload(ready);
+            return false;
         }
 
         if current_context != Some(ready.context) {
@@ -2284,6 +2814,11 @@ impl ConsensusService {
                 "discarding payload resolved for stale view or non-LockedQC parent"
             );
             counter!("n42_stale_payload_builds_total").increment(1);
+            // Two blocks ahead: what was built on this block is not
+            // proposed either.
+            if depth > 1 && ready.context.view == current_view {
+                self.drop_ahead_block(ready.block_hash);
+            }
             if owns_guard {
                 self.build_triggered_at = None;
             }
@@ -2319,9 +2854,152 @@ impl ConsensusService {
         true
     }
 
+    /// Starts the build of the next view's block on an own block the
+    /// execution layer has just accepted, when this validator also leads the
+    /// next view. Only the build starts early: the block is proposed in its
+    /// own view, justified by the QC of its parent, like any other.
+    async fn build_ahead_on(&mut self, ready: PayloadBuildReady) {
+        if !execution_bridge::build_on_seal_enabled() {
+            return;
+        }
+        let depth = execution_bridge::build_ahead_depth();
+        let current_view = self.engine.current_view();
+        let (emitting, tip) = own_block_guards(&ready, current_view);
+        if let Some(emitting) = emitting {
+            self.ahead.start_emitting(emitting);
+        }
+        if let Some((tip, parent)) = tip {
+            self.ahead
+                .record_tip(
+                    tip,
+                    parent,
+                    ahead::tip_capacity(depth, execution_bridge::finalize_on_tip_chain()),
+                );
+        }
+        let leads_next = self.engine.is_leader_for_view(ready.context.view + 1);
+        let child = PayloadBuildContext {
+            view: ready.context.view + 1,
+            parent_hash: ready.block_hash,
+        };
+        let on_output = self.ahead.output_build(child).is_some();
+        let covered = self.ahead.child_covered(child)
+            || self.building_on_parent == Some(child)
+            || self.engine.last_voted_view() >= child.view;
+        let child_covered = if depth > 1 {
+            covered
+        } else {
+            ready.kind == ReadyKind::OwnBlockValidated && on_output
+        };
+        let step = ahead_step(
+            &ready,
+            current_view,
+            depth,
+            leads_next,
+            execution_bridge::build_on_output_enabled(),
+            child_covered,
+        );
+        if depth == 1 && covered && matches!(step, AheadStep::Build(_)) {
+            // One block ahead keeps its former rule; this records how often
+            // it builds a child that already has a build.
+            counter!("n42_build_ahead_covered_child_builds_total").increment(1);
+            debug!(target: "n42::cl::orchestrator", view = child.view, parent = %child.parent_hash,
+                "building a child that already has a build");
+        }
+        match step {
+            AheadStep::Hold if ready.kind == ReadyKind::OwnBlockSealed => {
+                self.ahead.sealed.push(ready);
+            }
+            AheadStep::Hold => self.ahead.validated.push(ready),
+            AheadStep::Skip => {}
+            AheadStep::BuildOnOutput(child) => {
+                if child.view > current_view + 1 {
+                    counter!("n42_build_ahead_two_views_total").increment(1);
+                }
+                self.build_on_output(child).await;
+            }
+            AheadStep::AnnounceHead => {
+                if let Some(build) = self.ahead.output_build_mut(child) {
+                    build.validated = Some(ready);
+                }
+                self.announce_own_head(ready.block_hash).await;
+            }
+            AheadStep::Build(child) => {
+                counter!("n42_build_ahead_started_total").increment(1);
+                self.do_trigger_payload_build_on(Some(child), None).await;
+            }
+        }
+    }
+
+    /// The parent's validation to build from when the build on its output
+    /// that `completed` ends without a payload; ends that build's record.
+    pub(super) fn take_failed_output_build(
+        &mut self,
+        completed: PayloadBuildContext,
+    ) -> Option<PayloadBuildReady> {
+        let build = self.ahead.take_output_build(completed)?;
+        if build.produced {
+            return None;
+        }
+        counter!("n42_build_on_output_fallback_total").increment(1);
+        warn!(target: "n42::cl::orchestrator", view = completed.view,
+            parent = %completed.parent_hash,
+            "the build on the sealed block produced no payload; building on the validated block");
+        build.validated
+    }
+
+    /// Forgets an own block that will not be proposed and every block
+    /// built ahead on it.
+    fn drop_ahead_block(&mut self, block: B256) {
+        let dropped = self.ahead.drop_block(block);
+        if dropped > 0 {
+            counter!("n42_build_ahead_discarded_total").increment(dropped as u64);
+            debug!(target: "n42::cl::orchestrator", %block, dropped,
+                "dropping what was built ahead on a block that is not proposed");
+        }
+    }
+
+    /// On entering `new_view` as leader: hands consensus the payload built
+    /// ahead for it, if it still fits, and starts the builds now within
+    /// reach. Returns whether a proposal was released, so the caller starts
+    /// no other build.
+    pub(super) async fn take_ahead_build(&mut self, new_view: u64) -> bool {
+        let depth = execution_bridge::build_ahead_depth();
+        let release = self
+            .ahead
+            .take_release(new_view, self.required_payload_build_context());
+        for ready in release.discarded {
+            counter!("n42_build_ahead_discarded_total").increment(1);
+            debug!(target: "n42::cl::orchestrator", new_view, built_view = ready.context.view,
+                block_hash = %ready.block_hash, "payload built ahead no longer fits the view");
+            if depth > 1 {
+                self.drop_ahead_block(ready.block_hash);
+            }
+        }
+        let released = match release.released {
+            Some(ready) => {
+                counter!("n42_build_ahead_used_total").increment(1);
+                self.handle_payload_build_ready(ready)
+            }
+            None => false,
+        };
+        for held in self.ahead.take_reachable(new_view, depth) {
+            self.build_ahead_on(held).await;
+        }
+        released
+    }
+
+    /// The head to announce when `committed` is finalized: the newest
+    /// uncommitted own block on `committed`'s chain that the execution layer
+    /// has accepted, so it is not moved off the blocks under construction.
+    pub(super) fn finalize_head_for(&self, committed: B256) -> B256 {
+        self.ahead.head_for(committed)
+    }
+
     /// Clears only the guard owned by the task that completed. An older
     /// resolve task may finish after a new-view build has already started.
     fn handle_payload_build_complete(&mut self, completed: PayloadBuildContext) -> bool {
+        self.ahead.end_building(completed);
+        self.ahead.end_emitting(completed);
         if self.building_on_parent != Some(completed) {
             debug!(target: "n42::cl::orchestrator", ?completed,
                 active = ?self.building_on_parent,
@@ -2392,7 +3070,7 @@ impl ConsensusService {
             return self.engine.current_leader_index();
         }
         let validator_count = self.engine.validator_count().max(1) as u64;
-        (view % validator_count) as u32
+        n42_consensus::leader_index(view, validator_count, n42_consensus::leader_tenure())
     }
 
     fn timeout_diag_entry(&mut self, view: u64) -> &mut TimeoutViewDiag {
@@ -2673,6 +3351,7 @@ impl ConsensusService {
             import_done_tx,
             finalize_done_rx,
             finalize_done_tx,
+            finalized_view_mark: Default::default(),
             blob_store: None,
             exec_output_cache: None,
             bg_import_in_flight: false,
@@ -2685,6 +3364,7 @@ impl ConsensusService {
             state_diff_ready_tx,
             state_diff_ready_rx,
             speculative_build_hash: None,
+            ahead: ahead::AheadState::default(),
             building_on_parent: None,
             build_triggered_at: None,
             build_complete_tx,
@@ -2709,6 +3389,8 @@ impl ConsensusService {
             timeout_view_diags: BTreeMap::new(),
             commit_to_build_recorded_parent: None,
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            eager_imports_in_flight: Arc::default(),
+            rejected_block_data: Arc::default(),
             fast_propose: std::env::var("N42_FAST_PROPOSE")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
@@ -2929,6 +3611,7 @@ impl ConsensusService {
             import_done_tx,
             finalize_done_rx,
             finalize_done_tx,
+            finalized_view_mark: Default::default(),
             blob_store: None,
             exec_output_cache: None,
             bg_import_in_flight: false,
@@ -2941,6 +3624,7 @@ impl ConsensusService {
             state_diff_ready_tx,
             state_diff_ready_rx,
             speculative_build_hash: None,
+            ahead: ahead::AheadState::default(),
             building_on_parent: None,
             build_triggered_at: None,
             build_complete_tx,
@@ -2965,6 +3649,8 @@ impl ConsensusService {
             timeout_view_diags: BTreeMap::new(),
             commit_to_build_recorded_parent: None,
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            eager_imports_in_flight: Arc::default(),
+            rejected_block_data: Arc::default(),
             fast_propose,
             async_finalize_fcu,
             defer_state_root: false,
@@ -3409,7 +4095,11 @@ impl ConsensusService {
                     }
                 } => {
                     if let Some(ready) = payload_ready {
-                        self.handle_payload_build_ready(ready);
+                        if ready.kind == ReadyKind::Payload {
+                            self.handle_payload_build_ready(ready);
+                        } else {
+                            self.build_ahead_on(ready).await;
+                        }
                     }
                 }
 
@@ -3497,7 +4187,11 @@ impl ConsensusService {
                     // Payload resolve task finished (success or failure).
                     // A stale task must never clear a newer view's build guard.
                     if let Some(completed) = completed_build {
+                        let fallback = self.take_failed_output_build(completed);
                         self.handle_payload_build_complete(completed);
+                        if let Some(validated) = fallback {
+                            self.build_ahead_on(validated).await;
+                        }
                     }
                 }
 
@@ -4392,7 +5086,10 @@ mod tests {
         assert_eq!(decoded.block_hash, hash);
         let raw = n42_consensus::gov5_native_header_rlp(&hash).unwrap();
         assert!(remember_direct_native_header(hash, &raw));
-        assert!(!remember_direct_native_header(B256::repeat_byte(0x42), &raw));
+        assert!(!remember_direct_native_header(
+            B256::repeat_byte(0x42),
+            &raw
+        ));
         assert!(!remember_direct_native_header(hash, &[0xc0]));
     }
 
@@ -4858,6 +5555,7 @@ mod tests {
             blob_gas_used: 0,
             senders: Vec::new(),
             transactions_root: None,
+            restored_slots: None,
         };
         let execution_json = serde_json::to_vec(&compact).expect("serialize compact execution");
         let execution_output =
@@ -5543,6 +6241,7 @@ mod tests {
             !orch.handle_payload_build_ready(PayloadBuildReady {
                 context: stale_context,
                 block_hash: child,
+                kind: ReadyKind::Payload,
             }),
             "a payload from a sibling parent must not enter consensus"
         );
@@ -5564,6 +6263,7 @@ mod tests {
         assert!(orch.handle_payload_build_ready(PayloadBuildReady {
             context: locked_context,
             block_hash: child,
+            kind: ReadyKind::Payload,
         }));
 
         let proposal = match orch.output_rx.try_recv().expect("proposal output") {
@@ -6224,18 +6924,28 @@ mod tests {
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mock = Arc::new(MockExecutionLayer::new(
-            PayloadStatusEnum::Valid, PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
         ));
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.el = Some(mock.clone());
         orch.async_finalize_fcu = false;
         let hash = B256::repeat_byte(0xc2);
-        orch.handle_block_committed(1, hash, test_commit_qc(1, hash), None).await;
-        orch.handle_eager_import_done(hash, 1, B256::ZERO, 1, false, None).await;
+        orch.handle_block_committed(1, hash, test_commit_qc(1, hash), None)
+            .await;
+        orch.handle_eager_import_done(hash, 1, B256::ZERO, 1, false, None)
+            .await;
         assert!(orch.h2_v4_catchup_finalized.is_empty());
-        assert_eq!(orch.async_commit_states[&1].stage, AsyncCommitStage::Finalized);
-        orch.handle_finalize_done(1, hash, test_commit_qc(1, hash), false).await;
-        assert_eq!(orch.async_commit_states[&1].stage, AsyncCommitStage::Finalized);
+        assert_eq!(
+            orch.async_commit_states[&1].stage,
+            AsyncCommitStage::Finalized
+        );
+        orch.handle_finalize_done(1, hash, test_commit_qc(1, hash), false)
+            .await;
+        assert_eq!(
+            orch.async_commit_states[&1].stage,
+            AsyncCommitStage::Finalized
+        );
         assert_eq!(mock.fcu_heads(), vec![hash]);
     }
 
@@ -6284,6 +6994,193 @@ mod tests {
         }));
     }
 
+    fn own_block_report(kind: ReadyKind, view: u64) -> PayloadBuildReady {
+        PayloadBuildReady {
+            context: PayloadBuildContext {
+                view,
+                parent_hash: B256::repeat_byte(0x0A),
+            },
+            block_hash: B256::repeat_byte(0x0B),
+            kind,
+        }
+    }
+
+    #[test]
+    fn a_sealed_own_block_starts_its_child_on_its_output() {
+        let sealed = own_block_report(ReadyKind::OwnBlockSealed, 5);
+        let child = PayloadBuildContext {
+            view: 6,
+            parent_hash: sealed.block_hash,
+        };
+        assert_eq!(
+            ahead_step(&sealed, 5, 1, true, true, false),
+            AheadStep::BuildOnOutput(child)
+        );
+        // Switched off, a sealed block starts nothing.
+        assert_eq!(ahead_step(&sealed, 5, 1, true, false, false), AheadStep::Skip);
+        // Not the next leader, or the view has moved on.
+        assert_eq!(ahead_step(&sealed, 5, 1, false, true, false), AheadStep::Skip);
+        assert_eq!(ahead_step(&sealed, 6, 1, true, true, false), AheadStep::Skip);
+        // The block's own view has not started: one block ahead at most.
+        assert_eq!(ahead_step(&sealed, 4, 1, true, true, false), AheadStep::Hold);
+        // A child already built starts nothing.
+        assert_eq!(ahead_step(&sealed, 5, 1, true, true, true), AheadStep::Skip);
+        // A proposal release is never a reason to build ahead.
+        let payload = own_block_report(ReadyKind::Payload, 5);
+        assert_eq!(ahead_step(&payload, 5, 1, true, true, false), AheadStep::Skip);
+    }
+
+    #[test]
+    fn two_blocks_ahead_build_on_the_next_views_output() {
+        // Block of view 6 sealed while view 5 is current: its child, of view
+        // 7, is built on its output.
+        let sealed = own_block_report(ReadyKind::OwnBlockSealed, 6);
+        let child = PayloadBuildContext {
+            view: 7,
+            parent_hash: sealed.block_hash,
+        };
+        assert_eq!(
+            ahead_step(&sealed, 5, 2, true, true, false),
+            AheadStep::BuildOnOutput(child)
+        );
+        assert_eq!(ahead_step(&sealed, 5, 1, true, true, false), AheadStep::Hold);
+        // Two blocks ahead at most.
+        let further = own_block_report(ReadyKind::OwnBlockSealed, 7);
+        assert_eq!(ahead_step(&further, 5, 2, true, true, false), AheadStep::Hold);
+        assert_eq!(
+            ahead_step(&further, 6, 2, true, true, false),
+            AheadStep::BuildOnOutput(PayloadBuildContext {
+                view: 8,
+                parent_hash: further.block_hash
+            })
+        );
+        // The validation of a block whose child is under way only moves
+        // the head; without a build of the child it waits for its view.
+        let validated = own_block_report(ReadyKind::OwnBlockValidated, 6);
+        assert_eq!(
+            ahead_step(&validated, 5, 2, true, true, true),
+            AheadStep::AnnounceHead
+        );
+        assert_eq!(ahead_step(&validated, 5, 2, true, true, false), AheadStep::Hold);
+        assert_eq!(
+            ahead_step(&validated, 6, 2, true, true, false),
+            AheadStep::Build(child)
+        );
+        // Not leading the view after the block's.
+        assert_eq!(ahead_step(&sealed, 5, 2, false, true, false), AheadStep::Skip);
+    }
+
+    #[test]
+    fn a_sealed_own_block_guards_its_own_view_before_its_child_starts() {
+        // run148: the child build on the output took over `ahead_building`
+        // while the block's proposal was still pending; the block's own view
+        // then started a second build on the block's parent.
+        let sealed = own_block_report(ReadyKind::OwnBlockSealed, 5);
+        assert_eq!(own_block_guards(&sealed, 5), (Some(sealed.context), None));
+        assert_eq!(own_block_guards(&sealed, 4), (Some(sealed.context), None));
+        assert_eq!(own_block_guards(&sealed, 6), (None, None));
+        let validated = own_block_report(ReadyKind::OwnBlockValidated, 5);
+        assert_eq!(
+            own_block_guards(&validated, 5),
+            (
+                Some(validated.context),
+                Some((validated.block_hash, validated.context.parent_hash))
+            )
+        );
+    }
+
+    #[test]
+    fn a_validated_own_block_builds_its_child_once() {
+        let validated = own_block_report(ReadyKind::OwnBlockValidated, 5);
+        let child = PayloadBuildContext {
+            view: 6,
+            parent_hash: validated.block_hash,
+        };
+        assert_eq!(
+            ahead_step(&validated, 5, 1, true, true, false),
+            AheadStep::Build(child)
+        );
+        assert_eq!(
+            ahead_step(&validated, 5, 1, true, true, true),
+            AheadStep::AnnounceHead,
+            "the child is built already"
+        );
+        assert_eq!(ahead_step(&validated, 4, 1, true, true, false), AheadStep::Hold);
+    }
+
+    #[test]
+    fn a_produced_child_held_for_its_view_covers_its_parent() {
+        let mut orch = make_test_orchestrator_with_state(None);
+        let validated = own_block_report(ReadyKind::OwnBlockValidated, 5);
+        let child = PayloadBuildContext {
+            view: 6,
+            parent_hash: validated.block_hash,
+        };
+        // The child was built on the output, produced, and its record ended.
+        orch.ahead.hold_payload(PayloadBuildReady {
+            context: child,
+            block_hash: B256::repeat_byte(0x0D),
+            kind: ReadyKind::Payload,
+        });
+        assert!(orch.ahead.child_covered(child));
+        assert!(orch.ahead.output_build(child).is_none());
+    }
+
+    #[test]
+    fn a_build_on_output_without_a_payload_falls_back_to_the_validated_block() {
+        let mut orch = make_test_orchestrator_with_state(None);
+        let validated = own_block_report(ReadyKind::OwnBlockValidated, 5);
+        let child = PayloadBuildContext {
+            view: 6,
+            parent_hash: validated.block_hash,
+        };
+        orch.ahead.start_output_build(child);
+        orch.ahead.output_build_mut(child).unwrap().validated = Some(validated);
+        let other = PayloadBuildContext { view: 7, ..child };
+        assert_eq!(orch.take_failed_output_build(other), None);
+        assert!(orch.ahead.output_build(child).is_some(), "another build's end keeps the record");
+        assert_eq!(orch.take_failed_output_build(child), Some(validated));
+        assert!(orch.ahead.output_build(child).is_none());
+
+        // A build that released its payload needs no second build.
+        orch.ahead.start_output_build(child);
+        orch.ahead.output_build_mut(child).unwrap().validated = Some(validated);
+        orch.ahead.start_building(child);
+        orch.handle_payload_build_ready(PayloadBuildReady {
+            context: child,
+            block_hash: B256::repeat_byte(0x0D),
+            kind: ReadyKind::Payload,
+        });
+        assert!(orch.ahead.output_build(child).is_some_and(|build| build.produced));
+        assert!(orch.ahead.building_on(child.parent_hash).is_none());
+        assert_eq!(orch.take_failed_output_build(child), None);
+    }
+
+    #[tokio::test]
+    async fn a_view_change_releases_the_held_payload_and_keeps_the_next_one() {
+        let mut orch = make_test_orchestrator_with_state(None);
+        let view = orch.engine.current_view();
+        let required = orch.required_payload_build_context().expect("genesis context");
+        let first = PayloadBuildReady {
+            context: PayloadBuildContext { view, ..required },
+            block_hash: B256::repeat_byte(0x21),
+            kind: ReadyKind::Payload,
+        };
+        let second = PayloadBuildReady {
+            context: PayloadBuildContext {
+                view: view + 1,
+                parent_hash: first.block_hash,
+            },
+            block_hash: B256::repeat_byte(0x22),
+            kind: ReadyKind::Payload,
+        };
+        orch.ahead.hold_payload(second);
+        orch.ahead.hold_payload(first);
+        // The released payload goes to consensus; the next view's waits.
+        orch.take_ahead_build(view).await;
+        assert_eq!(orch.ahead.ready, vec![second]);
+    }
+
     #[tokio::test]
     async fn test_block_ready_channel() {
         let mut orch = make_test_orchestrator_with_state(None);
@@ -6296,6 +7193,7 @@ mod tests {
                 parent_hash: B256::repeat_byte(0xEE),
             },
             block_hash: test_hash,
+            kind: ReadyKind::Payload,
         };
         block_ready_tx.send(ready).await.unwrap();
 
@@ -7098,7 +7996,8 @@ mod tests {
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mock = Arc::new(MockExecutionLayer::new(
-            PayloadStatusEnum::Valid, PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
         ));
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.el = Some(mock.clone());
@@ -7113,22 +8012,39 @@ mod tests {
             (202, hash, AsyncCommitStage::Committed),
             (203, next, AsyncCommitStage::ExecutionReady),
         ] {
-            orch.async_commit_states.insert(view, AsyncCommitState {
-                view, block_hash, commit_qc: test_commit_qc(view, block_hash),
-                stage, finalize_in_flight: false, committed_at: Instant::now(),
-            });
+            orch.async_commit_states.insert(
+                view,
+                AsyncCommitState {
+                    view,
+                    block_hash,
+                    commit_qc: test_commit_qc(view, block_hash),
+                    stage,
+                    finalize_in_flight: false,
+                    committed_at: Instant::now(),
+                },
+            );
         }
-        assert!(orch.import_h2_v4_catchup_block(
-            n42_network::PeerId::random(),
-            n42_network::decode_gov5_block_rlp(&rlp).unwrap(), 201,
-        ).await);
+        assert!(
+            orch.import_h2_v4_catchup_block(
+                n42_network::PeerId::random(),
+                n42_network::decode_gov5_block_rlp(&rlp).unwrap(),
+                201,
+            )
+            .await
+        );
         for view in [201, 202] {
-            assert_eq!(orch.async_commit_states[&view].stage, AsyncCommitStage::Finalized);
+            assert_eq!(
+                orch.async_commit_states[&view].stage,
+                AsyncCommitStage::Finalized
+            );
         }
         assert_eq!(mock.fcu_heads(), vec![hash]);
         orch.drive_async_commits().await;
         assert_eq!(mock.fcu_heads(), vec![hash, next]);
-        assert_eq!(orch.async_commit_states[&203].stage, AsyncCommitStage::Finalized);
+        assert_eq!(
+            orch.async_commit_states[&203].stage,
+            AsyncCommitStage::Finalized
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7137,7 +8053,8 @@ mod tests {
         let (network, _cmd_rx, _prx) = make_test_network();
         let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
         let mock = Arc::new(MockExecutionLayer::new(
-            PayloadStatusEnum::Valid, PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
         ));
         let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
         orch.el = Some(mock.clone());
@@ -7146,25 +8063,45 @@ mod tests {
         orch.head_block_hash = B256::repeat_byte(0x70);
         orch.execution_validated_head_view = 200;
         let (hash, rlp) = test_gov5_block_rlp(orch.head_block_hash, 101, 201);
-        assert!(orch.import_h2_v4_catchup_block(
-            n42_network::PeerId::random(),
-            n42_network::decode_gov5_block_rlp(&rlp).unwrap(), 201,
-        ).await);
+        assert!(
+            orch.import_h2_v4_catchup_block(
+                n42_network::PeerId::random(),
+                n42_network::decode_gov5_block_rlp(&rlp).unwrap(),
+                201,
+            )
+            .await
+        );
         // Both a late original commit and a later view reusing that exact
         // hash are already finalized. Neither should dispatch an older FCU.
         for view in [201, 202] {
-            orch.handle_block_committed(view, hash, test_commit_qc(view, hash), None).await;
-            assert_eq!(orch.async_commit_states[&view].stage, AsyncCommitStage::Finalized);
+            orch.handle_block_committed(view, hash, test_commit_qc(view, hash), None)
+                .await;
+            assert_eq!(
+                orch.async_commit_states[&view].stage,
+                AsyncCommitStage::Finalized
+            );
         }
         assert_eq!(mock.fcu_heads(), vec![hash]);
-        orch.handle_finalize_done(201, hash, test_commit_qc(201, hash), false).await;
-        assert_eq!(orch.async_commit_states[&201].stage, AsyncCommitStage::Finalized);
+        orch.handle_finalize_done(201, hash, test_commit_qc(201, hash), false)
+            .await;
+        assert_eq!(
+            orch.async_commit_states[&201].stage,
+            AsyncCommitStage::Finalized
+        );
         let next = B256::repeat_byte(0x71);
-        orch.handle_block_committed(203, next, test_commit_qc(203, next), None).await;
-        assert_eq!(orch.async_commit_states[&203].stage, AsyncCommitStage::Committed);
-        orch.handle_eager_import_done(next, 203, hash, 102, false, None).await;
+        orch.handle_block_committed(203, next, test_commit_qc(203, next), None)
+            .await;
+        assert_eq!(
+            orch.async_commit_states[&203].stage,
+            AsyncCommitStage::Committed
+        );
+        orch.handle_eager_import_done(next, 203, hash, 102, false, None)
+            .await;
         assert_eq!(mock.fcu_heads(), vec![hash, next]);
-        assert_eq!(orch.async_commit_states[&203].stage, AsyncCommitStage::Finalized);
+        assert_eq!(
+            orch.async_commit_states[&203].stage,
+            AsyncCommitStage::Finalized
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -7190,38 +8127,54 @@ mod tests {
             let (network, _cmd_rx, _prx) = make_test_network();
             let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
             let mock = Arc::new(MockExecutionLayer::new(PayloadStatusEnum::Valid, status));
-            let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+            let mut orch =
+                ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
             orch.el = Some(mock);
             orch.head_block_number = 100;
             orch.head_block_hash = B256::repeat_byte(0x70);
             orch.execution_validated_head_view = 200;
             let (hash, rlp) = test_gov5_block_rlp(orch.head_block_hash, 101, 201);
-            orch.async_commit_states.insert(201, AsyncCommitState {
-                view: 201, block_hash: hash, commit_qc: test_commit_qc(201, hash),
-                stage: AsyncCommitStage::Committed, finalize_in_flight: false,
-                committed_at: Instant::now(),
-            });
-            assert!(!orch.import_h2_v4_catchup_block(
-                n42_network::PeerId::random(),
-                n42_network::decode_gov5_block_rlp(&rlp).unwrap(), 201,
-            ).await);
+            orch.async_commit_states.insert(
+                201,
+                AsyncCommitState {
+                    view: 201,
+                    block_hash: hash,
+                    commit_qc: test_commit_qc(201, hash),
+                    stage: AsyncCommitStage::Committed,
+                    finalize_in_flight: false,
+                    committed_at: Instant::now(),
+                },
+            );
+            assert!(
+                !orch
+                    .import_h2_v4_catchup_block(
+                        n42_network::PeerId::random(),
+                        n42_network::decode_gov5_block_rlp(&rlp).unwrap(),
+                        201,
+                    )
+                    .await
+            );
             assert!(orch.h2_v4_catchup_finalized.is_empty());
-            assert_eq!(orch.async_commit_states[&201].stage, AsyncCommitStage::Committed);
+            assert_eq!(
+                orch.async_commit_states[&201].stage,
+                AsyncCommitStage::Committed
+            );
             assert_eq!(orch.head_block_number, 100);
         }
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn eager_leader_height_waits_for_fcu_and_reconnects_the_catchup_suffix() {
-        let mut orch = make_test_orchestrator_with_state(None)
-            .with_h2_v4_participant(test_h2_identity());
+        let mut orch =
+            make_test_orchestrator_with_state(None).with_h2_v4_participant(test_h2_identity());
         let parent = B256::repeat_byte(0x70);
         orch.head_block_hash = parent;
         orch.head_block_number = 100;
         orch.execution_validated_head_view = 200;
         let (leader, _) = test_gov5_block_rlp(parent, 101, 201);
         // No leader envelope has reached the metadata cache yet.
-        orch.handle_eager_import_done(leader, 1, parent, 101, false, None).await;
+        orch.handle_eager_import_done(leader, 1, parent, 101, false, None)
+            .await;
         assert_eq!(orch.head_block_hash, parent);
         assert_eq!(orch.head_block_number, 100);
         assert_eq!(orch.h2_v4_block_numbers[&leader], 101);
@@ -7230,7 +8183,11 @@ mod tests {
         assert!(!orch.h2_v4_block_numbers.contains_key(&leader));
         let (_, child) = test_gov5_block_rlp(leader, 102, 202);
         assert!(orch.stage_h2_v4_catchup_block(
-            n42_network::PeerId::random(), child, 102, 202, true,
+            n42_network::PeerId::random(),
+            child,
+            102,
+            202,
+            true,
         ));
         assert_eq!(orch.ready_h2_v4_catchup_heights(), Some(vec![102]));
     }
@@ -8751,6 +9708,52 @@ mod tests {
     /// about the injected bytes, not block `H`, so the cache must be evicted
     /// without blacklisting `H`; a later honest compact-free arrival must run.
     #[tokio::test(flavor = "current_thread")]
+    async fn refused_peer_output_is_dropped_and_the_block_executed_locally() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let parent = B256::repeat_byte(0x76);
+        let hash = B256::repeat_byte(0x77);
+        // The verdict with the peer's output is Invalid; local execution says Valid.
+        let mock = Arc::new(MockExecutionLayer::with_new_payload_statuses(
+            [
+                PayloadStatusEnum::Invalid {
+                    validation_error: "cached execution output refused".to_owned(),
+                },
+                PayloadStatusEnum::Valid,
+            ],
+            PayloadStatusEnum::Valid,
+        ));
+        let cache = Arc::new(MockExecutionOutputCache::default());
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_exec_output_cache(cache.clone());
+        orch.el = Some(mock.clone());
+        orch.head_block_hash = parent;
+
+        let data = bincode::serialize(&BlockDataBroadcast {
+            block_hash: hash,
+            view: 1,
+            payload_json: serde_json::to_vec(&test_execution_data(parent, hash)).unwrap(),
+            timestamp: 1,
+            execution_output: Some(vec![0xBA, 0xD0, 0x00, 0x01]),
+            leader_ready_unix_ms: 0,
+            native_header_rlp: None,
+        })
+        .unwrap();
+        orch.handle_block_data(data).await;
+        for _ in 0..400 {
+            if mock.new_payload_hashes().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(mock.new_payload_hashes(), vec![hash, hash]);
+        assert_eq!(cache.evicted(), vec![hash]);
+        assert!(!cache.contains(hash));
+        assert!(!orch.bad_blocks.should_skip(hash, "test"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn forged_compact_output_does_not_blacklist_honest_hash() {
         let (engine, output_rx) = make_test_engine();
         let (network, _cmd_rx, _prx) = make_test_network();
@@ -8912,6 +9915,56 @@ mod tests {
         assert!(
             !orch.pending_block_data.contains_key(&bad_hash),
             "known bad direct/gossip data must be dropped before consensus notification"
+        );
+    }
+
+    /// An envelope naming an honest block's hash over a payload of another
+    /// hash is dropped once its import task has seen the mismatch, so the
+    /// real copy is taken instead of being treated as a duplicate.
+    #[tokio::test(flavor = "current_thread")]
+    async fn forged_block_data_gives_way_to_the_real_copy() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let parent = B256::repeat_byte(0x51);
+        let block_hash = B256::repeat_byte(0x52);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+
+        // The payload inside is the block of another hash.
+        let payload_json =
+            serde_json::to_vec(&test_execution_data(parent, B256::repeat_byte(0x53))).unwrap();
+        let forged = bincode::serialize(&BlockDataBroadcast {
+            block_hash,
+            view: u64::MAX,
+            payload_json,
+            timestamp: 1,
+            execution_output: None,
+            leader_ready_unix_ms: 0,
+            native_header_rlp: None,
+        })
+        .unwrap();
+        orch.handle_block_data(forged).await;
+        assert!(orch.pending_block_data.contains_key(&block_hash));
+        drain_spawned_tasks().await;
+        assert!(mock.new_payload_hashes().is_empty());
+
+        orch.handle_block_data(test_block_data(parent, block_hash, 1))
+            .await;
+        drain_spawned_tasks().await;
+        assert_eq!(mock.new_payload_hashes(), vec![block_hash]);
+        assert!(orch.pending_block_data.contains_key(&block_hash));
+        assert_eq!(
+            orch.recent_block_data
+                .iter()
+                .filter(|entry| entry.block_hash == block_hash)
+                .count(),
+            1,
+            "the forged envelope is gone from the recent ring too"
         );
     }
 

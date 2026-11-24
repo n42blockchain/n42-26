@@ -1,33 +1,85 @@
 {
   "schema": 1,
   "source": "https://github.com/paradigmxyz/reth",
-  "upstream_tag": "v2.8.1",
-  "upstream_commit": "d763342fa185e4e90ee79dc65f6a5706168b0bcb",
-  "adapted_commit": "5a8b035c3420f6cb5b5b074a51dab2d4272009e6",
+  "upstream_tag": "v2.11.0",
+  "upstream_commit": "b9abbcc1b982755baa9021e6874e2e58936ca65f",
+  "adapted_commit": "5a81f36296936cc9f1bda1142141861ced558bcf",
   "patch_series": [
     {
       "name": "reth-qmdb-state-reader",
-      "commit": "ccb3fa2bbc0d0de46b90ee5746b6c5bd7bbc50b4"
+      "commit": "1eb96074a7ca0edb77b4cae76734e1a1ef289a08"
     },
     {
       "name": "reth-n42-perf",
-      "commit": "9d57b535415000b58c71827eac0ee5e57fb9ea13"
+      "commit": "f97241fff2c5817841de9f24619c0421ec75852d"
     },
     {
       "name": "reth-payload-transactions-root",
-      "commit": "d5a9f5c6e90c898f7906049f7117d1b708a1a386"
+      "commit": "9ad4387b84f41c4e4bbedec4a267747b593cd778"
     },
     {
       "name": "reth-gov5-cached-state-root",
-      "commit": "98b5a371e0128a37cbc24d8f3dd7873bbf68c468"
-    },
-    {
-      "name": "reth-import-batch",
-      "commit": "bdd5abb9f69e1b8c476cf174990a6131c44ffdac"
+      "commit": "fe01928711602bea959b942ef66480f5df3b98b1"
     },
     {
       "name": "reth-engine-state-provider-factory",
-      "commit": "5a8b035c3420f6cb5b5b074a51dab2d4272009e6"
+      "commit": "7b58b9d49f5ee2edfd5cad3ca41fb69d283aad3c"
+    },
+    {
+      "name": "reth-cached-execution-refusal",
+      "commit": "2b4ba0f7719868daf57edf9a3437258dc602235f"
+    },
+    {
+      "name": "reth-native-import-path",
+      "commit": "1574758d1a4359ffb22a17d75f0343353d4c6648"
+    },
+    {
+      "name": "reth-executed-block-inbox",
+      "commit": "d8d631efe031dacaa1c09ea0ddc270e6d58e44b2"
+    },
+    {
+      "name": "reth-engine-tree-state-constructor",
+      "commit": "f0e68aa66f18a6e7e43498aec810e78c8e4c89ae"
+    },
+    {
+      "name": "reth-engine-execution-state-adapter",
+      "commit": "adac5ff76462fe5b4e09ddf1b73c15d574428a15"
+    },
+    {
+      "name": "reth-receipt-root-task-guard",
+      "commit": "20bc910983b45d53f5f5d287dca92f226d5c5622"
+    },
+    {
+      "name": "reth-cached-execution-skip-tx-conversion",
+      "commit": "5b4495f3fd7542839872c46afc09a68dc33fb1ca"
+    },
+    {
+      "name": "reth-pre-canonical-block-state",
+      "commit": "c71add151225cf7c3c9c95a9937e9ef914c221c3"
+    },
+    {
+      "name": "reth-payload-cache-recent-outputs",
+      "commit": "4c1615dd276381522b0252a6fc625db4b9c68a7f"
+    },
+    {
+      "name": "reth-inserted-block-cache-skip",
+      "commit": "a8583ac87e61027eda77bfce626546561032b92d"
+    },
+    {
+      "name": "reth-insert-executed-stage-timers",
+      "commit": "e037d26ce8589c907cce170ee380375d78364b25"
+    },
+    {
+      "name": "reth-parallel-account-history",
+      "commit": "48608ed84566e4088d93cc78e780bf8428e55e75"
+    },
+    {
+      "name": "reth-sorted-tx-hashes",
+      "commit": "f34dbada1680c5ad2d558ceaeafd538830b74172"
+    },
+    {
+      "name": "reth-sf-parallel-finalize",
+      "commit": "5a81f36296936cc9f1bda1142141861ced558bcf"
     }
   ],
   "workspace_dependency_versions": {
@@ -40,9 +92,11 @@
     "alloy-rpc-types-eth": "2.5.0",
     "alloy-signer": "2.5.0",
     "alloy-signer-local": "2.5.0",
-    "alloy-evm": "0.39.0",
-    "revm": "43.0.3",
     "alloy-primitives": "1.7.3",
     "alloy-sol-types": "1.7.3"
+  },
+  "git_dependency_revisions": {
+    "evm2": "66687c18b34d3bdbb899f5eb7605070615c03475",
+    "reth-core": "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61"
   }
 }

@@ -4,8 +4,8 @@ use n42_consensus::{
     shared_committee_pool,
 };
 use n42_execution::N42EvmConfig;
+use n42_tx_types::N42Primitives;
 use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
-use reth_ethereum_primitives::EthPrimitives;
 use reth_node_builder::{
     BuilderContext,
     components::{ConsensusBuilder, ExecutorBuilder},
@@ -21,7 +21,7 @@ pub struct N42ExecutorBuilder;
 
 impl<Types, Node> ExecutorBuilder<Node> for N42ExecutorBuilder
 where
-    Types: NodeTypes<ChainSpec = ChainSpec, Primitives = EthPrimitives>,
+    Types: NodeTypes<ChainSpec = ChainSpec, Primitives = N42Primitives>,
     Node: FullNodeTypes<Types = Types>,
 {
     type EVM = N42EvmConfig;
@@ -30,12 +30,6 @@ where
         let mut config = N42EvmConfig::new(ctx.chain_spec());
         if let Some(cache) = ctx.sender_recovery_cache() {
             config = config.with_sender_recovery_cache(cache.clone());
-        }
-        if std::env::var("N42_PARALLEL_IMPORT").as_deref() == Ok("1") {
-            use reth_storage_api::StateProviderFactory;
-            let provider = ctx.provider().clone();
-            config = config
-                .with_parallel_import_provider(move |parent| provider.state_by_block_hash(parent));
         }
         Ok(config)
     }
@@ -93,7 +87,7 @@ impl N42ConsensusBuilder {
 impl<Node> ConsensusBuilder<Node> for N42ConsensusBuilder
 where
     Node: FullNodeTypes<
-        Types: NodeTypes<ChainSpec: EthChainSpec + EthereumHardforks, Primitives = EthPrimitives>,
+        Types: NodeTypes<ChainSpec: EthChainSpec + EthereumHardforks, Primitives = N42Primitives>,
     >,
 {
     type Consensus = Arc<N42Consensus<<Node::Types as NodeTypes>::ChainSpec>>;

@@ -1,3 +1,4 @@
+use crate::native_pool::N42PooledTransaction;
 use reth_chainspec::EthereumHardforks;
 use reth_evm::ConfigureEvm;
 use reth_node_builder::{
@@ -7,7 +8,7 @@ use reth_node_builder::{
 };
 use reth_tasks::{RayonConfig, RuntimeBuilder, RuntimeConfig, TokioConfig};
 use reth_transaction_pool::{
-    CoinbaseTipOrdering, EthPooledTransaction, EthTransactionValidator, PoolConfig, SubPoolLimit,
+    CoinbaseTipOrdering, EthTransactionValidator, PoolConfig, SubPoolLimit,
     TransactionValidationTaskExecutor, blobstore::DiskFileBlobStore,
 };
 use tracing::info;
@@ -45,8 +46,8 @@ fn adaptive_pool_limit_size(max_txs: usize) -> usize {
 
 /// N42 transaction pool type — uses DiskFileBlobStore for EIP-4844 blob transaction support.
 pub type N42TransactionPool<Provider, Evm> = reth_transaction_pool::Pool<
-    TransactionValidationTaskExecutor<EthTransactionValidator<Provider, EthPooledTransaction, Evm>>,
-    CoinbaseTipOrdering<EthPooledTransaction>,
+    TransactionValidationTaskExecutor<EthTransactionValidator<Provider, N42PooledTransaction, Evm>>,
+    CoinbaseTipOrdering<N42PooledTransaction>,
     DiskFileBlobStore,
 >;
 
@@ -63,9 +64,9 @@ pub struct N42PoolBuilder;
 impl<Types, Node, Evm> PoolBuilder<Node, Evm> for N42PoolBuilder
 where
     Types: NodeTypes<
-            ChainSpec: EthereumHardforks,
+            ChainSpec: EthereumHardforks + reth_chainspec::EthChainSpec,
             Primitives: reth_primitives_traits::NodePrimitives<
-                SignedTx = reth_ethereum_primitives::TransactionSigned,
+                SignedTx = n42_tx_types::N42TxEnvelope,
             >,
         >,
     Node: FullNodeTypes<Types = Types>,
@@ -128,16 +129,29 @@ where
             "TX pool validation running on dedicated runtime"
         );
 
+        // Native 0x50 (Ed25519) transactions are admitted only on chains whose
+        // genesis sets `altSigTx`; otherwise the pool stays Ethereum-only.
+        let alt_sig = n42_chainspec::native::alt_sig_tx_enabled(
+            reth_chainspec::EthChainSpec::genesis(&*ctx.chain_spec()),
+        );
+        n42_tx_types::set_alt_sig_enabled(alt_sig);
+        info!(target: "n42::pool", alt_sig, "native 0x50 transaction admission");
+
         let additional_tasks = ctx.config().txpool.additional_validation_tasks.max(16);
-        let validator =
-            TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config)
-                .with_local_transactions_config(ctx.pool_config().local_transactions_config.clone())
-                .set_tx_fee_cap(ctx.config().rpc.rpc_tx_fee_cap)
-                .with_max_tx_input_bytes(ctx.config().txpool.max_tx_input_bytes)
-                .with_max_tx_gas_limit(ctx.config().txpool.max_tx_gas_limit)
-                .with_minimum_priority_fee(ctx.config().txpool.minimum_priority_fee)
-                .with_additional_tasks(additional_tasks)
-                .build_with_tasks(pool_runtime.clone(), blob_store.clone());
+        let mut validator_builder =
+            TransactionValidationTaskExecutor::eth_builder(ctx.provider().clone(), evm_config);
+        if alt_sig {
+            validator_builder =
+                validator_builder.with_custom_tx_type(n42_tx_types::ALT_SIG_TX_TYPE_ID);
+        }
+        let validator = validator_builder
+            .with_local_transactions_config(ctx.pool_config().local_transactions_config.clone())
+            .set_tx_fee_cap(ctx.config().rpc.rpc_tx_fee_cap)
+            .with_max_tx_input_bytes(ctx.config().txpool.max_tx_input_bytes)
+            .with_max_tx_gas_limit(ctx.config().txpool.max_tx_gas_limit)
+            .with_minimum_priority_fee(ctx.config().txpool.minimum_priority_fee)
+            .with_additional_tasks(additional_tasks)
+            .build_with_tasks(pool_runtime.clone(), blob_store.clone());
 
         let pool_config = idc_pool_config(&ctx.pool_config());
 

@@ -40,6 +40,8 @@ Key files:
 
 ## `n42-parallel-evm`
 
+> Parked: REVM-only and excluded from the workspace since the evm2 migration (devlog-186).
+
 Purpose:
 
 - optimistic parallel execution of transaction batches

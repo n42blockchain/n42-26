@@ -1,47 +1,82 @@
 use alloy_eips::Decodable2718;
-use alloy_primitives::{B256, Bytes};
+use alloy_primitives::Bytes;
 use alloy_rpc_types_engine::ExecutionData;
+use n42_tx_types::{AltSigSenderCache, N42Primitives, N42TxEnvelope, N42TxType, Receipt};
 use reth_chainspec::ChainSpec;
 use reth_evm::{
     ConfigureEngineEvm, ConfigureEvm, EvmEnvFor, ExecutableTxIterator, ExecutionCtxFor,
-    SenderRecoveryCache,
+    ReceiptBuilder, ReceiptBuilderCtx, SenderRecoveryCache,
 };
-use reth_evm_ethereum::EthEvmConfig;
+use reth_evm_ethereum::{
+    EthBlockAssembler, EthBlockExecutionCtx, EthBlockExecutorFactory, EthEvmConfig,
+};
 use reth_primitives_traits::{
-    BlockTy, HeaderTy, SealedBlock, SealedHeader, SignedTransaction, TxTy,
+    BlockTy, HeaderTy, Recovered, SealedBlock, SealedHeader, SignedTransaction,
 };
-use reth_storage_api::{StateProvider, StateProviderBox};
-use reth_storage_errors::{any::AnyError, provider::ProviderResult};
-use std::sync::Arc;
+use reth_storage_errors::any::AnyError;
+use std::{
+    borrow::Cow,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use crate::{evm_factory::N42EvmFactory, restored_slots::TrackingBlockExecutorFactory};
 
-/// The inner EthEvmConfig type we delegate to (parameterized with N42EvmFactory).
+/// The Ethereum EVM configuration the header and payload environments are
+/// taken from. Those depend only on the header and the chain spec, never on
+/// the transaction type, so they are shared with Ethereum unchanged.
 type InnerConfig = EthEvmConfig<ChainSpec, N42EvmFactory>;
 
-/// N42 EVM configuration wrapping `EthEvmConfig<ChainSpec>`.
-/// All `ConfigureEvm` methods delegate to the inner config, except that every
-/// block executor is wrapped by [`TrackingBlockExecutorFactory`] so the slots
-/// a block changes and restores are recorded for the QMDB root job (see
-/// `restored_slots`). Provides a distinct type for N42-specific extensions.
-#[derive(Debug, Clone)]
-pub struct N42EvmConfig {
-    /// Inner Ethereum EVM configuration.
-    inner: InnerConfig,
-    /// The inner block executor factory, watched for restored slots.
-    factory: TrackingBlockExecutorFactory<<InnerConfig as ConfigureEvm>::BlockExecutorFactory>,
-    parallel_import: Option<ParallelImportProvider>,
+/// Receipts for N42 transactions: Ethereum's receipt shape with the N42 type
+/// byte, so a 0x50 transaction's receipt reports type 0x50.
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct N42ReceiptBuilder;
+
+impl ReceiptBuilder for N42ReceiptBuilder {
+    type Transaction = N42TxEnvelope;
+    type Receipt = Receipt;
+
+    fn build_receipt<T: evm2::EvmTypes>(
+        &self,
+        ctx: ReceiptBuilderCtx<N42TxType, evm2::TxResult<T>>,
+    ) -> Self::Receipt {
+        let ReceiptBuilderCtx {
+            tx_type,
+            result,
+            cumulative_gas_used,
+        } = ctx;
+        Receipt {
+            tx_type,
+            success: result.status,
+            cumulative_gas_used,
+            logs: result.logs,
+        }
+    }
 }
 
-type ImportStateOpener = dyn Fn(B256) -> ProviderResult<StateProviderBox> + Send + Sync;
+/// The block executor factory over N42 transactions and receipts.
+pub type N42BlockExecutorFactory =
+    EthBlockExecutorFactory<N42ReceiptBuilder, ChainSpec, N42EvmFactory>;
 
-#[derive(Clone)]
-struct ParallelImportProvider(Arc<ImportStateOpener>);
-
-impl std::fmt::Debug for ParallelImportProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ParallelImportProvider(exact parent)")
-    }
+/// N42 EVM configuration over [`N42Primitives`].
+///
+/// Header and payload environments delegate to the Ethereum configuration.
+/// Blocks are executed by an Ethereum block executor whose receipt builder
+/// knows the N42 type byte, and every block executor is wrapped by
+/// [`TrackingBlockExecutorFactory`] so the slots a block changes and restores
+/// are recorded for the QMDB root job (see `restored_slots`).
+#[derive(Debug, Clone)]
+pub struct N42EvmConfig {
+    /// Ethereum configuration used for the header/payload environments and
+    /// for the shared secp256k1 sender-recovery cache.
+    inner: InnerConfig,
+    /// The block executor factory, watched for restored slots.
+    factory: TrackingBlockExecutorFactory<N42BlockExecutorFactory>,
+    /// Assembles blocks of N42 transactions.
+    assembler: EthBlockAssembler<ChainSpec>,
 }
 
 impl N42EvmConfig {
@@ -53,31 +88,26 @@ impl N42EvmConfig {
     /// Configure the transaction executor while retaining block-level system calls,
     /// receipts, withdrawals and restored-slot tracking.
     pub fn with_evm_factory(chain_spec: Arc<ChainSpec>, evm_factory: N42EvmFactory) -> Self {
-        let inner = EthEvmConfig::new_with_evm_factory(chain_spec, evm_factory);
-        let factory = TrackingBlockExecutorFactory::new(inner.block_executor_factory().clone());
+        let inner = EthEvmConfig::new_with_evm_factory(chain_spec.clone(), evm_factory.clone());
+        let factory =
+            TrackingBlockExecutorFactory::new(EthBlockExecutorFactory::new_with_receipt_builder(
+                N42ReceiptBuilder,
+                chain_spec.clone(),
+                evm_factory,
+            ));
         Self {
             inner,
             factory,
-            parallel_import: None,
+            assembler: EthBlockAssembler::new(chain_spec),
         }
     }
 
-    /// Enable complete transfer-block import using independent views of the exact parent.
-    /// The provider must preserve QMDB-only execution-read routing when configured.
-    pub fn with_parallel_import_provider(
-        mut self,
-        open: impl Fn(B256) -> ProviderResult<StateProviderBox> + Send + Sync + 'static,
-    ) -> Self {
-        self.parallel_import = Some(ParallelImportProvider(Arc::new(open)));
-        self
-    }
-
-    /// Returns a reference to the inner `EthEvmConfig`.
+    /// Returns a reference to the inner Ethereum configuration.
     pub fn inner(&self) -> &InnerConfig {
         &self.inner
     }
 
-    /// Shares verified sender recovery results with transaction ingress.
+    /// Shares verified secp256k1 sender recovery results with transaction ingress.
     pub fn with_sender_recovery_cache(mut self, cache: SenderRecoveryCache) -> Self {
         self.inner = self.inner.with_sender_recovery_cache(cache);
         self
@@ -90,51 +120,18 @@ impl N42EvmConfig {
 }
 
 impl ConfigureEvm for N42EvmConfig {
-    type Primitives = <InnerConfig as ConfigureEvm>::Primitives;
+    type Primitives = N42Primitives;
     type Error = <InnerConfig as ConfigureEvm>::Error;
     type NextBlockEnvCtx = <InnerConfig as ConfigureEvm>::NextBlockEnvCtx;
-    type BlockExecutorFactory =
-        TrackingBlockExecutorFactory<<InnerConfig as ConfigureEvm>::BlockExecutorFactory>;
-    type BlockAssembler = <InnerConfig as ConfigureEvm>::BlockAssembler;
-
-    fn batch_import_enabled(&self) -> bool {
-        self.parallel_import.is_some()
-    }
-
-    fn try_execute_import_batch<'a, DB: alloy_evm::Database + 'a>(
-        &self,
-        executor: &mut reth_evm::BlockExecutorForEvm<'a, Self, DB>,
-        env: &EvmEnvFor<Self>,
-        parent_hash: alloy_primitives::B256,
-        transactions: &[alloy_consensus::transaction::Recovered<
-            reth_ethereum_primitives::TransactionSigned,
-        >],
-    ) -> Result<Option<reth_evm::ImportBatchFinalize>, reth_evm::execute::BlockExecutionError> {
-        let Some(provider) = &self.parallel_import else {
-            return Ok(None);
-        };
-        crate::parallel_block::try_commit_import_batch(executor, env, transactions, &|| {
-            (provider.0)(parent_hash).ok().map(|provider| {
-                reth_revm::database::StateProviderDatabase::new(provider.into_evm_state_provider())
-            })
-        })
-        .map(|graft| {
-            graft.map(|graft| {
-                metrics::counter!("n42_parallel_import_executed_total")
-                    .increment(transactions.len() as u64);
-                Box::new(move |bundle: &mut revm::database::BundleState| {
-                    crate::parallel_transfer::append_reverts(bundle, graft.reverts);
-                }) as reth_evm::ImportBatchFinalize
-            })
-        })
-    }
+    type BlockExecutorFactory = TrackingBlockExecutorFactory<N42BlockExecutorFactory>;
+    type BlockAssembler = EthBlockAssembler<ChainSpec>;
 
     fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
         &self.factory
     }
 
     fn block_assembler(&self) -> &Self::BlockAssembler {
-        self.inner.block_assembler()
+        &self.assembler
     }
 
     fn evm_env(&self, header: &HeaderTy<Self::Primitives>) -> Result<EvmEnvFor<Self>, Self::Error> {
@@ -152,8 +149,24 @@ impl ConfigureEvm for N42EvmConfig {
     fn context_for_block<'a>(
         &self,
         block: &'a SealedBlock<BlockTy<Self::Primitives>>,
-    ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error> {
-        self.inner.context_for_block(block)
+    ) -> Result<ExecutionCtxFor<'a, Self>, Self::Error>
+    where
+        Self: 'a,
+    {
+        // Mirrors the Ethereum context; only the body's transaction type differs.
+        Ok(EthBlockExecutionCtx {
+            tx_count_hint: Some(block.transaction_count()),
+            parent_hash: block.header().parent_hash,
+            parent_beacon_block_root: block.header().parent_beacon_block_root,
+            ommers: &block.body().ommers,
+            withdrawals: block
+                .body()
+                .withdrawals
+                .as_ref()
+                .map(|w| Cow::Borrowed(w.as_slice())),
+            extra_data: block.header().extra_data.clone(),
+            slot_number: block.header().slot_number,
+        })
     }
 
     fn context_for_next_block(
@@ -181,22 +194,147 @@ impl ConfigureEngineEvm<ExecutionData> for N42EvmConfig {
         &self,
         payload: &ExecutionData,
     ) -> Result<impl ExecutableTxIterator<Self>, Self::Error> {
+        // Published once per payload: a registry lookup per transaction costs
+        // more than the sender lookup it counts.
+        for (outcome, count) in [
+            ("hit", &SENDER_HIT),
+            ("frame", &SENDER_FRAME),
+            ("miss", &SENDER_MISS),
+        ] {
+            metrics::counter!("n42_alt_sig_payload_sender_total", "cache" => outcome)
+                .absolute(count.load(Ordering::Relaxed));
+        }
         let txs = payload.payload.transactions().clone();
-        let sender_recovery_cache = self.inner.sender_recovery_cache.clone();
-        let convert = move |tx: Bytes| {
-            let tx =
-                TxTy::<Self::Primitives>::decode_2718_exact(tx.as_ref()).map_err(AnyError::new)?;
-            let signer = if let Some(cache) = &sender_recovery_cache {
-                cache.recover(&tx)
-            } else {
-                tx.try_recover()
-            }
-            .map_err(AnyError::new)?;
-            Ok::<_, AnyError>(tx.with_signer(signer))
-        };
+        let convert = self.payload_transaction_converter();
         Ok((txs, convert))
     }
 }
+
+impl N42EvmConfig {
+    /// Decodes one payload transaction and gives it its sender, from the
+    /// caches the node's admission filled where they hold it.
+    fn payload_transaction_converter(
+        &self,
+    ) -> impl Fn(Bytes) -> Result<Recovered<N42TxEnvelope>, AnyError> + Clone + Send + Sync + 'static
+    {
+        let sender_recovery_cache = self.inner.sender_recovery_cache.clone();
+        move |tx: Bytes| {
+            let (tx, source) = recover_payload_transaction(sender_recovery_cache.as_ref(), &tx)?;
+            if let Some(source) = source {
+                source.counter().fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(tx)
+        }
+    }
+
+    /// The payload's transactions decoded, with their senders, as the engine
+    /// converts them: a sender found here is in the cache the engine's own
+    /// conversion of the same payload reads.
+    pub fn recover_payload_transactions(
+        &self,
+        payload: &ExecutionData,
+    ) -> Result<(Vec<N42TxEnvelope>, Vec<alloy_primitives::Address>), AnyError> {
+        use rayon::prelude::*;
+        let cache = self.inner.sender_recovery_cache.as_ref();
+        let raw = payload.payload.transactions();
+        // Decoded from the payload's own bytes: a clone of each would count
+        // a reference on a buffer the transactions may all share, from every
+        // worker at once. Each lands in its own place of the result, and the
+        // senders' sources are counted once for the payload, not once per
+        // transaction on counters every worker writes.
+        let recovered: Vec<_> =
+            raw.par_iter().map(|tx| recover_payload_transaction(cache, tx)).collect();
+        let (mut transactions, mut senders) =
+            (Vec::with_capacity(raw.len()), Vec::with_capacity(raw.len()));
+        let mut sources = [0u64; 3];
+        for recovered in recovered {
+            let (tx, source) = recovered?;
+            if let Some(source) = source {
+                sources[source as usize] += 1;
+            }
+            let (tx, sender) = tx.into_parts();
+            transactions.push(tx);
+            senders.push(sender);
+        }
+        for (source, count) in
+            [SenderSource::Hit, SenderSource::Frame, SenderSource::Miss].into_iter().zip(sources)
+        {
+            if count > 0 {
+                source.counter().fetch_add(count, Ordering::Relaxed);
+            }
+        }
+        Ok((transactions, senders))
+    }
+}
+
+/// Where a 0x50 transaction's sender came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SenderSource {
+    /// The admission cache.
+    Hit = 0,
+    /// A frame this node holds.
+    Frame = 1,
+    /// Verified here.
+    Miss = 2,
+}
+
+impl SenderSource {
+    fn counter(self) -> &'static AtomicU64 {
+        match self {
+            Self::Hit => &SENDER_HIT,
+            Self::Frame => &SENDER_FRAME,
+            Self::Miss => &SENDER_MISS,
+        }
+    }
+}
+
+/// One payload transaction decoded from its bytes with its sender, and where
+/// a 0x50 transaction's sender came from.
+fn recover_payload_transaction(
+    sender_recovery_cache: Option<&SenderRecoveryCache>,
+    tx: &[u8],
+) -> Result<(Recovered<N42TxEnvelope>, Option<SenderSource>), AnyError> {
+    let tx = N42TxEnvelope::decode_2718_exact(tx).map_err(AnyError::new)?;
+    let (signer, source) = match &tx {
+        // Ed25519 senders verified at admission are reused; anything
+        // else is verified here and remembered.
+        N42TxEnvelope::AltSig(alt) => {
+            let cache = AltSigSenderCache::global();
+            match cache.get(alt.hash()) {
+                Some(sender) => (Ok(sender), Some(SenderSource::Hit)),
+                None => {
+                    // The cache drops entries under load; a frame this
+                    // node admitted and still holds has the sender too.
+                    let held = n42_tx_types::frame_ref_blocks_enabled()
+                        .then(|| n42_tx_types::FrameStore::global().sender_of(alt.hash()))
+                        .flatten();
+                    if let Some(sender) = held {
+                        (Ok(sender), Some(SenderSource::Frame))
+                    } else {
+                        (
+                            tx.try_recover().inspect(|sender| cache.insert(*alt.hash(), *sender)),
+                            Some(SenderSource::Miss),
+                        )
+                    }
+                }
+            }
+        }
+        N42TxEnvelope::Eth(_) => (
+            match sender_recovery_cache {
+                Some(cache) => cache.recover(&tx),
+                None => tx.try_recover(),
+            },
+            None,
+        ),
+    };
+    let signer = signer.map_err(AnyError::new)?;
+    Ok((tx.with_signer(signer), source))
+}
+
+/// Where the senders of 0x50 payload transactions came from, since start.
+static SENDER_HIT: AtomicU64 = AtomicU64::new(0);
+static SENDER_FRAME: AtomicU64 = AtomicU64::new(0);
+static SENDER_MISS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {
@@ -216,6 +354,78 @@ mod tests {
             },
         };
         ExecutionData::from_block_unchecked(B256::ZERO, &block)
+    }
+
+    /// A full block's payload recovery, timed: `N42_BENCH_TXS` 0x50
+    /// transfers (95,238 by default) whose senders the admission cache holds,
+    /// once as slices of one buffer and once as a buffer each.
+    ///
+    /// `N42_ALTSIG_SENDER_CACHE=4194304 cargo test --release -p n42-execution --lib payload_recovery_of_a_full_block -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing run, not a check"]
+    fn payload_recovery_of_a_full_block() {
+        use alloy_eips::eip2718::Encodable2718;
+        use alloy_primitives::{Address, Bytes};
+        let count: u64 =
+            std::env::var("N42_BENCH_TXS").ok().and_then(|v| v.parse().ok()).unwrap_or(95_238);
+        let cache = AltSigSenderCache::global();
+        let mut buffer = Vec::new();
+        let mut bounds = Vec::new();
+        for i in 0..count {
+            let mut seed = [0x42u8; 32];
+            seed[..8].copy_from_slice(&i.to_be_bytes());
+            let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+            let tx = n42_tx_types::TxAltSig {
+                    chain_id: N42_CHAIN_ID,
+                    nonce: 0,
+                    max_priority_fee_per_gas: 1,
+                    max_fee_per_gas: 100,
+                    gas_limit: 21_000,
+                    to: Address::left_padding_from(&(0x100_0000 + i).to_be_bytes()),
+                    value: U256::from(1_000u64),
+                    input: Bytes::new(),
+                    access_list: Default::default(),
+                    alg_type: n42_tx_types::ALG_ED25519,
+                    pubkey: Bytes::copy_from_slice(key.verifying_key().as_bytes()),
+            }
+            .sign_ed25519(&key);
+            cache.insert(*tx.hash(), tx.tx().sender());
+            let start = buffer.len();
+            N42TxEnvelope::AltSig(tx).encode_2718(&mut buffer);
+            bounds.push(start..buffer.len());
+        }
+        let buffer = Bytes::from(buffer);
+        let shared: Vec<Bytes> = bounds.iter().map(|range| buffer.slice(range.clone())).collect();
+        let apart: Vec<Bytes> = shared.iter().map(|tx| Bytes::copy_from_slice(tx)).collect();
+        let config = N42EvmConfig::new(n42_dev_chainspec());
+        for (name, transactions) in [("one buffer", shared), ("a buffer each", apart)] {
+            let mut input = payload(Vec::new());
+            input.payload.as_v1_mut().transactions = transactions;
+            let mut times = Vec::new();
+            for _ in 0..14 {
+                let at = std::time::Instant::now();
+                let (txs, senders) = config.recover_payload_transactions(&input).expect("recovered");
+                times.push(at.elapsed().as_secs_f64() * 1e3);
+                assert_eq!((txs.len() as u64, senders.len() as u64), (count, count));
+                assert_eq!(senders[1], txs[1].as_alt_sig().expect("0x50").tx().sender());
+            }
+            times.drain(..2);
+            times.sort_by(f64::total_cmp);
+            println!(
+                "PAYLOAD_RECOVERY {name}: txs={count} threads={} median_ms={:.1} min_ms={:.1} max_ms={:.1}",
+                rayon::current_num_threads(),
+                times[times.len() / 2],
+                times[0],
+                times[times.len() - 1],
+            );
+        }
+        // The cache is direct-mapped: a few of a block's entries displace
+        // each other and are verified again.
+        println!(
+            "PAYLOAD_RECOVERY senders: hit={} miss={}",
+            SENDER_HIT.load(Ordering::Relaxed),
+            SENDER_MISS.load(Ordering::Relaxed)
+        );
     }
 
     #[test]

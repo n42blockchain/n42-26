@@ -1,4 +1,6 @@
 mod keystore;
+#[cfg(feature = "pprof")]
+mod pprof_capture;
 
 // jemalloc is unix-only; tikv-jemallocator is a target.'cfg(unix)' dependency,
 // so the `feature = "jemalloc"` cfg is gated on `unix` to keep Windows builds happy.
@@ -78,9 +80,7 @@ fn gov5_canonical_block_reader<N>(
     provider: reth_provider::providers::BlockchainProvider<N>,
 ) -> n42_network::Gov5CanonicalBlockReader
 where
-    N: reth_provider::providers::ProviderNodeTypes<
-            Primitives = reth_ethereum_primitives::EthPrimitives,
-        >,
+    N: reth_provider::providers::ProviderNodeTypes<Primitives = n42_tx_types::N42Primitives>,
 {
     let best_provider = provider.clone();
     let hash_provider = provider.clone();
@@ -109,7 +109,9 @@ where
                         format!("canonical hash is missing for persisted block {number}")
                     })?;
                 let native = n42_consensus::Gov5NativeHeader::recover(&block.header, block_hash)
-                    .ok_or_else(|| format!("cannot recover persisted native header {block_hash}"))?;
+                    .ok_or_else(|| {
+                        format!("cannot recover persisted native header {block_hash}")
+                    })?;
                 n42_consensus::remember_gov5_native_header(&native.encode());
                 let execution = ExecutionData::from_block_unchecked(block_hash, &block);
                 rlps.push(
@@ -119,17 +121,28 @@ where
             }
             Ok(rlps)
         },
-    ).with_hash_reader(move |hash| {
-        let view = hash_provider.consistent_provider().map_err(|e| e.to_string())?;
-        let Some(block) = view.block(hash.into()).map_err(|e| e.to_string())? else { return Ok(None) };
-        if view.block_hash(block.header.number).map_err(|e| e.to_string())? != Some(hash) {
+    )
+    .with_hash_reader(move |hash| {
+        let view = hash_provider
+            .consistent_provider()
+            .map_err(|e| e.to_string())?;
+        let Some(block) = view.block(hash.into()).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        if view
+            .block_hash(block.header.number)
+            .map_err(|e| e.to_string())?
+            != Some(hash)
+        {
             return Ok(None);
         }
         let native = n42_consensus::Gov5NativeHeader::recover(&block.header, hash)
             .ok_or_else(|| format!("cannot recover persisted native header {hash}"))?;
         n42_consensus::remember_gov5_native_header(&native.encode());
         let execution = ExecutionData::from_block_unchecked(hash, &block);
-        n42_network::encode_gov5_block_rlp(&execution).map(Some).map_err(|e| e.to_string())
+        n42_network::encode_gov5_block_rlp(&execution)
+            .map(Some)
+            .map_err(|e| e.to_string())
     })
 }
 
@@ -237,6 +250,33 @@ fn resolve_observer_genesis_hash(
 
     configured_hash.parse::<B256>().map_err(|error| {
         eyre::eyre!("N42_INTEROP_GENESIS_HASH must be a 32-byte 0x-prefixed hash: {error}")
+    })
+}
+
+/// The parallel import of other nodes' blocks, when `N42_PARALLEL_IMPORT=1`.
+/// The follower import reading a block's parent from the provider when it
+/// is canonical or persisted, and otherwise from the engine tree, which
+/// holds a block from the moment it has validated it: the state the engine's
+/// own validation of the next block reads. A hash neither knows has no
+/// state here.
+fn follower_import<N>(
+    config: n42_execution::N42EvmConfig,
+    provider: reth_provider::providers::BlockchainProvider<N>,
+) -> Option<n42_node::el::FollowerImport>
+where
+    N: reth_provider::providers::ProviderNodeTypes,
+{
+    n42_node::el::FollowerImport::configured(config, move |hash| {
+        use reth_provider::StateProviderFactory as _;
+        if let Ok(state) = provider.state_by_block_hash(hash) {
+            metrics::counter!("n42_parallel_import_parent_state_total", "source" => "provider")
+                .increment(1);
+            return Some(state);
+        }
+        let state = provider.executed_state_by_block_hash(hash).ok().flatten()?;
+        metrics::counter!("n42_parallel_import_parent_state_total", "source" => "engine-tree")
+            .increment(1);
+        Some(state)
     })
 }
 
@@ -1188,6 +1228,35 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
+    // A trusting ingest (shard verification, frame gateways, an ingest server
+    // bound off loopback) lets transactions in under senders no signature
+    // check here established: benchmark probes, refused unless the operator
+    // acknowledges them with N42_BENCH_UNSAFE=1.
+    let ingest_enabled =
+        std::env::var_os("N42_INGEST_PORT").is_some() || std::env::var_os("N42_INJECT_PORT").is_some();
+    let ingest_bind = std::env::var("N42_INGEST_BIND").ok().filter(|_| ingest_enabled);
+    if let Some(refusal) = n42_tx_types::trusting_ingest_refusal(
+        n42_tx_types::ingest_verify_mode(),
+        std::env::var_os("N42_FRAME_GATEWAYS").is_some(),
+        ingest_bind.as_deref(),
+        std::env::var("N42_BENCH_UNSAFE").ok().as_deref(),
+    ) {
+        eprintln!("error: {refusal}");
+        std::process::exit(2);
+    }
+
+    // After the environment is final: the watcher is the first extra thread.
+    #[cfg(feature = "pprof")]
+    pprof_capture::spawn_from_env(
+        std::env::var_os("N42_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| ".".into()),
+    );
+
+    #[cfg(all(feature = "jemalloc", unix))]
+    n42_node::memory_watch::set_allocator_source(jemalloc_counters);
+    n42_node::memory_watch::spawn_memory_log();
+
     // Leave HTTP RPC disabled by default for release-oriented startup.
     //
     // NOTE: Do NOT call with_http_api()/with_ws_api() here — reth's
@@ -1398,6 +1467,9 @@ fn main() {
                 "N42_OBSERVER_MODE and N42_GOV5_H2_PARTICIPANT are mutually exclusive"
             ));
         }
+        // H2-v4 participants replace the builder's state root with the QMDB
+        // root during Gov5 normalization, so the builder's MPT root is skipped.
+        n42_node::payload::set_builder_state_root_replaced(h2_v4_participant);
         let header_profile = resolve_header_profile(
             observer_mode || h2_v4_participant,
             env_bool("N42_GOV5_HEADER_PROFILE"),
@@ -1895,6 +1967,7 @@ fn main() {
             .with_validator_set_resolver(validator_set_resolver)
             .with_header_profile(header_profile);
         if let Some(bootstrap) = &qmdb_execution {
+            n42_node::payload::set_builder_qmdb_store(bootstrap.store.clone());
             n42_node = n42_node.with_gov5_qmdb_state_root_store(bootstrap.store.clone());
         }
         let qmdb_reads = std::env::var("N42_QMDB_READS").unwrap_or_else(|_| "off".to_owned())
@@ -2115,6 +2188,25 @@ fn main() {
                     .flatten()
                     .unwrap_or_default();
 
+                {
+                    // Canonical blocks leave the in-memory state once persisted.
+                    let provider = full_node.provider.clone();
+                    n42_node::memory_watch::set_backlog_source(move || {
+                        let mut backlog = n42_node::memory_watch::Backlog::default();
+                        if let Some(head) = provider.canonical_in_memory_state().head_state() {
+                            for state in head.chain() {
+                                backlog.blocks += 1;
+                                backlog.transactions += state
+                                    .block_ref()
+                                    .recovered_block()
+                                    .body()
+                                    .transactions
+                                    .len() as u64;
+                            }
+                        }
+                        backlog
+                    });
+                }
                 let best_block_number = full_node.provider.best_block_number().unwrap_or(0);
                 let head_block_hash = {
                     if best_block_number > 0 {
@@ -2577,9 +2669,13 @@ fn main() {
                     }
 
                     let observer_el: std::sync::Arc<dyn n42_node::el::ExecutionLayer> =
-                        std::sync::Arc::new(n42_node::el::RethExecutionLayer::engine_only(
-                            beacon_engine_handle,
-                        ));
+                        std::sync::Arc::new(
+                            n42_node::el::RethExecutionLayer::engine_only(beacon_engine_handle)
+                                .with_follower_import(follower_import(
+                                    full_node.evm_config.clone(),
+                                    full_node.provider.clone(),
+                                )),
+                        );
                     let observer_head = replay_plan
                         .as_ref()
                         .map(|plan| plan.verification().last_block_hash)
@@ -3190,7 +3286,13 @@ fn main() {
                             tokio::time::interval(Duration::from_millis(pool_depth_poll_ms));
                         loop {
                             let size = pool_for_depth.pool_size();
-                            pool_depth_state.update_pool_depth(size.pending, size.queued);
+                            let frame_queued = if n42_node::frame_queue::frame_queue_enabled() {
+                                n42_node::frame_queue::FrameQueue::global().pending()
+                            } else {
+                                0
+                            };
+                            pool_depth_state
+                                .update_pool_depth(size.pending + frame_queued, size.queued);
                             interval.tick().await;
                         }
                     }),
@@ -3200,9 +3302,60 @@ fn main() {
                 // Enable with N42_INGEST_PORT=19900. Legacy fallback: N42_INJECT_PORT.
                 if std::env::var("N42_INGEST_PORT").is_ok() || std::env::var("N42_INJECT_PORT").is_ok() {
                     let inject_pool = full_node.pool.clone();
+                    let ingest_chain_id = full_node.chain_spec().chain().id();
                     task_executor.spawn_critical_task(
                         "n42-ingest-server",
-                        Box::pin(n42_node::ingest::run_ingest_server(inject_pool)),
+                        Box::pin(n42_node::ingest::run_ingest_server(
+                            inject_pool,
+                            ingest_chain_id,
+                        )),
+                    );
+                }
+
+                // Native frames queued outside the pool leave the queue as
+                // canonical blocks include their transactions.
+                if n42_node::frame_queue::frame_queue_enabled() {
+                    let mut canonical = reth_provider::CanonStateSubscriptions::subscribe_to_canonical_state(
+                        &full_node.provider,
+                    );
+                    task_executor.spawn_critical_task(
+                        "n42-frame-queue-canonical",
+                        Box::pin(async move {
+                            use tokio::sync::broadcast::error::RecvError;
+                            loop {
+                                let notification = match canonical.recv().await {
+                                    Ok(notification) => notification,
+                                    Err(RecvError::Closed) => break,
+                                    Err(RecvError::Lagged(missed)) => {
+                                        // Their transactions stay queued until
+                                        // the builder skips them or they expire.
+                                        warn!(missed, "frame queue missed canonical notifications");
+                                        continue;
+                                    }
+                                };
+                                // A reorg takes blocks off the chain: their
+                                // transactions are offered again.
+                                if let Some(reverted) = notification.reverted() {
+                                    for block in reverted.blocks_iter() {
+                                        n42_node::frame_queue::FrameQueue::global()
+                                            .revert_mined(block.header().number);
+                                    }
+                                }
+                                let committed = notification.committed();
+                                for block in committed.blocks_iter() {
+                                    let hashes: Vec<_> = block
+                                        .body()
+                                        .transactions()
+                                        .map(|tx| *tx.hash())
+                                        .collect();
+                                    n42_node::frame_queue::FrameQueue::global().mark_mined(
+                                        n42_tx_types::FrameStore::global(),
+                                        block.header().number,
+                                        &hashes,
+                                    );
+                                }
+                            }
+                        }),
                     );
                 }
 
@@ -3210,12 +3363,29 @@ fn main() {
                 // into (ingest virtual-block-credit arming).
                 n42_node::register_consensus_service_hooks();
 
-                let el: std::sync::Arc<dyn n42_node::el::ExecutionLayer> = std::sync::Arc::new(
-                    n42_node::el::RethExecutionLayer::new(
-                        beacon_engine_handle,
-                        payload_builder_handle,
-                    ),
-                );
+                // A key that shares its machine with the execution owner asks
+                // the owner instead of executing (import once per host).
+                let el: std::sync::Arc<dyn n42_node::el::ExecutionLayer> =
+                    match n42_node::el::DelegatedExecutionLayer::configured() {
+                        Ok(Some(delegated)) => {
+                            warn!(target: "n42::cli", "N42_EL_OWNER_RPC set: this key does not execute blocks; it reports the execution owner's result");
+                            std::sync::Arc::new(delegated)
+                        }
+                        Ok(None) => std::sync::Arc::new(
+                            n42_node::el::RethExecutionLayer::new(
+                                beacon_engine_handle,
+                                payload_builder_handle,
+                            )
+                            .with_follower_import(follower_import(
+                                full_node.evm_config.clone(),
+                                full_node.provider.clone(),
+                            )),
+                        ),
+                        Err(error) => {
+                            eprintln!("ERROR: {error}");
+                            std::process::exit(1);
+                        }
+                    };
                 let participant_replay_el = Arc::clone(&el);
                 let mut orchestrator = ConsensusOrchestrator::with_execution_layer(
                     consensus_engine,
@@ -3242,7 +3412,10 @@ fn main() {
                         qmdb_execution_store.clone(),
                         full_node.provider.chain_spec(),
                     )
-                    .with_peer_outputs(!authoritative_qmdb_execution),
+                    .with_peer_outputs(!authoritative_qmdb_execution)
+                    .with_shared_execution(
+                        n42_consensus_service::orchestrator::shared_execution_enabled(),
+                    ),
                 ))
                 .with_staking_sink(std::sync::Arc::new(
                     n42_node::sinks::ManagerStakingSink(staking_manager.clone()),
@@ -3482,6 +3655,52 @@ fn main() {
         eprintln!("Error: {err:?}");
         std::process::exit(1);
     }
+}
+
+/// jemalloc's allocated, active, resident, retained, mapped and metadata
+/// bytes, read after advancing its statistics epoch.
+#[cfg(all(feature = "jemalloc", unix))]
+fn jemalloc_counters() -> Vec<(&'static str, u64)> {
+    use std::ffi::{c_char, c_void};
+    // SAFETY: each name is NUL-terminated, and each counter is a size_t read
+    // into a size_t of the length passed.
+    unsafe fn read(name: &[u8]) -> Option<u64> {
+        let mut value: usize = 0;
+        let mut len = std::mem::size_of::<usize>();
+        let rc = unsafe {
+            tikv_jemalloc_sys::mallctl(
+                name.as_ptr() as *const c_char,
+                &mut value as *mut usize as *mut c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0).then_some(value as u64)
+    }
+    let mut epoch: u64 = 1;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: "epoch" takes and returns a u64.
+    unsafe {
+        tikv_jemalloc_sys::mallctl(
+            c"epoch".as_ptr(),
+            &mut epoch as *mut u64 as *mut c_void,
+            &mut len,
+            &mut epoch as *mut u64 as *mut c_void,
+            std::mem::size_of::<u64>(),
+        );
+    }
+    [
+        ("allocated", &b"stats.allocated\0"[..]),
+        ("active", b"stats.active\0"),
+        ("resident", b"stats.resident\0"),
+        ("retained", b"stats.retained\0"),
+        ("mapped", b"stats.mapped\0"),
+        ("metadata", b"stats.metadata\0"),
+    ]
+    .into_iter()
+    .filter_map(|(label, name)| unsafe { read(name) }.map(|bytes| (label, bytes)))
+    .collect()
 }
 
 #[cfg(test)]

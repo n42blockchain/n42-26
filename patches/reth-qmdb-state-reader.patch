@@ -1,8 +1,8 @@
 diff --git a/crates/storage/provider/src/providers/blockchain_provider.rs b/crates/storage/provider/src/providers/blockchain_provider.rs
-index 8a8d33dae..4739bae8f 100644
+index 71a80b4d4..6855b1d98 100644
 --- a/crates/storage/provider/src/providers/blockchain_provider.rs
 +++ b/crates/storage/provider/src/providers/blockchain_provider.rs
-@@ -808,7 +808,7 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
+@@ -843,7 +843,7 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
  
      fn state_by_block_hash(&self, hash: BlockHash) -> ProviderResult<StateProviderBox> {
          trace!(target: "providers::blockchain", ?hash, "Getting state by block hash");
@@ -11,7 +11,7 @@ index 8a8d33dae..4739bae8f 100644
              self.state_provider_for_state(state)
          } else if let Ok(state) = self.history_by_block_hash(hash) {
              // This could be tracked by a historical block
-@@ -819,7 +819,10 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
+@@ -854,7 +854,10 @@ impl<N: ProviderNodeTypes> StateProviderFactory for BlockchainProvider<N> {
          } else {
              // if we couldn't find it anywhere, then we should return an error
              Err(ProviderError::StateForHashNotFound(hash))
@@ -24,7 +24,7 @@ index 8a8d33dae..4739bae8f 100644
  
      /// Returns the state provider for pending state.
 diff --git a/crates/storage/storage-api/src/lib.rs b/crates/storage/storage-api/src/lib.rs
-index f4f8e53af..105c13572 100644
+index 72b221798..a30f5d0f2 100644
 --- a/crates/storage/storage-api/src/lib.rs
 +++ b/crates/storage/storage-api/src/lib.rs
 @@ -11,6 +11,10 @@

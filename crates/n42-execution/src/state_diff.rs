@@ -1,10 +1,10 @@
 use alloy_primitives::{Address, B256, U256};
-use revm::database::BundleState;
+use reth_trie_common::bundle_state::BundleState;
 use std::collections::BTreeMap;
 use tracing::debug;
 
 /// State diff for a single block: all account and storage changes.
-/// Extracted from revm's `BundleState` for incremental sync and state updates.
+/// Extracted from the block's `BundleState` for incremental sync and state updates.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct StateDiff {
     /// Per-account changes in this block.
@@ -93,7 +93,7 @@ impl StateDiff {
         self.accounts.values().map(|a| a.storage.len()).sum()
     }
 
-    /// Extracts a state diff from a revm `BundleState`.
+    /// Extracts a state diff from a `BundleState`.
     ///
     /// The `BundleState` tracks all account and storage changes with their
     /// original values, which allows us to construct a complete before/after diff.
@@ -105,7 +105,7 @@ impl StateDiff {
             let original_info = bundle_account.original_info.as_ref();
             let current_info = bundle_account.info.as_ref();
 
-            // `was_destroyed()` is true for revm's `DestroyedChanged` status — an
+            // `was_destroyed()` is true for the `DestroyedChanged` status — an
             // account SELFDESTRUCTed and then RE-CREATED within the same block
             // (reachable under EIP-6780: create+selfdestruct in one tx, then touch
             // the same address later in the block). In that case `current_info` is
@@ -146,10 +146,10 @@ impl StateDiff {
                 (Some(orig), Some(curr)) if orig.code_hash != curr.code_hash => {
                     Some(ValueChange::new(Some(orig.code_hash), Some(curr.code_hash)))
                 }
-                (None, Some(curr)) if curr.code_hash != revm::primitives::KECCAK_EMPTY => {
+                (None, Some(curr)) if curr.code_hash != alloy_primitives::KECCAK256_EMPTY => {
                     Some(ValueChange::new(None, Some(curr.code_hash)))
                 }
-                (Some(orig), None) if orig.code_hash != revm::primitives::KECCAK_EMPTY => {
+                (Some(orig), None) if orig.code_hash != alloy_primitives::KECCAK256_EMPTY => {
                     Some(ValueChange::new(Some(orig.code_hash), None))
                 }
                 _ => None,
@@ -205,18 +205,19 @@ impl StateDiff {
 mod tests {
     use super::*;
     use alloy_primitives::{Address, B256, U256};
-    use revm::database::states::StorageSlot;
-    use revm::database::{AccountStatus, BundleAccount, BundleState, StorageWithOriginalValues};
-    use revm::state::AccountInfo;
+    use evm2::evm::AccountInfo;
+    use reth_trie_common::bundle_state::{
+        AccountStatus, BundleAccount, BundleState, StorageSlot, StorageWithOriginalValues,
+    };
 
     /// Helper: create an AccountInfo with the given balance and nonce.
     fn make_account_info(balance: u64, nonce: u64) -> AccountInfo {
         AccountInfo {
             balance: U256::from(balance),
             nonce,
-            code_hash: revm::primitives::KECCAK_EMPTY,
+            code_hash: alloy_primitives::KECCAK256_EMPTY,
             code: None,
-            account_id: None,
+            ..AccountInfo::empty()
         }
     }
 
@@ -466,14 +467,14 @@ mod tests {
                 nonce: 1,
                 code_hash: new_hash,
                 code: None,
-                account_id: None,
+                ..AccountInfo::empty()
             }),
             original_info: Some(AccountInfo {
                 balance: U256::from(100),
                 nonce: 1,
                 code_hash: old_hash,
                 code: None,
-                account_id: None,
+                ..AccountInfo::empty()
             }),
             storage: StorageWithOriginalValues::default(),
             status: AccountStatus::Changed,
@@ -682,7 +683,7 @@ mod tests {
     }
 
     /// Helper: an account SELFDESTRUCTed and then RE-CREATED within the same
-    /// block — revm's `DestroyedChanged` status. `was_destroyed()` is true yet
+    /// block — the `DestroyedChanged` status. `was_destroyed()` is true yet
     /// `info` is `Some` (the account exists at block end).
     fn destroyed_then_recreated(
         orig_balance: u64,
@@ -698,7 +699,7 @@ mod tests {
         }
     }
 
-    /// Regression: a destroyed-then-recreated account (revm `DestroyedChanged`,
+    /// Regression: a destroyed-then-recreated account (`DestroyedChanged`,
     /// reachable under EIP-6780) must NOT be classified `Destroyed` — it exists
     /// at block end, and labeling it `Destroyed` would drop the live account
     /// from the state tree (apply_diff pushes `key→None`). It must be `Modified`
@@ -725,7 +726,7 @@ mod tests {
     }
 
     /// A freshly-created account that SELFDESTRUCTs in the same block ends absent
-    /// (revm `Destroyed` with `original_info == None`): net-absent ⇒ `Destroyed`.
+    /// (`Destroyed` with `original_info == None`): net-absent ⇒ `Destroyed`.
     #[test]
     fn test_state_diff_created_then_destroyed_is_absent() {
         let addr = Address::with_last_byte(10);

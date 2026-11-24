@@ -1,47 +1,139 @@
-//! N42 parallel prefix in the existing Ethereum payload lifecycle.
-//! Based on pinned Reth 23316e3ff8adca8c3bd5085ff0565fcae019202a payload builder
-//! plus this workspace's Reth patches. Keep the serial limits/finalization aligned.
+//! The parallel transfer prefix in the payload lifecycle.
+//!
+//! The serial part follows `native_payload::default_n42_payload` (reth v2.11.0
+//! `default_ethereum_payload`); keep its limits and finalization in step with
+//! it. Before the serial loop the pool's leading plain transfers are executed
+//! in sender batches (`n42_execution::parallel_build`) and handed to the
+//! block's executor, which folds their state changes into the block's bundle
+//! when it finishes.
 
-use alloy_consensus::{BlockHeader, Transaction};
-use alloy_evm::ToTxEnv;
-use alloy_primitives::{Bytes, U256};
+use crate::engine_types::N42BuiltPayload;
+use crate::native_payload::{BestTransactionsIter, default_n42_payload};
+use alloy_consensus::transaction::TxHashRef as _;
+use alloy_consensus::{Transaction, TransactionEnvelope as _};
+use alloy_primitives::{Address, B256, Bloom, U256};
 use alloy_rlp::Encodable;
 use alloy_rpc_types_engine::PayloadAttributes as EthPayloadAttributes;
-use n42_execution::N42EvmConfig;
+use n42_execution::{
+    N42EvmConfig,
+    direct_transfer::DirectTransfers,
+    parallel_build::{self, CacheScope},
+};
+use n42_tx_types::{N42Primitives, N42TxEnvelope};
 use reth_basic_payload_builder::{BuildArguments, BuildOutcome, PayloadConfig, is_better_payload};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE;
-use reth_errors::{BlockExecutionError, BlockValidationError, ConsensusError};
-use reth_ethereum_payload_builder::{EthereumBuilderConfig, default_ethereum_payload};
-use reth_ethereum_primitives::{EthPrimitives, TransactionSigned};
+use reth_errors::ConsensusError;
+use reth_ethereum_payload_builder::EthereumBuilderConfig;
 use reth_evm::{
-    ConfigureEvm, Evm, NextBlockEnvAttributes,
-    block::TxResult,
-    execute::{BasicBlockBuilder, BlockBuilder, BlockBuilderOutcome, BlockExecutionOutput},
+    ConfigureEvm, EvmEnv, NextBlockEnvAttributes,
+    database::StateProviderDatabase,
+    execute::{
+        BasicBlockBuilder, BlockAssemblerInput, BlockBuilder, BlockBuilderOutcome,
+        BlockExecutionError, BlockExecutionOutput, BlockExecutor, BlockValidationError,
+    },
 };
 use reth_execution_cache::{CachedStateMetrics, CachedStateMetricsSource, CachedStateProvider};
-use reth_payload_builder::{BlobSidecars, EthBuiltPayload};
+use reth_payload_builder::BlobSidecars;
 use reth_payload_builder_primitives::PayloadBuilderError;
-use reth_payload_primitives::PayloadAttributes;
-use reth_primitives_traits::transaction::error::InvalidTransactionError;
-use reth_revm::{database::StateProviderDatabase, db::State};
+use reth_payload_primitives::PayloadAttributes as _;
+use reth_primitives_traits::{
+    Recovered, RecoveredBlock, transaction::error::InvalidTransactionError,
+};
 use reth_storage_api::{EvmStateProvider, StateProvider, StateProviderFactory};
 use reth_transaction_pool::{
     BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
     ValidPoolTransaction,
     error::{Eip4844PoolTransactionError, InvalidPoolTransactionError},
 };
-use revm::context_interface::{Block as _, Cfg as _};
+use reth_trie_common::updates::TrieUpdates;
 use std::sync::Arc;
 use tracing::{debug, info, trace, warn};
 
-type BestTransactionsIter<Pool> = Box<
-    dyn BestTransactions<Item = Arc<ValidPoolTransaction<<Pool as TransactionPool>::Transaction>>>,
->;
+type Factory = <N42EvmConfig as ConfigureEvm>::BlockExecutorFactory;
+
+fn flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| value == "1")
+}
+
+/// The builder's parts, taken by value so that nothing of it outlives the
+/// call.
+/// Moves the executed candidates, `order` of `candidates`, into the block's
+/// transactions in that order.
+///
+/// A full block's transfers are tens of megabytes of transactions. Moved one
+/// after another into a vector that grows as it goes, they took as long as
+/// the merge of the block's execution (18 ms of a 79 ms prefix); when every
+/// candidate executed, which is the block the batches fill, they are moved
+/// side by side into room made once.
+fn move_executed<T: Send>(
+    mut candidates: Vec<std::sync::OnceLock<T>>,
+    order: &[usize],
+    transactions: &mut Vec<T>,
+) {
+    use rayon::prelude::*;
+    transactions.reserve(order.len());
+    let every_candidate = order.len() == candidates.len()
+        && order.iter().enumerate().all(|(at, &index)| at == index)
+        && candidates.iter().all(|candidate| candidate.get().is_some());
+    if every_candidate && order.len() >= 4_096 {
+        transactions.par_extend(candidates.into_par_iter().map(|candidate| {
+            candidate.into_inner().expect("every candidate was converted: checked above")
+        }));
+        return;
+    }
+    for &index in order {
+        if let Some(tx) = candidates[index].take() {
+            transactions.push(tx);
+        }
+    }
+}
+
+#[expect(clippy::type_complexity)]
+fn into_parts<'a, F, E, A, N>(
+    builder: BasicBlockBuilder<'a, F, E, A, N>,
+) -> (
+    E,
+    F::EvmEnv,
+    Vec<Recovered<reth_primitives_traits::TxTy<N>>>,
+    F::ExecutionCtx<'a>,
+    &'a reth_primitives_traits::SealedHeader<reth_primitives_traits::HeaderTy<N>>,
+    &'a A,
+)
+where
+    F: reth_evm::BlockExecutorFactory + 'a,
+    N: reth_primitives_traits::NodePrimitives,
+{
+    let BasicBlockBuilder {
+        executor,
+        evm_env,
+        transactions,
+        ctx,
+        parent,
+        assembler,
+    } = builder;
+    (executor, evm_env, transactions, ctx, parent, assembler)
+}
 
 pub(crate) fn enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("N42_PARALLEL_BUILD").is_ok_and(|value| value == "1"))
+    *ENABLED.get_or_init(|| flag("N42_PARALLEL_BUILD"))
+}
+
+/// `N42_GRAFT_STREAM=1` grafted each batch's bundle into the block's live
+/// state as the batch ended. The batches' changes are now merged once and
+/// folded into the finished bundle, so there is nothing to stream into: the
+/// switch is reported once and changes nothing.
+fn warn_graft_stream() {
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    REPORTED.call_once(|| {
+        if flag("N42_GRAFT_STREAM") {
+            warn!(
+                target: "n42::payload",
+                "N42_GRAFT_STREAM=1 has no effect: the transfer batches are merged once and folded into the block's bundle at its end"
+            );
+        }
+    });
 }
 
 pub(crate) fn build_with_parallel<Client, Pool, F>(
@@ -49,22 +141,23 @@ pub(crate) fn build_with_parallel<Client, Pool, F>(
     client: Client,
     pool: Pool,
     builder_config: EthereumBuilderConfig,
-    args: BuildArguments<EthPayloadAttributes, EthBuiltPayload>,
+    args: BuildArguments<EthPayloadAttributes, N42BuiltPayload>,
     best_txs: F,
     parallel: bool,
-) -> Result<BuildOutcome<EthBuiltPayload>, PayloadBuilderError>
+) -> Result<BuildOutcome<N42BuiltPayload>, PayloadBuilderError>
 where
     Client: StateProviderFactory + ChainSpecProvider<ChainSpec: EthereumHardforks>,
-    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = TransactionSigned>>,
+    Pool: TransactionPool<Transaction: PoolTransaction<Consensus = N42TxEnvelope>>,
     F: FnOnce(BestTransactionsAttributes) -> BestTransactionsIter<Pool>,
 {
     if !parallel {
-        return default_ethereum_payload(evm_config, client, pool, builder_config, args, best_txs);
+        return default_n42_payload(evm_config, client, pool, builder_config, args, best_txs);
     }
+    warn_graft_stream();
     let BuildArguments {
         mut cached_reads,
         execution_cache,
-        mut state_root_handle,
+        state_root_handle,
         config,
         cancel,
         best_payload,
@@ -76,125 +169,119 @@ where
         ..
     } = config;
     let skip_state_root = builder_config.skip_state_root;
-    // Direct bundle graft does not stream per-tx changes to the incremental root
-    // job. Drop its hook/receiver and compute the complete root at finish.
-    drop(state_root_handle.take());
+    let setup_start = std::time::Instant::now();
+    // The batches' changes reach the block's bundle at its end and are not
+    // streamed to the incremental root job transaction by transaction. Drop
+    // its hook and receiver and compute the complete root at finish.
+    drop(state_root_handle);
 
-    let state_provider = client.state_by_block_hash(parent_header.hash())?;
-    // Reth 2.7 separates the EVM read provider from the full provider used by
-    // block finalization. Open the same immutable parent twice so each API
-    // retains its required owned provider type.
-    let evm_state_provider = client
-        .state_by_block_hash(parent_header.hash())?
-        .into_evm_state_provider();
-    let evm_state_provider: Box<dyn EvmStateProvider + Send> =
-        if let Some(execution_cache) = execution_cache {
-            Box::new(CachedStateProvider::new(
-                evm_state_provider,
-                execution_cache.cache().clone(),
-                // It's ok to recreate the cache every time, because it's cheap to do so for a vanilla
-                // Ethereum builder every 12s.
-                Some(CachedStateMetrics::zeroed(
-                    CachedStateMetricsSource::Builder,
-                )),
-            ))
-        } else {
-            Box::new(evm_state_provider)
-        };
-    let state = StateProviderDatabase::new(evm_state_provider);
+    // An own block that is sealed but not yet in the engine is read from
+    // its published output (`N42_BUILD_ON_OUTPUT=1`).
+    let state_provider = crate::build_on_output::parent_state(&client, parent_header.hash())?;
+    let evm_state_provider = (&state_provider).into_evm_state_provider();
+    let cached_state_provider = execution_cache.map(|execution_cache| {
+        CachedStateProvider::new(
+            &evm_state_provider,
+            execution_cache.cache().clone(),
+            // It's ok to recreate the cache every time, because it's cheap to do so for a vanilla
+            // Ethereum builder every 12s.
+            Some(CachedStateMetrics::zeroed(
+                CachedStateMetricsSource::Builder,
+            )),
+        )
+    });
+    let state = StateProviderDatabase::new(
+        cached_state_provider
+            .as_ref()
+            .map(|provider| provider as &dyn EvmStateProvider)
+            .unwrap_or(&evm_state_provider),
+    );
+    let setup_provider_ms = setup_start.elapsed().as_millis() as u64;
     let chain_spec = client.chain_spec();
     let is_amsterdam = chain_spec.is_amsterdam_active_at_timestamp(attributes.timestamp());
-    let mut db = State::builder()
-        .with_database(cached_reads.as_db_mut(state))
-        .with_bundle_update()
-        .with_bal_builder_if(is_amsterdam)
-        .build();
+    let gas_limit = builder_config
+        .gas_limit_with_target(parent_header.gas_limit, attributes.target_gas_limit());
+    let blob_params = chain_spec.blob_params_at_timestamp(attributes.timestamp());
 
+    debug!(
+        target: "payload_builder",
+        id = %payload_id,
+        parent_header = ?parent_header.hash(),
+        parent_number = parent_header.number,
+        "building payload"
+    );
+
+    let cached_db = cached_reads.as_db_mut(state);
     let evm_config = evm_config.with_jit_support();
-    let next_attributes = NextBlockEnvAttributes {
+    let next_block_env_attributes = NextBlockEnvAttributes {
         timestamp: attributes.timestamp(),
         suggested_fee_recipient: attributes.suggested_fee_recipient,
         prev_randao: attributes.prev_randao,
-        gas_limit: builder_config
-            .gas_limit_with_target(parent_header.gas_limit, attributes.target_gas_limit()),
+        gas_limit,
         parent_beacon_block_root: attributes.parent_beacon_block_root(),
         withdrawals: attributes.withdrawals.clone().map(Into::into),
         extra_data: builder_config.extra_data.clone(),
         slot_number: attributes.slot_number(),
     };
     let batch_env = evm_config
-        .next_evm_env(&parent_header, &next_attributes)
+        .next_evm_env(&parent_header, &next_block_env_attributes)
         .map_err(PayloadBuilderError::other)?;
     let ctx = evm_config
-        .context_for_next_block(&parent_header, next_attributes)
+        .context_for_next_block(&parent_header, next_block_env_attributes)
         .map_err(PayloadBuilderError::other)?;
-    let evm = evm_config.evm_with_env(&mut db, batch_env.clone());
-    let mut builder = BasicBlockBuilder::<
-        <N42EvmConfig as ConfigureEvm>::BlockExecutorFactory,
-        _,
-        _,
-        EthPrimitives,
-    > {
-        executor: evm_config.create_executor(evm, ctx.clone()),
+    let evm = evm_config.evm_with_env(cached_db, batch_env.clone());
+    // Built by hand rather than through `builder_for_next_block`: the prefix
+    // and the H2-v4 finish below need the executor and the builder's parts.
+    let mut builder = BasicBlockBuilder::<Factory, _, _, N42Primitives>::new(
+        evm_config.block_executor_factory(),
+        evm_config.block_assembler(),
+        evm,
+        batch_env.clone(),
+        &parent_header,
         ctx,
-        parent: &parent_header,
-        assembler: evm_config.block_assembler(),
-        transactions: Vec::new(),
-    };
-
-    debug!(target: "payload_builder", id=%payload_id, parent_header = ?parent_header.hash(), parent_number = parent_header.number, "building new payload");
-    let mut cumulative_tx_gas_used = 0;
-    let mut block_regular_gas_used = 0;
-    let mut block_state_gas_used = 0;
-    let block_gas_limit: u64 = builder.evm_mut().block().gas_limit();
-    let tx_gas_limit_cap = builder.evm_mut().cfg_env().tx_gas_limit_cap();
-    let base_fee = builder.evm_mut().block().basefee();
-
-    let mut best_txs = best_txs(BestTransactionsAttributes::new(
-        base_fee,
-        builder
-            .evm_mut()
-            .block()
-            .blob_gasprice()
-            .map(|gasprice| gasprice as u64),
-    ));
-    let mut total_fees = U256::ZERO;
-
-    // If we have a state-root task, wire a state hook that streams per-tx state diffs.
-    if let Some(task) = state_root_handle.as_mut() {
-        builder
-            .evm_mut()
-            .db_mut()
-            .set_state_hook(Some(Box::new(task.take_state_hook())));
+    );
+    if is_amsterdam {
+        builder.executor_mut().enable_block_access_list_builder();
     }
+    let base_fee = builder.evm_env().block_base_fee();
+    let blob_fee = blob_params
+        .as_ref()
+        .map(|_| builder.evm_env().block_blob_base_fee());
+    let separate_block_gas = builder.evm_env().uses_separate_block_gas();
+    let regular_gas_limit_cap = builder.evm_env().regular_gas_limit_cap();
 
+    let setup_env_ms = setup_start.elapsed().as_millis() as u64 - setup_provider_ms;
+    let best_start = std::time::Instant::now();
+    let mut best_txs = best_txs(BestTransactionsAttributes::new(base_fee, blob_fee));
+    let setup_best_ms = best_start.elapsed().as_millis() as u64;
+
+    let pre_execution_start = std::time::Instant::now();
     builder.apply_pre_execution_changes().map_err(|err| {
         warn!(target: "payload_builder", %err, "failed to apply pre-execution changes");
         PayloadBuilderError::Internal(err.into())
     })?;
+    let setup_pre_execution_ms = pre_execution_start.elapsed().as_millis() as u64;
 
+    let mut total_fees = U256::ZERO;
+    let mut cumulative_tx_gas_used = 0u64;
+    let mut block_regular_gas_used = 0u64;
+    let mut block_state_gas_used = 0u64;
     // initialize empty blob sidecars at first. If cancun is active then this will be populated by
     // blob sidecars if any.
     let mut blob_sidecars = BlobSidecars::Empty;
-
     let mut block_blob_count = 0;
     let mut block_transactions_rlp_length = 0;
-
-    let blob_params = chain_spec.blob_params_at_timestamp(attributes.timestamp);
     let protocol_max_blob_count = blob_params
         .as_ref()
         .map(|params| params.max_blob_count)
-        .unwrap_or_else(Default::default);
-
+        .unwrap_or_default();
     // Apply user-configured blob limit (EIP-7872)
     // Per EIP-7872: if the minimum is zero, set it to one
     let max_blob_count = builder_config
         .max_blobs_per_block
         .map(|user_limit| std::cmp::min(user_limit, protocol_max_blob_count).max(1))
         .unwrap_or(protocol_max_blob_count);
-
-    let is_osaka = chain_spec.is_osaka_active_at_timestamp(attributes.timestamp);
-
+    let is_osaka = chain_spec.is_osaka_active_at_timestamp(attributes.timestamp());
     let withdrawals_rlp_length = attributes
         .withdrawals
         .as_ref()
@@ -220,18 +307,27 @@ where
     let mut tx_count: usize = 0;
 
     let packing_start = std::time::Instant::now();
+    let setup_ms = setup_start.elapsed().as_millis() as u64;
     let mut evm_exec_total = std::time::Duration::ZERO;
     let mut iter_total = std::time::Duration::ZERO;
     let mut consensus_total = std::time::Duration::ZERO;
 
-    // Optimization 1: Stop processing new arrivals during packing.
-    // The iterator already holds a snapshot; new txs arriving mid-pack only add
-    // overhead via broadcast channel polling (48K × try_recv calls).
+    // Stop processing new arrivals during packing. The iterator already holds
+    // a snapshot; new txs arriving mid-pack only add overhead via broadcast
+    // channel polling.
     best_txs.no_updates();
 
-    let mut graft_reverts = Vec::new();
+    // False once a batch was handed over without its accounts in the
+    // executor's cache: nothing may then read them from it.
+    let mut serial_allowed = true;
+    // Transactions root of a block that is exactly the parallel prefix, derived
+    // on a helper thread while the prefix is committed: (transaction count, job).
+    let mut early_transactions_root: Option<(usize, std::thread::JoinHandle<B256>)> = None;
     let mut replay = std::collections::VecDeque::new();
+    // The batches reproduce Cancun to Osaka; Amsterdam's block access list
+    // needs every transaction's own changes.
     if chain_spec.is_cancun_active_at_timestamp(attributes.timestamp()) && !is_amsterdam {
+        let beneficiary = batch_env.block.beneficiary;
         let mut candidates = Vec::new();
         let mut keys = Vec::new();
         let mut lengths = Vec::new();
@@ -251,15 +347,18 @@ where
                 replay.push_back(pool_tx);
                 break;
             };
-            let plain = pool_tx.tx_type() <= 2
+            // 0x50 executes as an EIP-1559 call from its key's address
+            // (`n42_tx_types::execution`), so a plain 0x50 transfer is one too.
+            let plain = (pool_tx.tx_type() <= 2
+                || pool_tx.tx_type() == n42_tx_types::ALT_SIG_TX_TYPE_ID)
                 && pool_tx.transaction.input().is_empty()
                 && pool_tx
                     .transaction
                     .access_list()
                     .is_none_or(|list| list.is_empty())
                 && pool_tx.sender() != to
-                && pool_tx.sender() != batch_env.block_env.beneficiary
-                && to != batch_env.block_env.beneficiary;
+                && pool_tx.sender() != beneficiary
+                && to != beneficiary;
             let length = if is_osaka {
                 pool_tx.transaction.consensus_ref().inner().length()
             } else {
@@ -267,7 +366,7 @@ where
             };
             // Reserve declared gas, which bounds actual gas even when candidates
             // are refused. The ordinary loop can spend any unused capacity later.
-            let fits = pool_tx.gas_limit() <= block_gas_limit.saturating_sub(reserved_gas)
+            let fits = pool_tx.gas_limit() <= gas_limit.saturating_sub(reserved_gas)
                 && reserved_rlp
                     .saturating_add(length)
                     .saturating_add(withdrawals_rlp_length)
@@ -284,66 +383,192 @@ where
             candidates.push(pool_tx);
         }
         if !candidates.is_empty() {
-            let prestate = builder.evm_mut().db_mut().cache.clone();
             let batch_started = std::time::Instant::now();
-            let run = n42_execution::parallel_transfer::execute_for_build(
+            // Each candidate as the block carries it, kept from its
+            // conversion on the batch's thread.
+            let consensus: Vec<std::sync::OnceLock<Recovered<N42TxEnvelope>>> =
+                (0..candidates.len()).map(|_| std::sync::OnceLock::new()).collect();
+            let convert = |i: usize| {
+                let tx = consensus[i].get_or_init(|| candidates[i].to_consensus());
+                Recovered::new_unchecked(n42_tx_types::execution::evm_tx_of(tx.inner()), tx.signer())
+            };
+            // Every batch reads the block's parent. A pre-execution system
+            // call that changed a batch account is caught by the cache half
+            // below, and the candidates then run serially.
+            let open = || {
+                let provider =
+                    crate::build_on_output::parent_state(&client, parent_header.hash()).ok()?;
+                Some(StateProviderDatabase::new(provider.into_evm_state_provider()))
+            };
+            // N42_GRAFT_NO_CACHE=1: a batch that fills the block, in a block
+            // without withdrawals, is not written into the executor's cache.
+            // Nothing may read a batch account from the executor afterwards,
+            // so the serial loop below does not run for such a block.
+            static NO_CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let keeps_cache = !(*NO_CACHE.get_or_init(|| flag("N42_GRAFT_NO_CACHE"))
+                && candidates.len() >= max_txs_per_block
+                && attributes
+                    .withdrawals
+                    .as_ref()
+                    .is_none_or(|withdrawals| withdrawals.is_empty()));
+            static ROOT_EARLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if !keeps_cache && *ROOT_EARLY.get_or_init(|| flag("N42_TX_ROOT_EARLY")) {
+                // No serial transaction follows a prefix that drops the cache
+                // copy, so the candidates are the block's whole transaction
+                // list when all of them execute. Hash them beside the execution.
+                let pooled = candidates.clone();
+                let job = std::thread::Builder::new()
+                    .name("tx-root".into())
+                    .spawn(move || {
+                        let started = std::time::Instant::now();
+                        let txs: Vec<_> =
+                            pooled.iter().map(|tx| tx.to_consensus().into_inner()).collect();
+                        let root = alloy_consensus::proofs::calculate_transaction_root(&txs);
+                        metrics::histogram!("n42_payload_builder_tx_root_ms")
+                            .record(started.elapsed().as_secs_f64() * 1000.0);
+                        debug!(target: "payload_builder", tx_root_ms = started.elapsed().as_millis() as u64, "early transactions root derived");
+                        root
+                    })
+                    .map_err(PayloadBuilderError::other)?;
+                early_transactions_root = Some((candidates.len(), job));
+            }
+            let batch_config = parallel_build::batch_config(&evm_config);
+            let direct =
+                DirectTransfers::for_env(&batch_env, n42_execution::direct_transfer::shape_of);
+            let run = parallel_build::execute_batches(
+                &batch_config,
                 &batch_env,
                 &keys,
-                &|i| {
-                    let tx = candidates[i].to_consensus();
-                    let env = tx.to_tx_env();
-                    (tx, env)
-                },
-                &|| {
-                    let provider = client.state_by_block_hash(parent_header.hash()).ok()?;
-                    Some(
-                        State::builder()
-                            .with_database(StateProviderDatabase::new(
-                                provider.into_evm_state_provider(),
-                            ))
-                            .with_cached_prestate(prestate.clone())
-                            .build(),
-                    )
-                },
-            )
-            .map_err(PayloadBuilderError::other)?;
+                &convert,
+                &open,
+                direct.as_ref(),
+            );
             if cancel.is_cancelled() {
                 return Ok(BuildOutcome::Cancelled);
             }
-            let accepted = run.executed.len();
-            let batches = run.phases.batches;
-            let skipped: Vec<_> = run.skipped.iter().map(|&i| candidates[i].clone()).collect();
-            for executed in &run.executed {
-                let fee = executed.tx.effective_tip_per_gas(base_fee).ok_or_else(|| {
-                    PayloadBuilderError::other(std::io::Error::other(
-                        "invalid executed transfer fee",
-                    ))
-                })?;
-                total_fees += U256::from(fee) * U256::from(executed.gas_used);
-                cumulative_tx_gas_used += executed.gas_used;
-                block_regular_gas_used += executed.result.gas().block_regular_gas_used();
-                block_state_gas_used += executed.result.gas().block_state_gas_used();
-                block_transactions_rlp_length += lengths[executed.index];
+            let run_ms = batch_started.elapsed().as_millis() as u64;
+            let commit_started = std::time::Instant::now();
+            // The run handed to the executor: the cache half, the receipts
+            // and the merge its finish folds. A refusal that leaves the
+            // executor as it was gives every candidate to the serial loop.
+            let handed = run.and_then(|run| {
+                let parallel_build::ParallelRun {
+                    executed,
+                    skipped,
+                    merged,
+                    touched,
+                    phases,
+                } = run;
+                // Each transfer's hash, type and fee are read out of its
+                // transaction side by side: one after another, a full block's
+                // 95,000 scattered transactions took about 4 ms.
+                let spent: Vec<(usize, u64)> = executed
+                    .iter()
+                    .map(|executed| (executed.index, executed.result.tx_gas_used()))
+                    .collect();
+                let entries = {
+                    use rayon::prelude::*;
+                    spent
+                        .par_iter()
+                        .with_min_len(2048)
+                        .map(|&(index, gas_used)| {
+                            let tx = consensus[index].get().ok_or_else(|| {
+                                parallel_build::Refused::Commit(
+                                    "an executed transfer was not converted".to_owned(),
+                                )
+                            })?;
+                            let fee = tx.effective_tip_per_gas(base_fee).ok_or_else(|| {
+                                parallel_build::Refused::Commit(
+                                    "invalid executed transfer fee".to_owned(),
+                                )
+                            })?;
+                            Ok::<_, parallel_build::Refused>((
+                                *tx.tx_hash(),
+                                tx.tx_type(),
+                                U256::from(fee) * U256::from(gas_used),
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, parallel_build::Refused>>()?
+                };
+                let fees = entries
+                    .iter()
+                    .fold(U256::ZERO, |fees, (_, _, fee)| fees + *fee);
+                let order: Vec<usize> = spent.iter().map(|(index, _)| *index).collect();
+                let results = entries
+                    .into_iter()
+                    .zip(executed)
+                    .map(|((hash, tx_type, _), executed)| (hash, tx_type, executed.result));
+                let scope = if keeps_cache {
+                    CacheScope::All
+                } else {
+                    CacheScope::Only(&[])
+                };
+                let committed =
+                    parallel_build::commit_run(&mut builder.executor, results, merged, touched, scope)?;
+                Ok((order, skipped, fees, committed, phases))
+            });
+            let commit_ms = commit_started.elapsed().as_millis() as u64;
+            match handed {
+                Ok((order, skipped, fees, committed, phases)) => {
+                    let accepted = order.len();
+                    // The job hashed every candidate; its root stands only if
+                    // all of them executed (they keep candidate order in the
+                    // block).
+                    if accepted != candidates.len() {
+                        early_transactions_root = None;
+                    }
+                    total_fees += fees;
+                    cumulative_tx_gas_used += committed.gas_used;
+                    block_regular_gas_used += committed.regular_gas_used;
+                    block_state_gas_used += committed.state_gas_used;
+                    block_transactions_rlp_length +=
+                        order.iter().map(|&index| lengths[index]).sum::<usize>();
+                    let moved_started = std::time::Instant::now();
+                    move_executed(consensus, &order, &mut builder.transactions);
+                    let moved_ms = moved_started.elapsed().as_millis() as u64;
+                    serial_allowed = keeps_cache;
+                    tx_count = accepted;
+                    let tail = std::mem::take(&mut replay);
+                    replay.extend(skipped.iter().map(|&i| candidates[i].clone()));
+                    replay.extend(tail);
+                    evm_exec_total += batch_started.elapsed();
+                    metrics::counter!("n42_parallel_payload_executed_total")
+                        .increment(accepted as u64);
+                    metrics::histogram!("n42_parallel_payload_batch_ms")
+                        .record(batch_started.elapsed().as_secs_f64() * 1_000.0);
+                    info!(target: "n42::payload", accepted, skipped = replay.len(),
+                        batches = phases.batches,
+                        run_ms,
+                        commit_ms,
+                        keeps_cache,
+                        total_ms = batch_started.elapsed().as_millis() as u64,
+                        partition_ms = phases.partition_ms,
+                        groups_ms = phases.groups_ms,
+                        open_ms_sum = phases.open_ms_sum,
+                        run_ms_sum = phases.run_ms_sum,
+                        batch_merge_ms_sum = phases.batch_merge_ms_sum,
+                        batch_ms_max = phases.batch_ms_max,
+                        collect_ms = phases.collect_ms,
+                        merge_ms = phases.merge_ms,
+                        moved_ms,
+                        direct_hits = phases.direct_hits,
+                        direct_delegated = phases.direct_delegated,
+                        "parallel transfer prefix executed; not a consensus commit");
+                }
+                Err(refused) if refused.executor_untouched() => {
+                    // Nothing of the run was kept: the serial loop takes the
+                    // candidates in their order.
+                    early_transactions_root = None;
+                    metrics::counter!("n42_parallel_payload_refused_total", "reason" => refused.reason())
+                        .increment(1);
+                    warn!(target: "n42::payload", %refused, candidates = candidates.len(),
+                        "parallel transfer prefix refused; its candidates are built serially");
+                    let tail = std::mem::take(&mut replay);
+                    replay.extend(candidates);
+                    replay.extend(tail);
+                }
+                Err(refused) => return Err(PayloadBuilderError::other(refused)),
             }
-            let (transactions, graft) = n42_execution::parallel_block::commit_transfer_batch(
-                &mut builder.executor,
-                run,
-                batch_env.block_env.beneficiary,
-                |tx| (*tx.tx_hash(), tx.tx_type()),
-            )
-            .map_err(PayloadBuilderError::other)?;
-            builder.transactions.extend(transactions);
-            graft_reverts = graft.reverts;
-            tx_count = accepted;
-            let tail = std::mem::take(&mut replay);
-            replay.extend(skipped);
-            replay.extend(tail);
-            evm_exec_total += batch_started.elapsed();
-            metrics::counter!("n42_parallel_payload_executed_total").increment(accepted as u64);
-            metrics::histogram!("n42_parallel_payload_batch_ms")
-                .record(batch_started.elapsed().as_secs_f64() * 1_000.0);
-            info!(target: "n42::payload", accepted, skipped = replay.len(), batches,
-                "parallel transfer prefix executed; not a consensus commit");
         }
     }
     let mut best_txs = ReplayTransactions {
@@ -357,7 +582,7 @@ where
         iter_total += iter_start.elapsed();
         tx
     } {
-        if tx_count >= max_txs_per_block {
+        if tx_count >= max_txs_per_block || !serial_allowed {
             break;
         }
         // Check build time budget every 256 transactions to avoid per-tx syscall overhead.
@@ -365,25 +590,27 @@ where
             debug!(target: "payload_builder", tx_count, "build time budget exceeded, stopping packing");
             break;
         }
-        // ensure we still have capacity for this transaction
-        let exceeds_gas_limit = if is_amsterdam {
-            let regular_available_gas = block_gas_limit.saturating_sub(block_regular_gas_used);
-            let state_available_gas = block_gas_limit.saturating_sub(block_state_gas_used);
-            let regular_tx_gas_limit = pool_tx.gas_limit().min(tx_gas_limit_cap);
+        // check if the job was cancelled, if so we can exit early
+        if cancel.is_cancelled() {
+            return Ok(BuildOutcome::Cancelled);
+        }
 
-            if regular_tx_gas_limit > regular_available_gas {
-                Some((regular_tx_gas_limit, regular_available_gas))
-            } else if pool_tx.gas_limit() > state_available_gas {
-                Some((pool_tx.gas_limit(), state_available_gas))
+        // ensure we still have capacity for this transaction
+        let exceeds_gas_limit = if separate_block_gas {
+            let regular_available = gas_limit.saturating_sub(block_regular_gas_used);
+            let state_available = gas_limit.saturating_sub(block_state_gas_used);
+            let regular_limit = pool_tx.gas_limit().min(regular_gas_limit_cap);
+            if regular_limit > regular_available {
+                Some((regular_limit, regular_available))
+            } else if pool_tx.gas_limit() > state_available {
+                Some((pool_tx.gas_limit(), state_available))
             } else {
                 None
             }
         } else {
-            let block_available_gas = block_gas_limit.saturating_sub(cumulative_tx_gas_used);
-            (pool_tx.gas_limit() > block_available_gas)
-                .then_some((pool_tx.gas_limit(), block_available_gas))
+            let available = gas_limit.saturating_sub(cumulative_tx_gas_used);
+            (pool_tx.gas_limit() > available).then_some((pool_tx.gas_limit(), available))
         };
-
         if let Some((transaction_gas_limit, block_available_gas)) = exceeds_gas_limit {
             // we can't fit this transaction into the block, so we need to mark it as invalid
             // which also removes all dependent transaction from the iterator before we can
@@ -398,25 +625,18 @@ where
             continue;
         }
 
-        // check if the job was cancelled, if so we can exit early
-        if cancel.is_cancelled() {
-            return Ok(BuildOutcome::Cancelled);
-        }
-
-        // Optimization 3: Defer to_consensus() conversion — only needed for txs
-        // that pass the gas check above. Also track its cost separately.
+        // Converted only for transactions that pass the gas check above; the
+        // cost is tracked on its own.
         let consensus_start = std::time::Instant::now();
         let tx = pool_tx.to_consensus();
         consensus_total += consensus_start.elapsed();
 
-        // Optimization 2: Skip RLP length computation and block size check
-        // for non-Osaka chains. The MAX_RLP_BLOCK_SIZE limit only applies to Osaka.
-        // This saves ~2µs/tx of RLP encoding traversal.
+        // MAX_RLP_BLOCK_SIZE applies from Osaka only: the RLP length is not
+        // computed before it (about 2 us a transaction).
         let tx_rlp_len = if is_osaka {
             let len = tx.inner().length();
             let estimated_block_size_with_tx =
-                block_transactions_rlp_length + len + withdrawals_rlp_length + 1024;
-
+                block_transactions_rlp_length + len + withdrawals_rlp_length + 1024; // 1Kb of overhead for the block header
             if estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
                 best_txs.mark_invalid(
                     &pool_tx,
@@ -436,14 +656,18 @@ where
         // the EIP-4844 can still fit in the block
         let mut blob_tx_sidecar = None;
         let tx_blob_count = tx.blob_count();
-
         if let Some(tx_blob_count) = tx_blob_count {
             if block_blob_count + tx_blob_count > max_blob_count {
                 // we can't fit this _blob_ transaction into the block, so we mark it as
                 // invalid, which removes its dependent transactions from
                 // the iterator. This is similar to the gas limit condition
                 // for regular transactions above.
-                trace!(target: "payload_builder", tx=?tx.hash(), ?block_blob_count, "skipping blob transaction because it would exceed the max blob count per block");
+                trace!(
+                    target: "payload_builder",
+                    tx = ?tx.hash(),
+                    ?block_blob_count,
+                    "skipping blob transaction because it would exceed the max blob count per block"
+                );
                 best_txs.mark_invalid(
                     &pool_tx,
                     InvalidPoolTransactionError::Eip4844(
@@ -488,12 +712,8 @@ where
 
         let miner_fee = tx.effective_tip_per_gas(base_fee);
         let tx_hash = *tx.tx_hash();
-
-        let mut tx_regular_gas_used = 0;
         let evm_start = std::time::Instant::now();
-        let gas_output = match builder.execute_transaction_with_result_closure(tx, |result| {
-            tx_regular_gas_used = result.result().result.gas().block_regular_gas_used();
-        }) {
+        let gas_output = match builder.execute_transaction(tx) {
             Ok(gas_output) => gas_output,
             Err(BlockExecutionError::Validation(BlockValidationError::InvalidTx {
                 error, ..
@@ -555,7 +775,7 @@ where
         let miner_fee = miner_fee.expect("fee is always valid; execution succeeded");
         total_fees += U256::from(miner_fee) * U256::from(gas_used);
         cumulative_tx_gas_used += gas_used;
-        block_regular_gas_used += tx_regular_gas_used;
+        block_regular_gas_used += gas_output.regular_gas_used();
         block_state_gas_used += gas_output.state_gas_used();
         tx_count += 1;
 
@@ -564,6 +784,7 @@ where
             blob_sidecars.push_sidecar_variant(sidecar.as_ref().clone());
         }
     }
+
 
     let packing_elapsed = packing_start.elapsed();
     let other_ms = packing_elapsed
@@ -582,6 +803,11 @@ where
         iter_ms = iter_total.as_millis() as u64,
         consensus_ms = consensus_total.as_millis() as u64,
         other_ms,
+        setup_ms,
+        setup_provider_ms,
+        setup_env_ms,
+        setup_best_ms,
+        setup_pre_execution_ms,
         "N42_PAYLOAD_PACK: tx packing complete"
     );
 
@@ -600,52 +826,154 @@ where
         });
     }
 
+    let finish_start = std::time::Instant::now();
+    let mut built_gov5_roots = None;
     let BlockBuilderOutcome {
         execution_result,
+        execution_state,
         block,
         block_access_list,
         ..
-    } = if skip_state_root {
+    } = if skip_state_root && !is_amsterdam && crate::payload::builder_state_root_replaced() {
+        // H2-v4 normalization overwrites both the state root (QMDB root) and the
+        // receipts root (Gov5 flat receipts hash) of every built block, and only
+        // the normalized block is proposed. The upstream finish would still hash
+        // the post state and build the MPT receipts trie; skip both. This mirrors
+        // `BasicBlockBuilder::finish_with_state_root` without those two steps;
+        // Amsterdam (block access lists) is excluded above and takes the
+        // upstream path.
+        let (executor, evm_env, transactions, ctx, parent, assembler) = into_parts(builder);
+        let BlockExecutionOutput {
+            state: execution_state,
+            result: execution_result,
+        } = executor.finish()?;
+        let executor_finish_ms = finish_start.elapsed().as_millis() as u64;
+        let receipts_started = std::time::Instant::now();
+        let receipts_root = n42_network::gov5_native_receipts_root(&execution_result.receipts);
+        let receipts_root_ms = receipts_started.elapsed().as_millis() as u64;
+        // The QMDB root that replaces this block's state root depends only on
+        // the state changes, which are final here. Derive it beside the block
+        // assembly instead of after the payload has been handed over.
+        let qmdb_root_job = crate::payload::builder_qmdb_store()
+            .filter(|_| !n42_consensus_service::orchestrator::shared_execution_enabled())
+            .map(|store| {
+                let context = n42_execution::restored_slots_execution_key(
+                    ctx.parent_hash,
+                    n42_execution::restored_slots_env_key(&evm_env.block),
+                    ctx.parent_beacon_block_root,
+                    ctx.withdrawals.as_deref(),
+                    [],
+                );
+                let key = n42_execution::restored_slots_key(
+                    context,
+                    transactions.iter().map(|tx| *tx.tx_hash()),
+                );
+                (store, key, ctx.parent_hash)
+            });
+        let prague = chain_spec.is_prague_active_at_timestamp(attributes.timestamp());
+        let bundle_state = &execution_state;
+        let (qmdb_root, block) = std::thread::scope(|scope| {
+            let qmdb_root = qmdb_root_job.map(|(store, key, parent_hash)| {
+                scope.spawn(move || {
+                    let started = std::time::Instant::now();
+                    let restored = n42_execution::restored_slots_for(key).unwrap_or_default();
+                    let operations =
+                        crate::exec_cache::gov5_sorted_operations(bundle_state, &restored, prague);
+                    // A parent built just before this block may still be
+                    // committing its own candidate, the one the store holds.
+                    crate::build_on_output::wait_parent_committed(store, parent_hash);
+                    let root = store.prepare_bound_candidate(parent_hash, operations, key);
+                    metrics::histogram!("n42_payload_builder_qmdb_root_ms")
+                        .record(started.elapsed().as_secs_f64() * 1000.0);
+                    root
+                })
+            });
+            let assemble_started = std::time::Instant::now();
+            // Used only when the block holds exactly the transactions the job
+            // hashed; a panicked job falls back to the assembler's own root.
+            let transactions_root = early_transactions_root
+                .take()
+                .filter(|(count, _)| *count == transactions.len())
+                .and_then(|(_, job)| job.join().ok());
+            let root_join_ms = assemble_started.elapsed().as_millis() as u64;
+            let mut logs_bloom = Bloom::ZERO;
+            for log in execution_result.receipts.iter().flat_map(|r| &r.logs) {
+                logs_bloom.accrue_log(log);
+            }
+            let (transactions, senders): (Vec<_>, Vec<Address>) =
+                transactions.into_iter().map(|tx| tx.into_parts()).unzip();
+            let block = assembler
+                .assemble_block(
+                    BlockAssemblerInput::<Factory>::new(
+                        evm_env,
+                        ctx,
+                        parent,
+                        transactions,
+                        &execution_result,
+                        bundle_state,
+                        state_provider.as_ref(),
+                        parent_header.state_root,
+                        None,
+                    ),
+                    transactions_root,
+                    Some(receipts_root),
+                    Some(logs_bloom),
+                )
+                .map(|block| RecoveredBlock::new_unhashed(block, senders));
+            let assemble_ms = assemble_started.elapsed().as_millis() as u64 - root_join_ms;
+            let qmdb_root = qmdb_root.map(|job| job.join());
+            info!(
+                target: "payload_builder",
+                executor_finish_ms,
+                receipts_root_ms,
+                early_tx_root = transactions_root.is_some(),
+                root_join_ms,
+                assemble_ms,
+                root_wait_ms = assemble_started.elapsed().as_millis() as u64 - assemble_ms,
+                "N42_PAYLOAD_FINISH: block finish stages"
+            );
+            (qmdb_root, block)
+        });
+        let block = block?;
+        match qmdb_root {
+            Some(Ok(Ok(state_root))) => built_gov5_roots = Some((state_root, receipts_root)),
+            // Normalization derives the root again and reports the failure.
+            Some(Ok(Err(error))) => {
+                warn!(target: "payload_builder", id = %payload_id, %error, "builder could not derive the QMDB root")
+            }
+            Some(Err(_)) => {
+                warn!(target: "payload_builder", id = %payload_id, "QMDB root worker panicked in the builder")
+            }
+            None => {}
+        }
+        BlockBuilderOutcome {
+            execution_result,
+            execution_state,
+            hashed_state: Default::default(),
+            trie_updates: Default::default(),
+            block,
+            block_access_list: None,
+        }
+    } else if skip_state_root {
         debug!(
             target: "payload_builder",
             id = %payload_id,
-            state_root = ?parent_header.state_root(),
+            state_root = ?parent_header.state_root,
             "skipping payload state-root computation"
         );
         builder.finish(
             state_provider.as_ref(),
-            Some((parent_header.state_root(), Default::default())),
+            Some((parent_header.state_root, TrieUpdates::default())),
         )?
-    } else if let Some(mut task) = state_root_handle {
-        // Drop the state hook, which signals the state-root task to finalize.
-        builder.evm_mut().db_mut().set_state_hook(None);
-
-        // The state-root task has been computing incrementally alongside tx execution.
-        // This recv() waits for the final root hash — most work is already done.
-        // Fall back to sync state root if the trie pipeline fails.
-        match task.state_root() {
-            Ok(outcome) => {
-                debug!(target: "payload_builder", id=%payload_id, state_root=?outcome.state_root, job = task.name(), "received state root from state-root job");
-                builder.finish(
-                    state_provider.as_ref(),
-                    Some((
-                        outcome.state_root,
-                        Arc::unwrap_or_clone(outcome.trie_updates),
-                    )),
-                )?
-            }
-            Err(err) => {
-                warn!(target: "payload_builder", id=%payload_id, %err, "state-root job failed, falling back to sync state root");
-                builder.finish(state_provider.as_ref(), None)?
-            }
-        }
     } else {
         builder.finish(state_provider.as_ref(), None)?
     };
 
-    // Extract requests before moving execution_result into cache.
+    let finish_ms = finish_start.elapsed().as_secs_f64() * 1000.0;
+    metrics::histogram!("n42_payload_builder_finish_ms").record(finish_ms);
+
     let requests = chain_spec
-        .is_prague_active_at_timestamp(attributes.timestamp)
+        .is_prague_active_at_timestamp(attributes.timestamp())
         .then(|| execution_result.requests.clone());
 
     if cancel.is_cancelled() {
@@ -658,36 +986,53 @@ where
         }));
     }
 
-    // Cache execution output for leader's new_payload AND broadcast to followers.
-    // Use the recovered block by reference — it is still needed to build the payload below,
-    // so we must not consume it via into_sealed_block().
+    // Retain the transaction root and execution output so this node's import
+    // and compact followers can reuse work already authenticated by the
+    // leader's sealed block hash.
+    let cache_start = std::time::Instant::now();
+    let block_hash = block.hash();
+    let transactions_root = block.header().transactions_root;
+    let senders = block.senders().to_vec();
+    let execution_output = BlockExecutionOutput {
+        state: execution_state,
+        result: execution_result,
+    };
+    reth_evm::payload_cache::store_payload_transactions_root(block_hash, transactions_root);
+    if let Some(roots) = built_gov5_roots {
+        crate::exec_cache::store_built_gov5_roots(block_hash, roots);
+    }
+    // The second copy exists to be sent to peers. A block whose roots the
+    // H2-v4 normalization replaces is sent without its output unless shared
+    // execution is on; the normalization then borrows the copy kept for this
+    // node's own import.
+    if !crate::payload::builder_state_root_replaced()
+        || n42_consensus_service::orchestrator::shared_execution_enabled()
     {
-        let mut bundle_state = db.take_bundle();
-        n42_execution::parallel_transfer::append_reverts(&mut bundle_state, graft_reverts);
-        let block_hash = block.hash();
-        let transactions_root = block.header().transactions_root();
-        let senders = block.senders().to_vec();
-        let execution_output = BlockExecutionOutput {
-            state: bundle_state,
-            result: execution_result,
-        };
-        reth_evm::payload_cache::store_payload_transactions_root(block_hash, transactions_root);
         reth_evm::payload_cache::store_broadcast_execution(
             block_hash,
             (execution_output.clone(), senders.clone()),
         );
-        reth_evm::payload_cache::store_payload_execution(block_hash, (execution_output, senders));
-        info!(
-            target: "payload_builder",
-            %block_hash,
-            "N42_PAYLOAD_CACHE: cached execution output for new_payload + broadcast"
-        );
     }
-    debug!(target: "payload_builder", id=%payload_id, sealed_block_header = ?block.sealed_header(), "sealed built block");
+    reth_evm::payload_cache::store_payload_execution(block_hash, (execution_output, senders));
+    let cache_ms = cache_start.elapsed().as_secs_f64() * 1000.0;
+    metrics::histogram!("n42_payload_builder_cache_ms").record(cache_ms);
+    info!(
+        target: "payload_builder",
+        %block_hash,
+        finish_ms,
+        cache_ms,
+        "N42_PAYLOAD_CACHE: cached execution output for new_payload + broadcast"
+    );
 
-    let block_access_list: Option<Bytes> =
-        block_access_list.map(|block_access_list| alloy_rlp::encode(&block_access_list).into());
-    let payload = EthBuiltPayload::new(Arc::new(block), total_fees, requests, block_access_list)
+    debug!(
+        target: "payload_builder",
+        id = %payload_id,
+        sealed_block_header = ?block.sealed_header(),
+        "sealed built block"
+    );
+
+    let block_access_list = block_access_list.map(|bal| bal.split().1);
+    let payload = N42BuiltPayload::new(Arc::new(block), total_fees, requests, block_access_list)
         // add blob sidecars from the executed txs
         .with_sidecars(blob_sidecars);
 
@@ -744,14 +1089,112 @@ impl<T: PoolTransaction> BestTransactions for ReplayTransactions<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_pool::N42PooledTransaction;
+
+    fn candidates_of(values: &[Option<u64>]) -> Vec<std::sync::OnceLock<[u64; 40]>> {
+        values
+            .iter()
+            .map(|value| {
+                let cell = std::sync::OnceLock::new();
+                if let Some(value) = value {
+                    let _ = cell.set([*value; 40]);
+                }
+                cell
+            })
+            .collect()
+    }
+
+    /// The executed candidates reach the block in `order`, after what the
+    /// block already holds, whether all of them executed or some did not.
+    #[test]
+    fn executed_candidates_move_into_the_block_in_order() {
+        let serial = |candidates: &[Option<u64>], order: &[usize]| {
+            let mut cells = candidates_of(candidates);
+            let mut out = vec![[7u64; 40]];
+            for &index in order {
+                if let Some(tx) = cells[index].take() {
+                    out.push(tx);
+                }
+            }
+            out
+        };
+        let moved = |candidates: &[Option<u64>], order: &[usize]| {
+            let mut out = vec![[7u64; 40]];
+            move_executed(candidates_of(candidates), order, &mut out);
+            out
+        };
+        // A full run, large enough for the side-by-side move, and a small one.
+        for n in [10_000usize, 5] {
+            let all: Vec<_> = (0..n as u64).map(Some).collect();
+            let order: Vec<usize> = (0..n).collect();
+            assert_eq!(moved(&all, &order), serial(&all, &order));
+            // Some candidates were skipped.
+            let some: Vec<usize> = (0..n).filter(|index| index % 3 != 1).collect();
+            assert_eq!(moved(&all, &some), serial(&all, &some));
+            // A candidate that was never converted is left out, as before.
+            let mut holed = all.clone();
+            holed[n / 2] = None;
+            assert_eq!(moved(&holed, &order), serial(&holed, &order));
+        }
+        assert_eq!(moved(&[], &[]), serial(&[], &[]));
+    }
+
+    /// `cargo test --release -p n42-node --lib moving_a_full_block -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing"]
+    fn moving_a_full_block_of_executed_candidates() {
+        type Tx = Recovered<N42TxEnvelope>;
+        let n = 95_238usize;
+        let one = transaction(A, TxKind::Call(B), 0, 1, Bytes::new(), 21_000).to_consensus();
+        let fresh = || -> Vec<std::sync::OnceLock<Tx>> {
+            (0..n)
+                .map(|_| {
+                    let cell = std::sync::OnceLock::new();
+                    let _ = cell.set(one.clone());
+                    cell
+                })
+                .collect()
+        };
+        let order: Vec<usize> = (0..n).collect();
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        for _ in 0..11 {
+            let mut cells = fresh();
+            let mut out: Vec<Tx> = Vec::new();
+            let at = std::time::Instant::now();
+            for &index in &order {
+                if let Some(tx) = cells[index].take() {
+                    out.push(tx);
+                }
+            }
+            before.push(at.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(out.len(), n);
+            let cells = fresh();
+            let mut out: Vec<Tx> = Vec::new();
+            let at = std::time::Instant::now();
+            move_executed(cells, &order, &mut out);
+            after.push(at.elapsed().as_secs_f64() * 1e3);
+            assert_eq!(out.len(), n);
+        }
+        println!(
+            "MOVE_EXECUTED txs={n} bytes_each={} one_by_one_ms={:.1} side_by_side_ms={:.1}",
+            std::mem::size_of::<Tx>(),
+            median(before),
+            median(after)
+        );
+    }
     use alloy_consensus::{Header, SignableTransaction, TxLegacy};
-    use alloy_primitives::{Address, B256, Signature, TxKind, address};
-    use reth_ethereum_primitives::Receipt;
+    use alloy_primitives::{Bytes, Signature, TxKind, address};
+    use n42_tx_types::Receipt;
+    use reth_ethereum_primitives::TransactionSigned;
     use reth_evm::execute::{BasicBlockExecutor, Executor};
-    use reth_primitives_traits::{Recovered, SealedHeader};
+    use reth_primitives_traits::SealedHeader;
     use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
     use reth_transaction_pool::{
-        EthPooledTransaction, TransactionOrigin,
+        TransactionOrigin,
         identifier::{SenderId, TransactionId},
         noop::NoopTransactionPool,
     };
@@ -761,7 +1204,7 @@ mod tests {
     const C: Address = address!("3000000000000000000000000000000000000003");
     const FEE: Address = address!("4000000000000000000000000000000000000004");
     const CONTRACT: Address = address!("6000000000000000000000000000000000000006");
-    type Item = Arc<ValidPoolTransaction<EthPooledTransaction>>;
+    type Item = Arc<ValidPoolTransaction<N42PooledTransaction>>;
     type Output = (BlockExecutionOutput<Receipt>, Vec<Address>);
 
     fn transaction(
@@ -784,8 +1227,9 @@ mod tests {
         .into_signed(Signature::new(U256::from(1), U256::from(1), false))
         .into();
         Arc::new(ValidPoolTransaction {
-            transaction: EthPooledTransaction::try_from_consensus(Recovered::new_unchecked(
-                signed, from,
+            transaction: N42PooledTransaction::try_from_consensus(Recovered::new_unchecked(
+                N42TxEnvelope::from(signed),
+                from,
             ))
             .unwrap(),
             transaction_id: TransactionId::new(
@@ -799,7 +1243,9 @@ mod tests {
         })
     }
 
-    fn provider() -> MockEthProvider {
+    type MockProvider = MockEthProvider<N42Primitives>;
+
+    fn provider() -> MockProvider {
         let mut chain = n42_chainspec::n42_dev_chainspec();
         let chain_mut = Arc::make_mut(&mut chain);
         chain_mut.hardforks.insert(
@@ -807,7 +1253,7 @@ mod tests {
             reth_chainspec::ForkCondition::Timestamp(0),
         );
         chain_mut.genesis.config.prague_time = Some(0);
-        let provider = MockEthProvider::default().with_chain_spec((*chain).clone());
+        let provider = MockProvider::new().with_chain_spec((*chain).clone());
         for (address, balance) in [
             (A, 100_000_000_000u64),
             (B, 100_000_000_000),
@@ -827,11 +1273,11 @@ mod tests {
     }
 
     fn build(
-        provider: MockEthProvider,
+        provider: MockProvider,
         txs: &[Item],
         parallel: bool,
         gas_limit: u64,
-    ) -> (EthBuiltPayload, Output) {
+    ) -> (N42BuiltPayload, Output) {
         let config = N42EvmConfig::with_evm_factory(
             provider.chain_spec(),
             n42_execution::N42EvmFactory::with_fast_transfers(false),
@@ -862,7 +1308,7 @@ mod tests {
             Default::default(),
             None,
         );
-        let pool = NoopTransactionPool::default();
+        let pool = NoopTransactionPool::<N42PooledTransaction>::new();
         // Mock root is only a sentinel proving the synchronous provider call;
         // state correctness is checked through the complete published bundle below.
         let sentinel = B256::repeat_byte(0xa7);
@@ -930,7 +1376,7 @@ mod tests {
         (payload, output)
     }
 
-    fn compare_provider(provider: MockEthProvider, txs: &[Item], gas_limit: u64) {
+    fn compare_provider(provider: MockProvider, txs: &[Item], gas_limit: u64) {
         let (serial, (mut serial_output, serial_senders)) =
             build(provider.clone(), txs, false, gas_limit);
         let (parallel, (mut parallel_output, parallel_senders)) =

@@ -13,9 +13,9 @@ n42-chainspec.workspace = true
 n42-consensus.workspace = true
 n42-consensus-service.workspace = true
 n42-execution.workspace = true
+n42-tx-types.workspace = true
 n42-mobile.workspace = true
 n42-network.workspace = true
-n42-parallel-evm.workspace = true
 n42-jmt.workspace = true
 n42-twig-core.workspace = true
 n42-zkproof.workspace = true
@@ -25,14 +25,12 @@ reth-consensus.workspace = true
 reth-consensus-common.workspace = true
 reth-errors.workspace = true
 reth-execution-cache.workspace = true
-alloy-evm.workspace = true
 reth-ethereum-consensus.workspace = true
 reth-ethereum-engine-primitives.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
 reth-execution-types.workspace = true
-reth-revm.workspace = true
 reth-node-api.workspace = true
 reth-node-builder.workspace = true
 reth-node-ethereum.workspace = true
@@ -64,6 +62,11 @@ reth-storage-api.workspace = true
 reth-trie-common.workspace = true
 reth-trie.workspace = true
 reth-rpc-builder.workspace = true
+reth-rpc.workspace = true
+reth-rpc-convert.workspace = true
+reth-rpc-eth-api.workspace = true
+reth-rpc-eth-types.workspace = true
+alloy-rpc-types-eth.workspace = true
 
 arc-swap.workspace = true
 imbl = "7.0.1"
@@ -73,7 +76,7 @@ serde_json.workspace = true
 tower.workspace = true
 bincode.workspace = true
 
-revm.workspace = true
+evm2.workspace = true
 async-trait = "0.1"
 hex.workspace = true
 
@@ -90,15 +93,19 @@ rand.workspace = true
 [dev-dependencies]
 metrics-util = { version = "0.20", default-features = false, features = ["debugging"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
+reth-db-api.workspace = true
 bitvec.workspace = true
 libp2p.workspace = true
-revm.workspace = true
+evm2.workspace = true
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
 reth-testing-utils.workspace = true
-# Keep key types identical to the Reth 2.4.1 / Alloy dependency graph.
-secp256k1 = { version = "0.30", features = ["global-context"] }
+# Keep key types identical to the reth / Alloy dependency graph.
+secp256k1 = { version = "0.33", features = ["global-context"] }
 tempfile.workspace = true
+ed25519-dalek = { version = "3.0", default-features = false }
 
 # Match the production node's default allocator in its library-test benchmarks.
 [target.'cfg(unix)'.dev-dependencies]
 tikv-jemallocator = "0.7"
+# CPU profile of the execution-cost benchmark (`exec_cost_bench`).
+pprof = { version = "0.15", default-features = false }

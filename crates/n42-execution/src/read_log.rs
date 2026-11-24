@@ -6,8 +6,8 @@
 //! Only the operation sequence is transmitted; addresses and slot keys are implicit
 //! by deterministic call position.
 //!
-//! Works because: same block + txs → deterministic `Database::basic()`,
-//! `Database::storage()`, `Database::block_hash()` call order.
+//! Works because: same block + txs → deterministic `Database::get_account()`,
+//! `Database::get_storage()`, `Database::get_block_hash()` call order.
 //!
 //! ## Compact encoding format
 //!
@@ -32,11 +32,9 @@
 //! and empty/zero-balance accounts.
 
 use alloy_primitives::{B256, Bytes, U256};
-use revm::{
+use evm2::{
     bytecode::Bytecode,
-    database_interface::{DBErrorMarker, Database},
-    primitives::StorageKey,
-    state::AccountInfo,
+    evm::{AccountInfo, Database},
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -112,17 +110,18 @@ impl<DB> ReadLogDatabase<DB> {
     }
 }
 
-impl<DB: Database> Database for ReadLogDatabase<DB>
-where
-    DB::Error: DBErrorMarker,
-{
+impl<DB: Database> Database for ReadLogDatabase<DB> {
     type Error = DB::Error;
 
-    fn basic(
+    fn is_fatal(error: &Self::Error) -> bool {
+        DB::is_fatal(error)
+    }
+
+    fn get_account(
         &mut self,
-        address: alloy_primitives::Address,
+        address: &alloy_primitives::Address,
     ) -> Result<Option<AccountInfo>, Self::Error> {
-        let result = self.inner.basic(address)?;
+        let result = self.inner.get_account(address)?;
         let mut log = lock_or_recover(&self.log);
         match &result {
             None => log.push(ReadLogEntry::AccountNotFound),
@@ -140,25 +139,25 @@ where
         Ok(result)
     }
 
-    fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        let bytecode = self.inner.code_by_hash(code_hash)?;
-        self.capture_bytecode(code_hash, &bytecode);
+    fn get_code_by_hash(&mut self, code_hash: &B256) -> Result<Bytecode, Self::Error> {
+        let bytecode = self.inner.get_code_by_hash(code_hash)?;
+        self.capture_bytecode(*code_hash, &bytecode);
         Ok(bytecode)
     }
 
-    fn storage(
+    fn get_storage(
         &mut self,
-        address: alloy_primitives::Address,
-        index: StorageKey,
+        address: &alloy_primitives::Address,
+        index: &U256,
     ) -> Result<U256, Self::Error> {
-        let value = self.inner.storage(address, index)?;
+        let value = self.inner.get_storage(address, index)?;
         let mut log = lock_or_recover(&self.log);
         log.push(ReadLogEntry::Storage(value));
         Ok(value)
     }
 
-    fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
-        let hash = self.inner.block_hash(number)?;
+    fn get_block_hash(&mut self, number: &U256) -> Result<B256, Self::Error> {
+        let hash = self.inner.get_block_hash(number)?;
         let mut log = lock_or_recover(&self.log);
         log.push(ReadLogEntry::BlockHash(hash));
         Ok(hash)
@@ -1013,12 +1012,12 @@ mod tests {
     #[test]
     fn test_read_log_database_capture() {
         use alloy_primitives::Address;
-        use revm::{database::CacheDB, database_interface::Database};
+        use evm2::evm::{CacheDB, Database, EmptyDB};
 
-        let mut cache_db = CacheDB::new(revm::database::EmptyDB::default());
+        let mut cache_db = CacheDB::new(EmptyDB::default());
         let addr = Address::with_last_byte(0x42);
         cache_db.insert_account_info(
-            addr,
+            &addr,
             AccountInfo {
                 nonce: 5,
                 balance: U256::from(1000u64),
@@ -1028,19 +1027,19 @@ mod tests {
 
         let mut logged_db = ReadLogDatabase::new(cache_db);
 
-        // basic() should be logged
-        let info = logged_db.basic(addr).unwrap().unwrap();
+        // get_account() should be logged
+        let info = logged_db.get_account(&addr).unwrap().unwrap();
         assert_eq!(info.nonce, 5);
 
-        // basic() on non-existent should log AccountNotFound
-        let none = logged_db.basic(Address::ZERO).unwrap();
+        // get_account() on non-existent should log AccountNotFound
+        let none = logged_db.get_account(&Address::ZERO).unwrap();
         assert!(none.is_none());
 
-        // storage() should be logged
-        let _val = logged_db.storage(addr, U256::ZERO).unwrap();
+        // get_storage() should be logged
+        let _val = logged_db.get_storage(&addr, &U256::ZERO).unwrap();
 
-        // block_hash() should be logged
-        let _hash = logged_db.block_hash(0).unwrap();
+        // get_block_hash() should be logged
+        let _hash = logged_db.get_block_hash(&U256::ZERO).unwrap();
 
         // Verify log contents
         let log = logged_db.log_handle();
@@ -1054,13 +1053,13 @@ mod tests {
 
     #[test]
     fn test_read_log_database_code_not_logged() {
-        use revm::{database::CacheDB, database_interface::Database};
+        use evm2::evm::{CacheDB, Database, EmptyDB};
 
-        let cache_db = CacheDB::new(revm::database::EmptyDB::default());
+        let cache_db = CacheDB::new(EmptyDB::default());
         let mut logged_db = ReadLogDatabase::new(cache_db);
 
         // KECCAK256_EMPTY should not produce log entries or captured codes
-        let _ = logged_db.code_by_hash(KECCAK256_EMPTY);
+        let _ = logged_db.get_code_by_hash(&KECCAK256_EMPTY);
 
         let handle = logged_db.log_handle();
         let entries = handle.lock().unwrap();
@@ -1077,33 +1076,50 @@ mod tests {
     #[test]
     fn test_read_log_database_captures_bytecode_from_basic() {
         use alloy_primitives::{Address, keccak256};
-        use revm::{bytecode::Bytecode, database::CacheDB, database_interface::Database};
+        use evm2::evm::Database;
 
-        let mut cache_db = CacheDB::new(revm::database::EmptyDB::default());
+        /// A database that hands an account's code over with the account.
+        /// (`CacheDB` keeps code apart and serves it by hash only.)
+        struct WithCode(AccountInfo);
+
+        impl Database for WithCode {
+            type Error = core::convert::Infallible;
+
+            fn get_account(&mut self, _: &Address) -> Result<Option<AccountInfo>, Self::Error> {
+                Ok(Some(self.0.clone()))
+            }
+
+            fn get_code_by_hash(&mut self, _: &B256) -> Result<Bytecode, Self::Error> {
+                Ok(Bytecode::default())
+            }
+
+            fn get_storage(&mut self, _: &Address, _: &U256) -> Result<U256, Self::Error> {
+                Ok(U256::ZERO)
+            }
+
+            fn get_block_hash(&mut self, _: &U256) -> Result<B256, Self::Error> {
+                Ok(B256::ZERO)
+            }
+        }
+
         let addr = Address::with_last_byte(0xC0);
         let code = alloy_primitives::Bytes::from(vec![0x60, 0x00, 0xF3]);
         let code_hash = keccak256(&code);
 
-        cache_db.insert_account_info(
-            addr,
-            AccountInfo {
-                nonce: 1,
-                balance: U256::ZERO,
-                code_hash,
-                code: Some(Bytecode::new_raw(code.clone())),
-                account_id: None,
-            },
-        );
-
-        let mut logged_db = ReadLogDatabase::new(cache_db);
-        let _ = logged_db.basic(addr).unwrap();
+        let mut logged_db = ReadLogDatabase::new(WithCode(AccountInfo::new(
+            U256::ZERO,
+            1,
+            code_hash,
+            Some(Bytecode::new_raw(code.clone())),
+        )));
+        let _ = logged_db.get_account(&addr).unwrap();
 
         let codes = logged_db.codes_handle();
         let codes = codes.lock().unwrap();
         assert_eq!(
             codes.len(),
             1,
-            "should capture contract bytecode via basic()"
+            "should capture contract bytecode via get_account()"
         );
         assert!(codes.contains_key(&code_hash));
     }
@@ -1111,29 +1127,29 @@ mod tests {
     #[test]
     fn test_code_by_hash_captures_bytecode() {
         use alloy_primitives::{Address, keccak256};
-        use revm::{bytecode::Bytecode, database::CacheDB, database_interface::Database};
+        use evm2::evm::{CacheDB, Database, EmptyDB};
 
-        let mut cache_db = CacheDB::new(revm::database::EmptyDB::default());
+        let mut cache_db = CacheDB::new(EmptyDB::default());
         let addr = Address::with_last_byte(0xC1);
         let code = alloy_primitives::Bytes::from(vec![0x60, 0x01, 0x60, 0x00, 0x52, 0xF3]);
         let code_hash = keccak256(&code);
 
         // Insert account with bytecode into CacheDB
         cache_db.insert_account_info(
-            addr,
+            &addr,
             AccountInfo {
                 nonce: 0,
                 balance: U256::ZERO,
                 code_hash,
                 code: Some(Bytecode::new_raw(code.clone())),
-                account_id: None,
+                ..AccountInfo::empty()
             },
         );
 
         let mut logged_db = ReadLogDatabase::new(cache_db);
 
         // code_by_hash should capture the bytecode
-        let result = logged_db.code_by_hash(code_hash).unwrap();
+        let result = logged_db.get_code_by_hash(&code_hash).unwrap();
         assert_eq!(result.original_byte_slice(), &code[..]);
 
         // No log entries (code_by_hash does not write to read log)
@@ -1153,13 +1169,13 @@ mod tests {
 
     #[test]
     fn test_code_by_hash_skips_empty_hash() {
-        use revm::{database::CacheDB, database_interface::Database};
+        use evm2::evm::{CacheDB, Database, EmptyDB};
 
-        let cache_db = CacheDB::new(revm::database::EmptyDB::default());
+        let cache_db = CacheDB::new(EmptyDB::default());
         let mut logged_db = ReadLogDatabase::new(cache_db);
 
         // KECCAK256_EMPTY should not be captured
-        let _ = logged_db.code_by_hash(KECCAK256_EMPTY);
+        let _ = logged_db.get_code_by_hash(&KECCAK256_EMPTY);
 
         let codes_handle = logged_db.codes_handle();
         let codes = codes_handle.lock().unwrap();

@@ -21,12 +21,13 @@
 //! EIP-7702 delegation designators start with `0xEF01` and are not EOF.
 
 use alloy_consensus::transaction::Transaction as _;
+use alloy_consensus::transaction::TxHashRef as _;
 use alloy_primitives::{Address, B256, Bytes, KECCAK256_EMPTY as KECCAK_EMPTY};
+use n42_tx_types::{Block, N42Primitives, N42TxEnvelope, Receipt};
 use reth_engine_tree::tree::state_root_strategy::{
     LazyHashedPostState, PreparedStateRootJob, StateRootJob, StateRootJobContext,
     StateRootJobOutcome, StateRootStrategy,
 };
-use reth_ethereum_primitives::{Block, EthPrimitives, Receipt, TransactionSigned};
 use reth_evm::ConfigureEvm;
 use reth_execution_types::BlockExecutionOutput;
 use reth_primitives_traits::RecoveredBlock;
@@ -195,7 +196,7 @@ fn record_rejection(stage: &'static str, error: &EofGuardError) {
 
 /// The first create transaction whose initcode is an EOF container.
 pub fn find_eof_initcode<'a>(
-    transactions: impl IntoIterator<Item = &'a TransactionSigned>,
+    transactions: impl IntoIterator<Item = &'a N42TxEnvelope>,
 ) -> Option<EofSighting> {
     for (tx_index, tx) in transactions.into_iter().enumerate() {
         if tx.kind().is_create() && is_eof_code(tx.input()) {
@@ -352,7 +353,7 @@ pub fn check_built_block(block: &RecoveredBlock<Block>) -> Result<(), EofGuardEr
 /// execution hook or update stream (the gov5 jobs); those capabilities cannot
 /// be re-attached through a wrapper.
 pub struct EofGuardedStateRootStrategy<P, Evm> {
-    inner: Arc<dyn StateRootStrategy<EthPrimitives, P, Evm>>,
+    inner: Arc<dyn StateRootStrategy<N42Primitives, P, Evm>>,
 }
 
 impl<P, Evm> std::fmt::Debug for EofGuardedStateRootStrategy<P, Evm> {
@@ -364,12 +365,12 @@ impl<P, Evm> std::fmt::Debug for EofGuardedStateRootStrategy<P, Evm> {
 
 impl<P, Evm> EofGuardedStateRootStrategy<P, Evm> {
     /// Wraps `inner`.
-    pub fn new(inner: Arc<dyn StateRootStrategy<EthPrimitives, P, Evm>>) -> Self {
+    pub fn new(inner: Arc<dyn StateRootStrategy<N42Primitives, P, Evm>>) -> Self {
         Self { inner }
     }
 }
 
-impl<P, Evm> StateRootStrategy<EthPrimitives, P, Evm> for EofGuardedStateRootStrategy<P, Evm>
+impl<P, Evm> StateRootStrategy<N42Primitives, P, Evm> for EofGuardedStateRootStrategy<P, Evm>
 where
     P: DatabaseProviderFactory + Clone + Send + Sync + 'static,
     P::Provider: BlockNumReader
@@ -379,11 +380,11 @@ where
         + StorageChangeSetReader
         + StorageSettingsCache
         + 'static,
-    OverlayStateProviderFactory<P, EthPrimitives>:
+    OverlayStateProviderFactory<P, N42Primitives>:
         DatabaseProviderROFactory + Clone + Send + Sync + 'static,
-    <OverlayStateProviderFactory<P, EthPrimitives> as DatabaseProviderROFactory>::Provider:
+    <OverlayStateProviderFactory<P, N42Primitives> as DatabaseProviderROFactory>::Provider:
         AccountReader + BytecodeReader + Send + 'static,
-    Evm: ConfigureEvm<Primitives = EthPrimitives>,
+    Evm: ConfigureEvm<Primitives = N42Primitives>,
 {
     fn supports_cached_output(&self) -> bool {
         self.inner.supports_cached_output()
@@ -391,8 +392,8 @@ where
 
     fn prepare(
         &self,
-        ctx: StateRootJobContext<'_, EthPrimitives, P, Evm>,
-    ) -> ProviderResult<PreparedStateRootJob<EthPrimitives>> {
+        ctx: StateRootJobContext<'_, N42Primitives, P, Evm>,
+    ) -> ProviderResult<PreparedStateRootJob<N42Primitives>> {
         let state_provider_factory = ctx.state_provider_factory().clone();
         let mut inner = self.inner.prepare(ctx)?;
         let hashed_state_rx = inner.take_hashed_state_rx();
@@ -407,14 +408,14 @@ where
 }
 
 struct EofGuardedJob<P> {
-    inner: PreparedStateRootJob<EthPrimitives>,
-    state_provider_factory: OverlayStateProviderFactory<P, EthPrimitives>,
+    inner: PreparedStateRootJob<N42Primitives>,
+    state_provider_factory: OverlayStateProviderFactory<P, N42Primitives>,
 }
 
-impl<P> StateRootJob<EthPrimitives> for EofGuardedJob<P>
+impl<P> StateRootJob<N42Primitives> for EofGuardedJob<P>
 where
-    OverlayStateProviderFactory<P, EthPrimitives>: DatabaseProviderROFactory + Send,
-    <OverlayStateProviderFactory<P, EthPrimitives> as DatabaseProviderROFactory>::Provider:
+    OverlayStateProviderFactory<P, N42Primitives>: DatabaseProviderROFactory + Send,
+    <OverlayStateProviderFactory<P, N42Primitives> as DatabaseProviderROFactory>::Provider:
         AccountReader + BytecodeReader,
 {
     fn name(&self) -> &'static str {
@@ -503,18 +504,15 @@ impl<T: PoolTransaction> BestTransactions for EofFilteringTransactions<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_consensus::BlockBody;
     use alloy_consensus::{Header, TxLegacy};
     use alloy_primitives::{TxKind, U256, keccak256};
-    use reth_ethereum_primitives::{BlockBody, Transaction};
+    use reth_ethereum_primitives::Transaction;
     use reth_execution_types::BlockExecutionResult;
-    use reth_primitives_traits::crypto::secp256k1::public_key_to_address;
     use reth_testing_utils::generators::sign_tx_with_key_pair;
-    use revm::{
-        bytecode::Bytecode,
-        database::states::{AccountStatus, BundleAccount, BundleState},
-        state::AccountInfo,
-    };
-    use secp256k1::{Keypair, Secp256k1, SecretKey};
+    use evm2::{bytecode::Bytecode, evm::AccountInfo};
+    use reth_trie_common::bundle_state::{AccountStatus, BundleAccount, BundleState};
+    use secp256k1::{Keypair, SecretKey};
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -554,14 +552,13 @@ mod tests {
     }
 
     fn keypair() -> Keypair {
-        let secp = Secp256k1::new();
-        let secret = SecretKey::from_slice(&[0x42; 32]).unwrap();
-        Keypair::from_secret_key(&secp, &secret)
+        let secret = SecretKey::from_secret_bytes([0x42; 32]).unwrap();
+        Keypair::from_secret_key(&secret)
     }
 
-    fn tx(nonce: u64, to: TxKind, input: Bytes) -> (TransactionSigned, Address) {
+    fn tx(nonce: u64, to: TxKind, input: Bytes) -> (N42TxEnvelope, Address) {
         let key = keypair();
-        let sender = public_key_to_address(key.public_key());
+        let sender = Address::from_raw_public_key(&key.public_key().serialize_uncompressed()[1..]);
         let tx = sign_tx_with_key_pair(
             key,
             Transaction::Legacy(TxLegacy {
@@ -574,10 +571,10 @@ mod tests {
                 input,
             }),
         );
-        (tx, sender)
+        (tx.into(), sender)
     }
 
-    fn block(txs: Vec<(TransactionSigned, Address)>) -> RecoveredBlock<Block> {
+    fn block(txs: Vec<(N42TxEnvelope, Address)>) -> RecoveredBlock<Block> {
         let (transactions, senders): (Vec<_>, Vec<_>) = txs.into_iter().unzip();
         let header = Header {
             number: 13_560_376,
