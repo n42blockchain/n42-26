@@ -376,3 +376,98 @@ SSZ wire（解码/重编码）、H2-v4 信封、snappy gossip 全部相等；经
   `(chain id, 创世哈希)` 自动启用 H2-v4 参与者（这与另一 worktree 的头导入接线重叠，留给那边或下一步）。
 - `N42_COLOCATED_VOTE` 在 Profile 1 上应列入禁用环境变量（引擎已不把它的裸导入当证据）。
 - E16 投票传输、G5 64 KiB 上限、gov5 的 `high_tc` 捎带、n42-rs 的 checked/executed 两级（延迟执行 3b）未做。
+
+## 9. 延迟执行（深度 1）：设计 PR 1-4（2026-11-24 追加）
+
+依据 `.artifacts/profile1-reply/deferred-execution-design.md`。区块 N 的头携带 N−1 的执行结果，共五个字段
+（A10 + AM25）：stateRoot（QMDB 根）、receiptsRoot（B7 原生收据根）、logsBloom、gasUsed（执行结果的
+`gas_used`，即 EIP-8037 的 `max(regular, state)`，不是收据累计）、requestsHash（N−1 的 EIP-7685 请求哈希，
+无请求为 sha256("")）。区块 1 携带 genesis 自身的字段。Round 1 与 CommitVote 的执行门（Phase A）沿用 V6，
+Phase B、可包含性（includability）、E14 标签、E12 停机不在本次范围。
+
+### 9.1 设计决策
+
+- **PR 1：`deferred_depth.rs` 逐字移植**自 n42-rs `h2-consensus`（origin/main e2a890f77），只在模块文档末尾加了出处说明；
+  六个原测试一并带入。`VoteRules` 只加 `deferred_depth()`（Profile 1 为 `Some(1)`）。
+- **PR 2：执行结果登记表放在 `n42-consensus`，不在设计写的 `n42-node`。** 原因是依赖方向：`n42-node` 依赖
+  `n42-consensus-service`，而 leader 的封印在 `n42-network`、出块在 `n42-consensus-service`，都够不到 `n42-node`；
+  `n42-consensus` 在三者之下（与原生头登记表同处）。
+  - 核心是不含全局状态的 `ExecutedFieldsRegistry`（便于测试），外加一个进程级实例供调用方使用。
+  - 持久化：`executed_fields.log`，与 QMDB 分支文件同目录。40 字节文件头（魔数 + genesis 哈希，防止串链），
+    之后是定长 400 字节记录（392 字节正文 + blake3 前 8 字节校验）。每次 `insert` 追加并 `sync_data` 后才返回，
+    因此早于该块的第一次 FCU。
+  - 打开时，在第一条不完整或校验失败的记录处截断（崩溃时写了半条）。超过 4096 条压缩到最新 1024 条（临时文件 + rename）。
+  - 同一哈希再次登记相同结果时不做任何事；结果不同则拒绝并保留第一条（`Conflict`）。这条规则让 leader 登记的结果与
+    本节点引擎导入时算出的结果互相校验。
+  - 没有移植 n42-rs 的 `fields_from_descendants`（设计 3.8：投票节点不从别人的头取结果）。
+- **PR 3：不改 reth。** 设计 §4 的两项都核实过：
+  1. 状态根任务返回的 `ProviderError` 不是 validation error，`cached_refusal` 不会把它记成无效块；
+  2. 唯一不经验证插入的路径是 executed-block inbox，只用于本节点自己的块，且只在 `N42_LEADER_INSERT_EXECUTED=1`
+     时启用。该路径只在头里的根是本块自己的根时才提交 QMDB，Profile 1 上永远不成立，会回落到 newPayload。
+     这个开关与 `N42_QMDB_ADOPT_BUILT` 现在都列入 Profile 1 禁用环境变量。cache-skip 与 native-import 补丁不跳过验证。
+- **AM25 改变了静态规则。** requestsHash 不再要求等于 sha256("")：导入门（B8）、replay 构造、leader 封印都只要求存在，
+  值由延迟检查比对（与 n42-rs 一致）。V1 的两条 requestsHash 拒绝用例因此不再由导入门拒绝，而是由延迟检查拒绝；
+  相关测试改为说明这一点（门的拒绝数由 23 改为 21）。
+
+### 9.2 实施细节
+
+- **QMDB 状态根任务**（`Gov5QmdbStateRootJob::finish_deferred`，Profile-1 头且链 genesis 声明 profile 时启用）：
+  1. 取 registry(parent)，没有则返回 `ProviderError`（可重试，reth 不记忆）；
+  2. 用 `deferred_depth::expected_fields` 求期望值，与头携带的五个字段比较；不一致时不提交任何东西，记录是哪个字段不同，
+     并返回一个不等于头的根，reth 走 BodyStateRootDiff 判 Invalid；
+  3. 一致时用新方法 `compute_and_commit_own` 按本块操作算出的根提交（`commit_operations` 的期望根改为 `Option`；
+     无期望根时不做根比较，也不走以头的根标记的重叠读视图）；
+  4. 把本块自己的五个字段（QMDB 根、原生收据根、bloom、`result.gas_used`、`result.requests.requests_hash()`）
+     登记到本块哈希下，返回头的根。
+  adopt-built 路径在 Profile 1 上不走（开关被禁用）。
+- **`N42Consensus::validate_block_post_execution`** 的 Profile-1 分支：交给内层以太坊规则的头副本中，receiptsRoot、
+  logsBloom、gasUsed、requestsHash 换成本块自己的值，内层对这几个字段的自我比较变成恒真，其余检查照常。
+- **启动**：Profile 1 节点安装 `executed_fields.log` 并登记 genesis 自身字段；共识头高于 0 而日志里没有其结果则拒绝启动。
+- **PR 4：leader 出块。**
+  - `seal_built_payload_for_profile1(execution, view, qc, carried, registry_root, key)` 写入父块的五个字段，
+    同时改载荷：V1 字段和 sidecar 的 requests hash。
+  - `profile1_built_own_fields` 从构建器载荷读出本块自己的 bloom、gas、requests hash，加上 QMDB 根和原生收据根。
+  - `handle_built_payload`：
+    - 父块结果最多等 2 秒（10 ms 轮询）。构建器只能在已执行的父块上出块，正常情况下结果已登记；等不到则放弃本次出块，
+      不猜也不填零。
+    - 封印后立即把本块自己的结果登记到封印哈希下（子块的出块会在这里找）。
+    - rekey 用放宽后的守卫 `profile1_seal_preserves_execution_input`：不比较 gasUsed、logsBloom、requests hash，
+      它们不是 EVM 输入。
+
+### 9.3 测试
+
+- PR 1：`deferred_depth` 的六个移植测试；`vote_rules` 测试覆盖 `deferred_depth()`。
+- PR 2：`executed_fields` 的 8 个测试：插入、读取与冲突；内存淘汰；五个字段的差异命名；重启后读回；
+  半条记录和翻转字节时截断；他链日志与非日志文件被拒绝；压缩；V1 genesis 条目与跨线程等待。
+- PR 3：`crates/n42-node/tests/profile1_deferred.rs`（gov5 的 V5，已复制到 `testdata/profile1/gov5/V5/`），经 reth
+  引擎（含委员会池）：
+  - (c) genesis 结果未登记时区块 1 得到 provider error，不提交、不记为无效；登记后同一块 Valid。
+  - (a) V5 六个块全部 Valid，本节点登记的结果与 gov5 的 `executed` 完全相同（state/receipts/bloom/gas）。
+  - (b) 区块 2 五个携带字段任改一个并重新封印，都是 Invalid（BodyStateRootDiff）；V5 三条 `deferred` 拒绝用例 Invalid；
+    `import` 用例被导入门拒绝。
+  - (d) 区块 1、3 是 state-gas 块：登记的 gasUsed = max(regular, state)，不等于收据累计（293760、183600）。
+  - (e) 兄弟链：6'（区块 6 换时间）与 6 都携带 result(5)，但执行结果不同；7' 在 6' 上携带 result(6) 被拒，
+    携带 result(6') 为 Valid。
+- PR 4：`profile1_import.rs` 改为三块（plain-transfer、contract-create、storage-set）。每块：
+  - 封印写入父块结果，leader 在封印哈希下登记自己的结果；
+  - 守卫对封印为真，对改了时间戳的载荷为假；
+  - 引擎导入时的结果与 leader 登记的相同（不同就会冲突而导入失败）；
+  - 头携带父块结果。
+
+### 9.4 四节点运行（`/tmp/p1-run/run4.sh`，genesis_now.json 时间戳更新并加入 V3 出资账户）
+
+- 四个节点按 8 秒出块。检查脚本 `/tmp/p1-run/check_deferred.py` 对每个块验证：四个节点哈希一致，且区块 N 携带的
+  五个字段等于每个节点 `executed_fields.log` 里为 N−1 登记的结果。结果：区块 1-18 全部一致，0 处不符。
+- 第 6-15 块各含一笔 V3 交易（10 笔全部 status 1）；区块 7 携带 183600（区块 6 转账到新账户的 state gas），
+  区块 8 携带 293760（区块 7 建合约），与 V5 的同类数值相同。
+- 日志：ERROR 0、拒绝 0、缺父块结果 0；leader 自己的导入命中缓存执行（cache hit 4-5 次/节点）。
+- 重启节点 0：读回 21 条结果，通过头检查，重新加入；链继续到 26 块，0 处不符。
+
+### 9.5 后续
+
+- PR 5：Round-1 门 Phase A 的剩余部分（BlockChecked/BlockRejected、B4 进门、已知父块、持有的 CommitVote）。
+- PR 6：可包含性与 Phase B。
+- PR 7：E14 标签（目前 latest = safe = finalized）、日志与 QMDB WAL 之间崩溃的恢复、E12 停机。
+- PR 8：延迟链上的同步与观察者。
+- 设计 3.10：手机端 receiptsRoot/stateRoot 的语义已变（N 的值在 N+1 的头里），Profile 1 上需关闭手机收据验证或改为对 N+1 证明。
+- V5 的 AM25 请求块（一个提款请求和一个合并请求）gov5 发布后加入 PR 3 测试。
