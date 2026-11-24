@@ -323,6 +323,10 @@ pub struct ConsensusEngine {
     /// for tests / single-validator dev mode; production builds inject a
     /// file-backed implementation from the orchestrator.
     pub(super) vote_log: Arc<dyn VoteLogWriter>,
+    /// The chain's leader tenure and rotate-on-timeout activation. A chain
+    /// constant: taken from this process's resolved schedule at construction
+    /// and never changed by events.
+    pub(super) leader_schedule: crate::validator::LeaderSchedule,
 }
 
 impl ConsensusEngine {
@@ -406,6 +410,7 @@ impl ConsensusEngine {
             pending_tx_roots: BoundedFifoMap::new(64),
             pending_changes_hashes: BoundedFifoMap::new(64),
             vote_log,
+            leader_schedule: crate::validator::leader_schedule(),
         }
     }
 
@@ -514,10 +519,23 @@ impl ConsensusEngine {
             pending_tx_roots: BoundedFifoMap::new(64),
             pending_changes_hashes: BoundedFifoMap::new(64),
             vote_log,
+            leader_schedule: crate::validator::leader_schedule(),
         }
     }
 
     // ── Public accessors ──
+
+    /// The leader tenure and rotate-on-timeout activation this engine runs.
+    pub fn leader_schedule(&self) -> crate::validator::LeaderSchedule {
+        self.leader_schedule
+    }
+
+    /// Replaces the leader rules. A chain constant: call before the engine
+    /// processes its first event (tests use it to run several chains in one
+    /// process).
+    pub fn set_leader_schedule(&mut self, schedule: crate::validator::LeaderSchedule) {
+        self.leader_schedule = schedule;
+    }
 
     /// Enables gov5-compatible, chain-bound H2-v4 signatures. This does not
     /// change wire routing by itself, so observer and native nodes remain
@@ -1345,7 +1363,23 @@ impl ConsensusEngine {
     }
 
     pub(super) fn leader_index_for_view(&self, view: ViewNumber) -> u32 {
-        LeaderSelector::leader_for_view(view, self.validator_set_for_view(view))
+        self.leader_in_set(view, self.validator_set_for_view(view))
+    }
+
+    /// The leader of `view` within `validator_set` under this engine's tenure.
+    pub(super) fn leader_in_set(&self, view: ViewNumber, validator_set: &ValidatorSet) -> u32 {
+        LeaderSelector::leader_for_view_with_tenure(
+            view,
+            validator_set,
+            self.leader_schedule.tenure,
+        )
+    }
+
+    /// The view entered on a TC for `tc_view` (sync standard section 10.2):
+    /// `tc_view + 1`, or the next tenure window under rotate-on-timeout.
+    pub(super) fn view_after_tc(&self, tc_view: ViewNumber) -> ViewNumber {
+        self.leader_schedule
+            .view_after_tc(tc_view, self.epoch_manager.epoch_length())
     }
 
     pub(super) fn local_validator_index_for_view(&self, view: ViewNumber) -> Option<u32> {
@@ -5548,5 +5582,154 @@ mod tests {
             "ViewChanged should report actual current_view ({}), got {}",
             actual_view, last_vc
         );
+    }
+
+    // ── Rotate on timeout (sync standard section 10) ──
+
+    fn rotation(active: bool) -> crate::validator::LeaderSchedule {
+        crate::validator::LeaderSchedule {
+            tenure: 4,
+            rotate_on_timeout_from: active.then_some(0),
+        }
+    }
+
+    /// A TC for `view` signed by `signers`.
+    fn test_tc(
+        view: ViewNumber,
+        sks: &[n42_primitives::BlsSecretKey],
+        vs: &ValidatorSet,
+        signers: &[u32],
+    ) -> n42_primitives::consensus::TimeoutCertificate {
+        use crate::protocol::quorum::{TimeoutCollector, timeout_signing_message};
+        let msg = timeout_signing_message(view);
+        let mut collector = TimeoutCollector::new(view, vs.len());
+        for &signer in signers {
+            collector
+                .add_verified_timeout(
+                    signer,
+                    sks[signer as usize].sign(&msg),
+                    QuorumCertificate::genesis(),
+                )
+                .unwrap();
+        }
+        collector.build_tc(vs).unwrap()
+    }
+
+    fn test_new_view(
+        view: ViewNumber,
+        tc: n42_primitives::consensus::TimeoutCertificate,
+        leader: u32,
+        sks: &[n42_primitives::BlsSecretKey],
+    ) -> ConsensusMessage {
+        let message = ConsensusSigningProfile::Native.new_view_message(view);
+        ConsensusMessage::NewView(n42_primitives::consensus::NewView {
+            view,
+            timeout_cert: tc,
+            leader,
+            signature: sks[leader as usize].sign(&message),
+        })
+    }
+
+    /// Tenure 4 over 4 validators: views 0-3 are led by 0, 4-7 by 1. With
+    /// validator 0 dead at view 1, the TC of view 1 hands the rest of the
+    /// window to validator 1 (view 4) when the rule is active, and moves to
+    /// view 2, still validator 0's, when it is not.
+    #[test]
+    fn a_tc_moves_to_the_next_tenure_window_only_when_rotation_is_active() {
+        use crate::protocol::quorum::timeout_signing_message;
+        use n42_primitives::consensus::TimeoutMessage;
+
+        for (active, expected_view, expected_leader) in [(true, 4, 1), (false, 2, 0)] {
+            let (mut engine, sks, _, mut rx) = make_engine(4, 1);
+            engine.set_leader_schedule(rotation(active));
+            assert_eq!(engine.current_view(), 1);
+            assert_eq!(engine.current_leader_index(), 0);
+
+            engine.on_timeout().expect("own timeout");
+            while rx.try_recv().is_ok() {}
+            let msg = timeout_signing_message(1);
+            for sender in [2u32, 3] {
+                engine
+                    .process_event(ConsensusEvent::Message(ConsensusMessage::Timeout(
+                        TimeoutMessage {
+                            view: 1,
+                            high_qc: QuorumCertificate::genesis(),
+                            sender,
+                            signature: sks[sender as usize].sign(&msg),
+                        },
+                    )))
+                    .expect("timeout");
+            }
+
+            assert_eq!(engine.current_view(), expected_view, "active = {active}");
+            assert_eq!(engine.current_leader_index(), expected_leader);
+            let new_views: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|output| match output {
+                    EngineOutput::BroadcastMessage(ConsensusMessage::NewView(nv)) => Some(nv),
+                    _ => None,
+                })
+                .collect();
+            if active {
+                // Validator 1 leads view 4 and announces it with the TC.
+                assert_eq!(new_views.len(), 1);
+                assert_eq!(new_views[0].view, 4);
+                assert_eq!(new_views[0].timeout_cert.view, 1);
+                assert_eq!(new_views[0].leader, 1);
+            } else {
+                assert!(new_views.is_empty(), "view 2 is validator 0's");
+            }
+        }
+    }
+
+    #[test]
+    fn new_view_must_name_the_view_its_tc_leads_to() {
+        for active in [true, false] {
+            let (rotated, classic) = (4, 2);
+            let (accepted, rejected) = if active {
+                ((rotated, 1), (classic, 0))
+            } else {
+                ((classic, 0), (rotated, 1))
+            };
+
+            let (mut engine, sks, vs, _rx) = make_engine(4, 2);
+            engine.set_leader_schedule(rotation(active));
+            let tc = test_tc(1, &sks, &vs, &[1, 2, 3]);
+            let error = engine
+                .process_event(ConsensusEvent::Message(test_new_view(
+                    rejected.0,
+                    tc.clone(),
+                    rejected.1,
+                    &sks,
+                )))
+                .expect_err("a NewView for another view than the TC leads to");
+            assert!(
+                matches!(error, ConsensusError::InvalidTC { view: 1, .. }),
+                "active = {active}: {error:?}"
+            );
+            assert_eq!(engine.current_view(), 1);
+
+            engine
+                .process_event(ConsensusEvent::Message(test_new_view(
+                    accepted.0, tc, accepted.1, &sks,
+                )))
+                .expect("the NewView the TC leads to");
+            assert_eq!(engine.current_view(), accepted.0, "active = {active}");
+        }
+    }
+
+    /// Activation from view A: a TC below A is classic, one at A rotates
+    /// (vector S8 with tenure 4: TC(5) -> 6, TC(6) -> 8 with A = 6).
+    #[test]
+    fn rotation_applies_from_its_activation_view() {
+        let (mut engine, ..) = make_engine(4, 0);
+        engine.set_leader_schedule(crate::validator::LeaderSchedule {
+            tenure: 4,
+            rotate_on_timeout_from: Some(6),
+        });
+        assert_eq!(engine.view_after_tc(5), 6);
+        assert_eq!(engine.view_after_tc(6), 8);
+        // A QC still moves to the next view, and leaders are the grid.
+        assert_eq!(engine.leader_index_for_view(6), 1);
+        assert_eq!(engine.leader_index_for_view(8), 2);
     }
 }
