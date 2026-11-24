@@ -6,6 +6,7 @@ use alloy_eips::{Decodable2718, Encodable2718};
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
 use alloy_rpc_types_engine::ExecutionData;
+use n42_chainspec::profile1::Profile1Header;
 use n42_consensus::{
     Gov5NativeHeader, Gov5Reward, remember_gov5_native_header, validate_gov5_interop_header,
 };
@@ -757,7 +758,49 @@ pub fn decode_gov5_block_rlp(encoded: &[u8]) -> Result<Gov5GossipBlock, Gov5Bloc
     let header = native.header;
     validate_gov5_interop_header(&header)
         .map_err(|error| Gov5BlockError::HeaderProfile(error.to_string()))?;
+    decode_gov5_block_body(payload, header_rlp, header, native.mobile_registry_root)
+}
 
+/// Decodes a block of a Profile-1 chain: the gov5 wire form of
+/// [`decode_gov5_block_rlp`] with the strict 24-element Profile-1 header
+/// (mixed production standard B10-B12). Any other header layout is a
+/// permanent [`Gov5BlockError::HeaderProfile`] refusal. The header rules that
+/// need the parent (B1-B4, B8-B14, A23) are checked by the importer.
+pub fn decode_profile1_block_rlp(encoded: &[u8]) -> Result<Gov5GossipBlock, Gov5BlockError> {
+    let mut payload = encoded;
+    let outer = RlpHeader::decode(&mut payload).map_err(|_| Gov5BlockError::InvalidRlp)?;
+    if !outer.list || outer.payload_length != payload.len() {
+        return Err(Gov5BlockError::InvalidRlp);
+    }
+    let header_rlp = take_rlp_item(&mut payload).ok_or(Gov5BlockError::InvalidRlp)?;
+    let profile1 = Profile1Header::decode(header_rlp)
+        .map_err(|error| Gov5BlockError::HeaderProfile(error.to_string()))?;
+    let Profile1Header {
+        header,
+        mobile_registry_root,
+    } = profile1;
+    decode_gov5_block_body(payload, header_rlp, header, Some(mobile_registry_root))
+}
+
+/// Decodes with the header layout of the chain: Profile 1 when `profile1`.
+pub fn decode_block_rlp_for(
+    encoded: &[u8],
+    profile1: bool,
+) -> Result<Gov5GossipBlock, Gov5BlockError> {
+    if profile1 {
+        decode_profile1_block_rlp(encoded)
+    } else {
+        decode_gov5_block_rlp(encoded)
+    }
+}
+
+/// The body items after the header, checked against the decoded header.
+fn decode_gov5_block_body(
+    mut payload: &[u8],
+    header_rlp: &[u8],
+    header: Header,
+    mobile_registry_root: Option<B256>,
+) -> Result<Gov5GossipBlock, Gov5BlockError> {
     let transactions_rlp = take_rlp_item(&mut payload).ok_or(Gov5BlockError::InvalidRlp)?;
     let transactions = decode_transactions(transactions_rlp)?;
 
@@ -800,7 +843,7 @@ pub fn decode_gov5_block_rlp(encoded: &[u8]) -> Result<Gov5GossipBlock, Gov5Bloc
         header,
         transactions,
         rewards,
-        mobile_registry_root: native.mobile_registry_root,
+        mobile_registry_root,
     })
 }
 

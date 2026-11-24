@@ -139,6 +139,15 @@ impl ConsensusService {
     }
 
     pub(super) async fn handle_engine_output(&mut self, output: EngineOutput) {
+        // Profile 1, B4: the Round-1 vote leaves only for a header whose time
+        // is at most floor(now) + 2. The engine has recorded the vote for the
+        // view, so holding it back means this node does not vote in the view.
+        if let EngineOutput::SendToValidator(_, ConsensusMessage::Vote(vote))
+        | EngineOutput::BroadcastMessage(ConsensusMessage::Vote(vote)) = &output
+            && !self.profile1_vote_allowed(vote.block_hash)
+        {
+            return;
+        }
         match output {
             EngineOutput::BroadcastMessage(msg) => {
                 if self.h2_v4_identity.is_some() {

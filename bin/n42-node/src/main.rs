@@ -1213,6 +1213,43 @@ fn resolve_validator_p2p_keypair(
 /// the genesis `config.hotstuff` (with the bench env overrides) and installs
 /// them for the whole process, before any consensus component exists, so the
 /// engine, the H2-v4 verifier and the orchestrator all use one value.
+/// Profile 1: the header gate of the orchestrator or observer, seeded with
+/// the genesis header and, after a restart, with the durable head. Reth stores
+/// the alloy view of a header; the head is trusted only when its 24-element
+/// form with a zero registry root hashes to the durable head hash (the only
+/// registry root a Profile-1 chain has today). Otherwise the gate starts from
+/// genesis and admits nothing until the head's header is supplied again.
+fn profile1_import_gate(
+    genesis: &alloy_genesis::Genesis,
+    config: &n42_chainspec::profile1::Profile1Config,
+    head: Option<(B256, alloy_consensus::Header)>,
+) -> eyre::Result<n42_consensus_service::profile1_header::Profile1ImportGate> {
+    let genesis_header = n42_chainspec::profile1::profile1_genesis_header(genesis, config)
+        .map_err(|error| eyre::eyre!("refusing to start: {error}"))?;
+    let mut gate =
+        n42_consensus_service::profile1_header::Profile1ImportGate::new(config, genesis_header)
+            .map_err(|error| eyre::eyre!("refusing to start: profile 1 header gate: {error}"))?;
+    if let Some((hash, header)) = head
+        && header.number > 0
+    {
+        let head = n42_chainspec::profile1::Profile1Header {
+            header,
+            mobile_registry_root: B256::ZERO,
+        };
+        if head.hash() == hash {
+            gate.seed(head);
+        } else {
+            tracing::warn!(
+                target: "n42::profile1",
+                %hash,
+                "durable head is not a 24-element header with a zero registry root; the header gate starts from genesis"
+            );
+        }
+    }
+    info!(target: "n42::profile1", genesis_hash = %gate.identity().genesis_hash, "profile 1 header gate installed on every import path and the Round-1 vote");
+    Ok(gate)
+}
+
 /// Resolves the genesis production profile (`config.n42Profile`, mixed
 /// production standard P2) and installs it for the whole process. On Profile 1
 /// a node refuses to start when the environment sets a consensus value the
@@ -1233,6 +1270,11 @@ fn install_genesis_profile(
         )
     })?;
     if let Some((_, config)) = &resolved {
+        if !n42_chainspec::profile1::install_profile1_config(config.clone()) {
+            return Err(eyre::eyre!(
+                "refusing to start: a profile 1 configuration was already installed"
+            ));
+        }
         info!(
             target: "n42::cli",
             chain_id = config.chain_id,
@@ -2837,6 +2879,17 @@ fn main() {
                         observer =
                             observer.with_epoch_schedule(consensus_config.epoch_length, schedule);
                     }
+                    if let Some(config) = &profile1 {
+                        let head = full_node
+                            .provider
+                            .header(observer_head)?
+                            .map(|header| (observer_head, header));
+                        observer = observer.with_profile1_gate(profile1_import_gate(
+                            &full_node.provider.chain_spec().genesis,
+                            config,
+                            head,
+                        )?);
+                    }
 
                     task_executor.spawn_critical_task("n42-observer-orchestrator", Box::pin(async move {
                         if let Some(plan) = replay_plan {
@@ -3502,6 +3555,17 @@ fn main() {
 
                 if let Some(header) = full_node.provider.header(consensus_head_hash)? {
                     orchestrator = orchestrator.with_recovered_head_timestamp(header.timestamp);
+                }
+                if let Some(config) = &profile1 {
+                    let head = full_node
+                        .provider
+                        .header(consensus_head_hash)?
+                        .map(|header| (consensus_head_hash, header));
+                    orchestrator = orchestrator.with_profile1_gate(profile1_import_gate(
+                        &full_node.provider.chain_spec().genesis,
+                        config,
+                        head,
+                    )?);
                 }
 
                 if h2_v4_participant {

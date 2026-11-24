@@ -278,6 +278,301 @@ pub fn check_profile1_vote_time(
     Ok(())
 }
 
+impl Profile1HeaderInvalid {
+    /// The standard's rule id, for logs and metric labels.
+    pub const fn rule(&self) -> &'static str {
+        match self {
+            Self::Extra(_) | Self::Qc(_) => "B1",
+            Self::Seal(_) => "B2",
+            Self::Proposer { .. }
+            | Self::Difficulty(_)
+            | Self::Nonce
+            | Self::MixHash(_)
+            | Self::OmmersHash(_) => "B3",
+            Self::TimeBeforeParent { .. } | Self::TimeFuture { .. } => "B4",
+            Self::RequestsHash(_) => "B8",
+            Self::BlobGas { .. } => "B9",
+            Self::SlotNumber { .. } => "B10",
+            Self::GasUsed { .. } => "B13",
+            Self::BaseFee { .. } => "B14",
+            Self::GasLimit { .. } => "A23",
+            Self::Parent(_) => "parent",
+        }
+    }
+}
+
+/// Why the import gate did not admit a block.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Profile1Refusal {
+    /// The header breaks a rule: permanent for this hash.
+    #[error(transparent)]
+    Invalid(#[from] Profile1HeaderInvalid),
+    /// The header is not in the 24-element layout (B10-B12): permanent.
+    #[error("profile 1 (B12): header layout: {0}")]
+    Layout(String),
+    /// No Profile-1 header is known for the hash: retryable.
+    #[error("profile 1: no header known for block {0}")]
+    HeaderUnknown(B256),
+    /// The parent has not been admitted yet: retryable.
+    #[error("profile 1: parent {parent} of block {hash} has not been admitted")]
+    ParentUnknown { hash: B256, parent: B256 },
+}
+
+impl Profile1Refusal {
+    /// The rule id, for logs and metric labels.
+    pub const fn rule(&self) -> &'static str {
+        match self {
+            Self::Invalid(invalid) => invalid.rule(),
+            Self::Layout(_) => "B12",
+            Self::HeaderUnknown(_) => "header_unknown",
+            Self::ParentUnknown { .. } => "parent_unknown",
+        }
+    }
+
+    /// Whether the refusal holds for the hash whatever arrives later.
+    pub const fn is_permanent(&self) -> bool {
+        matches!(self, Self::Invalid(_) | Self::Layout(_))
+    }
+}
+
+/// Logs and counts a refusal with its rule id. `path` names the import path.
+pub fn log_profile1_refusal(hash: B256, path: &'static str, refusal: &Profile1Refusal) {
+    let rule = refusal.rule();
+    metrics::counter!("n42_profile1_header_refused_total", "path" => path, "rule" => rule)
+        .increment(1);
+    tracing::warn!(
+        target: "n42::profile1",
+        %hash,
+        path,
+        rule,
+        permanent = refusal.is_permanent(),
+        %refusal,
+        "profile 1: header refused; block not imported, not voted on"
+    );
+}
+
+/// Admitted headers kept for parent lookups and the QC ancestry walk.
+const PROFILE1_GATE_CAPACITY: usize = 4096;
+/// How far back the B1 ancestry walk looks for the QC's block.
+const PROFILE1_ANCESTRY_DEPTH: usize = 256;
+
+/// The import gate of a Profile-1 node: every block header passes
+/// [`validate_profile1_header`] against its admitted parent before its
+/// payload reaches execution, and the Round-1 vote passes
+/// [`check_profile1_vote_time`].
+#[derive(Debug)]
+pub struct Profile1ImportGate {
+    identity: H2V4ChainIdentity,
+    validators: ValidatorSet,
+    schedule: LeaderSchedule,
+    gas_limit: u64,
+    admitted: std::collections::HashMap<B256, Profile1Header>,
+    order: std::collections::VecDeque<B256>,
+    refused: std::collections::HashMap<B256, Profile1Refusal>,
+    clock: fn() -> u64,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+impl Profile1ImportGate {
+    /// The gate of the chain `config` describes, seeded with its genesis
+    /// header. The validator set is the genesis set (AM5: no staged change).
+    pub fn new(
+        config: &n42_chainspec::profile1::Profile1Config,
+        genesis: Profile1Header,
+    ) -> Result<Self, String> {
+        let validators = ValidatorSet::try_new(&config.validator_infos(), config.fault_tolerance())
+            .map_err(|error| error.to_string())?;
+        let schedule = LeaderSchedule::resolve_profile1(config, None, None)
+            .map_err(|error| error.to_string())?
+            .schedule;
+        let mut gate = Self {
+            identity: H2V4ChainIdentity {
+                chain_id: config.chain_id,
+                genesis_hash: genesis.hash(),
+            },
+            validators,
+            schedule,
+            gas_limit: config.gas_limit,
+            admitted: Default::default(),
+            order: Default::default(),
+            refused: Default::default(),
+            clock: unix_now,
+        };
+        gate.seed(genesis);
+        Ok(gate)
+    }
+
+    /// Replaces the vote clock (unix seconds); for tests.
+    pub fn with_clock(mut self, clock: fn() -> u64) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The H2-v4 identity the gate checks QCs in.
+    pub const fn identity(&self) -> H2V4ChainIdentity {
+        self.identity
+    }
+
+    /// Trusts a header without checking it: genesis, or the durable head
+    /// this node executed before a restart.
+    pub fn seed(&mut self, header: Profile1Header) {
+        self.remember(header.hash(), header);
+    }
+
+    fn remember(&mut self, hash: B256, header: Profile1Header) {
+        if self.admitted.insert(hash, header).is_none() {
+            self.order.push_back(hash);
+        }
+        while self.order.len() > PROFILE1_GATE_CAPACITY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.admitted.remove(&evicted);
+            }
+        }
+    }
+
+    /// An admitted (or seeded) header.
+    pub fn header(&self, hash: &B256) -> Option<&Profile1Header> {
+        self.admitted.get(hash)
+    }
+
+    /// Checks `header` against its admitted parent and admits it.
+    /// Idempotent for an admitted header; a permanent refusal is remembered.
+    pub fn admit(&mut self, header: Profile1Header) -> Result<B256, Profile1Refusal> {
+        let hash = header.hash();
+        if self.admitted.contains_key(&hash) {
+            return Ok(hash);
+        }
+        if let Some(refusal) = self.refused.get(&hash) {
+            return Err(refusal.clone());
+        }
+        let parent_hash = header.header.parent_hash;
+        let Some(parent) = self.admitted.get(&parent_hash) else {
+            return Err(Profile1Refusal::ParentUnknown {
+                hash,
+                parent: parent_hash,
+            });
+        };
+        let rules = Profile1HeaderRules {
+            identity: self.identity,
+            validators: &self.validators,
+            schedule: self.schedule,
+            gas_limit: self.gas_limit,
+        };
+        let admitted = &self.admitted;
+        let is_ancestor = |target: B256| {
+            let mut cursor = parent_hash;
+            for _ in 0..PROFILE1_ANCESTRY_DEPTH {
+                if cursor == target {
+                    return true;
+                }
+                match admitted.get(&cursor) {
+                    Some(ancestor) if ancestor.header.number > 0 => {
+                        cursor = ancestor.header.parent_hash;
+                    }
+                    _ => return false,
+                }
+            }
+            false
+        };
+        match validate_profile1_header(&header, parent, &rules, is_ancestor) {
+            Ok(_) => {
+                self.remember(hash, header);
+                Ok(hash)
+            }
+            Err(invalid) => {
+                let refusal = Profile1Refusal::Invalid(invalid);
+                self.refuse(hash, refusal.clone());
+                Err(refusal)
+            }
+        }
+    }
+
+    /// Decodes the exact header encoding behind `hash` and admits it.
+    pub fn admit_raw(&mut self, hash: B256, raw: &[u8]) -> Result<B256, Profile1Refusal> {
+        if self.admitted.contains_key(&hash) {
+            return Ok(hash);
+        }
+        if alloy_primitives::keccak256(raw) != hash {
+            return Err(Profile1Refusal::HeaderUnknown(hash));
+        }
+        let header = match Profile1Header::decode(raw) {
+            Ok(header) => header,
+            Err(error) => {
+                let refusal = Profile1Refusal::Layout(error.to_string());
+                self.refuse(hash, refusal.clone());
+                return Err(refusal);
+            }
+        };
+        self.admit(header)
+    }
+
+    /// Admits the header of `hash` from `raw` when given, else from the
+    /// encoding the network layer remembered for it, else as already
+    /// admitted. A header admitted from `raw` is remembered for the
+    /// execution side's payload binding.
+    pub fn admit_known(&mut self, hash: B256, raw: Option<&[u8]>) -> Result<B256, Profile1Refusal> {
+        match raw {
+            Some(raw) => {
+                let admitted = self.admit_raw(hash, raw)?;
+                n42_consensus::remember_gov5_native_header(raw);
+                Ok(admitted)
+            }
+            None => match n42_consensus::gov5_native_header_rlp(&hash) {
+                Some(raw) => self.admit_raw(hash, &raw),
+                None => self
+                    .header(&hash)
+                    .map(|_| hash)
+                    .ok_or(Profile1Refusal::HeaderUnknown(hash)),
+            },
+        }
+    }
+
+    /// Admits the header of a block decoded from the gov5 wire with
+    /// [`n42_network::decode_profile1_block_rlp`].
+    pub fn admit_block(
+        &mut self,
+        block: &n42_network::Gov5GossipBlock,
+    ) -> Result<B256, Profile1Refusal> {
+        let hash = block.block_hash;
+        let Some(mobile_registry_root) = block.mobile_registry_root else {
+            return Err(Profile1Refusal::Layout(format!(
+                "block {hash} has no mobileRegistryRoot (element 24)"
+            )));
+        };
+        let header = Profile1Header {
+            header: block.header.clone(),
+            mobile_registry_root,
+        };
+        if header.hash() != hash {
+            return Err(Profile1Refusal::Layout(format!(
+                "block {hash} does not carry a Profile-1 header"
+            )));
+        }
+        self.admit(header)
+    }
+
+    fn refuse(&mut self, hash: B256, refusal: Profile1Refusal) {
+        if self.refused.len() >= PROFILE1_GATE_CAPACITY {
+            self.refused.clear();
+        }
+        self.refused.insert(hash, refusal);
+    }
+
+    /// B4, vote half, for an admitted block at the gate's clock.
+    pub fn check_vote(&self, hash: &B256) -> Result<(), Profile1Refusal> {
+        let header = self
+            .admitted
+            .get(hash)
+            .ok_or(Profile1Refusal::HeaderUnknown(*hash))?;
+        check_profile1_vote_time(header, (self.clock)()).map_err(Profile1Refusal::Invalid)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

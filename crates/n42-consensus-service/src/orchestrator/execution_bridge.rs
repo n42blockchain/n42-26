@@ -831,7 +831,17 @@ impl ConsensusService {
         }
 
         let hash = broadcast.block_hash;
-        if let Some(raw) = broadcast.native_header_rlp.as_deref()
+        if self.profile1.is_some() {
+            // Profile 1: the 24-element header is checked against its
+            // admitted parent before anything is cached, imported or voted.
+            if !self.profile1_admit_hash(
+                hash,
+                broadcast.native_header_rlp.as_deref(),
+                "follower_import",
+            ) {
+                return;
+            }
+        } else if let Some(raw) = broadcast.native_header_rlp.as_deref()
             && !super::remember_direct_native_header(hash, raw)
         {
             warn!(target: "n42::cl::exec_bridge", %hash, "block data carries an invalid native header");
@@ -1300,6 +1310,14 @@ impl ConsensusService {
             .bad_blocks
             .should_skip(broadcast.block_hash, "sync_import")
         {
+            self.discard_unvalidated_sidecar_diff(broadcast.view, broadcast.block_hash);
+            return false;
+        }
+        if !self.profile1_admit_hash(
+            broadcast.block_hash,
+            broadcast.native_header_rlp.as_deref(),
+            "sync_import",
+        ) {
             self.discard_unvalidated_sidecar_diff(broadcast.view, broadcast.block_hash);
             return false;
         }

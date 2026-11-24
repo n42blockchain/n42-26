@@ -1165,6 +1165,9 @@ pub struct ConsensusService {
     /// Enables bidirectional H2-v4 consensus conversion. `None` preserves the
     /// native network and observer behavior exactly.
     h2_v4_identity: Option<n42_network::h2_v4::H2V4ChainIdentity>,
+    /// Profile 1 (mixed production standard): the header gate every imported
+    /// block and every Round-1 vote passes. `None` on every other chain.
+    profile1: Option<crate::profile1_header::Profile1ImportGate>,
     /// H2-authenticated block hash -> consensus view. Gov5 block gossip is not
     /// executed until one of these bindings exists.
     h2_v4_block_views: BTreeMap<B256, u64>,
@@ -1754,7 +1757,7 @@ impl ConsensusService {
             .iter()
             .filter(|(hash, _)| self.h2_v4_block_views.contains_key(*hash))
             .map(|(hash, (_, rlp))| {
-                let height = n42_network::decode_gov5_block_rlp(rlp)
+                let height = self.decode_wire_block(rlp)
                     .map(|block| block.header.number)
                     // Keep malformed entries visible to the canonical handler,
                     // which records the rejection. They sort behind valid bodies.
@@ -1795,7 +1798,7 @@ impl ConsensusService {
         if first_height != expected_first_height {
             return None;
         }
-        let oldest = n42_network::decode_gov5_block_rlp(oldest_rlp).ok()?;
+        let oldest = self.decode_wire_block(oldest_rlp).ok()?;
         if oldest.header.parent_hash != base_hash {
             return None;
         }
@@ -1804,13 +1807,13 @@ impl ConsensusService {
         // authenticated block, select only the exact parent-hash chain that
         // terminates at the durable execution head.
         let (&last_height, (_, newest_rlp, _)) = self.h2_v4_catchup_blocks.last_key_value()?;
-        let newest = n42_network::decode_gov5_block_rlp(newest_rlp).ok()?;
+        let newest = self.decode_wire_block(newest_rlp).ok()?;
         let mut expected_hash = newest.block_hash;
         let mut height = last_height;
         let mut selected_heights = Vec::new();
         loop {
             let (_, candidate_rlp, _) = self.h2_v4_catchup_blocks.get(&height)?;
-            let candidate = n42_network::decode_gov5_block_rlp(candidate_rlp).ok()?;
+            let candidate = self.decode_wire_block(candidate_rlp).ok()?;
             if candidate.block_hash != expected_hash {
                 return None;
             }
@@ -1860,7 +1863,7 @@ impl ConsensusService {
             "releasing reverse-delivered authenticated Gov5 ancestry in execution order"
         );
         for (catchup_source, catchup_rlp, catchup_view) in catchup {
-            let catchup_block = match n42_network::decode_gov5_block_rlp(&catchup_rlp) {
+            let catchup_block = match self.decode_wire_block(&catchup_rlp) {
                 Ok(block) => block,
                 Err(error) => {
                     error!(target: "n42::interop::h2v4", %error, "buffered Gov5 block failed repeat decoding");
@@ -1881,6 +1884,61 @@ impl ConsensusService {
             "authenticated Gov5 ancestry reached a durable execution head"
         );
         true
+    }
+
+    /// Decodes a gov5-wire block with the header layout of this chain.
+    fn decode_wire_block(
+        &self,
+        rlp: &[u8],
+    ) -> Result<n42_network::Gov5GossipBlock, n42_network::Gov5BlockError> {
+        n42_network::decode_block_rlp_for(rlp, self.profile1.is_some())
+    }
+
+    /// Profile 1: admits the header of `hash` through the gate, from `raw`
+    /// or from the remembered encoding. `true` on every other chain. A
+    /// refused header is logged with its rule id and must not be imported or
+    /// voted on.
+    pub(super) fn profile1_admit_hash(
+        &mut self,
+        hash: B256,
+        raw: Option<&[u8]>,
+        path: &'static str,
+    ) -> bool {
+        let Some(gate) = self.profile1.as_mut() else {
+            return true;
+        };
+        gate.admit_known(hash, raw)
+            .map_err(|refusal| crate::profile1_header::log_profile1_refusal(hash, path, &refusal))
+            .is_ok()
+    }
+
+    /// Profile 1: admits the header of a decoded gov5-wire block.
+    pub(super) fn profile1_admit_block(
+        &mut self,
+        block: &n42_network::Gov5GossipBlock,
+        path: &'static str,
+    ) -> bool {
+        let Some(gate) = self.profile1.as_mut() else {
+            return true;
+        };
+        gate.admit_block(block)
+            .map_err(|refusal| {
+                crate::profile1_header::log_profile1_refusal(block.block_hash, path, &refusal)
+            })
+            .is_ok()
+    }
+
+    /// Profile 1, B4 vote half: whether this node may send its Round-1 vote
+    /// for `hash` now. `true` on every other chain.
+    pub(super) fn profile1_vote_allowed(&self, hash: B256) -> bool {
+        let Some(gate) = self.profile1.as_ref() else {
+            return true;
+        };
+        gate.check_vote(&hash)
+            .map_err(|refusal| {
+                crate::profile1_header::log_profile1_refusal(hash, "round1_vote", &refusal)
+            })
+            .is_ok()
     }
 
     async fn handle_h2_v4_gov5_block(
@@ -1904,7 +1962,7 @@ impl ConsensusService {
             self.retire_h2_v4_fetch_satisfied_elsewhere(hash).await;
             return;
         }
-        let block = match n42_network::decode_gov5_block_rlp(&rlp) {
+        let block = match self.decode_wire_block(&rlp) {
             Ok(block) => block,
             Err(error) => {
                 counter!("n42_h2_v4_blocks_rejected_total", "reason" => "decode").increment(1);
@@ -2049,6 +2107,11 @@ impl ConsensusService {
         block: n42_network::Gov5GossipBlock,
         view: u64,
     ) -> bool {
+        // Profile 1: the header is checked against its parent before the
+        // payload reaches execution (reverse-walk and range catch-up alike).
+        if !self.profile1_admit_block(&block, "catchup") {
+            return false;
+        }
         let Some(el) = self.el.clone() else {
             error!(target: "n42::interop::h2v4", "cannot import authenticated Gov5 catch-up without an execution layer");
             return false;
@@ -2172,6 +2235,9 @@ impl ConsensusService {
         if self.pending_block_data.contains_key(&block.block_hash) {
             counter!("n42_h2_v4_gov5_block_already_cached_total").increment(1);
             debug!(target: "n42::interop::h2v4", %source, hash = %block.block_hash, "native block data already cached; Gov5 copy not converted");
+            return;
+        }
+        if !self.profile1_admit_block(&block, "follower_import") {
             return;
         }
         let mut execution_data = match crate::replay_import::build_gov5_gossip_execution_data(
@@ -3330,6 +3396,7 @@ impl ConsensusService {
         Self {
             engine,
             h2_v4_identity: None,
+            profile1: None,
             h2_v4_block_views: BTreeMap::new(),
             h2_v4_block_view_order: VecDeque::new(),
             h2_v4_block_numbers: BTreeMap::new(),
@@ -3595,6 +3662,7 @@ impl ConsensusService {
         Self {
             engine,
             h2_v4_identity: None,
+            profile1: None,
             h2_v4_block_views: BTreeMap::new(),
             h2_v4_block_view_order: VecDeque::new(),
             h2_v4_block_numbers: BTreeMap::new(),
@@ -3741,6 +3809,17 @@ impl ConsensusService {
     ) -> Self {
         self.engine.enable_h2_v4_signing(identity);
         self.h2_v4_identity = Some(identity);
+        self
+    }
+
+    /// Profile 1: checks every imported header with [`validate_profile1_header`]
+    /// against its admitted parent before its payload reaches execution, reads
+    /// gov5 block bodies with the 24-element header, and holds the Round-1 vote
+    /// for a header whose time is past `floor(now) + 2` (B4).
+    ///
+    /// [`validate_profile1_header`]: crate::profile1_header::validate_profile1_header
+    pub fn with_profile1_gate(mut self, gate: crate::profile1_header::Profile1ImportGate) -> Self {
+        self.profile1 = Some(gate);
         self
     }
 
@@ -10521,7 +10600,7 @@ mod tests {
         assert!(orch.range_catchup.is_active());
         let rlps: Vec<Vec<u8>> = chain[..49].iter().map(|(_, rlp)| rlp.clone()).collect();
         // One result already queued, one decode started right before the stop.
-        orch.range_decoded.decode(peer, 1, rlps.clone());
+        orch.range_decoded.decode(peer, 1, rlps.clone(), false);
         let queued = loop {
             if let Ok(item) = orch.range_decoded.rx.try_recv() {
                 break item;
@@ -10529,7 +10608,7 @@ mod tests {
             tokio::task::yield_now().await;
         };
         orch.range_decoded.tx.send(queued).unwrap();
-        orch.range_decoded.decode(peer, 1, rlps);
+        orch.range_decoded.decode(peer, 1, rlps, false);
         orch.on_range_catchup_stopped(crate::range_catchup::Deactivation::Stalled)
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -10612,4 +10691,7 @@ mod tests {
         orch.drive_range_catchup().await;
         assert!(network.range_requests.lock().unwrap().is_empty());
     }
+
+    /// Profile 1: the V1 header vectors through the real import entry points.
+    mod profile1;
 }

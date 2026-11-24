@@ -10,6 +10,7 @@ async-trait = "0.1"
 # Internal
 n42-primitives.workspace = true
 n42-consensus.workspace = true
+n42-chainspec.workspace = true
 n42-mobile.workspace = true
 
 # Networking
