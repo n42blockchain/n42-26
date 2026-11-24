@@ -3328,7 +3328,7 @@ impl ConsensusService {
             h2_v4_catchup_active: false,
             range_catchup: crate::range_catchup::RangeCatchup::new(
                 crate::range_catchup::RangeCatchupConfig::default(),
-                crate::range_catchup::AnchorMode::from_env(),
+                range_sync::range_anchor_mode(),
             ),
             range_decoded: range_sync::RangeDecodeLane::new(),
             h2_v4_fetch_failed_peers: BTreeMap::new(),
@@ -3593,7 +3593,7 @@ impl ConsensusService {
             h2_v4_catchup_active: false,
             range_catchup: crate::range_catchup::RangeCatchup::new(
                 crate::range_catchup::RangeCatchupConfig::default(),
-                crate::range_catchup::AnchorMode::from_env(),
+                range_sync::range_anchor_mode(),
             ),
             range_decoded: range_sync::RangeDecodeLane::new(),
             h2_v4_fetch_failed_peers: BTreeMap::new(),
@@ -10509,7 +10509,11 @@ mod tests {
         for number in 1..=50u64 {
             // Tenure of four: views 1,1,1,1,2,2,2,2,...; the staged top
             // block carries a view of its own.
-            let view = if number == 50 { 100 } else { (number - 1) / 4 + 1 };
+            let view = if number == 50 {
+                100
+            } else {
+                (number - 1) / 4 + 1
+            };
             let (hash, rlp) = test_gov5_block_rlp(parent, number, view);
             chain.push((hash, rlp));
             parent = hash;
@@ -10519,7 +10523,10 @@ mod tests {
         orch.handle_h2_v4_gov5_block(peer, top_rlp, None).await;
         assert!(orch.range_catchup.is_active());
         orch.drive_range_catchup().await;
-        assert_eq!(network.range_requests.lock().unwrap().clone(), vec![(peer, 1, 49)]);
+        assert_eq!(
+            network.range_requests.lock().unwrap().clone(),
+            vec![(peer, 1, 49)]
+        );
         let rlps = chain[..49].iter().map(|(_, rlp)| rlp.clone()).collect();
         deliver_range_reply(&mut orch, peer, 1, rlps).await;
         for _ in 0..6 {
@@ -10528,7 +10535,27 @@ mod tests {
         assert_eq!(orch.head_block_number, 50);
         assert_eq!(orch.head_block_hash, top_hash);
         let expected: Vec<B256> = chain.iter().map(|(hash, _)| *hash).collect();
-        assert_eq!(mock.new_payload_hashes(), expected, "each height once, in order");
+        assert_eq!(
+            mock.new_payload_hashes(),
+            expected,
+            "each height once, in order"
+        );
+    }
+
+    /// Review item 7: a follower whose background import queue is busy
+    /// holds those blocks already; the range client stays idle.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_busy_background_import_keeps_the_range_client_idle() {
+        let (mut orch, network, _mock, peer, chain) =
+            range_catchup_orchestrator(crate::range_catchup::AnchorMode::Observe).await;
+        orch.bg_import_in_flight = true;
+        let (top_hash, top_rlp) = chain[49].clone();
+        orch.remember_h2_v4_block_view(top_hash, 50);
+        orch.handle_h2_v4_gov5_block(peer, top_rlp, None).await;
+        assert!(!orch.range_catchup.is_active());
+        assert!(orch.h2_v4_fetch_requested_at.contains_key(&chain[48].0));
+        orch.drive_range_catchup().await;
+        assert!(network.range_requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

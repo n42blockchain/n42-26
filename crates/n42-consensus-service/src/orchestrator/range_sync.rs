@@ -20,6 +20,9 @@
 //!   layer keeps refusing), the reverse hash walk resumes from the staged
 //!   suffix. That walk is not governed by `N42_SYNC_ANCHOR`, so `enforce` is
 //!   not a security boundary yet.
+//! - It never starts while blocks wait in the background import queue (a
+//!   follower lagging at peak load holds those blocks already) or when the
+//!   execution layer is delegated to an owner node (`N42_EL_OWNER_RPC`).
 //! - While caught up the client does nothing: no per-block work, no timer,
 //!   and the decode lane is not polled.
 
@@ -37,6 +40,17 @@ use tracing::{debug, error, info, warn};
 
 /// Blocks imported per wake-up; the loop yields to consensus between batches.
 const RANGE_IMPORT_BATCH: usize = 32;
+
+/// The anchor mode the client starts with: off when this key's execution
+/// layer is delegated to an owner node (it does not execute, so it has
+/// nothing to catch up), else `N42_SYNC_ANCHOR`.
+pub(super) fn range_anchor_mode() -> AnchorMode {
+    if std::env::var_os("N42_EL_OWNER_RPC").is_some_and(|owner| !owner.is_empty()) {
+        AnchorMode::Off
+    } else {
+        AnchorMode::from_env()
+    }
+}
 
 /// A range reply decoded off the orchestrator loop.
 pub(super) type RangeDecoded = (PeerId, u64, RangeReply);
@@ -112,6 +126,11 @@ impl ConsensusService {
             return false;
         }
         let was_active = self.range_catchup.is_active();
+        // A follower lagging behind its own background imports holds those
+        // blocks already; the range client would download them again.
+        if !was_active && (self.bg_import_in_flight || !self.bg_import_queue.is_empty()) {
+            return false;
+        }
         if !self.range_catchup.activate(
             self.head_block_number,
             block.header.number,
