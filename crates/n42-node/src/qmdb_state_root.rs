@@ -2805,6 +2805,16 @@ impl Gov5QmdbStateRootJob {
                 expected = ?expected,
                 "REJECTING block: its deferred execution fields are not this node's result for its parent"
             );
+            // Kept for E12: a commit of this block is a deferred-execution fault.
+            n42_consensus::record_carried_mismatch(
+                block.hash(),
+                n42_consensus::CarriedMismatch {
+                    parent: block.parent_hash,
+                    field,
+                    carried,
+                    expected,
+                },
+            );
             // Any root but the header's: reth refuses through BodyStateRootDiff.
             let mut refused = block.state_root;
             refused.0[31] ^= 0x01;
@@ -4610,6 +4620,60 @@ mod tests {
             root
         );
         assert_eq!(std::fs::read(wal_path(&path)).unwrap(), wal);
+    }
+
+    /// Design 3.8, a crash between the QMDB WAL and the executed-fields
+    /// log: the block's operations are durable in QMDB but its result was
+    /// never filed. After the restart the block is imported again (reth
+    /// never made it valid, so never persisted it); the deferred commit of
+    /// the same operations returns the same root without a new WAL record,
+    /// and the result is filed then. Different operations under that hash
+    /// are refused.
+    #[test]
+    fn deferred_commit_after_a_crash_before_the_result_was_filed() {
+        let (base, snapshot) = store();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deferred-crash.bin");
+        let log = dir.path().join("executed_fields.log");
+        let parent = base.base_block_hash();
+        let hash = B256::repeat_byte(0x7c);
+        let operations = vec![operation(2, 2), operation(3, 3)];
+        let root = expected_root(&snapshot, std::slice::from_ref(&operations));
+        let store = persistent_store(&base, &snapshot, &path);
+        assert_eq!(
+            store.compute_and_commit_own(parent, hash, operations.clone()).unwrap(),
+            root
+        );
+        let wal = std::fs::read(wal_path(&path)).unwrap();
+        // Crash: the result is not in the log.
+        drop(store);
+        let registry = n42_consensus::executed_fields::ExecutedFieldsRegistry::open(&log, parent).unwrap();
+        assert!(registry.get(&hash).is_none());
+        drop(registry);
+
+        let reopened = persistent_store(&base, &snapshot, &path);
+        assert_eq!(
+            reopened.compute_and_commit_own(parent, hash, operations.clone()).unwrap(),
+            root,
+            "the re-import commits the same root"
+        );
+        assert_eq!(std::fs::read(wal_path(&path)).unwrap(), wal, "no second WAL record");
+        assert_eq!(
+            reopened.compute_and_commit_own(parent, hash, vec![operation(2, 9)]),
+            Err(Gov5QmdbStateRootError::ConflictingBlock { block_hash: hash })
+        );
+        let fields = n42_consensus::ExecutedFields {
+            state_root: root,
+            receipts_root: B256::repeat_byte(1),
+            logs_bloom: Default::default(),
+            gas_used: 0,
+            requests_hash: n42_chainspec::profile1::PROFILE1_REQUESTS_HASH,
+        };
+        let mut registry = n42_consensus::executed_fields::ExecutedFieldsRegistry::open(&log, parent).unwrap();
+        registry.insert(hash, fields).unwrap();
+        drop(registry);
+        let registry = n42_consensus::executed_fields::ExecutedFieldsRegistry::open(&log, parent).unwrap();
+        assert_eq!(registry.get(&hash), Some(fields));
     }
 
     #[test]

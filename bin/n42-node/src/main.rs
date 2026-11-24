@@ -12,7 +12,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use alloy_consensus::Header;
 use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256, U256, keccak256};
-use alloy_rpc_types_engine::{ExecutionData, ForkchoiceState, PayloadStatusEnum};
+use alloy_rpc_types_engine::{ExecutionData, PayloadStatusEnum};
 use clap::Parser;
 use n42_chainspec::{ConsensusConfig, ValidatorInfo};
 use n42_consensus::{
@@ -65,6 +65,35 @@ use std::sync::{Arc, Mutex, Once, atomic::AtomicBool};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+/// E14 fork-choice tags of a Profile-1 node over reth: block links from the
+/// Profile-1 header registry (the block being committed may not be canonical
+/// yet) or else from reth, and the highest block reth has persisted.
+fn profile1_fcu_tags<N>(
+    provider: reth_provider::providers::BlockchainProvider<N>,
+) -> n42_consensus_service::fcu_tags::ForkchoiceTags
+where
+    N: reth_provider::providers::ProviderNodeTypes<Primitives = n42_tx_types::N42Primitives>,
+{
+    let in_memory = provider.canonical_in_memory_state();
+    n42_consensus_service::fcu_tags::ForkchoiceTags::new(
+        move |hash| {
+            if let Some(header) = n42_consensus::remembered_profile1_header(hash) {
+                return Some((header.header.number, header.header.parent_hash));
+            }
+            provider
+                .header(*hash)
+                .ok()
+                .flatten()
+                .map(|header| (header.number, header.parent_hash))
+        },
+        move || {
+            in_memory
+                .get_persisted_num_hash()
+                .map(|block| (block.number, block.hash))
+        },
+    )
+}
 
 /// Serve gov5 bodies-by-range from one consistent storage view per batch.
 ///
@@ -865,6 +894,7 @@ fn historical_replay_checkpoint_due(position: usize, total: usize, interval: usi
 async fn import_authenticated_replay_plan(
     execution: &dyn n42_node::el::ExecutionLayer,
     plan: &ReplayExecutionPlan,
+    fcu_tags: Option<&n42_consensus_service::fcu_tags::ForkchoiceTags>,
 ) -> eyre::Result<B256> {
     let verification = plan.verification();
     let replay_started = std::time::Instant::now();
@@ -910,11 +940,11 @@ async fn import_authenticated_replay_plan(
             let forkchoice = execution
                 .fork_choice_updated_for(
                     ExecutionPath::HISTORICAL_SEQUENTIAL,
-                    ForkchoiceState {
-                        head_block_hash: block_hash,
-                        safe_block_hash: block_hash,
-                        finalized_block_hash: block_hash,
-                    },
+                    n42_consensus_service::fcu_tags::forkchoice_state(
+                        fcu_tags,
+                        block_hash,
+                        block_hash,
+                    ),
                 )
                 .await
                 .map_err(|error| {
@@ -2978,10 +3008,16 @@ fn main() {
                             head,
                         )?);
                     }
+                    // E14: safe = the head's parent, finalized = persisted.
+                    let observer_fcu_tags =
+                        profile1.as_ref().map(|_| profile1_fcu_tags(full_node.provider.clone()));
+                    if let Some(tags) = &observer_fcu_tags {
+                        observer = observer.with_fcu_tags(tags.clone());
+                    }
 
                     task_executor.spawn_critical_task("n42-observer-orchestrator", Box::pin(async move {
                         if let Some(plan) = replay_plan {
-                            match import_authenticated_replay_plan(observer_el.as_ref(), &plan).await {
+                            match import_authenticated_replay_plan(observer_el.as_ref(), &plan, observer_fcu_tags.as_ref()).await {
                                 Ok(imported) => info!(
                                     target: "n42::cli",
                                     %imported,
@@ -3647,13 +3683,9 @@ fn main() {
                 // A10 (design 3.1/3.8): the first header after a restart
                 // carries the head's result, which must be this node's own;
                 // it is never taken from a header.
-                if profile1.is_some()
-                    && consensus_head_number > 0
-                    && n42_consensus::executed_fields(&consensus_head_hash).is_none()
-                {
-                    return Err(eyre::eyre!(
-                        "refusing to start: profile 1: no executed result for head {consensus_head_number} ({consensus_head_hash}) in executed_fields.log"
-                    ));
+                if profile1.is_some() {
+                    n42_consensus::require_head_result(consensus_head_number, consensus_head_hash)
+                        .map_err(|error| eyre::eyre!("refusing to start: profile 1: {error}"))?;
                 }
                 if let Some(config) = &profile1 {
                     let head = full_node
@@ -3860,6 +3892,24 @@ fn main() {
                     orchestrator = orchestrator.with_evidence_store(Arc::clone(store));
                 }
 
+                // E14: safe = the committed head's parent, finalized = the
+                // highest persisted block at or below it.
+                let participant_fcu_tags =
+                    profile1.as_ref().map(|_| profile1_fcu_tags(full_node.provider.clone()));
+                if let Some(tags) = &participant_fcu_tags {
+                    orchestrator = orchestrator.with_fcu_tags(tags.clone());
+                }
+                // E12: evidence of a halt survives restarts; the node starts
+                // halted while `profile1_halt.json` is in the data directory.
+                if profile1.is_some() {
+                    let halt = n42_consensus_service::halt::Halt::open(&data_dir)
+                        .map_err(|error| eyre::eyre!("refusing to start: profile 1: halt evidence: {error}"))?;
+                    if let Some(evidence) = halt.evidence() {
+                        tracing::error!(target: "n42::profile1", ?evidence, dir = %data_dir.display(), "starting HALTED (E12): move profile1_halt.json out of the data directory to resume");
+                    }
+                    orchestrator = orchestrator.with_halt(Arc::new(halt));
+                }
+
                 let orchestrator = orchestrator;
 
                 task_executor.spawn_critical_task(
@@ -3869,6 +3919,7 @@ fn main() {
                             match import_authenticated_replay_plan(
                                 participant_replay_el.as_ref(),
                                 &plan,
+                                participant_fcu_tags.as_ref(),
                             )
                             .await
                             {

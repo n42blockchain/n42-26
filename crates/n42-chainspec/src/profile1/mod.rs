@@ -184,6 +184,9 @@ pub const PROFILE1_FORBIDDEN_ENV: &[&str] = &[
     // fields; neither switch has a deferred variant.
     "N42_QMDB_ADOPT_BUILT",
     "N42_LEADER_INSERT_EXECUTED",
+    // E14: a key whose execution an owner runs reads the finalized tag as
+    // the committed block; on Profile 1 finalized trails the head.
+    "N42_EL_OWNER_RPC",
 ];
 
 /// Prefixes of forbidden variables: every gov5 interop switch

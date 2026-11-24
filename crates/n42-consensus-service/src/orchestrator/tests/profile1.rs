@@ -343,3 +343,245 @@ async fn non_profile_votes_are_not_gated() {
     orch.handle_engine_output(EngineOutput::SendToValidator(0, vote)).await;
     assert!(matches!(cmd_rx.try_recv(), Ok(NetworkCommand::BroadcastConsensus(_))));
 }
+
+/// A Profile-1 header remembered in the native header registry: V1's
+/// block 2 moved to `number` under `parent`, with `change` applied.
+fn remembered_header(number: u64, parent: B256, change: impl FnOnce(&mut Profile1Header)) -> Profile1Header {
+    let (f, _) = v1();
+    let mut header = Profile1Header::decode(&f.block2).unwrap();
+    header.header.number = number;
+    header.header.parent_hash = parent;
+    change(&mut header);
+    n42_consensus::remember_gov5_native_header(&header.encode());
+    assert!(n42_consensus::remembered_profile1_header(&header.hash()).is_some());
+    header
+}
+
+fn halted_orchestrator(
+    gate: Profile1ImportGate,
+) -> (
+    ConsensusService,
+    Arc<MockExecutionLayer>,
+    Arc<crate::halt::Halt>,
+    mpsc::Sender<NetworkEvent>,
+) {
+    let (engine, output_rx) = make_test_engine();
+    let (network, _cmd_rx, _prx) = make_test_network();
+    let (net_event_tx, net_event_rx) = mpsc::channel(8192);
+    let halt = Arc::new(crate::halt::Halt::in_memory());
+    let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+        .with_profile1_gate(gate)
+        .with_halt(halt.clone());
+    let mock = Arc::new(MockExecutionLayer::new(PayloadStatusEnum::Valid, PayloadStatusEnum::Valid));
+    orch.el = Some(mock.clone());
+    orch.async_finalize_fcu = false;
+    (orch, mock, halt, net_event_tx)
+}
+
+/// E12 fault injection: a block committed by consensus whose carried state
+/// root is not this node's result for its parent halts the node before it
+/// imports, makes canonical, votes or builds anything, and the halted loop
+/// processes nothing more.
+#[tokio::test]
+async fn e12_a_committed_block_with_wrong_carried_fields_halts() {
+    let (_, gate) = v1();
+    let (mut orch, mock, halt, net_event_tx) = halted_orchestrator(gate);
+    let parent = B256::repeat_byte(0xe1);
+    let header = remembered_header(41, parent, |header| {
+        header.header.state_root = B256::repeat_byte(0xbd);
+    });
+    // This node's own result for the parent differs in the state root only.
+    let mut own = n42_consensus::ExecutedFields::carried_by(&header.header);
+    own.state_root = B256::repeat_byte(0x0d);
+    n42_consensus::remember_executed_fields(parent, own).unwrap();
+    let hash = header.hash();
+    orch.pending_block_data
+        .insert(hash, test_block_data(parent, hash, 7).into());
+
+    orch.handle_engine_output(EngineOutput::BlockCommitted {
+        view: 7,
+        block_hash: hash,
+        commit_qc: QuorumCertificate::genesis(),
+        validator_changes: None,
+    })
+    .await;
+
+    let evidence = halt.evidence().expect("halted");
+    assert_eq!(evidence.view, 7);
+    assert!(evidence.commit_qc.is_some(), "the commit QC is kept as evidence");
+    match &evidence.reason {
+        crate::halt::HaltReason::CarriedFields { block, parent: p, field, .. } => {
+            assert_eq!((*block, *p, field.as_str()), (hash, parent, "stateRoot"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(orch.committed_block_count, 0, "the commit is not acted on");
+    assert!(mock.new_payload_hashes().is_empty(), "nothing imported");
+    assert!(mock.fcu_heads().is_empty(), "nothing made canonical");
+
+    // The halted loop drops a proposal and engine output unprocessed and
+    // ends only when its channels close.
+    let (_, block) = block_data(&header.encode(), 8);
+    net_event_tx
+        .send(NetworkEvent::BlockAnnouncement {
+            source: libp2p::PeerId::random(),
+            data: bincode::serialize(&block).unwrap(),
+        })
+        .await
+        .unwrap();
+    drop(net_event_tx);
+    tokio::time::timeout(Duration::from_secs(5), orch.run())
+        .await
+        .expect("the halted loop ends when its channels close");
+    assert!(mock.new_payload_hashes().is_empty());
+    assert!(mock.fcu_heads().is_empty());
+    assert!(mock.build_parents().is_empty(), "nothing built");
+}
+
+/// E12: a block the import refused for its carried fields halts the node
+/// when it is committed, with the import's evidence.
+#[tokio::test]
+async fn e12_a_committed_block_the_import_refused_halts() {
+    let (_, gate) = v1();
+    let (mut orch, mock, halt, _net_event_tx) = halted_orchestrator(gate);
+    let hash = B256::repeat_byte(0xe2);
+    let carried = n42_consensus::ExecutedFields {
+        state_root: B256::repeat_byte(1),
+        receipts_root: B256::repeat_byte(2),
+        logs_bloom: Default::default(),
+        gas_used: 21_000,
+        requests_hash: n42_chainspec::profile1::PROFILE1_REQUESTS_HASH,
+    };
+    let expected = n42_consensus::ExecutedFields { gas_used: 42_000, ..carried };
+    n42_consensus::record_carried_mismatch(
+        hash,
+        n42_consensus::CarriedMismatch {
+            parent: B256::repeat_byte(0xe3),
+            field: "gasUsed",
+            carried,
+            expected,
+        },
+    );
+    orch.handle_engine_output(EngineOutput::BlockCommitted {
+        view: 3,
+        block_hash: hash,
+        commit_qc: QuorumCertificate::genesis(),
+        validator_changes: None,
+    })
+    .await;
+    match halt.evidence().expect("halted").reason {
+        crate::halt::HaltReason::CarriedFields { field, own, .. } => {
+            assert_eq!(field, "gasUsed");
+            assert_eq!(own["gasUsed"], 42_000);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(mock.fcu_heads().is_empty());
+}
+
+/// E12: two committed blocks at one height halt the node; the first commit
+/// alone does not.
+#[tokio::test]
+async fn e12_a_conflicting_commit_halts() {
+    let (_, gate) = v1();
+    let (mut orch, _mock, halt, _net_event_tx) = halted_orchestrator(gate);
+    let parent = B256::repeat_byte(0xe4);
+    let first = remembered_header(52, parent, |_| {});
+    let second = remembered_header(52, parent, |header| header.header.timestamp += 1);
+    for (view, header) in [(5, &first), (6, &second)] {
+        let hash = header.hash();
+        orch.pending_block_data
+            .insert(hash, test_block_data(parent, hash, view).into());
+        orch.handle_engine_output(EngineOutput::BlockCommitted {
+            view,
+            block_hash: hash,
+            commit_qc: QuorumCertificate::genesis(),
+            validator_changes: None,
+        })
+        .await;
+        assert_eq!(halt.is_halted(), view == 6, "view {view}");
+    }
+    assert_eq!(
+        halt.evidence().unwrap().reason,
+        crate::halt::HaltReason::ConflictingCommit {
+            number: 52,
+            committed: first.hash(),
+            conflicting: second.hash(),
+        }
+    );
+}
+
+/// Off Profile 1 there is no halt latch: the same commit proceeds.
+#[tokio::test]
+async fn e12_needs_a_halt_latch() {
+    let (_, gate) = v1();
+    let mut orch = profile1_orchestrator(gate);
+    let hash = B256::repeat_byte(0xe5);
+    n42_consensus::record_carried_mismatch(
+        hash,
+        n42_consensus::CarriedMismatch {
+            parent: B256::ZERO,
+            field: "stateRoot",
+            carried: n42_consensus::ExecutedFields::carried_by(&Default::default()),
+            expected: n42_consensus::ExecutedFields::carried_by(&Default::default()),
+        },
+    );
+    assert!(!orch.profile1_check_committed(1, hash, None));
+}
+
+/// E14: on Profile 1 the commit's forkchoice update makes the committed
+/// block the head, its parent safe and the highest persisted ancestor
+/// finalized; off Profile 1 all three are the committed block.
+#[tokio::test]
+async fn e14_commit_forkchoice_tags() {
+    let p8 = B256::repeat_byte(0x48);
+    let p9 = B256::repeat_byte(0x49);
+    let head = remembered_header(10, p9, |header| header.header.gas_limit += 1).hash();
+    for profile1 in [true, false] {
+        let (_, gate) = v1();
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx)
+            .with_profile1_gate(gate);
+        if profile1 {
+            let links = std::collections::HashMap::from([
+                (head, (10u64, p9)),
+                (p9, (9, p8)),
+                (p8, (8, B256::repeat_byte(0x47))),
+            ]);
+            orch = orch.with_fcu_tags(crate::fcu_tags::ForkchoiceTags::new(
+                move |hash| links.get(hash).copied(),
+                move || Some((8, p8)),
+            ));
+        }
+        let mock = Arc::new(MockExecutionLayer::new(PayloadStatusEnum::Valid, PayloadStatusEnum::Valid));
+        orch.el = Some(mock.clone());
+        orch.async_finalize_fcu = false;
+        orch.head_block_hash = p9;
+        orch.pending_block_data
+            .insert(head, test_block_data(p9, head, 10).into());
+        orch.handle_engine_output(EngineOutput::BlockCommitted {
+            view: 10,
+            block_hash: head,
+            commit_qc: QuorumCertificate::genesis(),
+            validator_changes: None,
+        })
+        .await;
+        orch.handle_commit_execution_timeout(10, head);
+        if let Ok(Some((hash, view, outcome, ts))) =
+            tokio::time::timeout(Duration::from_secs(2), orch.import_done_rx.recv()).await
+        {
+            orch.handle_import_done(hash, view, outcome, ts).await;
+        }
+        let states = mock.fcu_states();
+        let expected = if profile1 { (head, p9, p8) } else { (head, head, head) };
+        assert!(states.contains(&expected), "profile1={profile1}: {states:?}");
+        if profile1 {
+            assert!(
+                states.iter().all(|(_, safe, finalized)| *safe != head && *finalized != head),
+                "the committed head is never safe or finalized on Profile 1: {states:?}"
+            );
+        }
+    }
+}

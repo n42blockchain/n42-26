@@ -469,6 +469,73 @@ pub fn wait_for_executed_fields(hash: &B256, timeout: Duration) -> Option<Execut
     }
 }
 
+/// A block this node refused because a field it carries is not this node's
+/// result for its parent (A10). Kept so that a later commit of the block can
+/// be recognised as a deferred-execution fault (E12) with its evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CarriedMismatch {
+    /// The refused block's parent.
+    pub parent: B256,
+    /// The first field that differs (`stateRoot`, `receiptsRoot`, ...).
+    pub field: &'static str,
+    /// What the block carries.
+    pub carried: ExecutedFields,
+    /// This node's result for the parent.
+    pub expected: ExecutedFields,
+}
+
+/// How many refused blocks are remembered.
+const MISMATCHES_KEPT: usize = 256;
+
+static MISMATCHES: Mutex<VecDeque<(B256, CarriedMismatch)>> = Mutex::new(VecDeque::new());
+
+/// Remembers that block `hash` was refused for carrying `mismatch`.
+pub fn record_carried_mismatch(hash: B256, mismatch: CarriedMismatch) {
+    let mut kept = MISMATCHES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if kept.iter().any(|(known, _)| *known == hash) {
+        return;
+    }
+    if kept.len() >= MISMATCHES_KEPT {
+        kept.pop_front();
+    }
+    kept.push_back((hash, mismatch));
+}
+
+/// The mismatch block `hash` was refused for, if it was refused here.
+pub fn carried_mismatch(hash: &B256) -> Option<CarriedMismatch> {
+    MISMATCHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(known, _)| known == hash)
+        .map(|(_, mismatch)| *mismatch)
+}
+
+/// Why a node may not resume from its head (design 3.8).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RestartError {
+    /// The head is above genesis and its result is not in the log.
+    #[error(
+        "no executed result for head {number} ({hash}): its child would carry it and it is never \
+         taken from a header; re-import the head from a peer's committed range into an empty \
+         datadir, or restore executed_fields.log from this node's backup"
+    )]
+    HeadResultMissing {
+        /// Head number.
+        number: u64,
+        /// Head hash.
+        hash: B256,
+    },
+}
+
+/// A restarting node needs its own result for its head: the first block it
+/// builds or checks carries it (design 3.8). It is never adopted from a
+/// header (this node's or a peer's); genesis is filed from its own header
+/// when the log is installed.
+pub fn require_head_result(number: u64, hash: B256) -> Result<ExecutedFields, RestartError> {
+    executed_fields(&hash).ok_or(RestartError::HeadResultMissing { number, hash })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,8 +693,12 @@ mod tests {
 
     /// Genesis's own fields from the V1 genesis (A6): its QMDB alloc root,
     /// the empty receipts root, a zero bloom, no gas, `sha256("")`.
+    /// Serialises the tests that install the process registry.
+    static GLOBAL: Mutex<()> = Mutex::new(());
+
     #[test]
     fn the_genesis_entry_is_the_v1_genesis_header() {
+        let _global = GLOBAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../n42-chainspec/testdata/profile1/V1/genesis_8s.json");
         let json: serde_json::Value =
@@ -654,5 +725,41 @@ mod tests {
         filer.join().unwrap();
         assert_eq!(wait_for_executed_fields(&hash(0xdead), Duration::from_millis(10)), None);
         drop(dir);
+    }
+
+    /// Design 3.8: a restart resumes only from a head whose result is in the
+    /// log. A clean restart has it; a head whose record was torn by a crash
+    /// (it was never made valid, so its block is re-imported) or a lost log
+    /// refuses the start; genesis always has its own.
+    #[test]
+    fn a_restart_needs_the_heads_own_result() {
+        let _global = GLOBAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let genesis = alloy_consensus::Header::default();
+        let genesis_hash = genesis.hash_slow();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("executed_fields.log");
+        let (head, torn) = (hash(0x3801), hash(0x3802));
+        {
+            let mut registry = ExecutedFieldsRegistry::open(&log, genesis_hash).unwrap();
+            registry.insert(head, fields(1)).unwrap();
+            registry.insert(torn, fields(2)).unwrap();
+        }
+        // The crash tore the last record.
+        let len = std::fs::metadata(&log).unwrap().len();
+        OpenOptions::new().write(true).open(&log).unwrap().set_len(len - 9).unwrap();
+
+        install_executed_fields_log(&log, genesis_hash, &genesis).unwrap();
+        assert_eq!(require_head_result(5, head), Ok(fields(1)), "clean restart");
+        assert_eq!(
+            require_head_result(6, torn),
+            Err(RestartError::HeadResultMissing { number: 6, hash: torn }),
+            "a torn head record refuses the start"
+        );
+        assert_eq!(require_head_result(0, genesis_hash), Ok(ExecutedFields::carried_by(&genesis)));
+        // The header of the head's child is never a source: only filing is.
+        let lost = hash(0x3803);
+        assert!(require_head_result(9, lost).is_err());
+        remember_executed_fields(torn, fields(2)).unwrap();
+        assert_eq!(require_head_result(6, torn), Ok(fields(2)), "re-imported and filed");
     }
 }

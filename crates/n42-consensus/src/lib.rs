@@ -34,7 +34,7 @@ pub use committee_pool::{
 };
 pub use error::ConsensusError as N42ConsensusError;
 pub use executed_fields::{
-    ExecutedFields, ExecutedFieldsError, executed_fields, install_executed_fields_log,
+    CarriedMismatch, ExecutedFields, ExecutedFieldsError, RestartError, carried_mismatch, executed_fields, record_carried_mismatch, require_head_result, install_executed_fields_log,
     remember_executed_fields, wait_for_executed_fields,
 };
 pub use gov5_native_header::{

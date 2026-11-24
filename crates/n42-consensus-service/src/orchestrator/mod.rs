@@ -1168,6 +1168,14 @@ pub struct ConsensusService {
     /// Profile 1 (mixed production standard): the header gate every imported
     /// block and every Round-1 vote passes. `None` on every other chain.
     profile1: Option<crate::profile1_header::Profile1ImportGate>,
+    /// E14 fork-choice tags of a deferred-execution chain (Profile 1):
+    /// safe = the committed head's parent, finalized = the highest persisted
+    /// block at or below safe. `None`: every tag names the committed block.
+    fcu_tags: Option<crate::fcu_tags::ForkchoiceTags>,
+    /// E12 halt latch of a Profile-1 node; `None` on every other chain.
+    halt: Option<Arc<crate::halt::Halt>>,
+    /// Committed block per height (Profile 1), for conflicting commits.
+    committed_heights: crate::halt::CommittedHeights,
     /// H2-authenticated block hash -> consensus view. Gov5 block gossip is not
     /// executed until one of these bindings exists.
     h2_v4_block_views: BTreeMap<B256, u64>,
@@ -2162,11 +2170,7 @@ impl ConsensusService {
             return true;
         }
 
-        let forkchoice = ForkchoiceState {
-            head_block_hash: block_hash,
-            safe_block_hash: block_hash,
-            finalized_block_hash: block_hash,
-        };
+        let forkchoice = self.fcu_state(block_hash, block_hash);
         match el
             .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, forkchoice)
             .await
@@ -3399,6 +3403,9 @@ impl ConsensusService {
             engine,
             h2_v4_identity: None,
             profile1: None,
+            fcu_tags: None,
+            halt: None,
+            committed_heights: Default::default(),
             h2_v4_block_views: BTreeMap::new(),
             h2_v4_block_view_order: VecDeque::new(),
             h2_v4_block_numbers: BTreeMap::new(),
@@ -3670,6 +3677,9 @@ impl ConsensusService {
             engine,
             h2_v4_identity: None,
             profile1: None,
+            fcu_tags: None,
+            halt: None,
+            committed_heights: Default::default(),
             h2_v4_block_views: BTreeMap::new(),
             h2_v4_block_view_order: VecDeque::new(),
             h2_v4_block_numbers: BTreeMap::new(),
@@ -3828,6 +3838,104 @@ impl ConsensusService {
     pub fn with_profile1_gate(mut self, gate: crate::profile1_header::Profile1ImportGate) -> Self {
         self.profile1 = Some(gate);
         self
+    }
+
+    /// E14: on a deferred-execution chain every forkchoice update names the
+    /// committed head's parent as safe and a persisted ancestor as finalized.
+    pub fn with_fcu_tags(mut self, tags: crate::fcu_tags::ForkchoiceTags) -> Self {
+        self.fcu_tags = Some(tags);
+        self
+    }
+
+    /// E12: halts import, voting and producing on proof that the committed
+    /// chain and this node's execution disagree (see [`crate::halt`]).
+    pub fn with_halt(mut self, halt: Arc<crate::halt::Halt>) -> Self {
+        self.halt = Some(halt);
+        self
+    }
+
+    /// Whether this node is halted (E12).
+    pub(super) fn halted(&self) -> bool {
+        self.halt.as_ref().is_some_and(|halt| halt.is_halted())
+    }
+
+    /// E12 check of a committed block on Profile 1: a conflicting commit, or
+    /// carried fields that are not this node's result for the parent, trips
+    /// the halt. Returns `true` if the node is halted.
+    pub(super) fn profile1_check_committed(
+        &mut self,
+        view: u64,
+        block_hash: B256,
+        commit_qc: Option<&QuorumCertificate>,
+    ) -> bool {
+        let Some(halt) = self.halt.clone() else {
+            return false;
+        };
+        if halt.is_halted() {
+            return true;
+        }
+        let header = n42_consensus::remembered_profile1_header(&block_hash);
+        let mut reason = None;
+        if let Some(header) = &header
+            && let Some((number, committed)) = self.committed_heights.commit(
+                header.header.number,
+                block_hash,
+                header.header.parent_hash,
+            )
+        {
+            reason = Some(crate::halt::HaltReason::ConflictingCommit {
+                number,
+                committed,
+                conflicting: block_hash,
+            });
+        }
+        if reason.is_none() {
+            let parent = header.as_ref().map(|header| header.header.parent_hash);
+            reason = crate::halt::committed_block_verdict(
+                block_hash,
+                parent.unwrap_or_default(),
+                header
+                    .as_ref()
+                    .map(|header| n42_consensus::ExecutedFields::carried_by(&header.header)),
+                parent.and_then(|parent| n42_consensus::executed_fields(&parent)),
+                n42_consensus::carried_mismatch(&block_hash),
+            );
+        }
+        let Some(reason) = reason else {
+            return false;
+        };
+        halt.trip(crate::halt::HaltEvidence {
+            reason,
+            view,
+            commit_qc: commit_qc.and_then(|qc| serde_json::to_value(qc).ok()),
+            at_unix_ms: crate::now_unix_ms(),
+        });
+        true
+    }
+
+    /// The halted node's loop: every consensus message, block and engine
+    /// output is dropped unprocessed until the channels close (shutdown).
+    async fn idle_halted(&mut self) {
+        let mut reminder = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                output = self.output_rx.recv() => if output.is_none() { return },
+                event = self.net_event_rx.recv() => if event.is_none() { return },
+                _ = reminder.tick() => {
+                    error!(
+                        target: "n42::profile1",
+                        evidence = ?self.halt.as_ref().and_then(|halt| halt.evidence()),
+                        "HALTED (E12): not importing, voting or producing; move profile1_halt.json out of the consensus data directory and restart to resume"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The forkchoice state that makes `head` reth's head with the E14 tags
+    /// of the committed block `committed`.
+    pub(super) fn fcu_state(&self, head: B256, committed: B256) -> ForkchoiceState {
+        crate::fcu_tags::forkchoice_state(self.fcu_tags.as_ref(), head, committed)
     }
 
     /// Stamps gov5's committee-evidence root into every payload this node
@@ -4033,7 +4141,9 @@ impl ConsensusService {
             "N42 consensus layer initialized"
         );
 
-        self.initialize_startup_schedule().await;
+        if !self.halted() {
+            self.initialize_startup_schedule().await;
+        }
 
         // Set validator context for Rotor relay forwarding in network layer
         self.network
@@ -4041,6 +4151,10 @@ impl ConsensusService {
             .await;
 
         loop {
+            if self.halted() {
+                self.idle_halted().await;
+                break;
+            }
             // Bind this Sleep to the view/deadline from which it was created. The
             // event loop recreates and drops the timer after every selected branch;
             // the checks in the timeout branch are defense-in-depth against a stale
@@ -5346,6 +5460,8 @@ mod tests {
         /// Every attribute-less forkchoiceUpdated head - the canonical-writer
         /// audit trail (import paths must NEVER appear here).
         fcu_heads: Arc<Mutex<Vec<B256>>>,
+        /// Every attribute-less forkchoiceUpdated as (head, safe, finalized).
+        fcu_states: Arc<Mutex<Vec<(B256, B256, B256)>>>,
         /// Every new_payload block hash.
         new_payload_hashes: Arc<Mutex<Vec<B256>>>,
     }
@@ -5358,6 +5474,7 @@ mod tests {
                 build_parents: Arc::new(Mutex::new(Vec::new())),
                 build_forkchoices: Arc::new(Mutex::new(Vec::new())),
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
+                fcu_states: Arc::new(Mutex::new(Vec::new())),
                 new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -5377,6 +5494,7 @@ mod tests {
                 build_parents: Arc::new(Mutex::new(Vec::new())),
                 build_forkchoices: Arc::new(Mutex::new(Vec::new())),
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
+                fcu_states: Arc::new(Mutex::new(Vec::new())),
                 new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -5396,8 +5514,16 @@ mod tests {
                 build_parents: Arc::new(Mutex::new(Vec::new())),
                 build_forkchoices: Arc::new(Mutex::new(Vec::new())),
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
+                fcu_states: Arc::new(Mutex::new(Vec::new())),
                 new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn fcu_states(&self) -> Vec<(B256, B256, B256)> {
+            self.fcu_states
+                .lock()
+                .expect("mock execution-layer lock")
+                .clone()
         }
 
         fn fcu_heads(&self) -> Vec<B256> {
@@ -5459,6 +5585,10 @@ mod tests {
                 .lock()
                 .expect("mock execution-layer lock")
                 .push(state.head_block_hash);
+            self.fcu_states
+                .lock()
+                .expect("mock execution-layer lock")
+                .push((state.head_block_hash, state.safe_block_hash, state.finalized_block_hash));
             let mut statuses = self.fcu_statuses.lock().expect("mock execution-layer lock");
             let status = if statuses.len() > 1 {
                 statuses.pop_front().expect("non-empty FCU status queue")

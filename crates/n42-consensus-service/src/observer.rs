@@ -278,6 +278,9 @@ pub struct ObserverOrchestrator {
     /// Profile 1: the header gate every imported block passes. `None` on
     /// every other chain.
     profile1: Option<crate::profile1_header::Profile1ImportGate>,
+    /// E14 fork-choice tags of a deferred-execution chain; `None` names the
+    /// followed block as safe and finalized.
+    fcu_tags: Option<crate::fcu_tags::ForkchoiceTags>,
     head_block_hash: B256,
 
     // CL state
@@ -365,6 +368,7 @@ impl ObserverOrchestrator {
             blob_store: None,
             exec_output_cache: None,
             profile1: None,
+            fcu_tags: None,
             bad_blocks: BadBlockCache::default(),
             gov5_live_blocks: HashMap::new(),
             gov5_live_order: VecDeque::new(),
@@ -404,6 +408,17 @@ impl ObserverOrchestrator {
     pub fn with_profile1_gate(mut self, gate: crate::profile1_header::Profile1ImportGate) -> Self {
         self.profile1 = Some(gate);
         self
+    }
+
+    /// E14: safe = the followed head's parent, finalized = a persisted
+    /// ancestor at or below safe.
+    pub fn with_fcu_tags(mut self, tags: crate::fcu_tags::ForkchoiceTags) -> Self {
+        self.fcu_tags = Some(tags);
+        self
+    }
+
+    fn fcu_state(&self, head: B256) -> ForkchoiceState {
+        crate::fcu_tags::forkchoice_state(self.fcu_tags.as_ref(), head, head)
     }
 
     /// Profile 1: admits the header of `hash`; `true` on every other chain.
@@ -1057,11 +1072,7 @@ impl ObserverOrchestrator {
                 }
             }
 
-            let state = ForkchoiceState {
-                head_block_hash: entry.hash,
-                safe_block_hash: entry.hash,
-                finalized_block_hash: entry.hash,
-            };
+            let state = self.fcu_state(entry.hash);
             match self
                 .el
                 .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, state)
@@ -1188,11 +1199,7 @@ impl ObserverOrchestrator {
             };
             let first_number = path.first().map(|(number, _)| *number).unwrap_or_default();
             let number = path.last().map(|(number, _)| *number).unwrap_or_default();
-            let state = ForkchoiceState {
-                head_block_hash: hash,
-                safe_block_hash: hash,
-                finalized_block_hash: hash,
-            };
+            let state = self.fcu_state(hash);
             let promoted = match self
                 .el
                 .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, state)
@@ -1324,11 +1331,7 @@ impl ObserverOrchestrator {
                         return true;
                     }
 
-                    let fcu_state = ForkchoiceState {
-                        head_block_hash: hash,
-                        safe_block_hash: hash,
-                        finalized_block_hash: hash,
-                    };
+                    let fcu_state = self.fcu_state(hash);
                     let fcu_valid = match self
                         .el
                         .fork_choice_updated_for(ExecutionPath::LIVE_SEQUENTIAL, fcu_state)

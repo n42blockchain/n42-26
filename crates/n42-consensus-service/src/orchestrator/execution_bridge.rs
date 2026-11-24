@@ -443,6 +443,7 @@ impl ConsensusService {
         let timestamp = attrs.timestamp;
 
         let same_execution_branch = parent == self.head_block_hash;
+        let committed_tags = self.fcu_state(self.head_block_hash, self.head_block_hash);
         let fcu_state = ForkchoiceState {
             // Build on the branch certified by LockedQC. When the local head
             // differs, it may be a sibling rather than an ancestor; advertising
@@ -451,13 +452,15 @@ impl ConsensusService {
             // imported the LockedQC block, it returns Syncing/no payload and the
             // existing retry path defers instead of falling back to another fork.
             head_block_hash: parent,
+            // E14: on Profile 1 the committed head's tags are its parent
+            // and a persisted ancestor, not the head itself.
             safe_block_hash: if same_execution_branch {
-                self.head_block_hash
+                committed_tags.safe_block_hash
             } else {
                 B256::ZERO
             },
             finalized_block_hash: if same_execution_branch {
-                self.head_block_hash
+                committed_tags.finalized_block_hash
             } else {
                 B256::ZERO
             },
@@ -1488,11 +1491,7 @@ impl ConsensusService {
             return;
         }
 
-        let fcu_state = ForkchoiceState {
-            head_block_hash: broadcast.block_hash,
-            safe_block_hash: broadcast.block_hash,
-            finalized_block_hash: broadcast.block_hash,
-        };
+        let fcu_state = self.fcu_state(broadcast.block_hash, broadcast.block_hash);
         match engine_handle
             .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, fcu_state)
             .await
@@ -1696,11 +1695,7 @@ impl ConsensusService {
                         continue;
                     }
                     info!(target: "n42::cl::exec_bridge", %retry_hash, "syncing block retry succeeded");
-                    let fcu = ForkchoiceState {
-                        head_block_hash: retry_hash,
-                        safe_block_hash: retry_hash,
-                        finalized_block_hash: retry_hash,
-                    };
+                    let fcu = self.fcu_state(retry_hash, retry_hash);
                     match engine_handle
                         .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, fcu)
                         .await
