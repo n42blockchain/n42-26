@@ -48,7 +48,7 @@ pub use mobile::{
     MSG_TYPE_CACHE_SYNC, MSG_TYPE_CACHE_SYNC_ZSTD, ShardedStarHub, ShardedStarHubConfig,
     ShardedStarHubHandle, StarHub, StarHubConfig, StarHubHandle,
 };
-pub use service::{NetworkCommand, NetworkEvent, NetworkHandle, NetworkService};
+pub use service::{Gov5RangeOutcome, NetworkCommand, NetworkEvent, NetworkHandle, NetworkService};
 pub use state_sync::{
     BlockSyncRequest, BlockSyncResponse, MAX_BLOCKS_PER_SYNC_REQUEST, MAX_SYNC_MESSAGE_SIZE,
     SyncBlock, SyncPayload,

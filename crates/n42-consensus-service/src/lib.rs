@@ -20,6 +20,7 @@ pub mod net_port;
 pub mod observer;
 pub mod orchestrator;
 pub mod persistence;
+pub mod range_catchup;
 pub mod replay_import;
 pub mod sinks;
 pub mod validator_peers;
