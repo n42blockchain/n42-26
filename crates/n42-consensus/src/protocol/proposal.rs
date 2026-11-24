@@ -427,11 +427,15 @@ impl ConsensusEngine {
                 block_hash: proposal.block_hash,
                 justify_block: proposal.justify_qc.block_hash,
             });
-            if self.imported_blocks.contains(&proposal.block_hash) {
+            let checked = self.vote_rules.round1_needs_execution()
+                && self.checked_parents.get(&proposal.block_hash).is_some();
+            if self.refused_blocks.get(&proposal.block_hash).is_some() {
+                tracing::warn!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, "Round-1 vote withheld: the deferred check refused the block");
+            } else if self.imported_blocks.contains(&proposal.block_hash) || checked {
                 if !self.extends_justify(proposal.block_hash) {
                     return Ok(());
                 }
-                tracing::info!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, "import-gated vote: block already execution-validated");
+                tracing::info!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, checked, "import-gated vote: block already execution-validated or checked");
                 self.send_vote(view, proposal.block_hash)?;
             } else {
                 tracing::info!(target: "n42::interop::h2v4", view, block_hash = %proposal.block_hash, "import-gated vote: waiting for execution validation");
@@ -630,6 +634,7 @@ impl ConsensusEngine {
 
         let gated = self.signing_profile.is_gov5() || self.vote_rules.round1_needs_execution();
         if gated
+            && self.refused_blocks.get(&block_hash).is_none()
             && let Some(pending) = self.pending_proposal.as_ref()
             && pending.view == self.round_state.current_view()
             && pending.block_hash == block_hash
@@ -656,6 +661,41 @@ impl ConsensusEngine {
         Ok(())
     }
 
+    /// Profile 1, Phase B: the deferred check passed for `block_hash` before
+    /// its import. Releases the pending Round-1 vote under the same extends
+    /// rule as an import; the CommitVote still waits for the import.
+    pub(super) fn on_block_checked(
+        &mut self,
+        block_hash: B256,
+        parent_hash: B256,
+    ) -> ConsensusResult<()> {
+        if !self.vote_rules.round1_needs_execution() || self.refused_blocks.get(&block_hash).is_some() {
+            return Ok(());
+        }
+        self.checked_parents.insert(block_hash, parent_hash);
+        if let Some(pending) = self.pending_proposal.as_ref()
+            && pending.view == self.round_state.current_view()
+            && pending.block_hash == block_hash
+            && self.round_state.may_vote_in(pending.view)
+        {
+            let view = pending.view;
+            if self.extends_justify(block_hash) {
+                tracing::info!(target: "n42::interop::h2v4", view, %block_hash, "checked vote: deferred check passed before the import, sending vote");
+                self.send_vote(view, block_hash)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Profile 1: the deferred check refused `block_hash`; its Round-1 vote
+    /// is withheld from now on.
+    pub(super) fn on_block_refused(&mut self, block_hash: B256) {
+        if self.vote_rules.round1_needs_execution() {
+            self.checked_parents.remove(&block_hash);
+            self.refused_blocks.insert(block_hash, ());
+        }
+    }
+
     /// The extends rule: a proposal's block has to be a child of the block its
     /// justify QC certifies. `is_safe_to_vote` compares views only, so without
     /// this a leader that never imported the certified block can propose a
@@ -673,7 +713,12 @@ impl ConsensusEngine {
         if pending.justify_block == B256::ZERO {
             return true;
         }
-        let Some(parent) = self.imported_parents.get(&block_hash).copied() else {
+        let Some(parent) = self
+            .imported_parents
+            .get(&block_hash)
+            .or_else(|| self.checked_parents.get(&block_hash))
+            .copied()
+        else {
             // Profile 1 (AM19): the block's parent has to be the justify
             // block, so a parent not known here abstains (n42-rs, audit
             // 2026-10 A-2).

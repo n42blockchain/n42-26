@@ -186,11 +186,58 @@ where
         .map(|withdrawals| withdrawals.length())
         .unwrap_or(0);
 
+    // Profile 1 (design 3.3): every proposed block must pass the deferred
+    // proposal check of gov5 and n42-26 followers, which judges the block's
+    // transactions against the parent's post-state without executing them.
+    // The builder applies the same rules as it packs.
+    let mut includability = n42_chainspec::profile1::genesis_declares_profile(chain_spec.genesis())
+        .then(|| {
+            n42_consensus_service::deferred_check::IncludabilityFilter::new(
+                n42_consensus_service::deferred_check::PlanHeader {
+                    number: parent_header.number + 1,
+                    gas_limit,
+                    base_fee: Some(base_fee),
+                },
+                crate::el::intrinsic_rules(
+                    chain_spec.as_ref(),
+                    parent_header.number + 1,
+                    attributes.timestamp(),
+                ),
+            )
+        });
+
     while let Some(pool_tx) = best_txs.next() {
         // check if the job was cancelled, if so we can exit early
         if cancel.is_cancelled() {
             return Ok(BuildOutcome::Cancelled);
         }
+
+        let admitted = match includability.as_ref() {
+            Some(filter) => {
+                let tx = pool_tx.transaction.clone_into_consensus();
+                let planned = crate::el::plan_tx(tx.inner(), Ok(pool_tx.sender()));
+                match filter.admit(&planned, |address| {
+                    state_provider
+                        .basic_account(address)
+                        .map(|account| account.map(crate::el::sender_state))
+                }) {
+                    Ok(admitted) => Some(admitted),
+                    Err(Ok(error)) => return Err(PayloadBuilderError::other(error)),
+                    Err(Err(refusal)) => {
+                        trace!(target: "payload_builder", tx = ?pool_tx.hash(), reason = %refusal.0, "not includable under deferred execution");
+                        metrics::counter!("n42_builder_not_includable_total").increment(1);
+                        best_txs.mark_invalid(
+                            &pool_tx,
+                            InvalidPoolTransactionError::Consensus(
+                                InvalidTransactionError::TxTypeNotSupported,
+                            ),
+                        );
+                        continue;
+                    }
+                }
+            }
+            None => None,
+        };
 
         // ensure we still have capacity for this transaction
         let exceeds_gas_limit = if separate_block_gas {
@@ -363,6 +410,10 @@ where
         cumulative_tx_gas_used += gas_used;
         block_regular_gas_used += gas_output.regular_gas_used();
         block_state_gas_used += gas_output.state_gas_used();
+
+        if let (Some(filter), Some(admitted)) = (includability.as_mut(), admitted) {
+            filter.commit(admitted);
+        }
 
         // Add blob tx sidecar to the payload.
         if let Some(sidecar) = blob_tx_sidecar {

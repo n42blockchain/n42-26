@@ -987,6 +987,9 @@ impl ConsensusService {
             );
             let in_flight =
                 super::EagerImportInFlight::enter(&self.eager_imports_in_flight, hash);
+            // Profile 1, Phase B: the deferred check runs beside the import.
+            let deferred_check_tx = (self.profile1.is_some() && !self.halted())
+                .then(|| self.deferred_check_tx.clone());
             tokio::spawn(async move {
                 let _in_flight = in_flight;
                 let decompress_start = std::time::Instant::now();
@@ -1065,6 +1068,14 @@ impl ConsensusService {
                 let block_number = execution_data.block_number();
                 let parent_hash = execution_data.parent_hash();
                 let tx_count = execution_data.transaction_count();
+                if let Some(checked_tx) = deferred_check_tx {
+                    let checker = eh.clone();
+                    let payload = execution_data.clone();
+                    tokio::spawn(async move {
+                        let outcome = checker.deferred_check(&payload).await;
+                        let _ = checked_tx.send((hash, parent_hash, outcome)).await;
+                    });
+                }
                 let has_staking_target =
                     super::execution_might_contain_staking_target(&execution_data);
                 if bad_blocks.should_skip(hash, "block_data_eager") {

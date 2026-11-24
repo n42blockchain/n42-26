@@ -1247,3 +1247,104 @@ fn v6_profile1_refuses_validator_set_changes() {
         .expect("address");
     assert!(engine.propose_remove_validator(first).is_err());
 }
+
+// ------------------------------------------------------- Phase B (PR 6) --
+
+/// Phase B (design 3.6): the deferred check passing before the import
+/// releases Round 1 (gov5's vote, byte for byte); the CommitVote still waits
+/// for this node's execution of the block.
+#[test]
+fn phase_b_round1_on_the_check_commit_vote_on_the_execution() {
+    let v6 = load();
+    let (mut engine, mut rx) = v6.engine(0);
+    let proposal = v6.engine_message(v6.wire("proposal_v2")).expect("bridged");
+    let ConsensusMessage::Proposal(p) = &proposal else {
+        panic!("a proposal")
+    };
+    let (block, parent) = (p.block_hash, p.justify_qc.block_hash);
+    engine.process_event(ConsensusEvent::Message(proposal)).expect("accepted");
+    assert!(votes(&outputs(&mut rx)).is_empty());
+    engine
+        .process_event(ConsensusEvent::BlockChecked { block_hash: block, parent_hash: parent })
+        .expect("checked");
+    let cast = votes(&outputs(&mut rx));
+    assert_eq!(cast.len(), 1, "Round 1 on the check, before the import");
+    let H2Message::Vote(want) = v6.wire("prepare_vote_v2") else {
+        panic!("a vote")
+    };
+    assert_eq!(cast[0].signature, want.signature, "prepare_vote_v2 byte for byte");
+
+    let pqc = v6.engine_message(v6.wire("prepare_qc_v2")).expect("bridged");
+    engine.process_event(ConsensusEvent::Message(pqc)).expect("prepare_qc_v2");
+    assert!(
+        commit_votes(&outputs(&mut rx)).is_empty(),
+        "the check is not execution: no commit vote"
+    );
+    engine.process_event(executed(block, parent)).expect("the execution");
+    let out = outputs(&mut rx);
+    assert_eq!(commit_votes(&out).len(), 1, "the commit vote on the execution");
+    assert!(votes(&out).is_empty(), "no second Round 1");
+}
+
+/// A check that names another parent than the justify block releases
+/// nothing (AM19), and the check before the proposal counts on arrival.
+#[test]
+fn phase_b_extends_rule_and_check_before_the_proposal() {
+    let v6 = load();
+    let proposal = v6.engine_message(v6.wire("proposal_v2")).expect("bridged");
+    let ConsensusMessage::Proposal(p) = &proposal else {
+        panic!("a proposal")
+    };
+    let (block, parent) = (p.block_hash, p.justify_qc.block_hash);
+
+    let (mut engine, mut rx) = v6.engine(0);
+    engine.process_event(ConsensusEvent::Message(proposal.clone())).expect("accepted");
+    engine
+        .process_event(ConsensusEvent::BlockChecked { block_hash: block, parent_hash: B256::repeat_byte(0x99) })
+        .expect("checked on another parent");
+    assert!(votes(&outputs(&mut rx)).is_empty(), "AM19");
+
+    let (mut engine, mut rx) = v6.engine(0);
+    engine
+        .process_event(ConsensusEvent::BlockChecked { block_hash: block, parent_hash: parent })
+        .expect("checked first");
+    engine.process_event(ConsensusEvent::Message(proposal)).expect("accepted");
+    assert_eq!(votes(&outputs(&mut rx)).len(), 1, "Round 1 on the proposal of a checked block");
+}
+
+/// A block the check refused never gets Round 1, even once it executes
+/// (gov5 votes on the check); its CommitVote on a quorum's PrepareQC still
+/// follows this node's execution.
+#[test]
+fn phase_b_refused_block_gets_no_round1() {
+    let v6 = load();
+    let (mut engine, mut rx) = v6.engine(0);
+    let proposal = v6.engine_message(v6.wire("proposal_v2")).expect("bridged");
+    let ConsensusMessage::Proposal(p) = &proposal else {
+        panic!("a proposal")
+    };
+    let (block, parent) = (p.block_hash, p.justify_qc.block_hash);
+    engine.process_event(ConsensusEvent::Message(proposal)).expect("accepted");
+    engine.process_event(ConsensusEvent::BlockRefused(block)).expect("refused");
+    engine
+        .process_event(ConsensusEvent::BlockChecked { block_hash: block, parent_hash: parent })
+        .expect("a late pass is ignored");
+    engine.process_event(executed(block, parent)).expect("the execution");
+    assert!(votes(&outputs(&mut rx)).is_empty(), "no Round 1 for a refused block");
+    let pqc = v6.engine_message(v6.wire("prepare_qc_v2")).expect("bridged");
+    engine.process_event(ConsensusEvent::Message(pqc)).expect("prepare_qc_v2");
+    assert_eq!(commit_votes(&outputs(&mut rx)).len(), 1, "commit vote on the own execution");
+}
+
+/// Off Profile 1 the check events change nothing.
+#[test]
+fn phase_b_check_events_are_profile1_only() {
+    let v6 = load();
+    let (mut engine, mut rx) = v6.engine(0);
+    engine.set_vote_rules(VoteRules::TODAY);
+    engine
+        .process_event(ConsensusEvent::BlockChecked { block_hash: B256::repeat_byte(1), parent_hash: B256::ZERO })
+        .expect("ignored");
+    engine.process_event(ConsensusEvent::BlockRefused(B256::repeat_byte(1))).expect("ignored");
+    assert!(outputs(&mut rx).is_empty());
+}

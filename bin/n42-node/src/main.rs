@@ -309,6 +309,25 @@ where
     })
 }
 
+/// Profile 1 (design 3.4): the deferred proposal check over the parent's
+/// post-state, from reth's persisted state or its engine tree.
+fn profile1_deferred_checker<N>(
+    provider: reth_provider::providers::BlockchainProvider<N>,
+) -> n42_node::el::DeferredChecker
+where
+    N: reth_provider::providers::ProviderNodeTypes<ChainSpec = reth_chainspec::ChainSpec>,
+{
+    use reth_chainspec::ChainSpecProvider as _;
+    let chain_spec = provider.chain_spec();
+    n42_node::el::DeferredChecker::new(chain_spec, move |hash| {
+        use reth_provider::StateProviderFactory as _;
+        if let Ok(state) = provider.state_by_block_hash(hash) {
+            return Some(state);
+        }
+        provider.executed_state_by_block_hash(hash).ok().flatten()
+    })
+}
+
 fn resolve_header_profile(
     gov5_interop_mode: bool,
     gov5_profile_requested: bool,
@@ -3628,7 +3647,10 @@ fn main() {
                             .with_follower_import(follower_import(
                                 full_node.evm_config.clone(),
                                 full_node.provider.clone(),
-                            )),
+                            ))
+                            .with_deferred_check(profile1.as_ref().map(|_| {
+                                profile1_deferred_checker(full_node.provider.clone())
+                            })),
                         ),
                         Err(error) => {
                             eprintln!("ERROR: {error}");

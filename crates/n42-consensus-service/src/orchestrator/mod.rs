@@ -1099,6 +1099,9 @@ impl Drop for EagerImportInFlight {
 }
 type StateDiffReady = (B256, n42_execution::state_diff::StateDiff);
 type CommitExecutionTimeout = (u64, B256);
+/// `(block, parent, outcome)` of a Profile-1 deferred proposal check.
+type DeferredCheckDone = (B256, B256, crate::deferred_check::DeferredCheck);
+
 type EagerImportDone = (
     B256,
     u64,
@@ -1376,6 +1379,10 @@ pub struct ConsensusService {
     /// Allows the next leader to start building before consensus commits the current block.
     eager_import_done_tx: mpsc::Sender<EagerImportDone>,
     eager_import_done_rx: mpsc::Receiver<EagerImportDone>,
+    /// Profile 1, Phase B: deferred proposal checks run beside the eager
+    /// import report `(block, parent, outcome)` here.
+    deferred_check_tx: mpsc::Sender<DeferredCheckDone>,
+    deferred_check_rx: mpsc::Receiver<DeferredCheckDone>,
     /// Wakes a committed lifecycle that did not receive `new_payload(Valid)`
     /// within the bounded grace period. The timer runs outside the consensus
     /// loop; its handler starts the retained-data import/catch-up fallback.
@@ -3396,6 +3403,7 @@ impl ConsensusService {
         let (import_done_tx, import_done_rx) = mpsc::channel(256);
         let (finalize_done_tx, finalize_done_rx) = mpsc::channel(256);
         let (eager_import_done_tx, eager_import_done_rx) = mpsc::channel(256);
+        let (deferred_check_tx, deferred_check_rx) = mpsc::channel(256);
         let (commit_execution_timeout_tx, commit_execution_timeout_rx) = mpsc::channel(256);
         let (state_diff_ready_tx, state_diff_ready_rx) = mpsc::channel(256);
         let (build_complete_tx, build_complete_rx) = mpsc::channel(256);
@@ -3486,6 +3494,8 @@ impl ConsensusService {
             bg_import_queue: VecDeque::new(),
             eager_import_done_tx,
             eager_import_done_rx,
+            deferred_check_tx,
+            deferred_check_rx,
             commit_execution_timeout_tx,
             commit_execution_timeout_rx,
             state_diff_ready_tx,
@@ -3638,6 +3648,7 @@ impl ConsensusService {
         let (import_done_tx, import_done_rx) = mpsc::channel(256);
         let (finalize_done_tx, finalize_done_rx) = mpsc::channel(256);
         let (eager_import_done_tx, eager_import_done_rx) = mpsc::channel(256);
+        let (deferred_check_tx, deferred_check_rx) = mpsc::channel(256);
         let (commit_execution_timeout_tx, commit_execution_timeout_rx) = mpsc::channel(256);
         let (state_diff_ready_tx, state_diff_ready_rx) = mpsc::channel(256);
         let (build_complete_tx, build_complete_rx) = mpsc::channel(256);
@@ -3760,6 +3771,8 @@ impl ConsensusService {
             bg_import_queue: VecDeque::new(),
             eager_import_done_tx,
             eager_import_done_rx,
+            deferred_check_tx,
+            deferred_check_rx,
             commit_execution_timeout_tx,
             commit_execution_timeout_rx,
             state_diff_ready_tx,
@@ -3929,6 +3942,37 @@ impl ConsensusService {
                     );
                 }
             }
+        }
+    }
+
+    /// Profile 1, Phase B: a deferred check that ran beside the import. A
+    /// pass releases the Round-1 vote before the import completes; a
+    /// refusal withholds it; anything else leaves the vote to the import
+    /// (Phase A).
+    pub(super) fn handle_deferred_check_done(
+        &mut self,
+        hash: B256,
+        parent: B256,
+        outcome: crate::deferred_check::DeferredCheck,
+    ) {
+        use crate::deferred_check::DeferredCheck;
+        let event = match outcome {
+            DeferredCheck::Checked => n42_consensus::ConsensusEvent::BlockChecked {
+                block_hash: hash,
+                parent_hash: parent,
+            },
+            DeferredCheck::Refused(reason) => {
+                warn!(target: "n42::profile1", %hash, %reason, "Round-1 vote withheld: the deferred check refused the proposal");
+                n42_consensus::ConsensusEvent::BlockRefused(hash)
+            }
+            DeferredCheck::Retry(reason) => {
+                debug!(target: "n42::profile1", %hash, %reason, "deferred check not decidable yet; the vote waits for the import");
+                return;
+            }
+            DeferredCheck::Unsupported => return,
+        };
+        if let Err(error) = self.engine.process_event(event) {
+            error!(target: "n42::profile1", %hash, %error, "failed to apply the deferred check");
         }
     }
 
@@ -4432,6 +4476,12 @@ impl ConsensusService {
                         // A late eager completion may close a committed Case C
                         // and advance the guard outside handle_block_committed.
                         self.save_consensus_state();
+                    }
+                }
+
+                checked = self.deferred_check_rx.recv() => {
+                    if let Some((hash, parent, outcome)) = checked {
+                        self.handle_deferred_check_done(hash, parent, outcome);
                     }
                 }
 

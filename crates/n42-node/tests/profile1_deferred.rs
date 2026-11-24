@@ -41,6 +41,7 @@ use reth_engine_tree::tree::{
     payload_validator::{BasicEngineValidator, BlockOrPayload, TreeCtx},
 };
 use reth_primitives_traits::SealedHeader;
+use n42_consensus_service::deferred_check::DeferredCheck;
 use reth_provider::{providers::BlockchainProvider, test_utils::create_test_provider_factory_with_node_types};
 use serde_json::Value;
 use std::{path::PathBuf, sync::Arc};
@@ -271,6 +272,23 @@ async fn v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid() ->
                 }
             }
         };
+        // PR 6: the deferred proposal check over the parent's post-state,
+        // before the import (Phase B).
+        let checker = {
+            let provider = provider.clone();
+            n42_node::el::DeferredChecker::new(spec.clone(), move |hash| {
+                use reth_provider::StateProviderFactory as _;
+                provider.state_by_block_hash(hash).ok()
+            })
+        };
+        let payload_of = |header: &Profile1Header, transactions: &[N42TxEnvelope]| {
+            let rewards = rewards(&config, header.header.beneficiary);
+            let wire = n42_network::encode_profile1_block_rlp(header, transactions, &rewards);
+            let decoded = n42_network::decode_profile1_block_rlp(&wire).expect("decodes");
+            n42_consensus::remember_gov5_native_header(&header.encode());
+            n42_consensus_service::replay_import::build_gov5_gossip_execution_data(&decoded)
+                .expect("payload")
+        };
         // A forkchoice update to `block`: on the head, or replacing `old`.
         let make_head = |block: &ExecutedBlock<N42Primitives>, old: Vec<ExecutedBlock<N42Primitives>>| {
             overlay.insert_block(block.clone());
@@ -282,6 +300,11 @@ async fn v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid() ->
             canonical.set_canonical_head(block.recovered_block().clone_sealed_header());
         };
 
+        // The check cannot judge block 1 either: it retries, never refuses.
+        assert!(matches!(
+            checker.check(&payload_of(&headers[0], &transactions(&blocks[0]))),
+            DeferredCheck::Retry(_)
+        ));
         // (c) Genesis's result is not filed yet: block 1 cannot be judged.
         // The engine reports a provider error, commits nothing and does not
         // remember the block as invalid.
@@ -349,6 +372,20 @@ async fn v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid() ->
                     );
                     assert_eq!(store.root_for(tampered.hash())?, None, "{field}");
                 }
+            }
+
+            // PR 6: the check passes before the import (Phase B), over the
+            // parent's post-state; a wrong carried field is refused by it.
+            assert_eq!(
+                checker.check(&payload_of(header, &transactions(block))),
+                DeferredCheck::Checked,
+                "block {number} ({name}): includable against its parent"
+            );
+            let mut wrong = parent_result;
+            wrong.requests_hash = EMPTY_ROOT_HASH;
+            match checker.check(&payload_of(&carry(header, &wrong, signer), &transactions(block))) {
+                DeferredCheck::Refused(reason) => assert!(reason.contains("carried requestsHash"), "{reason}"),
+                other => panic!("block {number} carrying a wrong requestsHash: {other:?}"),
             }
 
             // (a) The block itself: it carries its parent's result.

@@ -137,6 +137,16 @@ pub enum ConsensusEvent {
     /// both in one event prevents H2's extends-justify check from racing a
     /// separate metadata update.
     BlockImportedWithParent { block_hash: B256, parent_hash: B256 },
+    /// Profile 1, Phase B (design 3.5/3.6): the block passed the deferred
+    /// proposal check (its carried fields are this node's result for
+    /// `parent_hash` and its transactions are includable) before its import
+    /// completed. Releases the Round-1 vote only; the CommitVote still waits
+    /// for this node's execution (`BlockImportedWithParent`).
+    BlockChecked { block_hash: B256, parent_hash: B256 },
+    /// Profile 1: the deferred proposal check refused the block. Its Round-1
+    /// vote is withheld even if its import later succeeds (gov5 votes on the
+    /// check, not on the import).
+    BlockRefused(B256),
 }
 
 /// A vote message whose single-validator BLS signature was verified by the
@@ -333,6 +343,12 @@ pub struct ConsensusEngine {
     /// A PrepareQC whose commit vote waits for this node's own execution of
     /// the block (Profile 1, A13/AM19); `on_block_imported` releases it.
     pub(super) held_prepare_qc: Option<PrepareQC>,
+    /// Profile 1, Phase B: the parent of every block that passed the
+    /// deferred proposal check here, before its import.
+    pub(super) checked_parents: BoundedFifoMap<B256, B256>,
+    /// Profile 1: blocks the deferred proposal check refused; never given
+    /// the Round-1 vote.
+    pub(super) refused_blocks: BoundedFifoMap<B256, ()>,
 }
 
 impl ConsensusEngine {
@@ -419,6 +435,8 @@ impl ConsensusEngine {
             leader_schedule: crate::validator::leader_schedule(),
             vote_rules: crate::VoteRules::installed(),
             held_prepare_qc: None,
+            checked_parents: BoundedFifoMap::new(64),
+            refused_blocks: BoundedFifoMap::new(64),
         }
     }
 
@@ -530,6 +548,8 @@ impl ConsensusEngine {
             leader_schedule: crate::validator::leader_schedule(),
             vote_rules: crate::VoteRules::installed(),
             held_prepare_qc: None,
+            checked_parents: BoundedFifoMap::new(64),
+            refused_blocks: BoundedFifoMap::new(64),
         }
     }
 
@@ -945,6 +965,8 @@ impl ConsensusEngine {
             ConsensusEvent::BlockImported(_) | ConsensusEvent::BlockImportedWithParent { .. } => {
                 "block_imported"
             }
+            ConsensusEvent::BlockChecked { .. } => "block_checked",
+            ConsensusEvent::BlockRefused(_) => "block_refused",
         };
         let _span = tracing::info_span!(
             target: "n42.cl.consensus.event",
@@ -964,6 +986,14 @@ impl ConsensusEngine {
                 block_hash,
                 parent_hash,
             } => self.on_block_imported(block_hash, Some(parent_hash)),
+            ConsensusEvent::BlockChecked {
+                block_hash,
+                parent_hash,
+            } => self.on_block_checked(block_hash, parent_hash),
+            ConsensusEvent::BlockRefused(block_hash) => {
+                self.on_block_refused(block_hash);
+                Ok(())
+            }
         }
     }
 

@@ -150,7 +150,11 @@ where
     Pool: TransactionPool<Transaction: PoolTransaction<Consensus = N42TxEnvelope>>,
     F: FnOnce(BestTransactionsAttributes) -> BestTransactionsIter<Pool>,
 {
-    if !parallel {
+    // Profile 1 builds with the sequential builder, which applies the
+    // deferred includability filter (design 3.3) per transaction.
+    if !parallel
+        || n42_chainspec::profile1::genesis_declares_profile(client.chain_spec().genesis())
+    {
         return default_n42_payload(evm_config, client, pool, builder_config, args, best_txs);
     }
     warn_graft_stream();

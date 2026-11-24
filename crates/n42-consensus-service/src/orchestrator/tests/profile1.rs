@@ -585,3 +585,52 @@ async fn e14_commit_forkchoice_tags() {
         }
     }
 }
+
+/// Phase B pitfall (design 3.6): with Round 1 cast on the check, a quorum
+/// can commit a block before this node's import of it completes. The commit
+/// is held, not re-imported beside the running import, and is finalised
+/// when that import reports Valid.
+#[tokio::test]
+async fn phase_b_a_decide_before_the_import_is_queued() {
+    let (_, gate) = v1();
+    let (mut orch, mock, _halt, _net_event_tx) = halted_orchestrator(gate);
+    let parent = B256::repeat_byte(0x61);
+    let hash = B256::repeat_byte(0x62);
+    orch.head_block_hash = parent;
+    orch.pending_block_data
+        .insert(hash, test_block_data(parent, hash, 4).into());
+    let in_flight = EagerImportInFlight::enter(&orch.eager_imports_in_flight, hash);
+
+    orch.handle_engine_output(EngineOutput::BlockCommitted {
+        view: 4,
+        block_hash: hash,
+        commit_qc: QuorumCertificate::genesis(),
+        validator_changes: None,
+    })
+    .await;
+    orch.handle_commit_execution_timeout(4, hash);
+    assert!(mock.new_payload_hashes().is_empty(), "no second import beside the running one");
+    assert_ne!(orch.head_block_hash, hash, "not canonical before its import");
+
+    drop(in_flight);
+    orch.handle_eager_import_done(hash, 1, parent, 1, false, None).await;
+    assert_eq!(orch.head_block_hash, hash, "finalised on the import's Valid");
+    assert!(mock.fcu_heads().contains(&hash));
+}
+
+/// Phase B in the orchestrator: a check outcome becomes the engine event;
+/// Retry and Unsupported leave the vote to the import.
+#[tokio::test]
+async fn phase_b_check_outcomes_reach_the_engine() {
+    use crate::deferred_check::DeferredCheck;
+    let (_, gate) = v1();
+    let mut orch = profile1_orchestrator(gate);
+    let (block, parent) = (B256::repeat_byte(0x71), B256::repeat_byte(0x70));
+    orch.handle_deferred_check_done(block, parent, DeferredCheck::Retry("parent".into()));
+    orch.handle_deferred_check_done(block, parent, DeferredCheck::Unsupported);
+    orch.handle_deferred_check_done(block, parent, DeferredCheck::Refused("nonce".into()));
+    orch.handle_deferred_check_done(block, parent, DeferredCheck::Checked);
+    // The engine is not on Profile-1 vote rules in this harness; the calls
+    // above must simply be accepted without output.
+    assert!(orch.output_rx.try_recv().is_err());
+}

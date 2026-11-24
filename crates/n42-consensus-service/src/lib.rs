@@ -11,6 +11,7 @@
 pub mod blob_port;
 pub mod bootstrap;
 pub mod consensus_state;
+pub mod deferred_check;
 pub mod el;
 pub mod epoch_schedule;
 pub mod exec_cache;
