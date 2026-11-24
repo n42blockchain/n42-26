@@ -172,3 +172,123 @@ three_validators 等）从 testdata 删除；`every_v8_refused_genesis_is_refuse
 4. 重启时门只在“零注册根重建的 24 元素头哈希 = 持久头哈希”时信任持久头。
 5. V8 用 n42-rs 的 14 个拒绝用例（原 33 个中多余的 19 个已删）。
 6. 出块、延迟执行（AM19）、V6 不在本步范围。
+
+## 8. 第 3 步：Profile-1 块完整走通 reth 执行（2026-11-24 追加）
+
+本步头里仍是**本块自己的**执行结果（未做延迟执行）。延迟执行按
+`deferred-execution-design.md` 后续做；本步新增的出块封印函数是唯一写四个执行字段
+（stateRoot、receiptsRoot、logsBloom、gasUsed）的地方，延迟执行只需改这一处，不受阻碍。
+
+### 8.1 设计决策
+
+- **不新增 `N42HeaderProfile` 变体。** Profile-1 节点用 `Gov5H2` 头配置；在 Gov5H2 的各分支里用
+  “链 genesis 声明了 `n42Profile` 且头带 `slotNumber`”识别 Profile-1 头（旧 gov5 布局都没有 slotNumber）。
+  这样复用现有 gov5 原生头的全部机制（原生头登记表、按哈希绑定、gov5 奖励根、委员会证据链），改动最小。
+- **Engine API 载荷。** Profile-1 块的载荷是 V3 载荷，sidecar 带 Prague 的 requestsHash（AM24，等于 alloy 的
+  `EMPTY_REQUESTS_HASH`）；载荷里没有 slotNumber 和 mobileRegistryRoot。引擎校验器
+  `bind_gov5_h2_header` 在其它布局都不匹配时调用 `bind_profile1_header`：按标准补齐 difficulty=0、
+  ommersHash=0、slotNumber=number、withdrawalsRoot=gov5 奖励根，mobileRegistryRoot 取登记表里该哈希的头
+  （没有则为 0），只有 24 元素编码的哈希等于载荷哈希才接受。哈希相等即证明每个字段都是头里的。
+  `MissingRequests` 由 `replay_import::build_profile1_execution_data` 解决（旧的 v1 输入检查不再用于 Profile-1 头）。
+- **与 reth 头检查的冲突，全部在 N42Consensus 里处理，不改 reth：**
+  - `SlotNumberUnexpected`：reth 的 Amsterdam 已从链规格移除，而头带 slotNumber。
+    `normalize_header` 在交给内层 Ethereum 规则的临时副本里去掉 slotNumber；slotNumber 由块哈希认证，并由导入门检查（= number）。
+  - 时间戳：reth 要求子块严格晚于父块，Profile 1（B4）允许相等。`validate_header_against_parent` 先检查 `time ≥ parent.time`，
+    相等时把临时副本加 1 秒；内层其余规则（gasLimit、baseFee、同一分叉的 blob 参数）都不读时间戳。
+  - requestsHash：Prague 下 reth 比较执行产生的 requests 哈希；空请求的哈希就是 sha256("")，与 AM24 一致，无需改动。
+  - BAL：链规格没有 Amsterdam，执行不建 BAL，头里也没有 BAL 哈希，一致。
+- **C1-C4。**
+  - 交易池：Profile 1 上 `no_eip4844()`（拒 blob）；0x50 因 Profile 1 没有 `altSigTx` 本来就不收；0x05 及以上的类型解码就失败。
+  - 块导入：`N42Consensus::validate_block_pre_execution` 在 Profile 1 链上逐笔检查类型（`check_profile1_tx_type`），
+    所有导入路径都经过这里。
+
+### 8.2 实施细节
+
+- `n42-consensus`：`remembered_profile1_header(hash)`（登记表中按哈希取 24 元素头并复核哈希）；adapter 的 Profile-1 处理和 C1-C4 检查。
+- `n42-network/gov5_block.rs`：
+  - `seal_built_payload_for_profile1`：出块封印。只改不进入执行的头字段，prevRandao 不为 0 或 requestsHash 不对时拒绝；
+    嵌入最后的 CommitQC（须为祖先且 view 更低），用 leader 的 BLS 密钥封印（B2），登记原生头，返回新哈希的载荷。
+  - `encode_profile1_block_rlp`、`encode_block_wire`；`encode_gov5_block_rlp` 遇到 Profile-1 哈希时用登记的 24 元素头编码 gov5 线格式。
+  - `header_qc_wire` 的祖先回溯同时认 Profile-1 头。
+- `n42-consensus-service`：
+  - `replay_import::build_profile1_execution_data`。
+  - `Profile1ImportGate::with_seal_key` / `seal_key`。
+  - `handle_built_payload` 在 Profile 1 上走封印分支；出块的 rekey 仍由 `gov5_normalization_preserves_execution_input` 守护。
+  - Profile 1 的 payload attributes 中 prevRandao 为 0（B3）。
+- `n42-node`：`engine_validator::bind_profile1_header`；`pool.rs` 的 C2。
+- `bin/n42-node/src/main.rs`（V6 合并前提）：
+  - Profile 1 自动成为 H2-v4 参与者，用 Gov5H2 头配置；H2-v4 身份为 genesis 的链 id 与哈希。
+  - QMDB 执行基从 genesis alloc 建（`load_profile1_execution_base`，根须等于 Profile-1 genesis 头）。
+  - A8 奖励来源由 genesis 构建（`Gov5WithdrawalSource::from_genesis`）。
+  - 导入门带本节点封印密钥；genesis 与持久头的原生编码写入登记表。
+  - 以上都不读任何 N42_GOV5_* 环境变量。
+- `PROFILE1_FORBIDDEN_ENV` 增加 `N42_COLOCATED_VOTE`。
+
+### 8.3 测试
+
+- `crates/n42-node/tests/profile1_import.rs`：
+  - `a_profile1_chain_imports_through_reth_and_becomes_canonical`：genesis_8s（加 V3 的出资账户）→ 区块 1（V3 plain-transfer 交易）
+    → 区块 2（V3 contract-create 交易）。每块按 leader 的方式产生：在引擎的父状态上执行，算 QMDB 根和原生收据根，
+    用 V1 测试密钥里该 view 的 leader 封印。之后依次经过：gov5 线编码（与 `encode_gov5_block_rlp` 字节一致）、
+    Profile-1 解码、导入门、`build_gov5_gossip_execution_data`（与 leader 载荷一致）、reth 的 `BasicEngineValidator`
+    （N42EngineValidator + N42Consensus(Gov5H2) + QMDB 状态根策略）。结果：
+    - 两块都是 Valid，QMDB store 记录的根等于独立计算的根；
+    - QMDB 根被篡改的同一块被拒（BodyStateRootDiff），且不提交任何东西；
+    - 每块按 FCU 的做法成为 canonical head，最后持久化（`save_blocks`）后按 Profile-1 哈希能读回头，头里 slot = number。
+  - `profile1_block_import_refuses_transaction_types_outside_c1_c4`：V4 的 blob（C2）与 0x50（C4）在执行前被拒，其余合法类型通过类型检查。
+- `orchestrator/tests/profile1.rs` 的 catch-up 测试改为：V1 区块 1、2 通过门后进入 new_payload（以前停在 MissingRequests）。
+
+- `profile1_header::tests::own_sealed_parent_is_admitted_only_under_the_own_key`：leader 自己封印的父块只在本节点密钥验封通过时进入门。
+
+### 8.4 本地四节点出块（真实 n42-node 进程）
+
+用 V1 的 `genesis_8s.json` 与 `header_profile_v1.json` 的四把 BLS 测试密钥起四个 debug 构建的 n42-node
+（本机回环，`N42_ALLOW_DETERMINISTIC_P2P=1`，不设任何 Profile 1 禁用的变量）。
+四个验证者 quorum 为 3，单节点无法定案，因此直接跑四节点。
+
+**遇到的问题及解决（按出现顺序）：**
+
+1. **委员会证据根取不到父块。** `committee_parent_beacon_root` 只按 gov5 布局解码父块，
+   而 Profile-1 genesis 与块是 24 元素头。改为取不到时用 `remembered_profile1_header`
+   （number 与 receipts_root 和 follower 的 `verify_parent_link` 读的是同一份）。
+2. **A23 gasLimit。** reth 构建器按 1/1024 步长把 gasLimit 拉向 `--builder.gaslimit` 默认值
+   （480000000 → 479531251），follower 按 A23 拒块。Profile 1 上构建器的期望 gasLimit 固定为 genesis gasLimit（payload.rs）。
+3. **serve cache 认不出 Profile-1 块**（“refusing to retain malformed local Gov5 block”）。`attributable_hash` 同时接受 24 元素头；
+   新增 `decode_wire_block_rlp`（gov5 或 Profile-1），serve cache 的三处校验改用它。
+4. **V1 genesis 时间戳在未来。** `genesis_8s.json` 的 timestamp 为 1795564800（2026-11-25 00:00 UTC），
+   B4 正确拒绝了超前于本地时钟的投票。本地运行用一份把 timestamp 改为当前时间的副本（只改变 genesis 哈希，密钥与验证者不变）。
+5. **leader 自己的块不在自己的门里。** 门只认导入路径上的头，leader 自己封印的块从不经过导入路径，
+   所以它的子块报 `parent_unknown`，leader 也不能为自己的块投 Round-1 票。新增 `Profile1ImportGate::admit_own_sealed`：
+   从原生头登记表取出该头，**只有封印用本节点密钥验证通过**才按普通规则走一遍 admit；`admit` 遇到未知父块时、
+   `profile1_vote_allowed` 投票前各调用一次。
+6. **没有 8 秒 slot 节奏。** 编排器的 slot 时间只读 `N42_BLOCK_INTERVAL_MS`，该变量在 Profile 1 上被禁止，
+   于是编排器不按 slot 出块，一次连出约 4 块，时间戳逐块 +1 超前，触发 B4，视图超时 24 秒。
+   改为 Profile 1 上取已安装的 `Profile1Config::block_interval_ms`。
+
+**结果（修复后）：**
+
+- 四节点按 8 秒 slot 出块，leader 轮换（tenure 1），每块 finalized = latest；运行到 15 块无任何拒绝或错误。
+- 头字段：mixHash 0、gasLimit 480000000、extraData 259 字节（N42H + view + CommitQC + 封印；区块 1 无 QC 为 108 字节）、
+  2 笔 A8 奖励提款、parentBeaconRoot 为委员会证据根、requestsHash = sha256("")。
+- 用 V3 的出资账户和 10 笔预签名交易（chain id 1144）：全部进块（区块 3-12，status 1，合约创建在 `0x9ed5…`），
+  四节点块哈希与状态根一致。
+
+### 8.5 阶段完成状态
+
+| 项 | 状态 |
+|---|---|
+| 24 元素头绑定到 reth 载荷与引擎路径 | 完成（`bind_profile1_header`） |
+| MissingRequests 重建 | 完成（`build_profile1_execution_data`） |
+| SlotNumberUnexpected、等时间戳 | 完成，在 N42Consensus 内处理，未改 reth |
+| 进程内导入测试 genesis → 1 → 2（Valid、canonical、持久化） | 完成 |
+| leader 出块封印、本节点验证者接受 | 完成，四节点真实进程出块并定案 |
+| C1-C4 进交易池和块导入 | 完成 |
+| V6 前提：H2-v4 参与者由 profile 推出；`N42_COLOCATED_VOTE` 禁用 | 完成 |
+
+### 8.6 后续计划 / 受阻
+
+- 延迟执行（`deferred-execution-design.md`）：唯一写执行字段的地方是 `seal_built_payload_for_profile1`，从这里改。
+- mobileRegistryRoot 目前恒为 0（登记表没有该头时绑定也按 0）。
+- EIP-8282 不改 evm2/reth，由用户决定。
+- V1 `genesis_8s.json` 的时间戳在 2026-11-25 00:00 UTC 之前无法出块（B4），这是测试数据本身的属性。
+- V6 合并后需复核：`VoteRules::installed()` 下 Round 1 等 `BlockImportedWithParent`，leader 自己的块需要发出该事件。
