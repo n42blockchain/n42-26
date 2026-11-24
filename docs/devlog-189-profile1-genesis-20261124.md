@@ -471,3 +471,102 @@ Phase B、可包含性（includability）、E14 标签、E12 停机不在本次�
 - PR 8：延迟链上的同步与观察者。
 - 设计 3.10：手机端 receiptsRoot/stateRoot 的语义已变（N 的值在 N+1 的头里），Profile 1 上需关闭手机收据验证或改为对 N+1 证明。
 - V5 的 AM25 请求块（一个提款请求和一个合并请求）gov5 发布后加入 PR 3 测试。
+
+## 10. 延迟执行：PR 7（E14、E12、重启）、PR 6（可包含性与 Phase B）、PR 8（同步与观察者）（2026-11-24 追加）
+
+顺序按协调要求：先 PR 7（较便宜的正确性项），再 PR 6，最后 PR 8。PR 5 视为已由 V6 Phase A 与 PR 4 完成。
+
+### 10.1 PR 7：E14 标签、E12 停机、重启边界
+
+**设计决策**
+
+- **E14**（`n42-consensus-service/src/fcu_tags.rs`）：Profile 1 上每个 FCU 为 head = 已提交块 N，safe = N−1，
+  finalized = reth 报告已持久化的块中不高于 safe 的那个（`canonical_in_memory_state().get_persisted_num_hash()`）。
+  - finalized 必须在 safe 的链上：沿父链接回走验证（上限 `MAX_FINALIZED_WALK = 1024`），持久化块在别的分支上时不断言。
+  - 持久化块高于 safe 时，只在它是 safe 的后代时取 safe；finalized 永远不会等于 head。
+  - 无法从本节点知识确定的标签发零哈希（Engine API 的"不更新"），不猜。genesis 是自己的 safe/finalized。
+  - 父链接来自原生头登记表（`remembered_profile1_header`），否则读 reth 的头。
+  - 非 Profile 1 保持 (N,N,N)。`forkchoice_state(tags, head, committed)` 区分"head"和"已提交块"：流水线定案可能使 head 越过已提交块，标签按已提交块算。
+  - 检查"finalized == head"的假设：所有 FCU 点（orchestrator 定案、重试、后台导入、构建、导入、catch-up，observer 3 处，
+    replay plan）都改为走同一函数。委托 EL（`N42_EL_OWNER_RPC`）把 finalized 当作已提交块读取，与延迟标签不兼容，
+    因此该变量列入 Profile 1 禁用环境变量。
+- **E12**（`halt.rs`）：已提交块（有 CommitQC，或被共识提交、或位于严格提交锚之下的 range 块）出现以下任一情况即停机：
+  1. 头携带的字段 ≠ 本节点对父块的结果；
+  2. 本节点导入时记录了携带字段不符（QMDB 任务 `record_carried_mismatch`）；
+  3. 同一高度提交了两个不同块（`CommittedHeights`，SYNC §3.3 冲突提交证据）。
+  停机行为：证据写入共识数据目录下 `profile1_halt.json`（临时文件 + rename + 目录 fsync），gauge `n42_profile1_halted = 1`；
+  orchestrator 主循环进入 `idle_halted()`，丢弃一切共识消息、区块与引擎输出（不导入、不投票、不出块），每分钟打一条 ERROR。
+  启动时若该文件存在则以停机状态启动。
+  - **恢复只能由运维操作**：停节点；保存并移走 `<N42_DATA_DIR>/profile1_halt.json`；查明原因（本节点执行错误则从可信快照/对等节点重建
+    datadir，网络分叉则按 SYNC 处理）；再启动。
+- **重启（设计 3.8）**：
+  - `require_head_result(number, hash)`：共识头高于 0 而 `executed_fields.log` 没有其结果时拒绝启动（`RestartError::HeadResultMissing`，
+    提示从对等节点重导或从备份恢复）。orchestrator 与 observer（PR 8 补上）启动时都检查。
+  - QMDB WAL 已提交而结果日志未写入时崩溃：重启后同一块再导入，`compute_and_commit_own` 对相同操作幂等，补登结果；操作不同则 ConflictingBlock。
+
+**测试**：`fcu_tags` 5 个；`halt` 4 个；`executed_fields::a_restart_needs_the_heads_own_result`；
+`qmdb_state_root::deferred_commit_after_a_crash_before_the_result_was_filed`；orchestrator 进程内故障注入
+`e12_a_committed_block_with_wrong_carried_fields_halts`、`e12_a_committed_block_the_import_refused_halts`、
+`e12_a_conflicting_commit_halts`、`e12_needs_a_halt_latch`（无停机锁存时不停机），以及 `e14_commit_forkchoice_tags`。
+
+**四节点**：区块 1-18 0 处不符，四节点标签均为 latest=18 safe=17 finalized=17；重启节点 2 后到 23 块，标签 23/22/22。
+
+### 10.2 PR 6：可包含性与 Phase B
+
+**设计决策**
+
+- **gov5 规则逐字移植**（`n42-consensus-service/src/deferred_check.rs`，只读参考 gov5 `deferred_includable.go` 等）：
+  `intrinsic_gas`（含 Amsterdam 的 EIP-2780：TX_BASE 12000、冷账户 3000、value 6000、create 12000、访问列表 2900+20×64 / 2000+32×64、授权 7816）、
+  `deferred_tx_plan`（无状态规则、按发送者分组、gas limit 之和不超块上限）、`check_sender_states`（nonce 连续、最坏费用 ≤ 余额 + 先前转入、发送者无代码）。
+  gov5 的测试用例作为表驱动测试带入。
+- **`ExecutionLayer::deferred_check`**（默认 `Unsupported`）。`n42-node/src/el/deferred.rs` 的 `DeferredChecker` 只读不执行，按顺序：
+  已执行过 → Checked；头未进门 → Retry；载荷父块与头不符 → Refused；父块结果未登记 → Retry；携带字段与本节点结果不符 → Refused；
+  解码与恢复签名（rayon）；plan；在父块后状态上读发送者。指标 `n42_deferred_check_total{outcome}`、`n42_blocks_refused_total{reason}`。
+- **Phase B**：新事件 `ConsensusEvent::BlockChecked{block_hash,parent_hash}` 只释放 Round 1（仍要求父块 = justify 块，AM19）；
+  `BlockRefused(hash)` 永久扣下该块的 Round 1，即使之后导入成功也不投（gov5 在检查上投票）。CommitVote 仍要求 `BlockImportedWithParent`（本节点执行）。
+  follower 的 eager import 任务在 Profile 1 且未停机时同时起 `deferred_check` 与 new_payload，导入与检查重叠。
+- **陷阱：Decide 早于本节点导入**：Round 1 在检查上投出，法定人数可能在本节点导入完成前提交。现有 `finish_eager_import_completion`
+  把提交挂起（`enqueue_async_commit` + `mark_async_commit_execution_ready`），超时处理见到 eager import 在途时只等待、不重复导入；导入 Valid 后再定案。
+- **构建器可包含性过滤**（设计 3.3）：`IncludabilityFilter` 用与检查相同的规则逐笔判断（`admit` 不改状态，构建器执行成功后 `commit`）；
+  在 `default_n42_payload` 中 Profile 1 启用，被拒交易 `mark_invalid`（连带后续 nonce），计数 `n42_builder_not_includable_total`。
+  Profile 1 上并行构建器回落到顺序构建器（并行路径不做逐笔过滤）。
+- **Phase A/B 取舍**：Retry/Unsupported 回落 Phase A（导入后投票），所以检查不可判定时不会少投或错投，只是慢；
+  Refused 扣下 Round 1，但如果法定人数仍形成 PrepareQC，本节点执行成功后照常投 CommitVote（与 gov5 一致，避免活性问题）。
+  Phase B 的收益在 leader 自己的块和父块结果已就绪时；检查本身不执行，只有签名恢复与少量账户读。
+
+**测试**：`deferred_check` 6 个（含 `builder_filter_matches_the_check`：过滤器接纳的集合恰好通过检查）；
+`profile1_v6.rs` 新增 4 个 Phase B 引擎测试（检查释放 Round 1 且字节等于 gov5 的 prepare_vote_v2，但不释放 CommitVote；
+AM19 与检查早于提案；被拒块无 Round 1；非 Profile 1 无效果）；orchestrator `phase_b_a_decide_before_the_import_is_queued`、
+`phase_b_check_outcomes_reach_the_engine`；`profile1_deferred.rs` 中 V5 每块在导入前检查为 Checked，携带错误 requestsHash 时检查拒绝。
+
+**四节点**：区块 1-20 0 处不符，10 笔交易全部上链，标签 20/19/19；ERROR 0、REFUSED 0；日志中可见 "checked vote: deferred check passed before the import"（各节点 4-11 次）。
+
+### 10.3 PR 8：延迟链上的 range 同步与观察者
+
+- range 导入失败的块若不是仅松散锚定（即在严格提交锚之下，已提交），在 Profile 1 上走 `profile1_check_committed`：有携带字段不符证据则停机（E12），否则照旧停止本轮。
+- 观察者启动时同样 `require_head_result`（从重启头开始必须有自己的结果）。
+- **range 服务端修复（四节点运行发现）**：Profile 1 节点无法提供 `bodies_by_range`，请求方 range 客户端卡死：
+  1. `gov5_rpc` 服务端对要发出的块用 `decode_gov5_block_rlp` 自检，只认 gov5 原生头布局，Profile 1 的 24 元素头一律
+     "invalid gov5 block RLP"（code 2）。改为 `decode_wire_block_rlp`（两种布局都读），by-hash 同样。
+  2. `main.rs` 的 `gov5_canonical_block_reader` 先从 reth 头 `Gov5NativeHeader::recover`，Profile 1 块 reth 头不哈希到块哈希，恢复失败。
+     改为已记住 Profile-1 头时跳过恢复，`encode_gov5_block_rlp` 本身已按记住的 Profile-1 头编码。
+  - 新测试 `gov5_rpc::range_and_hash_serve_profile1_blocks`。
+  - 限制：Profile-1 头只存在进程内登记表（8192 条），服务端重启后无法提供重启前的块；持久化 Profile-1 头是后续项。
+  - 另一个原有问题（未改）：range 客户端在没有任何回复可用时，`anchored_total` 随实时区块增长被当作"进展"，
+    `stall_timeout` 永不触发，且客户端激活后反向遍历被跳过，节点停在原高度（本次在修复前观察到 23 分钟无进展）。
+- **20 块延迟链 range 测试**（`profile1_deferred.rs` (f)）：在 V5 + 6' + 7' 之上再出 20 块（8-27，每块携带父块结果，leader 轮换并封印）；
+  第二个节点用自己的 reth 树与自己的 QMDB 存储，从 genesis 按高度顺序导入整段 27 块（导入门 → Phase B 检查 → 引擎），
+  每个子块携带的 stateRoot 都等于第二个节点自己算出的父块根；重新打开 `executed_fields.log` 含全部 27 块结果，`require_head_result(27)` 成立；
+  追平节点的 E14 标签为 safe=26、finalized=持久化块。
+  - 限制：登记表是进程级的，第二个节点的检查对已登记块直接返回 Checked；真正的独立性由它自己的 QMDB 根与引擎导入（结果不同会冲突）保证。
+- **四节点重启**：停节点 3（高度 6），三节点继续到 30，重启节点 3：从重启头 6 开始经反向祖先遍历追平 7-30（24 块，gap < 32 未触发 range 客户端），
+  0 ERROR，四节点到 31 块 0 处不符，标签 31/30/30。
+- **四节点 range 客户端**（修复后，新链）：停节点 3（高度 5），三节点到 45，重启节点 3：`range catch-up started head=5 target=45`，
+  3 秒后 `stopped reason=CaughtUp released=39 faults=0 conflicts=0`，24 秒内追平；到 59 块 0 处不符，四节点标签一致，ERROR/REFUSED/HALT 均为 0。
+  交易：节点 3 停机期间同一发送者的 nonce 缺口使后续交易等待，节点 3 恢复后区块 49-51 上链（区块 51 一块 5 笔同发送者交易，构建器过滤器正常接纳），10 笔全部 status 1。
+
+### 10.4 状态与后续
+
+- 门禁：`cargo clippy --workspace --all-targets -D warnings` 通过；`cargo test --workspace` 2080 通过、0 失败、38 忽略。
+- EIP-8282 创世 alloc 拒绝（方案 C）已按协调撤销：预部署地址可由 Nick 方法在创世后部署，创世规则无法保证调用为空操作；由用户在 evm2 侧决定。
+- 后续：设计 3.10 手机端语义；V5 的 AM25 请求块；observer 的 E12（目前只有 orchestrator 停机）。
