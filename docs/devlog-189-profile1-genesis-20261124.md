@@ -106,3 +106,69 @@ three_validators 等）从 testdata 删除；`every_v8_refused_genesis_is_refuse
 规则未删，仍生效。qs-scratch 目录仍是旧向量，不再使用。
 
 **状态。** `n42-chainspec` profile1_vectors 11 个、`profile1_header` 3 个、`chainspec_parser` 3 个测试通过。
+
+## 7. 第 2 步：导入路径的头校验、AM2 块大小、AM1 执行集合与 V3/V4（2026-11-24 追加）
+
+### 7.1 设计决策
+
+- **头校验放在解码处，而不是 reth 引擎里。** Profile 1 头有 24 个 RLP 元素，`Gov5NativeHeader` 最多 23 个，
+  旧解码器根本读不出来。新增 `n42_network::decode_profile1_block_rlp` / `decode_block_rlp_for(rlp, profile1)`，
+  Profile 1 上用 `Profile1Header::decode`，解码失败是永久错误（`HeaderProfile`）。
+  校验状态集中在 `Profile1ImportGate`（`n42-consensus-service/src/profile1_header.rs`）：记住已接纳的头（4096 个，
+  父必须已接纳；祖先回溯深度 256），记住拒绝；拒绝原因带规则号，打 `n42_profile1_header_refused_total{path,rule}`
+  指标和 `n42::profile1` 告警。未在 Profile 1 的链 `profile1 = None`，路径与原来一致。
+- **Round-1 投票门**：H2-v4 参与者模式是导入后投票，投票以 `EngineOutput::SendToValidator(Vote)` 或广播发出；
+  在 `handle_engine_output` 入口对 Vote 调 `check_vote`（即 `check_profile1_vote_time`），未到时间则不发。
+- **AM2**：块大小唯一上界是 `hotstuff.maxBlockBytes`。`block_rlp_size_limit` 只在 Profile 1 时返回 maxBlockBytes，
+  否则保持 Osaka 的 8 MiB；适配器在 Profile 1 时自己比较 `rlp_length`，并不再让 reth 内层做 8 MiB 检查。
+- **AM1**：reth 的 `EthereumHardfork::Amsterdam` 从 Profile 1 链规格中移除（`profile1_chain_spec`），
+  在 `N42EvmConfig` 里把 evm2 的 spec/version 提到 `AMSTERDAM`，并设 `slot_num`（= 块号，EIP-7843）。
+  这样执行集合跟 n42-rs `GLAMSTERDAM_EXECUTION_PARITY.md` 一致，而只受链规格 Amsterdam 控制的东西保持关闭。
+- **写集合规则（A9/D3/D5）**：V3 首次运行发现两类差异：每块多写 `0xff..fe` 系统调用者叶子（D3），
+  `a9-no-op` 多写零值转账接收者的账户叶子（A9）。新增 `qmdb_state::gov5_block_operations`，Profile 1 下：
+  只写前后值不同的键；有存储操作的账户保留账户操作（V3 README 开放点 1，gov5 现状）；不加 restored-slot 重写（D5）；
+  不加系统调用者叶子（D3）。非 Profile 链仍是原 replay-v2 规则。根任务、构建器（native/parallel）、
+  `exec_cache` 统一走这个函数。
+
+### 7.2 Amsterdam 下各 EIP 的开关
+
+| EIP | 由谁开 | Profile 1 上 |
+|-----|--------|-------------|
+| evm2 AMSTERDAM 版本：gas 表、EIP-8037、2^32-1 交易 gas 上限、EIP-2780、7623/7976、7981、8038、7708 转账日志、7778、7954 代码/initcode 上限、8246、8024、7843 SLOTNUM | evm env 的 spec/version | 开（AM1），由 `amsterdamTime` 提升 |
+| EIP-7928 BAL | reth 链规格 Amsterdam（构建器 `with_bal_builder_if`、payload 校验、头校验） | 关：链规格去掉 Amsterdam |
+| EIP-8282 builder deposit/exit 块末调用 | **evm2 按 env `spec_id.enables(AMSTERDAM)`**（`block/ethereum/execution.rs:422`），不看链规格 | **仍会执行**；两个合约地址无代码，调用成功且不改状态，V3 结果相等；要真正关掉需改 evm2，按要求停止并上报 |
+| EIP-7997 | 未实现 | 无 |
+
+### 7.3 实施细节（文件）
+
+- `n42-network/src/gov5_block.rs`、`lib.rs`、`Cargo.toml`：Profile 1 解码。
+- `n42-consensus-service`：`profile1_header.rs`（门、拒绝、日志）、`orchestrator/{mod,execution_bridge,range_sync,consensus_loop}.rs`、
+  `observer.rs`、`orchestrator/tests/profile1.rs`。
+- `bin/n42-node/src/main.rs`：`profile1_import_gate` 构建门并接入 observer 和 orchestrator；安装 `install_profile1_config`。
+- `n42-chainspec/src/profile1/mod.rs`：`install_profile1_config`、`block_rlp_size_limit`、去掉 reth Amsterdam、
+  `check_profile1_tx_type`（C1-C4）。
+- `n42-consensus/src/adapter.rs`、`n42-node/src/{native_payload,parallel_payload}.rs`：AM2。
+- `n42-execution/src/evm_config.rs`、`lib.rs`：AM1 提升。
+- `n42-node/src/{qmdb_state,qmdb_state_root,exec_cache,parallel_payload}.rs`：写集合规则。
+- `n42-node/tests/profile1_vectors.rs` + `n42-node/testdata/profile1/gov5/`（n42-rs origin/main 向量逐字节拷贝，SHA-256 与清单一致）。
+
+### 7.4 结果
+
+- 导入路径：follower 导入（`handle_block_data`、gov5 体 `process_h2_v4_gov5_block`）、sync 导入（`import_and_notify`）、
+  catch-up（反向回溯与 range，`import_h2_v4_catchup_block`、range 解码）、observer（finalized catch-up、live import、
+  `import_block_data`）都先过门；V1 全部 23 个导入拒绝在各路径都被拒，不调 new_payload，不投票。
+- V3：genesis QMDB 根相等；`main.json` 7 块、`system_address_live.json` 2 块，写集合与根全部相等。
+- V4：17 个用例裁决全部相等。阶段差别两处（裁决相同）：`type-4-create` gov5 在 includable 拒，本节点 alloy 解码即拒；
+  `type-0x50` gov5 解码拒，本节点解码通过、由类型规则 C4 拒。
+- clippy `--workspace --all-targets -D warnings` 通过；`cargo test --workspace` 2018 通过、0 失败。
+
+### 7.5 未完成
+
+1. Profile 1 块走 Engine API 时 payload 重建失败（`MissingRequests`：payload 不带 requestsHash/slot），引擎校验器
+   `bind_gov5_h2_header` 也只认 23 元素头；导入门之后的 EL 绑定尚未做。reth 头校验对非 Amsterdam 的 `slot_number`
+   也会报 `SlotNumberUnexpected`，Profile 1 头需绕过这条或由 N42 共识层替代。
+2. C1-C4 类型规则只在向量测试里使用，尚未接入交易池与块导入（`import alone` 时 blob 交易会被执行接受）。
+3. EIP-8282 块末调用需 evm2 改动才能关（见 7.2）。
+4. 重启时门只在“零注册根重建的 24 元素头哈希 = 持久头哈希”时信任持久头。
+5. V8 用 n42-rs 的 14 个拒绝用例（原 33 个中多余的 19 个已删）。
+6. 出块、延迟执行（AM19）、V6 不在本步范围。

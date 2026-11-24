@@ -16,7 +16,7 @@ Logs are split into separate files by phase for easy maintenance:
 
 | File | Content | Phase |
 |------|---------|-------|
-| [devlog-189-profile1-genesis-20261124](docs/devlog-189-profile1-genesis-20261124.md) | 混合生产标准 Profile 1 第一步：`config.n42Profile` 开关与 V8 封闭键表、Profile-1 创世头（QMDB stateRoot，哈希等于 V1 `0x6f733745…`）、24 元素头编解码与封印、V1 头校验与 33 个 V8 拒绝用例、J4 环境变量拒绝 | Consensus |
+| [devlog-189-profile1-genesis-20261124](docs/devlog-189-profile1-genesis-20261124.md) | 混合生产标准 Profile 1 第一步：`config.n42Profile` 开关与 V8 封闭键表、Profile-1 创世头（QMDB stateRoot，哈希等于 V1 `0x188e9d93…`，AM24 requestsHash=sha256("")）、24 元素头编解码与封印、V1 头校验与 14 个 V8 拒绝用例、J4 环境变量拒绝；第二步：各导入路径与 Round-1 投票的头校验门、AM2 maxBlockBytes、AM1 Amsterdam 执行集合、V3/V4 全部相等 | Consensus |
 | [devlog-188-rotate-on-timeout-20261124](docs/devlog-188-rotate-on-timeout-20261124.md) | 同步标准 §10：leader tenure 改由创世 `config.hotstuff.leaderTenure` 决定（`N42_LEADER_TENURE` 仅作基准覆盖），rotate-on-timeout（`rotateOnTimeoutView` / `N42_HOTSTUFF_ROTATE_ON_TIMEOUT`）在所有 TC→下一 view 处使用 `view_after_tc`；§10.4 全部向量为单元测试 | Consensus |
 | [devlog-187-mixed-3go-4rust-fresh-fleet-20261117](docs/devlog-187-mixed-3go-4rust-fresh-fleet-20261117.md) | 3 Gov5 + 4 n42-26 全新创世混合舰队（单机）：修复 pre-Shanghai leader 未注册原生头导致无法出块；零小费交易在未设 `unchangedAccountNoOpTime` 时两端 QMDB 根不同并新增启动告警；停启/掉节点/kill -9 演练 17 项通过 | Interop |
 | [devlog-186-reth-2110-evm2-upgrade-20261119](docs/devlog-186-reth-2110-evm2-upgrade-20261119.md) | Reth v2.11.0 upgrade with revm replaced by evm2: nineteen-patch series (eight ported, import-batch pair dropped, eleven new), mobile SDK on evm2, touched-but-unchanged accounts kept in the bundle, `n42-parallel-evm` / `n42-evm-bench` parked; lock, patches, scripts, CI and docs aligned | Upgrade |
