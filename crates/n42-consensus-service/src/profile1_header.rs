@@ -370,6 +370,9 @@ pub struct Profile1ImportGate {
     order: std::collections::VecDeque<B256>,
     refused: std::collections::HashMap<B256, Profile1Refusal>,
     clock: fn() -> u64,
+    /// This validator's BLS key, with which its blocks are sealed (B2);
+    /// `None` on a node that does not produce.
+    seal_key: Option<std::sync::Arc<n42_primitives::BlsSecretKey>>,
 }
 
 fn unix_now() -> u64 {
@@ -402,9 +405,22 @@ impl Profile1ImportGate {
             order: Default::default(),
             refused: Default::default(),
             clock: unix_now,
+            seal_key: None,
         };
         gate.seed(genesis);
         Ok(gate)
+    }
+
+    /// The key this node seals its own blocks with (B2: the leader of the
+    /// view signs `sealHash`).
+    pub fn with_seal_key(mut self, key: std::sync::Arc<n42_primitives::BlsSecretKey>) -> Self {
+        self.seal_key = Some(key);
+        self
+    }
+
+    /// The key this node seals its own blocks with, when it produces.
+    pub fn seal_key(&self) -> Option<std::sync::Arc<n42_primitives::BlsSecretKey>> {
+        self.seal_key.clone()
     }
 
     /// Replaces the vote clock (unix seconds); for tests.
@@ -451,6 +467,9 @@ impl Profile1ImportGate {
             return Err(refusal.clone());
         }
         let parent_hash = header.header.parent_hash;
+        if !self.admitted.contains_key(&parent_hash) {
+            self.admit_own_sealed(parent_hash);
+        }
         let Some(parent) = self.admitted.get(&parent_hash) else {
             return Err(Profile1Refusal::ParentUnknown {
                 hash,
@@ -530,6 +549,26 @@ impl Profile1ImportGate {
                     .ok_or(Profile1Refusal::HeaderUnknown(hash)),
             },
         }
+    }
+
+    /// A block this validator sealed itself never arrives over an import
+    /// path, so its children would find no parent. Its header is taken from
+    /// the native-header registry only when the seal verifies under this
+    /// gate's own key, and is then admitted under the same rules as any other.
+    pub fn admit_own_sealed(&mut self, hash: B256) -> bool {
+        if self.admitted.contains_key(&hash) {
+            return true;
+        }
+        let Some(key) = self.seal_key.clone() else {
+            return false;
+        };
+        let Some(header) = n42_consensus::remembered_profile1_header(&hash) else {
+            return false;
+        };
+        if header.verify_seal(&key.public_key()).is_err() {
+            return false;
+        }
+        self.admit(header).is_ok()
     }
 
     /// Admits the header of a block decoded from the gov5 wire with
@@ -707,6 +746,43 @@ mod tests {
             }
         }
         assert_eq!(checked, 24);
+    }
+
+    /// A leader's own block reaches its gate through no import path. Its
+    /// child still finds the parent: the remembered header is admitted when
+    /// its seal verifies under the gate's own key, and only then.
+    #[test]
+    fn own_sealed_parent_is_admitted_only_under_the_own_key() {
+        let f = Fixture::load();
+        let (_, config, _) = profile1_chain_spec(&testdata("genesis_8s.json")).unwrap();
+        let key = |index: usize| {
+            let hex_key = f.vector["validators"][index]["blsSecretKey"].as_str().unwrap();
+            let bytes: [u8; 32] = hex::decode(hex_key.trim_start_matches("0x"))
+                .unwrap()
+                .try_into()
+                .unwrap();
+            std::sync::Arc::new(n42_primitives::BlsSecretKey::from_bytes(&bytes).unwrap())
+        };
+        n42_consensus::remember_gov5_native_header(&f.block1.encode());
+
+        let mut no_key = Profile1ImportGate::new(&config, f.genesis.clone()).unwrap();
+        assert!(matches!(
+            no_key.admit(f.block2.clone()),
+            Err(Profile1Refusal::ParentUnknown { .. })
+        ));
+        // Validator 0 did not seal block 1 (view 1's leader is validator 1).
+        let mut other = Profile1ImportGate::new(&config, f.genesis.clone())
+            .unwrap()
+            .with_seal_key(key(0));
+        assert!(matches!(
+            other.admit(f.block2.clone()),
+            Err(Profile1Refusal::ParentUnknown { .. })
+        ));
+        let mut sealer = Profile1ImportGate::new(&config, f.genesis.clone())
+            .unwrap()
+            .with_seal_key(key(1));
+        assert_eq!(sealer.admit(f.block2.clone()).unwrap(), f.block2.hash());
+        assert!(sealer.header(&f.block1.hash()).is_some());
     }
 
     /// B6 / A8: block N's withdrawalsRoot is the rewards root of

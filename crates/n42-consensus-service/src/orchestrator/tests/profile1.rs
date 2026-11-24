@@ -198,11 +198,11 @@ async fn sync_import_refuses_before_new_payload() {
 }
 
 /// The catch-up import (reverse walk and range client) checks the header
-/// before the payload is rebuilt. A valid V1 block passes the gate; the
-/// Engine API payload of a 24-element header cannot be rebuilt yet
-/// (`MissingRequests`: the payload path does not carry requestsHash and the
-/// slot number), so the valid block stops there; that binding is the next
-/// step. No refused header gets past the gate.
+/// before the payload is rebuilt. A valid V1 block passes the gate and goes
+/// on to `new_payload` under its Profile-1 hash (the payload is a V3 payload
+/// with the requests hash in its sidecar; the engine validator binds the
+/// 24-element header back from the remembered encoding). No refused header
+/// gets past the gate.
 #[tokio::test]
 async fn catchup_import_refuses_before_new_payload() {
     let (f, gate) = v1();
@@ -224,12 +224,15 @@ async fn catchup_import_refuses_before_new_payload() {
     assert!(n42_network::decode_gov5_block_rlp(&wire1).is_err());
     let decoded1 = orch.decode_wire_block(&wire1).unwrap();
     assert_eq!(decoded1.block_hash, block1.hash());
-    assert!(matches!(
-        crate::replay_import::build_gov5_gossip_execution_data(&decoded1),
-        Err(crate::replay_import::ReplayImportPlanError::MissingRequests(1))
-    ));
-    assert!(!orch.import_h2_v4_catchup_block(source, decoded1, 1).await);
+    let payload1 = crate::replay_import::build_gov5_gossip_execution_data(&decoded1).unwrap();
+    assert_eq!(payload1.block_hash(), block1.hash());
+    assert_eq!(
+        payload1.sidecar.requests_hash(),
+        Some(n42_chainspec::profile1::PROFILE1_REQUESTS_HASH)
+    );
+    assert!(orch.import_h2_v4_catchup_block(source, decoded1, 1).await);
     assert!(admitted(&orch, block1.hash()), "V1 block 1 passes the header gate");
+    assert_eq!(mock.new_payload_hashes(), vec![block1.hash()]);
 
     let mut refused = 0;
     for (name, header) in f.import_refusals() {
@@ -255,9 +258,13 @@ async fn catchup_import_refuses_before_new_payload() {
 
     let wire2 = gov5_wire_block(&f.block2, block2.header.beneficiary);
     let decoded2 = orch.decode_wire_block(&wire2).unwrap();
-    assert!(!orch.import_h2_v4_catchup_block(source, decoded2, 2).await);
+    assert!(orch.import_h2_v4_catchup_block(source, decoded2, 2).await);
     assert!(admitted(&orch, block2.hash()), "V1 block 2 passes the header gate");
-    assert!(mock.new_payload_hashes().is_empty());
+    assert_eq!(
+        mock.new_payload_hashes(),
+        vec![block1.hash(), block2.hash()],
+        "only the two valid blocks reach new_payload"
+    );
 }
 
 #[tokio::test]

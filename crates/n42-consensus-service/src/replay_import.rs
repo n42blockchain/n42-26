@@ -169,6 +169,16 @@ fn build_execution_data(
     header_profile: N42HeaderProfile,
 ) -> Result<ExecutionData, ReplayImportPlanError> {
     let number = header.number;
+    if header.slot_number.is_some() && header_profile == N42HeaderProfile::Gov5H2 {
+        // Only the Profile-1 layout carries `slotNumber`.
+        return build_profile1_execution_data(
+            block_hash,
+            header,
+            transactions,
+            rewards,
+            mobile_registry_root,
+        );
+    }
     validate_v1_payload_inputs(number, header, header_profile)?;
     let replay_v2_shape = header_profile == N42HeaderProfile::Gov5H2
         && validate_gov5_replay_v2_header(header).is_ok();
@@ -246,6 +256,62 @@ fn build_execution_data(
         });
     }
     Ok(payload)
+}
+
+/// The Engine API payload of a Profile-1 block (mixed production standard
+/// B1-B12): a V3 payload whose sidecar carries the requests hash (AM24,
+/// `sha256("")`), with the rewards as withdrawals (B6). The payload holds
+/// neither `slotNumber` nor `mobileRegistryRoot`; the engine validator binds
+/// them back from the remembered 24-element header, and the identity here is
+/// that header's hash.
+fn build_profile1_execution_data(
+    block_hash: B256,
+    header: &Header,
+    transactions: &[N42TxEnvelope],
+    rewards: &[Gov5Reward],
+    mobile_registry_root: Option<B256>,
+) -> Result<ExecutionData, ReplayImportPlanError> {
+    let number = header.number;
+    let profile_error =
+        |reason: &str| ReplayImportPlanError::HeaderProfile(number, format!("profile 1: {reason}"));
+    let mobile_registry_root =
+        mobile_registry_root.ok_or_else(|| profile_error("mobileRegistryRoot is missing"))?;
+    if header.ommers_hash != B256::ZERO {
+        return Err(ReplayImportPlanError::UnsupportedOmmersHash(number, header.ommers_hash));
+    }
+    if header.slot_number != Some(number) {
+        return Err(profile_error("slotNumber is not the block number"));
+    }
+    if header.requests_hash != Some(n42_chainspec::profile1::PROFILE1_REQUESTS_HASH) {
+        return Err(profile_error("requestsHash is not sha256(\"\")"));
+    }
+    if header.block_access_list_hash.is_some() {
+        return Err(ReplayImportPlanError::MissingBlockAccessList(number));
+    }
+    validate_gov5_header_extra(&header.extra_data)
+        .map_err(|error| ReplayImportPlanError::HeaderProfile(number, error.to_string()))?;
+    let withdrawals = gov5_withdrawals(number, header, rewards, false)?;
+    let native_hash = n42_chainspec::profile1::Profile1Header {
+        header: header.clone(),
+        mobile_registry_root,
+    }
+    .hash();
+    if native_hash != block_hash {
+        return Err(ReplayImportPlanError::PayloadIdentity {
+            number,
+            expected: block_hash,
+            reconstructed: native_hash,
+        });
+    }
+    let block = Block {
+        header: header.clone(),
+        body: BlockBody {
+            transactions: transactions.to_vec(),
+            ommers: Vec::new(),
+            withdrawals,
+        },
+    };
+    Ok(ExecutionData::from_block_unchecked(block_hash, &block))
 }
 
 fn validate_v1_payload_inputs(

@@ -176,6 +176,9 @@ pub const PROFILE1_FORBIDDEN_ENV: &[&str] = &[
     "N42_UNSTAKED_REWARD_RATIO",
     // §3: anchored ranges are enforced, no observe mode.
     "N42_SYNC_ANCHOR",
+    // A13/AM19: the Round-1 vote waits for the own import; a vote released
+    // on cached data is not allowed.
+    "N42_COLOCATED_VOTE",
 ];
 
 /// Prefixes of forbidden variables: every gov5 interop switch

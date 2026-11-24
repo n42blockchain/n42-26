@@ -437,6 +437,57 @@ fn load_qmdb_execution_checkpoint(
     Ok((portable, verified))
 }
 
+/// Profile 1: block zero of the genesis file is the QMDB execution base. The
+/// tree is the genesis alloc's (`n42_chainspec::profile1::qmdb_genesis_tree`),
+/// whose root the Profile-1 genesis header already commits; no external
+/// checkpoint or range is read.
+fn load_profile1_execution_base(
+    genesis: &Genesis,
+    chain_id: u64,
+    genesis_header: Header,
+    genesis_hash: B256,
+    branch_state_path: &Path,
+    max_replay_depth: usize,
+) -> eyre::Result<QmdbExecutionBootstrap> {
+    let tree = gov5_qmdb_genesis_tree(genesis)
+        .map_err(|error| eyre::eyre!("failed to build the Profile-1 QMDB genesis state: {error}"))?;
+    let root = B256::from(tree.root());
+    if root != genesis_header.state_root {
+        return Err(eyre::eyre!(
+            "the genesis alloc gives QMDB root {root}, the Profile-1 genesis header commits {}",
+            genesis_header.state_root
+        ));
+    }
+    let checkpoint = QmdbPortableVerification {
+        chain_id,
+        genesis_hash: genesis_hash.0,
+        block_number: 0,
+        block_hash: genesis_hash.0,
+        root: root.0,
+        next_slot: tree.next_slot(),
+        live_count: tree.next_slot(),
+    };
+    let store = Gov5QmdbStateRootStore::persistent(
+        genesis_hash,
+        root,
+        tree.snapshot(),
+        max_replay_depth,
+        branch_state_path.to_path_buf(),
+    )
+    .map_err(|error| eyre::eyre!("failed to initialize the Profile-1 QMDB store: {error}"))?;
+    info!(target: "n42::profile1", %genesis_hash, %root, "QMDB execution base: the genesis alloc");
+    Ok(QmdbExecutionBootstrap {
+        store: Arc::new(store),
+        checkpoint,
+        base_block_number: 0,
+        base_block_hash: genesis_hash,
+        base_root: root,
+        genesis_header,
+        execution_genesis: genesis.clone(),
+        execution_profile: "profile1",
+    })
+}
+
 /// Establish block zero as the execution base by binding four independently checked views of it:
 /// the configured alloc, Gov5's authenticated genesis header, the portable history prefix, and the
 /// checkpoint's full QMDB commitment.
@@ -1226,6 +1277,7 @@ fn profile1_import_gate(
 ) -> eyre::Result<n42_consensus_service::profile1_header::Profile1ImportGate> {
     let genesis_header = n42_chainspec::profile1::profile1_genesis_header(genesis, config)
         .map_err(|error| eyre::eyre!("refusing to start: {error}"))?;
+    n42_consensus::remember_gov5_native_header(&genesis_header.encode());
     let mut gate =
         n42_consensus_service::profile1_header::Profile1ImportGate::new(config, genesis_header)
             .map_err(|error| eyre::eyre!("refusing to start: profile 1 header gate: {error}"))?;
@@ -1237,6 +1289,8 @@ fn profile1_import_gate(
             mobile_registry_root: B256::ZERO,
         };
         if head.hash() == hash {
+            // The leader's build and the engine bind the head by its encoding.
+            n42_consensus::remember_gov5_native_header(&head.encode());
             gate.seed(head);
         } else {
             tracing::warn!(
@@ -1575,7 +1629,11 @@ fn main() {
             .unwrap_or_else(|_| "./n42-data".to_string())
             .into();
         let observer_mode = env_bool("N42_OBSERVER_MODE");
-        let h2_v4_participant = env_bool("N42_GOV5_H2_PARTICIPANT");
+        // Profile 1: every node is an H2-v4 participant keyed by the genesis
+        // chain id and hash, with the gov5 header profile and QMDB execution
+        // from block zero; none of it is configured by the environment (J4).
+        let profile1_node = profile1.is_some();
+        let h2_v4_participant = env_bool("N42_GOV5_H2_PARTICIPANT") || profile1_node;
         if observer_mode && h2_v4_participant {
             return Err(eyre::eyre!(
                 "N42_OBSERVER_MODE and N42_GOV5_H2_PARTICIPANT are mutually exclusive"
@@ -1584,11 +1642,15 @@ fn main() {
         // H2-v4 participants replace the builder's state root with the QMDB
         // root during Gov5 normalization, so the builder's MPT root is skipped.
         n42_node::payload::set_builder_state_root_replaced(h2_v4_participant);
-        let header_profile = resolve_header_profile(
-            observer_mode || h2_v4_participant,
-            env_bool("N42_GOV5_HEADER_PROFILE"),
-            std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
-        )?;
+        let header_profile = if profile1_node {
+            N42HeaderProfile::Gov5H2
+        } else {
+            resolve_header_profile(
+                observer_mode || h2_v4_participant,
+                env_bool("N42_GOV5_HEADER_PROFILE"),
+                std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
+            )?
+        };
         let interop_genesis = resolve_observer_genesis_hash(
             B256::ZERO,
             std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
@@ -1654,7 +1716,22 @@ fn main() {
             &data_dir.join("gov5_qmdb_branches.bin"),
         )
         .is_file();
-        let qmdb_execution = if env_bool("N42_GOV5_QMDB_EXECUTION")
+        let qmdb_execution = if profile1_node {
+            if builder.config().prune_config().is_some() {
+                return Err(eyre::eyre!(
+                    "profile 1 QMDB execution rejects all CLI pruning options"
+                ));
+            }
+            let chain = &builder.config().chain;
+            Some(load_profile1_execution_base(
+                &chain.genesis,
+                chain.chain.id(),
+                chain.genesis_header().clone(),
+                chain.genesis_hash(),
+                &data_dir.join("gov5_qmdb_branches.bin"),
+                DEFAULT_QMDB_REPLAY_DEPTH,
+            )?)
+        } else if env_bool("N42_GOV5_QMDB_EXECUTION")
             || bootstrap_bundle.is_some()
         {
             if builder.config().prune_config().is_some() {
@@ -2000,6 +2077,8 @@ fn main() {
         }
 
         let my_pubkey = secret_key.public_key();
+        // Profile 1 (B2): this validator seals its own blocks with its key.
+        let profile1_seal_key = secret_key.clone();
         let resolved_my_index = startup_validator_set.index_of_public_key(&my_pubkey);
         if h2_v4_participant && resolved_my_index.is_none() {
             return Err(eyre::eyre!(
@@ -3561,15 +3640,25 @@ fn main() {
                         .provider
                         .header(consensus_head_hash)?
                         .map(|header| (consensus_head_hash, header));
-                    orchestrator = orchestrator.with_profile1_gate(profile1_import_gate(
-                        &full_node.provider.chain_spec().genesis,
-                        config,
-                        head,
-                    )?);
+                    orchestrator = orchestrator.with_profile1_gate(
+                        profile1_import_gate(
+                            &full_node.provider.chain_spec().genesis,
+                            config,
+                            head,
+                        )?
+                        .with_seal_key(Arc::new(profile1_seal_key.clone())),
+                    );
                 }
 
                 if h2_v4_participant {
-                    if env_bool("N42_GOV5_NATIVE_PRODUCER") {
+                    if profile1.is_some() {
+                        // A8: devBlockReward to the coinbase and to the
+                        // faucet every block, carried as withdrawals.
+                        let rewards = n42_node::sinks::Gov5WithdrawalSource::from_genesis(
+                            &full_node.provider.chain_spec().genesis, fee_recipient,
+                        ).map_err(eyre::Report::msg)?;
+                        orchestrator = orchestrator.with_withdrawal_source(Arc::new(rewards));
+                    } else if env_bool("N42_GOV5_NATIVE_PRODUCER") {
                         if qmdb_execution_store.is_none() || trusted_state_root_base.is_some() {
                             return Err(eyre::eyre!("native producer requires recomputed QMDB roots"));
                         }

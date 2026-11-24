@@ -1930,10 +1930,12 @@ impl ConsensusService {
 
     /// Profile 1, B4 vote half: whether this node may send its Round-1 vote
     /// for `hash` now. `true` on every other chain.
-    pub(super) fn profile1_vote_allowed(&self, hash: B256) -> bool {
-        let Some(gate) = self.profile1.as_ref() else {
+    pub(super) fn profile1_vote_allowed(&mut self, hash: B256) -> bool {
+        let Some(gate) = self.profile1.as_mut() else {
             return true;
         };
+        // The leader's vote on its own block: admit the header it sealed.
+        gate.admit_own_sealed(hash);
         gate.check_vote(&hash)
             .map_err(|refusal| {
                 crate::profile1_header::log_profile1_refusal(hash, "round1_vote", &refusal)
@@ -3633,10 +3635,15 @@ impl ConsensusService {
         let (state_diff_ready_tx, state_diff_ready_rx) = mpsc::channel(256);
         let (build_complete_tx, build_complete_rx) = mpsc::channel(256);
 
-        let slot_time_ms: u64 = std::env::var("N42_BLOCK_INTERVAL_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        // Profile 1 (A16/A17): the genesis owns the slot; the environment
+        // variable is refused at startup.
+        let slot_time_ms: u64 = match n42_chainspec::profile1::profile1_config() {
+            Some(config) => config.block_interval_ms,
+            None => std::env::var("N42_BLOCK_INTERVAL_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+        };
         let slot_time = Duration::from_millis(slot_time_ms);
 
         let fast_propose = std::env::var("N42_FAST_PROPOSE")

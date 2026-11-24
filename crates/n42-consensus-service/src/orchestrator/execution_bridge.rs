@@ -210,9 +210,13 @@ impl ConsensusService {
         let Some(pool) = &self.committee_pool else {
             return Ok(B256::ZERO);
         };
+        // A Profile-1 parent is remembered in its 24-element form; its alloy
+        // view carries the same number and receipts root followers link to.
         let header = n42_consensus::remembered_gov5_native_header(&parent)
+            .map(|native| native.header)
+            .or_else(|| n42_consensus::remembered_profile1_header(&parent).map(|p1| p1.header))
             .ok_or_else(|| format!("native header of parent {parent} is not remembered"))?;
-        pool.child_beacon_root(header.header.number, &parent, &header.header.receipts_root)
+        pool.child_beacon_root(header.number, &parent, &header.receipts_root)
             .map_err(|error| format!("committee evidence for parent {parent}: {error}"))
     }
 
@@ -256,7 +260,12 @@ impl ConsensusService {
 
         PayloadAttributes {
             timestamp,
-            prev_randao: self.prev_randao_cache,
+            // Profile 1 (B3): prevRandao (mixHash) is zero in every header.
+            prev_randao: if self.profile1.is_some() {
+                B256::ZERO
+            } else {
+                self.prev_randao_cache
+            },
             suggested_fee_recipient: self.fee_recipient,
             withdrawals: Some(withdrawals),
             // N42 has no beacon chain. Without a committee pool B256::ZERO is a
@@ -674,6 +683,9 @@ impl ConsensusService {
         let header_qc = h2_v4_participant
             .then(|| n42_network::Gov5HeaderQc::from_commit_qc(self.engine.last_committed_qc()))
             .flatten();
+        // Profile 1: the built block is sealed into its 24-element header.
+        let profile1_seal_key = self.profile1.as_ref().and_then(|gate| gate.seal_key());
+        let profile1 = self.profile1.is_some();
 
         let handle = tokio::spawn(async move {
             let build_el = el.clone();
@@ -724,6 +736,7 @@ impl ConsensusService {
                         build_start,
                         build_context,
                         header_qc,
+                        profile1.then_some(profile1_seal_key),
                     )
                     .await;
                 }
@@ -1841,6 +1854,8 @@ async fn handle_built_payload(
     build_start: Instant,
     build_context: super::PayloadBuildContext,
     header_qc: Option<n42_network::Gov5HeaderQc>,
+    // `Some` on a Profile-1 chain: the key the block is sealed with (B2).
+    profile1_seal: Option<Option<Arc<n42_primitives::BlsSecretKey>>>,
 ) {
     let BuiltBlock {
         mut hash,
@@ -1873,6 +1888,43 @@ async fn handle_built_payload(
             .as_ref()
             .and_then(|cache| cache.built_transactions_root(original_hash));
         let normalize_started = Instant::now();
+        if let Some(seal_key) = profile1_seal {
+            // Profile 1: the 24-element header with the block's own QMDB
+            // and native receipts roots, sealed by this leader (B1-B12).
+            let Some(seal_key) = seal_key else {
+                error!(target: "n42::profile1", %original_hash, "refusing to propose: this node holds no sealing key");
+                return;
+            };
+            let sealed = match n42_network::seal_built_payload_for_profile1(
+                &execution_data,
+                current_view,
+                header_qc.as_ref(),
+                gov5_state_root,
+                gov5_receipts_root,
+                B256::ZERO,
+                &seal_key,
+            ) {
+                Ok(sealed) => sealed,
+                Err(error) => {
+                    error!(target: "n42::profile1", %original_hash, %error, "refusing to propose a payload that cannot be sealed as a Profile-1 block");
+                    return;
+                }
+            };
+            let preserves_execution_input =
+                n42_network::gov5_normalization_preserves_execution_input(
+                    &execution_data,
+                    &sealed.payload,
+                );
+            hash = sealed.payload.block_hash();
+            if let Some(ref cache) = exec_output_cache
+                && (!preserves_execution_input || !cache.rekey_gov5_built(original_hash, hash))
+            {
+                cache.evict(original_hash);
+            }
+            execution_data = sealed.payload;
+            metrics::histogram!("n42_leader_emit_stage_ms", "stage" => "normalize")
+                .record(normalize_started.elapsed().as_secs_f64() * 1000.0);
+        } else {
         let normalized = match n42_network::normalize_built_payload_for_gov5_h2(
             execution_data,
             current_view,
@@ -1907,6 +1959,7 @@ async fn handle_built_payload(
         execution_data = normalized.payload;
         metrics::histogram!("n42_leader_emit_stage_ms", "stage" => "normalize")
             .record(normalize_started.elapsed().as_secs_f64() * 1000.0);
+        }
     }
     let actual_parent = execution_data.parent_hash();
     let payload_hash = execution_data.block_hash();
