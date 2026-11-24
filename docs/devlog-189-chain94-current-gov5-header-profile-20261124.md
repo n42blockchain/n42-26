@@ -1,4 +1,4 @@
-# devlog-188：chain-94 原生路径按以太坊规则对齐当前 Gov5（2026-11-24）
+# devlog-189：chain-94 原生路径按以太坊规则对齐当前 Gov5（2026-11-24）
 
 路线归属：[自定义链兼容主线](04-Product-Lines-and-Performance.md)，ETH ECDSA 交易、H2 共识、QMDB bin 状态承诺。
 

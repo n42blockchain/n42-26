@@ -506,6 +506,21 @@ impl RecentBlockAnnouncementDedup {
     }
 }
 
+/// Result of one outbound `/rpc/bodies_by_range/1` request.
+///
+/// Sync standard section 3.5: a refusal, a short or empty reply and a
+/// transport failure are all legitimate peer behaviour; only the content of
+/// `Blocks` can prove a fault.
+#[derive(Debug)]
+pub enum Gov5RangeOutcome {
+    /// Block RLPs in served order: possibly a prefix, possibly empty.
+    Blocks(Vec<Vec<u8>>),
+    /// An error chunk before the first block (code 1 invalid/busy, 2 unavailable).
+    Refused { code: u8, message: String },
+    /// Timeout, connection loss, or the peer does not speak the protocol.
+    Failed { error: String, unsupported: bool },
+}
+
 /// Commands sent to the network service from the node layer.
 #[derive(Debug)]
 pub enum NetworkCommand {
@@ -538,6 +553,13 @@ pub enum NetworkCommand {
     RequestGov5BlockByHash {
         peer: PeerId,
         block_hash: B256,
+    },
+    /// Request `count` contiguous blocks from `start` over
+    /// `/rpc/bodies_by_range/1` (range catch-up client; step is always 1).
+    RequestGov5Range {
+        peer: PeerId,
+        start: u64,
+        count: u64,
     },
     /// Retire an in-flight Gov5 hash fetch after the same block body arrived
     /// through gossip or the validator direct-push lane.
@@ -611,6 +633,20 @@ pub enum NetworkEvent {
     H2V4Message {
         source: PeerId,
         envelope: Box<H2V4Envelope>,
+    },
+    /// Outcome of a [`NetworkCommand::RequestGov5Range`]. The blocks are
+    /// untrusted: the range catch-up client screens and anchors them.
+    Gov5RangeResponse {
+        source: PeerId,
+        start: u64,
+        count: u64,
+        outcome: Gov5RangeOutcome,
+    },
+    /// A peer on this genesis reported its (unauthenticated) head height in a
+    /// Gov5 status exchange. Used only to size catch-up fetches.
+    Gov5PeerStatus {
+        peer: PeerId,
+        height: u64,
     },
     BlockAnnouncement {
         source: PeerId,
@@ -1006,6 +1042,17 @@ impl NetworkHandle {
         self.send_priority(NetworkCommand::RequestGov5BlockByHash { peer, block_hash })
     }
 
+    /// Request a contiguous block range (range catch-up). Sent on the normal
+    /// command lane: catch-up must never delay consensus commands.
+    pub fn request_gov5_range(
+        &self,
+        peer: PeerId,
+        start: u64,
+        count: u64,
+    ) -> Result<(), NetworkError> {
+        self.send(NetworkCommand::RequestGov5Range { peer, start, count })
+    }
+
     pub async fn cancel_gov5_block_fetch_reliable(
         &self,
         block_hash: B256,
@@ -1053,6 +1100,9 @@ pub struct NetworkService {
     gov5_range_quotas: HashMap<PeerId, Gov5RangeQuota>,
     /// Accepted range streams still being written by request-response.
     pending_gov5_ranges: HashMap<libp2p::request_response::InboundRequestId, PeerId>,
+    /// Outbound range requests of the catch-up client: peer, start, count.
+    pending_gov5_range_requests:
+        HashMap<libp2p::request_response::OutboundRequestId, (PeerId, u64, u64)>,
     block_announce_topic_hash: gossipsub::TopicHash,
     mempool_topic_hash: gossipsub::TopicHash,
     blob_sidecar_topic_hash: gossipsub::TopicHash,
@@ -1417,6 +1467,7 @@ impl NetworkService {
             gov5_canonical_blocks: None,
             gov5_range_quotas: HashMap::new(),
             pending_gov5_ranges: HashMap::new(),
+            pending_gov5_range_requests: HashMap::new(),
             block_announce_topic_hash,
             mempool_topic_hash,
             blob_sidecar_topic_hash,
@@ -3534,10 +3585,57 @@ impl NetworkService {
             }
             libp2p::request_response::Event::Message {
                 peer,
-                message: libp2p::request_response::Message::Response { .. },
+                message:
+                    libp2p::request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
                 ..
             } => {
-                tracing::warn!(%peer, "unexpected outbound Gov5 bodies-by-range response");
+                let Some((_, start, count)) = self.pending_gov5_range_requests.remove(&request_id)
+                else {
+                    tracing::debug!(%peer, "unsolicited Gov5 range response");
+                    return;
+                };
+                let outcome = match response {
+                    Gov5BodiesByRangeResponse::Blocks(chunks) => {
+                        let digest = self.gov5_status.map(|status| {
+                            <[u8; 4]>::try_from(&status.genesis_hash.as_slice()[..4])
+                                .expect("four genesis bytes")
+                        });
+                        let served = chunks.len();
+                        // A chunk for another fork digest ends the usable reply.
+                        let blocks: Vec<Vec<u8>> = chunks
+                            .into_iter()
+                            .take_while(|chunk| digest.is_none_or(|d| d == chunk.fork_digest))
+                            .map(|chunk| chunk.rlp)
+                            .collect();
+                        if blocks.len() < served {
+                            tracing::warn!(
+                                target: "n42::interop::range",
+                                %peer,
+                                served,
+                                kept = blocks.len(),
+                                "Gov5 range reply carries a foreign fork digest; truncated"
+                            );
+                        }
+                        metrics::counter!("n42_gov5_range_client_blocks_total")
+                            .increment(blocks.len() as u64);
+                        Gov5RangeOutcome::Blocks(blocks)
+                    }
+                    Gov5BodiesByRangeResponse::Error { code, message } => {
+                        Gov5RangeOutcome::Refused { code, message }
+                    }
+                    Gov5BodiesByRangeResponse::Stream { .. } => {
+                        Gov5RangeOutcome::Blocks(Vec::new())
+                    }
+                };
+                self.emit_event(NetworkEvent::Gov5RangeResponse {
+                    source: peer,
+                    start,
+                    count,
+                    outcome,
+                });
             }
             libp2p::request_response::Event::InboundFailure {
                 peer,
@@ -3549,8 +3647,27 @@ impl NetworkService {
                 metrics::counter!("n42_gov5_range_response_failures_total").increment(1);
                 tracing::debug!(%peer, ?request_id, %error, "Gov5 range response failed");
             }
-            libp2p::request_response::Event::OutboundFailure { peer, error, .. } => {
-                tracing::warn!(%peer, %error, "unexpected outbound Gov5 range request failed");
+            libp2p::request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+                ..
+            } => {
+                let Some((_, start, count)) = self.pending_gov5_range_requests.remove(&request_id)
+                else {
+                    return;
+                };
+                let error = error.to_string();
+                let unsupported =
+                    error.contains("supports none") || error.contains("UnsupportedProtocols");
+                metrics::counter!("n42_gov5_range_client_failures_total").increment(1);
+                tracing::debug!(target: "n42::interop::range", %peer, start, count, %error, "Gov5 range request failed");
+                self.emit_event(NetworkEvent::Gov5RangeResponse {
+                    source: peer,
+                    start,
+                    count,
+                    outcome: Gov5RangeOutcome::Failed { error, unsupported },
+                });
             }
             libp2p::request_response::Event::ResponseSent {
                 peer, request_id, ..
@@ -3583,6 +3700,10 @@ impl NetworkService {
                     tracing::warn!(%peer, remote_genesis = %request.genesis_hash, local_genesis = %local_status.genesis_hash, "gov5 status genesis mismatch");
                 } else {
                     self.gov5_chain_authenticated_peers.insert(peer);
+                    self.emit_event(NetworkEvent::Gov5PeerStatus {
+                        peer,
+                        height: request.current_height,
+                    });
                 }
                 let _ = self
                     .swarm
@@ -3597,6 +3718,10 @@ impl NetworkService {
             } => {
                 if response.genesis_hash == local_status.genesis_hash {
                     self.gov5_chain_authenticated_peers.insert(peer);
+                    self.emit_event(NetworkEvent::Gov5PeerStatus {
+                        peer,
+                        height: response.current_height,
+                    });
                     metrics::counter!("n42_gov5_status_succeeded_total").increment(1);
                     tracing::debug!(%peer, height = response.current_height, "validated gov5 status response");
                 } else {
@@ -3785,6 +3910,8 @@ impl NetworkService {
                 | NetworkEvent::Gov5BlockFetched { .. }
                 | NetworkEvent::Gov5BlockFetchFailed { .. }
                 | NetworkEvent::H2V4Message { .. }
+                | NetworkEvent::Gov5RangeResponse { .. }
+                | NetworkEvent::Gov5PeerStatus { .. }
                 | NetworkEvent::VerificationReceipt { .. }
                 | NetworkEvent::BlobSidecarReceived { .. }
                 | NetworkEvent::PeerConnected(_)
@@ -4133,6 +4260,33 @@ impl NetworkService {
                     .insert(block_hash, (now, selected_peers[0]));
                 metrics::counter!("n42_gov5_block_fetch_fanout_total")
                     .increment(selected_peers.len() as u64);
+            }
+            NetworkCommand::RequestGov5Range { peer, start, count } => {
+                let request = Gov5BodiesByRangeRequest {
+                    start,
+                    count,
+                    step: 1,
+                };
+                if request.validate().is_err() || self.gov5_status.is_none() {
+                    self.emit_event(NetworkEvent::Gov5RangeResponse {
+                        source: peer,
+                        start,
+                        count,
+                        outcome: Gov5RangeOutcome::Failed {
+                            error: "range request not sendable".to_owned(),
+                            unsupported: self.gov5_status.is_none(),
+                        },
+                    });
+                    return;
+                }
+                let request_id = self
+                    .swarm
+                    .behaviour_mut()
+                    .gov5_bodies_by_range
+                    .send_request(&peer, request);
+                self.pending_gov5_range_requests
+                    .insert(request_id, (peer, start, count));
+                metrics::counter!("n42_gov5_range_client_requests_total").increment(1);
             }
             NetworkCommand::CancelGov5BlockFetch { block_hash } => {
                 let requests_before = self.pending_gov5_block_requests.len();

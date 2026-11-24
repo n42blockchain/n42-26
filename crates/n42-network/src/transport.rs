@@ -553,9 +553,9 @@ fn build_swarm_with_transports(
             .then(|| {
                 (
                     libp2p::StreamProtocol::new(GOV5_BODIES_BY_RANGE_PROTOCOL),
-                    // This node only serves ranges. Keeping outbound disabled
-                    // also prevents accidental use as N42's native sync path.
-                    libp2p::request_response::ProtocolSupport::Inbound,
+                    // Served to authorized peers, and requested by the range
+                    // catch-up client (consensus-service `range_catchup`).
+                    libp2p::request_response::ProtocolSupport::Full,
                 )
             })
             .into_iter();

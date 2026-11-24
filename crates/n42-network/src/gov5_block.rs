@@ -83,6 +83,157 @@ pub fn attributable_hash(encoded: &[u8]) -> Option<B256> {
 }
 
 const GOV5_H2_SEAL_BYTES: usize = 96;
+/// Magic plus the little-endian view.
+const GOV5_H2_EXTRA_PREFIX: usize = 12;
+/// How many remembered headers a producer walks back from the parent to find
+/// the block its CommitQC names. A committed block normally sits one to
+/// three blocks below the parent.
+const HEADER_QC_ANCESTOR_DEPTH: usize = 64;
+
+/// The CommitQC a gov5 H2 producer embeds in the header `Extra` (sync
+/// standard section 3.2): the last CommitQC the leader holds at build time,
+/// in gov5's QC wire form.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gov5HeaderQc {
+    /// The view the QC certifies.
+    pub view: u64,
+    /// The block the QC certifies.
+    pub block_hash: B256,
+    /// `encodeQC` of the certificate.
+    pub wire: Vec<u8>,
+}
+
+impl Gov5HeaderQc {
+    /// The header form of a commit-domain QC. `None` for the view-0 genesis
+    /// sentinel, which a producer never embeds, or a certificate gov5's
+    /// encoding cannot carry.
+    pub fn from_commit_qc(qc: &n42_primitives::consensus::QuorumCertificate) -> Option<Self> {
+        if qc.view == 0 {
+            return None;
+        }
+        let h2 = crate::h2_bridge::quorum_certificate_to_h2(qc).ok()?;
+        let wire = crate::h2_wire::encode_h2_qc(&h2).ok()?;
+        Some(Self {
+            view: qc.view,
+            block_hash: qc.block_hash,
+            wire,
+        })
+    }
+}
+
+/// What a gov5 H2 header `Extra` carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Gov5HeaderExtra {
+    /// The view the block was proposed in.
+    pub view: u64,
+    /// The embedded QC, when the layout carries one.
+    pub qc: Option<crate::h2_wire::H2QuorumCertificate>,
+    /// Whether the layout ends in the 96-byte seal.
+    pub sealed: bool,
+}
+
+/// `"N42H" || view u64 LE || qc || seal(96)`, the seal zero: what gov5's
+/// `buildHeaderExtra(view, committedQC)` writes. An empty `qc` gives the
+/// QC-less layout `"N42H" || view || seal(96)`.
+pub fn gov5_header_extra(view: u64, qc: &[u8]) -> Vec<u8> {
+    let mut extra = Vec::with_capacity(GOV5_H2_EXTRA_PREFIX + qc.len() + GOV5_H2_SEAL_BYTES);
+    extra.extend_from_slice(b"N42H");
+    extra.extend_from_slice(&view.to_le_bytes());
+    extra.extend_from_slice(qc);
+    extra.resize(extra.len() + GOV5_H2_SEAL_BYTES, 0);
+    extra
+}
+
+/// Reads every layout gov5's `decodeHeaderExtra` accepts: `magic||view`,
+/// `magic||view||seal`, `magic||view||QC||seal` and the legacy
+/// `magic||view||QC`. A payload longer than the seal is read as QC followed
+/// by seal first, then as a QC alone, as gov5 does.
+pub fn decode_gov5_header_extra(extra: &[u8]) -> Result<Gov5HeaderExtra, Gov5BlockError> {
+    let invalid = |reason: &str| Gov5BlockError::HeaderProfile(reason.to_owned());
+    if extra.len() > n42_consensus::MAX_GOV5_HEADER_EXTRA_BYTES {
+        return Err(invalid("header extra exceeds 4096 bytes"));
+    }
+    let header_view = gov5_extra_view(extra)?;
+    let payload = &extra[GOV5_H2_EXTRA_PREFIX..];
+    let (qc, sealed) = match payload.len() {
+        0 => (None, false),
+        GOV5_H2_SEAL_BYTES => (None, true),
+        len if len > GOV5_H2_SEAL_BYTES => {
+            match crate::h2_wire::decode_h2_qc(&payload[..len - GOV5_H2_SEAL_BYTES]) {
+                Ok(qc) => (Some(qc), true),
+                Err(_) => (
+                    Some(
+                        crate::h2_wire::decode_h2_qc(payload)
+                            .map_err(|_| invalid("header extra QC does not decode"))?,
+                    ),
+                    false,
+                ),
+            }
+        }
+        _ => (
+            Some(
+                crate::h2_wire::decode_h2_qc(payload)
+                    .map_err(|_| invalid("header extra QC does not decode"))?,
+            ),
+            false,
+        ),
+    };
+    Ok(Gov5HeaderExtra {
+        view: header_view,
+        qc,
+        sealed,
+    })
+}
+
+fn gov5_extra_view(encoded: &[u8]) -> Result<u64, Gov5BlockError> {
+    if encoded.len() < GOV5_H2_EXTRA_PREFIX || &encoded[..4] != b"N42H" {
+        return Err(Gov5BlockError::HeaderProfile(
+            "missing canonical N42H view prefix".to_owned(),
+        ));
+    }
+    Ok(u64::from_le_bytes(
+        encoded[4..GOV5_H2_EXTRA_PREFIX]
+            .try_into()
+            .expect("length checked before fixed-width conversion"),
+    ))
+}
+
+/// The QC wire to embed in a header of `view` built on `parent`, or empty
+/// for the QC-less layout.
+///
+/// The standard requires the QC to name an ancestor of the block, its parent
+/// or lower. A committed block is an ancestor of every block on the locked
+/// branch, so this holds for an honest leader by construction; it is still
+/// checked against the remembered headers, because a header naming a
+/// non-ancestor would be non-conformant. When the ancestor cannot be found
+/// the QC-less layout is used and the miss is counted.
+fn header_qc_wire(header_qc: Option<&Gov5HeaderQc>, view: u64, parent: B256) -> &[u8] {
+    let Some(qc) = header_qc else {
+        return &[];
+    };
+    if qc.view == 0 || qc.view >= view {
+        metrics::counter!("n42_header_qc_omitted_total", "reason" => "view").increment(1);
+        return &[];
+    }
+    let mut cursor = parent;
+    for _ in 0..HEADER_QC_ANCESTOR_DEPTH {
+        if cursor == qc.block_hash {
+            return &qc.wire;
+        }
+        let Some(header) = n42_consensus::remembered_gov5_native_header(&cursor) else {
+            break;
+        };
+        if header.header.number == 0 {
+            break;
+        }
+        cursor = header.header.parent_hash;
+    }
+    metrics::counter!("n42_header_qc_omitted_total", "reason" => "ancestor").increment(1);
+    tracing::warn!(target: "n42::interop::h2v4", %parent, qc_view = qc.view,
+        qc_block = %qc.block_hash,
+        "the held CommitQC names no remembered ancestor; header carries no QC");
+    &[]
+}
 
 /// Returns the consensus view committed into a validated Gov5 H2 header.
 ///
@@ -90,17 +241,7 @@ const GOV5_H2_SEAL_BYTES: usize = 96;
 /// walking an authenticated parent chain must therefore read this value from
 /// each header instead of deriving `parent_view = child_view - 1`.
 pub fn gov5_header_view(header: &Header) -> Result<u64, Gov5BlockError> {
-    let encoded = header.extra_data.as_ref();
-    if encoded.len() < 12 || &encoded[..4] != b"N42H" {
-        return Err(Gov5BlockError::HeaderProfile(
-            "missing canonical N42H view prefix".to_owned(),
-        ));
-    }
-    Ok(u64::from_le_bytes(
-        encoded[4..12]
-            .try_into()
-            .expect("length checked before fixed-width conversion"),
-    ))
+    gov5_extra_view(header.extra_data.as_ref())
 }
 
 /// Converts a standard locally built Engine payload into the live gov5 H2
@@ -109,10 +250,8 @@ pub fn gov5_header_view(header: &Header) -> Result<u64, Gov5BlockError> {
 /// header-extra reservation, and pre-Shanghai withdrawals markers are
 /// normalized before the new block hash is formed.
 ///
-/// The first interoperable producer profile intentionally omits the optional
-/// header QC and reserves a zero seal. Gov5 authenticates the same block hash
-/// through the chain-bound H2 Proposal/CommitQC, and its header decoder accepts
-/// this current `magic || view || seal` layout.
+/// This form embeds no header QC: `magic || view || seal`. A producer passes
+/// its last CommitQC through [`normalize_built_payload_for_gov5_h2`].
 pub fn normalize_execution_payload_for_gov5_h2(
     execution: &ExecutionData,
     view: u64,
@@ -139,6 +278,24 @@ pub fn normalize_execution_payload_for_gov5_h2_with_transactions_root(
     receipts_root: B256,
     transactions_root: Option<B256>,
 ) -> Result<ExecutionData, Gov5BlockError> {
+    normalize_payload(
+        execution,
+        view,
+        state_root,
+        receipts_root,
+        transactions_root,
+        None,
+    )
+}
+
+fn normalize_payload(
+    execution: &ExecutionData,
+    view: u64,
+    state_root: B256,
+    receipts_root: B256,
+    transactions_root: Option<B256>,
+    header_qc: Option<&Gov5HeaderQc>,
+) -> Result<ExecutionData, Gov5BlockError> {
     // A native chain-94 parent selects the post-Cancun profile. Never erase
     // executed withdrawals or the committee link as the early devnet profile does.
     if let Some(parent) = n42_consensus::remembered_gov5_native_header(&execution.parent_hash())
@@ -150,6 +307,7 @@ pub fn normalize_execution_payload_for_gov5_h2_with_transactions_root(
             state_root,
             receipts_root,
             transactions_root,
+            header_qc,
             &parent,
         );
     }
@@ -207,11 +365,8 @@ pub fn normalize_execution_payload_for_gov5_h2_with_transactions_root(
     // QMDB. The caller derives this root from the authenticated parent QMDB
     // branch and the builder's exact execution output.
     block.header.state_root = state_root;
-    let mut extra = Vec::with_capacity(12 + GOV5_H2_SEAL_BYTES);
-    extra.extend_from_slice(b"N42H");
-    extra.extend_from_slice(&view.to_le_bytes());
-    extra.resize(12 + GOV5_H2_SEAL_BYTES, 0);
-    block.header.extra_data = extra.into();
+    block.header.extra_data =
+        gov5_header_extra(view, header_qc_wire(header_qc, view, block.header.parent_hash)).into();
     validate_gov5_interop_header(&block.header)
         .map_err(|error| Gov5BlockError::HeaderProfile(error.to_string()))?;
 
@@ -269,23 +424,29 @@ pub struct NormalizedBuiltPayload {
 /// list is the result's: a full block's 95,000 transactions are then neither
 /// copied twice nor compared byte by byte on the leader's way to its own
 /// validation.
+///
+/// `header_qc` is the last CommitQC the leader holds; the header embeds it
+/// when it names the parent or a lower ancestor (sync standard section 3.2).
+/// `None` gives the QC-less layout.
 pub fn normalize_built_payload_for_gov5_h2(
     mut execution: ExecutionData,
     view: u64,
     state_root: B256,
     receipts_root: B256,
     transactions_root: Option<B256>,
+    header_qc: Option<&Gov5HeaderQc>,
 ) -> Result<NormalizedBuiltPayload, Gov5BlockError> {
     let native = n42_consensus::remembered_gov5_native_header(&execution.parent_hash())
         .is_some_and(|parent| native_profile_parent(&parent));
     let set_aside = (native && transactions_root.is_some())
         .then(|| std::mem::take(&mut execution.payload.as_v1_mut().transactions));
-    let mut payload = normalize_execution_payload_for_gov5_h2_with_transactions_root(
+    let mut payload = normalize_payload(
         &execution,
         view,
         state_root,
         receipts_root,
         transactions_root,
+        header_qc,
     )?;
     let preserves_execution_input =
         gov5_normalization_preserves_execution_input(&execution, &payload);
@@ -345,6 +506,7 @@ fn normalize_native_payload(
     state_root: B256,
     receipts_root: B256,
     transactions_root: Option<B256>,
+    header_qc: Option<&Gov5HeaderQc>,
     parent: &Gov5NativeHeader,
 ) -> Result<ExecutionData, Gov5BlockError> {
     // The child's header takes its parent's shape: no registry root on a
@@ -386,11 +548,8 @@ fn normalize_native_payload(
     block.header.state_root = state_root;
     block.header.receipts_root = receipts_root;
     block.header.withdrawals_root = Some(n42_consensus::gov5_native_rewards_root(&rewards));
-    let mut extra = Vec::with_capacity(12 + GOV5_H2_SEAL_BYTES);
-    extra.extend_from_slice(b"N42H");
-    extra.extend_from_slice(&view.to_le_bytes());
-    extra.resize(12 + GOV5_H2_SEAL_BYTES, 0);
-    block.header.extra_data = extra.into();
+    block.header.extra_data =
+        gov5_header_extra(view, header_qc_wire(header_qc, view, block.header.parent_hash)).into();
     validate_gov5_interop_header(&block.header)
         .map_err(|error| Gov5BlockError::HeaderProfile(error.to_string()))?;
     let native = Gov5NativeHeader {
@@ -944,6 +1103,7 @@ mod tests {
                 state_root,
                 receipts_root,
                 root,
+                None,
             )
             .unwrap();
             assert!(built.preserves_execution_input);
@@ -956,6 +1116,171 @@ mod tests {
             assert_eq!(decoded.block_hash, normalized.block_hash());
             assert_eq!(decoded.transactions, block.body.transactions);
         }
+    }
+
+    /// A header `Extra` gov5 produced on chain 94 (block 13,560,375, view
+    /// 11029): `magic || view || QC || seal`, the QC of view 11028 with a
+    /// 7-validator bitmap, the seal the leader's BLS signature.
+    const GOV5_CHAIN94_EXTRA: &str = "4e343248152b000000000000142b00000000000020000000910d74febb5dac309b7389bb53ebea19bf91a664a4cfc4d74c127c15428be4ee60000000977324f952eb3d8f92cd1a9f790dc0c4fbf518c57fc70ced923e4c36d7829610d8532f5912de3e6066fc3b22eca090cc022980b768946ebea5a8b583a2c09d98def9724bdc047462dac65210ba4876921cf217b1e340c0adeb3fdf59862b71020300000007003b9517bc3a0e87fcdda01e00ac99ef1458cff9f7de7e9701c6ab5618cc9dded960654c9ae9a754fb779f6ef188a35399ee1395be42a6b86c6d4e56807ec9938ef0c6a753510cf3c7cde0218487b5b32acda479cacb530a2af80efaffbc302cfc90";
+
+    fn test_commit_qc(view: u64, block_hash: B256) -> n42_primitives::consensus::QuorumCertificate {
+        use bitvec::prelude::{BitVec, Msb0};
+        let key = n42_primitives::BlsSecretKey::key_gen(&[7u8; 32]).unwrap();
+        let mut signers: BitVec<u8, Msb0> = BitVec::repeat(false, 7);
+        for index in [0, 2, 3, 6] {
+            signers.set(index, true);
+        }
+        n42_primitives::consensus::QuorumCertificate {
+            view,
+            block_hash,
+            aggregate_signature: key.sign(b"commit"),
+            signers,
+        }
+    }
+
+    #[test]
+    fn header_qc_matches_gov5_bytes() {
+        let extra = alloy_primitives::hex::decode(GOV5_CHAIN94_EXTRA).unwrap();
+        let decoded = decode_gov5_header_extra(&extra).unwrap();
+        assert_eq!(decoded.view, 11029);
+        assert!(decoded.sealed);
+        let qc = decoded.qc.unwrap();
+        assert_eq!(qc.view, 11028);
+        assert_eq!(qc.signers_bitmap, [0x07, 0x00, 0x3b]);
+        let wire = &extra[12..extra.len() - GOV5_H2_SEAL_BYTES];
+        assert_eq!(crate::h2_wire::encode_h2_qc(&qc).unwrap(), wire);
+
+        // Through the native certificate, as a producer holds it, the header
+        // form is gov5's byte for byte, and so is the unsealed Extra.
+        let native = crate::h2_bridge::quorum_certificate_from_h2(qc).unwrap();
+        let header_qc = Gov5HeaderQc::from_commit_qc(&native).unwrap();
+        assert_eq!(header_qc.view, 11028);
+        assert_eq!(header_qc.wire, wire);
+        let built = gov5_header_extra(11029, &header_qc.wire);
+        assert_eq!(built[..extra.len() - GOV5_H2_SEAL_BYTES], extra[..extra.len() - GOV5_H2_SEAL_BYTES]);
+        assert_eq!(built.len(), extra.len());
+        assert!(built[extra.len() - GOV5_H2_SEAL_BYTES..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn header_extra_reads_every_layout() {
+        let qc = test_commit_qc(6, B256::repeat_byte(3));
+        let header_qc = Gov5HeaderQc::from_commit_qc(&qc).unwrap();
+        let h2 = crate::h2_bridge::quorum_certificate_to_h2(&qc).unwrap();
+        // view 8 + (4 + 32) + (4 + 96) + (4 + 2 + 1)
+        assert_eq!(header_qc.wire.len(), 151);
+        assert_eq!(h2.signers_bitmap, [7, 0, 0b0100_1101]);
+        let mut prefix = b"N42H".to_vec();
+        prefix.extend_from_slice(&7u64.to_le_bytes());
+
+        let bare = decode_gov5_header_extra(&prefix).unwrap();
+        assert_eq!((bare.view, bare.qc, bare.sealed), (7, None, false));
+        let legacy = gov5_header_extra(7, &[]);
+        assert_eq!(legacy, [prefix.clone(), vec![0; 96]].concat());
+        let sealed = decode_gov5_header_extra(&legacy).unwrap();
+        assert_eq!((sealed.qc, sealed.sealed), (None, true));
+        let current = gov5_header_extra(7, &header_qc.wire);
+        assert_eq!(current, [prefix.clone(), header_qc.wire.clone(), vec![0; 96]].concat());
+        let with_qc = decode_gov5_header_extra(&current).unwrap();
+        assert_eq!((with_qc.qc.as_ref(), with_qc.sealed), (Some(&h2), true));
+        let qc_only = decode_gov5_header_extra(&[prefix.clone(), header_qc.wire.clone()].concat())
+            .unwrap();
+        assert_eq!((qc_only.qc.as_ref(), qc_only.sealed), (Some(&h2), false));
+        // A non-zero seal is not looked at.
+        let mut signed = current.clone();
+        let len = signed.len();
+        signed[len - 96..].fill(0xab);
+        assert_eq!(decode_gov5_header_extra(&signed).unwrap().qc, Some(h2));
+
+        assert!(decode_gov5_header_extra(&[prefix.clone(), vec![1; 40]].concat()).is_err());
+        assert!(decode_gov5_header_extra(&[prefix.clone(), vec![1; 140]].concat()).is_err());
+        assert!(decode_gov5_header_extra(b"N42H").is_err());
+        assert!(decode_gov5_header_extra(&[b"XXXX".as_slice(), &[0; 104]].concat()).is_err());
+        assert!(decode_gov5_header_extra(&[prefix, vec![0; 4096]].concat()).is_err());
+
+        // The genesis sentinel is never embedded.
+        assert!(
+            Gov5HeaderQc::from_commit_qc(&n42_primitives::consensus::QuorumCertificate::genesis())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn producer_embeds_a_commit_qc_naming_the_parent_or_lower() {
+        let grandparent = Gov5NativeHeader {
+            header: Header {
+                number: 76,
+                extra_data: gov5_header_extra(3, &[]).into(),
+                ..Default::default()
+            },
+            mobile_registry_root: Some(B256::ZERO),
+        };
+        let grandparent_hash = remember_gov5_native_header(&grandparent.encode());
+        let parent = Gov5NativeHeader {
+            header: Header {
+                number: 77,
+                parent_hash: grandparent_hash,
+                extra_data: gov5_header_extra(4, &[]).into(),
+                ..Default::default()
+            },
+            mobile_registry_root: Some(B256::ZERO),
+        };
+        let parent_hash = remember_gov5_native_header(&parent.encode());
+        let block: Block<N42TxEnvelope> = Block {
+            header: Header {
+                parent_hash,
+                number: 78,
+                base_fee_per_gas: Some(7),
+                transactions_root: calculate_transaction_root::<N42TxEnvelope>(&[]),
+                withdrawals_root: Some(alloy_consensus::constants::EMPTY_ROOT_HASH),
+                blob_gas_used: Some(0),
+                excess_blob_gas: Some(0),
+                parent_beacon_block_root: Some(B256::repeat_byte(0x44)),
+                ..Default::default()
+            },
+            body: BlockBody {
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+                withdrawals: Some(Default::default()),
+            },
+        };
+        let execution = ExecutionData::from_block_unchecked(block.header.hash_slow(), &block);
+        let build = |qc: Option<&Gov5HeaderQc>| {
+            normalize_built_payload_for_gov5_h2(
+                execution.clone(),
+                5,
+                B256::repeat_byte(0x71),
+                B256::repeat_byte(0x72),
+                None,
+                qc,
+            )
+            .unwrap()
+            .payload
+        };
+
+        let legacy = build(None);
+        assert_eq!(legacy.payload.as_v1().extra_data.as_ref(), gov5_header_extra(5, &[]));
+        for named in [parent_hash, grandparent_hash] {
+            let qc = Gov5HeaderQc::from_commit_qc(&test_commit_qc(4, named)).unwrap();
+            let built = build(Some(&qc));
+            let extra = built.payload.as_v1().extra_data.clone();
+            assert_eq!(extra.as_ref(), gov5_header_extra(5, &qc.wire));
+            assert_ne!(built.block_hash(), legacy.block_hash());
+            let decoded = decode_gov5_header_extra(&extra).unwrap();
+            assert_eq!(decoded.view, 5);
+            assert_eq!(decoded.qc.unwrap().block_hash, named);
+            // A follower recovers the same block, and its hash, from the wire.
+            let wire = decode_gov5_block_rlp(&encode_gov5_block_rlp(&built).unwrap()).unwrap();
+            assert_eq!(wire.block_hash, built.block_hash());
+            assert_eq!(gov5_header_view(&wire.header).unwrap(), 5);
+            assert_eq!(reconstruct_gov5_block(&built).unwrap().header.extra_data, extra);
+        }
+        // Not an ancestor, or not below the block's view: no QC.
+        let stranger = Gov5HeaderQc::from_commit_qc(&test_commit_qc(4, B256::repeat_byte(0x5e)))
+            .unwrap();
+        assert_eq!(build(Some(&stranger)).block_hash(), legacy.block_hash());
+        let same_view = Gov5HeaderQc::from_commit_qc(&test_commit_qc(5, parent_hash)).unwrap();
+        assert_eq!(build(Some(&same_view)).block_hash(), legacy.block_hash());
     }
 
     #[test]
@@ -1029,6 +1354,7 @@ mod tests {
                 native_state_root,
                 gov5_native_receipts_root::<alloy_consensus::TxType>(&[]),
                 root,
+                None,
             )
             .unwrap();
             assert_eq!(built.payload.payload, normalized.payload);

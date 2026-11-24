@@ -43,6 +43,11 @@ pub trait ConsensusNetwork: Send + Sync {
         block_hash: alloy_primitives::B256,
     ) -> Result<(), NetworkError>;
 
+    /// Request `count` contiguous gov5 blocks from `start` over
+    /// `/rpc/bodies_by_range/1` for the range catch-up client. The answer
+    /// arrives as `NetworkEvent::Gov5RangeResponse`.
+    fn request_gov5_range(&self, peer: PeerId, start: u64, count: u64) -> Result<(), NetworkError>;
+
     /// Retire a hash fetch whose body arrived through another authenticated
     /// delivery path before the request-response stream completed.
     async fn cancel_gov5_block_fetch_reliable(
@@ -129,6 +134,10 @@ impl ConsensusNetwork for NetworkHandle {
         block_hash: alloy_primitives::B256,
     ) -> Result<(), NetworkError> {
         NetworkHandle::request_gov5_block_by_hash(self, peer, block_hash)
+    }
+
+    fn request_gov5_range(&self, peer: PeerId, start: u64, count: u64) -> Result<(), NetworkError> {
+        NetworkHandle::request_gov5_range(self, peer, start, count)
     }
 
     async fn cancel_gov5_block_fetch_reliable(

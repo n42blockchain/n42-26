@@ -955,8 +955,13 @@ fn encode_range_error(code: u8, message: &str) -> io::Result<Vec<u8>> {
     Ok(encoded)
 }
 
-/// Read one bodies-by-range response, refusing it once the decoded chunks
-/// together exceed `response_budget` bytes.
+/// Read one bodies-by-range response within `response_budget` decoded bytes.
+///
+/// Sync standard section 4.3: once at least one block has been read the reply
+/// is never discarded. An error chunk after the prefix, a chunk that would
+/// cross the budget, or a stream that breaks mid-chunk all end the reply with
+/// the blocks received so far; the requester re-requests from the next number.
+/// Only a reply that fails before its first block is reported as an error.
 async fn read_range_response<T>(
     io: &mut T,
     response_budget: usize,
@@ -965,19 +970,49 @@ where
     T: AsyncRead + Unpin + Send,
 {
     let mut blocks = Vec::new();
+    match read_range_chunks(io, response_budget, &mut blocks).await {
+        Ok(Some((code, message))) if blocks.is_empty() => {
+            Ok(Gov5BodiesByRangeResponse::Error { code, message })
+        }
+        Ok(_) => Ok(Gov5BodiesByRangeResponse::Blocks(blocks)),
+        Err(error) if blocks.is_empty() => Err(error),
+        Err(error) => {
+            tracing::debug!(
+                target: "n42::interop::range",
+                kept = blocks.len(),
+                %error,
+                "Gov5 range reply ended early; keeping the received prefix"
+            );
+            Ok(Gov5BodiesByRangeResponse::Blocks(blocks))
+        }
+    }
+}
+
+/// Reads block chunks into `blocks` until EOF (`Ok(None)`), an error chunk
+/// (`Ok(Some((code, message)))`), or a failure. A chunk that would cross the
+/// budget fails from its declared length, before it is decoded.
+async fn read_range_chunks<T>(
+    io: &mut T,
+    response_budget: usize,
+    blocks: &mut Vec<Gov5RangeBlockChunk>,
+) -> io::Result<Option<(u8, String)>>
+where
+    T: AsyncRead + Unpin + Send,
+{
     let mut decoded_total = 0usize;
     loop {
         let mut status = [0u8; 1];
         match io.read(&mut status).await? {
-            0 => return Ok(Gov5BodiesByRangeResponse::Blocks(blocks)),
+            0 => return Ok(None),
             1 if status[0] == 0 => {}
             1 => {
-                let message =
-                    read_framed_payload(io, MAX_SNAPPY_FRAME_SIZE, MAX_GOV5_BLOCK_SIZE).await?;
-                return Ok(Gov5BodiesByRangeResponse::Error {
-                    code: status[0],
-                    message: String::from_utf8_lossy(&message).into_owned(),
-                });
+                // A peer may send a bare code with no message (n42-26's
+                // block-by-hash miss); any non-zero code is the end either way.
+                let message = read_framed_payload(io, MAX_SNAPPY_FRAME_SIZE, MAX_GOV5_BLOCK_SIZE)
+                    .await
+                    .map(|message| String::from_utf8_lossy(&message).into_owned())
+                    .unwrap_or_default();
+                return Ok(Some((status[0], message)));
             }
             _ => unreachable!("one-byte read buffer"),
         }
@@ -989,9 +1024,6 @@ where
         }
         let mut fork_digest = [0u8; 4];
         io.read_exact(&mut fork_digest).await?;
-        // Bound the next chunk by whatever budget is left, so an over-budget
-        // chunk is refused from its declared length rather than after it has
-        // been decoded.
         let remaining = response_budget.saturating_sub(decoded_total);
         let rlp = read_framed_payload(
             io,
@@ -1901,10 +1933,20 @@ mod tests {
         };
         assert_eq!(decoded.len(), 4, "a response exactly on budget is accepted");
 
+        // One byte short: the chunk that would cross the budget is refused
+        // from its declared length and the reply ends with the prefix.
         let mut short = futures::io::Cursor::new(wire.clone());
-        let error = futures::executor::block_on(read_range_response(&mut short, total - 1))
-            .expect_err("one byte over budget must be refused");
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let Gov5BodiesByRangeResponse::Blocks(prefix) =
+            futures::executor::block_on(read_range_response(&mut short, total - 1)).unwrap()
+        else {
+            panic!("expected the received prefix");
+        };
+        assert_eq!(prefix, blocks[..3].to_vec());
+
+        // A budget below the first block refuses the reply as a whole.
+        let mut tiny = futures::io::Cursor::new(wire.clone());
+        let error = futures::executor::block_on(read_range_response(&mut tiny, 1))
+            .expect_err("a first block over budget must be refused");
         assert!(
             error.to_string().contains("decoded budget"),
             "unexpected error: {error}"
@@ -2018,6 +2060,69 @@ mod tests {
 
     /// Before the first block a missing block is still reported with the
     /// gov5 "block not found" error chunk; after one it is a clean stop.
+    /// Sync standard section 4.3: a requester keeps the blocks it received
+    /// before an error chunk, a bare code byte or a broken stream, and still
+    /// sees an error-only reply as a refusal.
+    #[test]
+    fn range_client_keeps_the_prefix_before_an_early_end() {
+        let mut parent = B256::repeat_byte(9);
+        let mut chunks = Vec::new();
+        for number in 1..=2u64 {
+            let (hash, rlp) = range_block(number, parent);
+            chunks.push(Gov5RangeBlockChunk {
+                fork_digest: [1, 2, 3, 4],
+                rlp,
+            });
+            parent = hash;
+        }
+        let mut prefix_wire = Vec::new();
+        for chunk in &chunks {
+            prefix_wire.extend(encode_range_chunk(chunk).unwrap());
+        }
+        let read = |wire: Vec<u8>| {
+            futures::executor::block_on(read_range_response(
+                &mut futures::io::Cursor::new(wire),
+                MAX_GOV5_RANGE_RESPONSE_BYTES,
+            ))
+        };
+
+        let mut error_after = prefix_wire.clone();
+        error_after.extend(encode_range_error(2, "block not found").unwrap());
+        let Gov5BodiesByRangeResponse::Blocks(kept) = read(error_after).unwrap() else {
+            panic!("error chunk after a prefix must keep the prefix");
+        };
+        assert_eq!(kept, chunks);
+
+        let mut bare_after = prefix_wire.clone();
+        bare_after.push(1);
+        let Gov5BodiesByRangeResponse::Blocks(kept) = read(bare_after).unwrap() else {
+            panic!("bare code after a prefix must keep the prefix");
+        };
+        assert_eq!(kept, chunks);
+
+        let third = encode_range_chunk(&chunks[0]).unwrap();
+        let mut broken = prefix_wire.clone();
+        broken.extend_from_slice(&third[..third.len() / 2]);
+        let Gov5BodiesByRangeResponse::Blocks(kept) = read(broken).unwrap() else {
+            panic!("a stream broken mid-chunk must keep the prefix");
+        };
+        assert_eq!(kept, chunks);
+
+        let refusal = read(encode_range_error(1, "busy").unwrap()).unwrap();
+        assert!(matches!(
+            refusal,
+            Gov5BodiesByRangeResponse::Error { code: 1, ref message } if message == "busy"
+        ));
+        assert!(matches!(
+            read(vec![2]).unwrap(),
+            Gov5BodiesByRangeResponse::Error { code: 2, .. }
+        ));
+        assert!(
+            read(prefix_wire[..3].to_vec()).is_err(),
+            "nothing usable before the first block"
+        );
+    }
+
     #[test]
     fn range_batch_reports_errors_only_before_the_first_block() {
         let (hash, block) = range_block(1, B256::repeat_byte(9));

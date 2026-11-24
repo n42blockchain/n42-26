@@ -1208,6 +1208,34 @@ fn resolve_validator_p2p_keypair(
     Ok(keypair)
 }
 
+/// Resolves the chain's leader tenure and rotate-on-timeout activation from
+/// the genesis `config.hotstuff` (with the bench env overrides) and installs
+/// them for the whole process, before any consensus component exists, so the
+/// engine, the H2-v4 verifier and the orchestrator all use one value.
+fn install_genesis_leader_schedule(genesis: &alloy_genesis::Genesis) -> eyre::Result<()> {
+    let resolved = n42_consensus::LeaderSchedule::resolve_for_genesis(genesis)
+        .map_err(|error| eyre::eyre!("refusing to start: {error}"))?;
+    for note in &resolved.notes {
+        warn!(target: "n42::cli", "leader schedule bench override: {note}");
+    }
+    n42_consensus::install_leader_schedule(resolved.schedule).map_err(|installed| {
+        eyre::eyre!(
+            "refusing to start: leader schedule {:?} was already in force before the genesis one {:?}",
+            installed,
+            resolved.schedule
+        )
+    })?;
+    info!(
+        target: "n42::cli",
+        tenure = resolved.schedule.tenure,
+        rotate_on_timeout_from = ?resolved.schedule.rotate_on_timeout_from,
+        genesis_tenure = resolved.genesis.tenure,
+        genesis_rotate_on_timeout_from = ?resolved.genesis.rotate_on_timeout_from,
+        "leader schedule"
+    );
+    Ok(())
+}
+
 fn main() {
     // Install a global panic hook so that panics in ANY thread or tokio task
     // produce visible output on stderr.  Without this, panics in non-critical
@@ -1301,6 +1329,7 @@ fn main() {
         )
         .map_err(eyre::Report::msg)?;
         info!(target: "n42::cli", "Launching N42 node");
+        install_genesis_leader_schedule(&builder.config().chain.genesis)?;
 
         // Warn about benchmark/debug env vars that weaken security.
         for (var, desc) in [

@@ -4,7 +4,6 @@ use super::quorum::TimeoutCollector;
 use super::round::Phase;
 use super::state_machine::{ConsensusEngine, EngineOutput};
 use crate::error::{ConsensusError, ConsensusResult};
-use crate::validator::LeaderSelector;
 
 impl ConsensusEngine {
     /// Verifies and collects a timeout vote for a bounded future view.
@@ -36,7 +35,8 @@ impl ConsensusEngine {
             );
             return Ok(false);
         };
-        let next_view = timeout.view.saturating_add(1);
+        // The view a TC for this timeout leads to (sync standard 10.2).
+        let next_view = self.view_after_tc(timeout.view);
         let Some(next_view_set) = self
             .epoch_manager
             .known_validator_set_for_view(next_view)
@@ -64,7 +64,7 @@ impl ConsensusEngine {
         }
         self.verify_embedded_qc(&timeout.high_qc)?;
 
-        let next_leader = LeaderSelector::leader_for_view(next_view, &next_view_set);
+        let next_leader = self.leader_in_set(next_view, &next_view_set);
         let local_timeout_index = view_set.index_of_public_key(&self.local_public_key);
         let local_next_index = next_view_set.index_of_public_key(&self.local_public_key);
         if local_timeout_index != Some(timeout.sender) && local_next_index != Some(next_leader) {
@@ -197,7 +197,7 @@ impl ConsensusEngine {
             // Check if quorum was reached while we were waiting (messages may have
             // arrived between repeats). A quorum can advance even without the next leader.
             let quorum_size = self.validator_set_for_view(view).quorum_size();
-            let next_view = view.saturating_add(1);
+            let next_view = self.view_after_tc(view);
             if let Some(ref collector) = self.timeout_collector
                 && collector.has_quorum(quorum_size)
             {
@@ -291,8 +291,10 @@ impl ConsensusEngine {
 
         let n_validators = view_set.len();
         let quorum_size = view_set.quorum_size();
-        let next_view = view.saturating_add(1);
-        let next_leader = LeaderSelector::leader_for_view(next_view, view_set);
+        // The view a TC for `view` leads to and its leader, who forms the TC
+        // and sends NewView (sync standard 10.2).
+        let next_view = self.view_after_tc(view);
+        let next_leader = self.leader_index_for_view(next_view);
         // gov5 members gossip every timeout themselves and their next leader
         // forms the TC from that; relaying through this node's H2 fan-out
         // (gossip plus a direct stream to every peer) only multiplies copies.
@@ -367,7 +369,7 @@ impl ConsensusEngine {
         }
 
         let new_view_set = self.validator_set_for_view(nv.view);
-        let expected_leader = LeaderSelector::leader_for_view(nv.view, new_view_set);
+        let expected_leader = self.leader_in_set(nv.view, new_view_set);
         if nv.leader != expected_leader {
             return Err(ConsensusError::InvalidProposer {
                 view: nv.view,
@@ -389,14 +391,15 @@ impl ConsensusEngine {
             });
         }
 
-        // TC must be for the previous view (nv.view - 1).
-        if nv.timeout_cert.view != nv.view.saturating_sub(1) {
+        // The NewView must be for the view the TC leads to: TC view + 1, or
+        // the next tenure window under rotate-on-timeout (sync standard 10.2).
+        let expected_view = self.view_after_tc(nv.timeout_cert.view);
+        if expected_view != nv.view {
             return Err(ConsensusError::InvalidTC {
                 view: nv.timeout_cert.view,
                 reason: format!(
-                    "TC view {} does not match expected view {} (nv.view - 1)",
-                    nv.timeout_cert.view,
-                    nv.view.saturating_sub(1)
+                    "NewView for view {} carries a TC for view {}, which leads to view {}",
+                    nv.view, nv.timeout_cert.view, expected_view
                 ),
             });
         }

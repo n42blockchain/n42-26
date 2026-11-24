@@ -509,7 +509,12 @@ impl ObserverOrchestrator {
                     self.epoch_schedule.as_ref(),
                 );
                 match view_set.as_ref() {
-                    Some(view_set) => match verify_h2_v4_shadow_message(&envelope, view_set) {
+                    Some(view_set) => match verify_h2_v4_shadow_message(
+                        &envelope,
+                        view_set,
+                        n42_consensus::leader_schedule(),
+                        self.epoch_length,
+                    ) {
                         Ok(proof) => {
                             counter!("n42_h2_v4_shadow_verified_total", "kind" => kind)
                                 .increment(1);

@@ -261,6 +261,7 @@ async fn a_block_built_on_the_sealed_output_is_the_block_built_on_the_engine_sta
         state_root,
         receipts_root,
         transactions_root,
+        None,
     )?;
     let first_hash = normalized.payload.block_hash();
     assert!(cache.rekey_gov5_built(original_hash, first_hash));
@@ -338,13 +339,34 @@ async fn a_block_built_on_the_sealed_output_is_the_block_built_on_the_engine_sta
     // Block 2's candidate is prepared and not committed when block 3's root
     // job runs; that job waits for block 2's commit as block 2's waited for
     // block 1's.
+    // Block 2 carries the CommitQC of block 1, its parent, in its header
+    // (sync standard section 3.2); the follower's validation below and block
+    // 3, built on it, take the longer Extra.
+    let commit_qc = {
+        use bitvec::prelude::{BitVec, Msb0};
+        let key = n42_primitives::BlsSecretKey::key_gen(&[5u8; 32])?;
+        n42_primitives::consensus::QuorumCertificate {
+            view: 1,
+            block_hash: first_hash,
+            aggregate_signature: key.sign(b"commit"),
+            signers: BitVec::<u8, Msb0>::repeat(true, 4),
+        }
+    };
+    let header_qc = n42_network::Gov5HeaderQc::from_commit_qc(&commit_qc)
+        .ok_or_else(|| eyre::eyre!("no header QC"))?;
     let second_normalized = n42_network::normalize_built_payload_for_gov5_h2(
         on_output.execution.clone(),
         2,
         on_output.roots.0,
         on_output.roots.1,
         cache.built_transactions_root(on_output.hash),
+        Some(&header_qc),
     )?;
+    assert_eq!(
+        second_normalized.payload.payload.as_v1().extra_data.as_ref(),
+        n42_network::gov5_header_extra(2, &header_qc.wire),
+        "block 2 embeds the CommitQC naming its parent"
+    );
     let second_block = {
         use reth_engine_primitives::PayloadValidator;
         <n42_node::engine_validator::N42EngineValidator<_> as PayloadValidator<

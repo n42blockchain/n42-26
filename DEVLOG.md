@@ -16,7 +16,8 @@ Logs are split into separate files by phase for easy maintenance:
 
 | File | Content | Phase |
 |------|---------|-------|
-| [devlog-188-chain94-current-gov5-header-profile-20261124](docs/devlog-188-chain94-current-gov5-header-profile-20261124.md) | 对齐当前 Gov5 的 chain-94 块头：原生 profile 按 Cancun 字段判定、注册根跟随父块、requests hash 从 Gov5 `pragueTime` 起携带 | chain-94 interop |
+| [devlog-189-chain94-current-gov5-header-profile-20261124](docs/devlog-189-chain94-current-gov5-header-profile-20261124.md) | 对齐当前 Gov5 的 chain-94 块头：原生 profile 按 Cancun 字段判定、注册根跟随父块、requests hash 从 Gov5 `pragueTime` 起携带 | chain-94 interop |
+| [devlog-188-rotate-on-timeout-20261124](docs/devlog-188-rotate-on-timeout-20261124.md) | 同步标准 §10：leader tenure 改由创世 `config.hotstuff.leaderTenure` 决定（`N42_LEADER_TENURE` 仅作基准覆盖），rotate-on-timeout（`rotateOnTimeoutView` / `N42_HOTSTUFF_ROTATE_ON_TIMEOUT`）在所有 TC→下一 view 处使用 `view_after_tc`；§10.4 全部向量为单元测试 | Consensus |
 | [devlog-187-mixed-3go-4rust-fresh-fleet-20261117](docs/devlog-187-mixed-3go-4rust-fresh-fleet-20261117.md) | 3 Gov5 + 4 n42-26 全新创世混合舰队（单机）：修复 pre-Shanghai leader 未注册原生头导致无法出块；零小费交易在未设 `unchangedAccountNoOpTime` 时两端 QMDB 根不同并新增启动告警；停启/掉节点/kill -9 演练 17 项通过 | Interop |
 | [devlog-186-reth-2110-evm2-upgrade-20261119](docs/devlog-186-reth-2110-evm2-upgrade-20261119.md) | Reth v2.11.0 upgrade with revm replaced by evm2: nineteen-patch series (eight ported, import-batch pair dropped, eleven new), mobile SDK on evm2, touched-but-unchanged accounts kept in the bundle, `n42-parallel-evm` / `n42-evm-bench` parked; lock, patches, scripts, CI and docs aligned | Upgrade |
 | [devlog-180-native-port-phase1-20261107](docs/devlog-180-native-port-phase1-20261107.md) | Native-path port phase 1: node on N42Primitives (pool/payload/engine/RPC/QMDB/mobile), 0x50 gated by genesis `altSigTx`; 1851/0 tests; 7-node 0x50 + mixed 0x02/0x50 over RPC with matching roots; tx storage format change | Port |

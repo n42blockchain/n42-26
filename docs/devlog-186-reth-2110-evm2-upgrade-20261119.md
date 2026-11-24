@@ -1440,3 +1440,43 @@ PR #31（本分支合入 main）评审中确认的三处缺陷，各附回归测
 - **重号**：main 上 PR #30 的 `devlog-186-mixed-3go-4rust-fresh-fleet-20261117.md` 改名为 `devlog-187-…`，标题与编号说明同步修改；本文件保留 186，因为已被 `CLAUDE.md` 与多处文档引用。
 - **自动合并后需手工修的一处**：PR #30 的测试 `pre_shanghai_leader_payload_is_registered_for_direct_broadcast` 调用 `gov5_native_receipts_root(&[])`，本分支该函数已带类型参数，补为 `::<alloy_consensus::TxType>`。
 - **状态**：`cargo clippy --workspace --all-targets --locked -- -D warnings` 通过；单元测试 n42-network 227、n42-consensus-service 268、n42-node 312（另 1 个失败仍是 macOS 上的 `resident_memory_is_read`）、n42-node-bin 25、n42-execution 156、n42-tx-types 36、n42-consensus 253，均无其他失败。未跑 E2E。
+
+## 进度记录（2026-11-24 续四）：同步标准 W6，producer 在 Extra 中嵌入 CommitQC
+
+依据 `N42-SYNC-SPEC.md` §1.2（QC wire 与 Extra 布局）、§3.2（producer 规则）、§8.1（`extra_qc.json`），Q-S2 定为强制。
+
+### 设计决策
+
+- **QC 来源**：取共识引擎的 `last_committed_qc()`（`round_state.commit` 单调更新：Decide 收到的、leader 自己聚合的、重启恢复的都经过它），在 `spawn_payload_resolve_task` 派发构建时捕获。FCU 构建、build on output（`BuildSource::SealedParent`）与 `N42_BUILD_AHEAD_DEPTH=2` 的提前构建都走这一个入口，因此三条路径一致。只在 H2-v4 participant 下嵌入；非 v4 链的 QC 签名域不是 gov5 的 commit 域，不嵌入。
+- **"名为父块或更低祖先"**：已提交块必然是锁定分支上每个块的祖先（提前两个 view 构建时父块是自己已封装的 v+1 块，CommitQC 至多指向 v），所以诚实 leader 天然满足。仍在规范化时校验：`qc.view < 块的 view`，且从父块沿已记住的 native header 向上最多 64 层能找到 QC 指向的块；找不到则退回无 QC 布局，并计数 `n42_header_qc_omitted_total{reason=view|ancestor}`、打 warn。考虑过直接无条件嵌入（gov5 的做法），但标准要求祖先关系，宁可少嵌一次也不产出不合规的头。
+- **在构建时而非规范化时取 QC**：与 `prev_randao`（同样来自 CommitQC）同一时刻；规范化在异步任务里，取 QC 时若已有更新的 CommitQC 也无妨，但派发时的取值更符合"build time"并且与祖先检查的父块一致。
+- **follower 不新增拒绝条件**：gov5 的 `decodeQC` 比 n42-26 的 `decode_qc` 宽松（位图只做上限检查），若 follower 用严格解码拒绝块，混合网络可能在 gov5 接受的块上分叉。故 follower 校验仍只是 magic + 12 ≤ 长度 ≤ 4096，Extra 其余部分作为哈希认证的不透明字节；新增解码器供读者（视图、未来的 catch-up 锚定）使用。seal 不校验，与标准一致。
+
+### 实施细节
+
+- `h2_wire::encode_h2_qc`（公开 `encode_qc`，与 n42-rs `encode_h2_qc` 同义）；`h2_bridge::quorum_certificate_to_h2`（公开 Decide 用的同一转换，genesis 哨兵编码为空签名空位图）。
+- `gov5_block.rs`：
+  - `Gov5HeaderQc { view, block_hash, wire }`，`from_commit_qc` 对 view 0 返回 `None`；
+  - `gov5_header_extra(view, qc_wire)` = `"N42H" ‖ view LE ‖ qc ‖ 96 个零`，空 qc 即旧布局；
+  - `decode_gov5_header_extra` 按 gov5 `decodeHeaderExtra` 接受四种布局（payload 长于 96 时先按 QC+seal 解，失败再按仅 QC 解）；
+  - `normalize_built_payload_for_gov5_h2` 新增参数 `header_qc: Option<&Gov5HeaderQc>`，两处 producer（早期 pre-Shanghai 与 native 路径）都改用 `gov5_header_extra(view, header_qc_wire(..))`；`normalize_execution_payload_for_gov5_h2[_with_transactions_root]` 签名不变，不嵌 QC。
+  - `gov5_header_view` 改用共享的前缀解析。
+- `execution_bridge.rs`：派发时 `Gov5HeaderQc::from_commit_qc(self.engine.last_committed_qc())`，传入 `handle_built_payload` 再传给规范化。
+- **读者审计**：`gov5_header_view`、`validate_gov5_header_extra`（≤4096）、`engine_validator` 的 `convert_payload_to_block` / `bind_gov5_h2_header` / `gov5_block_from_built_body`、`reconstruct_gov5_block_raw`、`decode_gov5_block_rlp`、`replay_import`、orchestrator 的 H2-v4 块绑定都只读前 12 字节或把 Extra 原样带回头部；没有按固定 108 字节或 seal 偏移计算哈希的代码。follower 从 payload（`payload_json`）、`native_header_rlp` 或 gov5 块 RLP 拿到 leader 的原始 Extra，从不自己重新规范化，因此 leader 与 follower 的块哈希一致。
+
+### 测试
+
+- `header_qc_matches_gov5_bytes`：chain 94 第 13,560,375 块（gov5 产出，view 11029）的 Extra 作为 golden vector：解出 view 11028、7 验证者位图 `07 00 3b` 的 QC；`encode_h2_qc` 逐字节还原；经 native QC 再到 `Gov5HeaderQc` 也逐字节相同，`gov5_header_extra` 除 seal 外与 gov5 原字节一致。§8.1 的 `extra_qc.json` 尚未生成，此块即来自参考编码器。
+- `header_extra_reads_every_layout`：四种布局、非零 seal、畸形 QC、缺 magic、超 4096、genesis 哨兵不嵌入；QC wire 长度 151 字节（7 验证者）。
+- `producer_embeds_a_commit_qc_naming_the_parent_or_lower`：QC 指向父块与祖父块时嵌入，gov5 块 RLP 往返后哈希与 view 不变；指向非祖先或 view 不小于块 view 时退回旧布局。
+- `tests/build_on_output.rs`：第 2 块嵌入指向第 1 块的 QC，follower 的 `convert_payload_to_block` 接受，第 3 块在其上 build on output 与按引擎状态构建结果一致。
+
+### 每块开销
+
+- Extra 从 108 字节变为 `12 + 8 + 36 + 100 + 4 + 2 + ceil(n/8) + 96` 字节：7 验证者 259 字节（+151），21 验证者 261，500 验证者 321。每个头、每次块广播与每个 gov5 块 RLP 增加约 150–215 字节，相对满块（数十 MB）可忽略。
+- 热路径：派发时一次 BitVec 打包与 G2 签名序列化（微秒级，在 orchestrator 线程）；规范化时祖先查找通常 1–3 次 registry 读取（每次解码并 keccak 一个约 600 字节的头）。头部 keccak 多 150 字节。无新增锁或拷贝大对象。
+
+### 状态与机群待查
+
+- `cargo clippy --all-targets -p n42-network -p n42-consensus-service -p n42-node -p n42-node-bin -- -D warnings` 通过；`cargo test --workspace`（nice、`-j 16`、`--test-threads=16`）1939 通过、0 失败，含上述新测试与 `tests/build_on_output.rs`。未跑 E2E 与机群。
+- 机群上需看：gov5 节点日志中 `header-QC canonicalize` 无 verify 失败（gov5 `maybeCommitFromHeaderQC` 会用 commit 域验证我们嵌入的 QC）；`n42_header_qc_omitted_total` 应只在启动初期非零；gov5 follower 不出现 "invalid QC in extra-data" BAD BLOCK；混合网络块哈希无分歧；n42-rs / gov5 catch-up（`range_catchup.rs` 的 `extra_qc`）能从 n42-26 产出的头取到锚点。

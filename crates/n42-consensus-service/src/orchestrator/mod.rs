@@ -4,6 +4,7 @@ mod consensus_loop;
 mod execution_bridge;
 pub mod frame_ref;
 pub use execution_bridge::{compact_block_enabled, shared_execution_enabled};
+mod range_sync;
 mod state_mgmt;
 mod view_jump_throttle;
 
@@ -1190,6 +1191,12 @@ pub struct ConsensusService {
     /// incoming ancestors.
     h2_v4_last_pruned_head_block_number: Option<u64>,
     h2_v4_catchup_active: bool,
+    /// Range catch-up client over gov5 bodies-by-range (`range_sync.rs`).
+    /// Idle unless an authenticated block reveals a gap above its threshold.
+    range_catchup: crate::range_catchup::RangeCatchup,
+    /// Range replies decoded off the loop (`spawn_blocking`), back in order
+    /// of completion. Polled only while the client is active.
+    range_decoded: range_sync::RangeDecodeLane,
     /// Peers that failed to serve an authenticated block hash during the
     /// current bounded retry round. A mixed Rust/Gov set may gossip a child
     /// from a Rust validator whose execution head is also behind; retrying
@@ -1759,7 +1766,19 @@ impl ConsensusService {
         ready.into_iter().map(|(_, hash)| hash).collect()
     }
 
+    #[cfg(test)]
     fn ready_h2_v4_catchup_heights(&self) -> Option<Vec<u64>> {
+        self.ready_h2_v4_catchup_heights_from(self.head_block_number, self.head_block_hash)
+    }
+
+    /// The staged heights that extend `(base_number, base_hash)`, in order.
+    /// The base is the execution head, or a block the range
+    /// client imported without a forkchoice update (a repeated header view).
+    fn ready_h2_v4_catchup_heights_from(
+        &self,
+        base_number: u64,
+        base_hash: B256,
+    ) -> Option<Vec<u64>> {
         if !self.h2_v4_catchup_active {
             return None;
         }
@@ -1771,13 +1790,13 @@ impl ConsensusService {
         // successor of the durable head. Keep the common incomplete check O(1)
         // and perform the full hash-chain validation only once that boundary
         // is present.
-        let expected_first_height = self.head_block_number.checked_add(1)?;
+        let expected_first_height = base_number.checked_add(1)?;
         let (&first_height, (_, oldest_rlp, _)) = self.h2_v4_catchup_blocks.first_key_value()?;
         if first_height != expected_first_height {
             return None;
         }
         let oldest = n42_network::decode_gov5_block_rlp(oldest_rlp).ok()?;
-        if oldest.header.parent_hash != self.head_block_hash {
+        if oldest.header.parent_hash != base_hash {
             return None;
         }
         // The unbound-message cache can release old, already-executed blocks
@@ -1796,7 +1815,7 @@ impl ConsensusService {
                 return None;
             }
             selected_heights.push(height);
-            if candidate.header.parent_hash == self.head_block_hash {
+            if candidate.header.parent_hash == base_hash {
                 selected_heights.reverse();
                 return Some(selected_heights);
             }
@@ -1809,7 +1828,17 @@ impl ConsensusService {
     }
 
     async fn release_ready_h2_v4_catchup_blocks(&mut self) -> bool {
-        let Some(selected_heights) = self.ready_h2_v4_catchup_heights() else {
+        self.release_ready_h2_v4_catchup_blocks_from(self.head_block_number, self.head_block_hash)
+            .await
+    }
+
+    async fn release_ready_h2_v4_catchup_blocks_from(
+        &mut self,
+        base_number: u64,
+        base_hash: B256,
+    ) -> bool {
+        let Some(selected_heights) = self.ready_h2_v4_catchup_heights_from(base_number, base_hash)
+        else {
             return false;
         };
         let mut catchup = Vec::with_capacity(selected_heights.len());
@@ -1985,6 +2014,11 @@ impl ConsensusService {
                 .contains_key(&block.header.parent_hash)
             {
                 self.remember_h2_v4_block_view(block.header.parent_hash, 0);
+            }
+            // A far gap goes to the range client instead of a block-by-block
+            // reverse walk; it hands the gap back if it stops.
+            if self.consider_range_catchup(&block) {
+                return;
             }
             self.request_h2_v4_gov5_block(source, block.header.parent_hash);
             return;
@@ -3070,7 +3104,11 @@ impl ConsensusService {
             return self.engine.current_leader_index();
         }
         let validator_count = self.engine.validator_count().max(1) as u64;
-        n42_consensus::leader_index(view, validator_count, n42_consensus::leader_tenure())
+        n42_consensus::leader_index(
+            view,
+            validator_count,
+            self.engine.leader_schedule().tenure,
+        )
     }
 
     fn timeout_diag_entry(&mut self, view: u64) -> &mut TimeoutViewDiag {
@@ -3235,8 +3273,16 @@ impl ConsensusService {
 
     fn record_timeout_diag_view_changed(&mut self, new_view: u64) {
         let now = Instant::now();
-        let timed_out_view = new_view.saturating_sub(1);
-        let Some(diag) = self.timeout_view_diags.get(&timed_out_view) else {
+        // The timed-out view whose TC leads to `new_view`: the view before
+        // it, or an earlier view of the window under rotate-on-timeout.
+        let schedule = self.engine.leader_schedule();
+        let epoch_length = self.engine.epoch_manager().epoch_length();
+        let Some((&timed_out_view, diag)) = self
+            .timeout_view_diags
+            .range(..new_view)
+            .rev()
+            .find(|(view, _)| schedule.view_after_tc(**view, epoch_length) == new_view)
+        else {
             return;
         };
         let Some(timeout_at) = diag.timeout_at else {
@@ -3292,6 +3338,11 @@ impl ConsensusService {
             h2_v4_catchup_buffer_blocks: h2_v4_catchup_buffer_blocks(),
             h2_v4_last_pruned_head_block_number: None,
             h2_v4_catchup_active: false,
+            range_catchup: crate::range_catchup::RangeCatchup::new(
+                crate::range_catchup::RangeCatchupConfig::default(),
+                range_sync::range_anchor_mode(),
+            ),
+            range_decoded: range_sync::RangeDecodeLane::new(),
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
             gov5_execution_pull_rounds: 0,
@@ -3552,6 +3603,11 @@ impl ConsensusService {
             h2_v4_catchup_buffer_blocks,
             h2_v4_last_pruned_head_block_number: None,
             h2_v4_catchup_active: false,
+            range_catchup: crate::range_catchup::RangeCatchup::new(
+                crate::range_catchup::RangeCatchupConfig::default(),
+                range_sync::range_anchor_mode(),
+            ),
+            range_decoded: range_sync::RangeDecodeLane::new(),
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
             gov5_execution_pull_rounds: 0,
@@ -3963,6 +4019,22 @@ impl ConsensusService {
             };
             tokio::pin!(h2_v4_fetch_timer);
 
+            // Range catch-up: no timer at all unless the client is active.
+            let range_catchup_deadline = if self.range_catchup.is_active() {
+                self.range_catchup
+                    .next_deadline(std::time::Instant::now())
+                    .map(Instant::from_std)
+            } else {
+                None
+            };
+            let range_catchup_timer = async {
+                match range_catchup_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(range_catchup_timer);
+
             // Biased select: consensus-critical channels are checked FIRST.
             // Without biased, tokio randomly permutes branch order on each poll,
             // causing consensus votes to compete with high-frequency TX events.
@@ -4024,6 +4096,16 @@ impl ConsensusService {
 
                 _ = &mut h2_v4_fetch_timer => {
                     self.retry_expired_h2_v4_fetches();
+                }
+
+                _ = &mut range_catchup_timer => {
+                    self.drive_range_catchup().await;
+                }
+
+                decoded = self.range_decoded.rx.recv(), if self.range_catchup.is_active() => {
+                    if let Some((source, start, reply)) = decoded {
+                        self.on_range_reply_decoded(source, start, reply).await;
+                    }
                 }
 
                 // === Priority 3: Async finalize-FCU completion ===
@@ -4911,6 +4993,7 @@ impl ConsensusService {
                 warn!(target: "n42::cl::orchestrator", %peer_id, "consensus peer disconnected");
                 self.connected_peers.remove(&peer_id);
                 self.view_jump_throttle.forget(&peer_id);
+                self.range_catchup.peer_disconnected(&peer_id);
                 gauge!("n42_connected_peers").set(self.connected_peers.len() as f64);
 
                 if self.pending_leader_build_mode_for_current_view().is_some() {
@@ -5047,6 +5130,17 @@ impl ConsensusService {
             NetworkEvent::BlobSidecarReceived { source: _, data } => {
                 self.handle_blob_sidecar(data);
             }
+            NetworkEvent::Gov5PeerStatus { peer, height } => {
+                self.note_range_peer_status(peer, height);
+            }
+            NetworkEvent::Gov5RangeResponse {
+                source,
+                start,
+                outcome,
+                ..
+            } => {
+                self.handle_range_reply(source, start, outcome).await;
+            }
             _ => {
                 // Verification receipts are handled by dedicated subsystems.
             }
@@ -5123,6 +5217,7 @@ mod tests {
         h2_v4_broadcasts: Arc<Mutex<Vec<n42_network::h2_v4::H2V4Envelope>>>,
         direct_messages: Arc<Mutex<Vec<(n42_network::PeerId, n42_primitives::ConsensusMessage)>>>,
         cancelled_gov5_fetches: Arc<Mutex<Vec<B256>>>,
+        range_requests: Arc<Mutex<Vec<(n42_network::PeerId, u64, u64)>>>,
     }
 
     impl MockConsensusNetwork {
@@ -5646,6 +5741,19 @@ mod tests {
             _peer: n42_network::PeerId,
             _block_hash: B256,
         ) -> Result<(), n42_network::NetworkError> {
+            Ok(())
+        }
+
+        fn request_gov5_range(
+            &self,
+            peer: n42_network::PeerId,
+            start: u64,
+            count: u64,
+        ) -> Result<(), n42_network::NetworkError> {
+            self.range_requests
+                .lock()
+                .expect("mock range requests lock")
+                .push((peer, start, count));
             Ok(())
         }
 
@@ -10274,5 +10382,234 @@ mod tests {
                 compressed.len()
             );
         }
+    }
+
+    /// Range catch-up end to end on the orchestrator: a bound block far above
+    /// the head starts the range client instead of the reverse walk; the
+    /// fetched range executes in order up to the staged block, which the
+    /// existing staged path then releases. Every height is imported once.
+    async fn range_catchup_orchestrator(
+        mode: crate::range_catchup::AnchorMode,
+    ) -> (
+        ConsensusService,
+        MockConsensusNetwork,
+        Arc<MockExecutionLayer>,
+        n42_network::PeerId,
+        Vec<(B256, Vec<u8>)>,
+    ) {
+        let (engine, output_rx) = make_test_engine();
+        let network = MockConsensusNetwork::default();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch =
+            ConsensusService::new(engine, Arc::new(network.clone()), net_event_rx, output_rx)
+                .with_h2_v4_participant(test_h2_identity());
+        orch.el = Some(mock.clone());
+        orch.async_finalize_fcu = false;
+        orch.range_catchup = crate::range_catchup::RangeCatchup::new(
+            crate::range_catchup::RangeCatchupConfig::default(),
+            mode,
+        );
+        let genesis = B256::repeat_byte(0x10);
+        orch.head_block_hash = genesis;
+        orch.head_block_number = 0;
+        let mut chain = Vec::new();
+        let mut parent = genesis;
+        for number in 1..=50u64 {
+            let (hash, rlp) = test_gov5_block_rlp(parent, number, number);
+            chain.push((hash, rlp));
+            parent = hash;
+        }
+        let peer = n42_network::PeerId::random();
+        orch.note_range_peer_status(peer, 50);
+        (orch, network, mock, peer, chain)
+    }
+
+    /// A range reply through the decode lane, as the select loop does.
+    async fn deliver_range_reply(
+        orch: &mut ConsensusService,
+        peer: n42_network::PeerId,
+        start: u64,
+        rlps: Vec<Vec<u8>>,
+    ) {
+        orch.handle_range_reply(peer, start, n42_network::Gov5RangeOutcome::Blocks(rlps))
+            .await;
+        let (source, start, reply) = orch.range_decoded.rx.recv().await.expect("decoded reply");
+        orch.on_range_reply_decoded(source, start, reply).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn range_catchup_replaces_the_reverse_walk_and_imports_each_height_once() {
+        let (mut orch, network, mock, peer, chain) =
+            range_catchup_orchestrator(crate::range_catchup::AnchorMode::Observe).await;
+        let (top_hash, top_rlp) = chain[49].clone();
+        orch.remember_h2_v4_block_view(top_hash, 50);
+        orch.handle_h2_v4_gov5_block(peer, top_rlp, None).await;
+        assert!(
+            orch.range_catchup.is_active(),
+            "a 50-block gap starts the range client"
+        );
+        assert!(
+            orch.h2_v4_fetch_requested_at.is_empty(),
+            "the reverse walk does not fetch the parent by hash"
+        );
+
+        orch.drive_range_catchup().await;
+        let requests = network.range_requests.lock().unwrap().clone();
+        assert_eq!(
+            requests,
+            vec![(peer, 1, 49)],
+            "fetch up to below the staged block"
+        );
+
+        let rlps = chain[..49].iter().map(|(_, rlp)| rlp.clone()).collect();
+        deliver_range_reply(&mut orch, peer, 1, rlps).await;
+        for _ in 0..4 {
+            orch.drive_range_catchup().await;
+        }
+        assert_eq!(orch.head_block_number, 50);
+        assert_eq!(orch.head_block_hash, top_hash);
+        let imported = mock.new_payload_hashes();
+        let expected: Vec<B256> = chain.iter().map(|(hash, _)| *hash).collect();
+        assert_eq!(imported, expected, "each height once, in order");
+        for _ in 0..3 {
+            orch.drive_range_catchup().await;
+        }
+        assert!(
+            !orch.range_catchup.is_active(),
+            "caught up: the client switches off"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enforce_holds_a_qc_less_range_until_a_commit_anchor_arrives() {
+        let (mut orch, network, mock, peer, chain) =
+            range_catchup_orchestrator(crate::range_catchup::AnchorMode::Enforce).await;
+        let (top_hash, top_rlp) = chain[49].clone();
+        orch.remember_h2_v4_block_view(top_hash, 50);
+        orch.handle_h2_v4_gov5_block(peer, top_rlp, None).await;
+        orch.drive_range_catchup().await;
+        assert_eq!(network.range_requests.lock().unwrap().len(), 1);
+        let rlps = chain[..49].iter().map(|(_, rlp)| rlp.clone()).collect();
+        deliver_range_reply(&mut orch, peer, 1, rlps).await;
+        orch.drive_range_catchup().await;
+        assert!(
+            mock.new_payload_hashes().is_empty(),
+            "a PrepareQC-style binding is not an anchor in enforce mode"
+        );
+        // A Decide for the staged block anchors the whole fetched range.
+        orch.range_catchup.note_strict_anchor(top_hash);
+        for _ in 0..4 {
+            orch.drive_range_catchup().await;
+        }
+        assert_eq!(orch.head_block_number, 50);
+        assert_eq!(mock.new_payload_hashes().len(), 50);
+    }
+
+    /// Second review, R1: a stopped client keeps no decoded reply, neither
+    /// one already queued nor one whose decode was still running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopped_client_retains_no_decoded_reply() {
+        let (mut orch, _network, _mock, peer, chain) =
+            range_catchup_orchestrator(crate::range_catchup::AnchorMode::Observe).await;
+        let (top_hash, top_rlp) = chain[49].clone();
+        orch.remember_h2_v4_block_view(top_hash, 50);
+        orch.handle_h2_v4_gov5_block(peer, top_rlp, None).await;
+        assert!(orch.range_catchup.is_active());
+        let rlps: Vec<Vec<u8>> = chain[..49].iter().map(|(_, rlp)| rlp.clone()).collect();
+        // One result already queued, one decode started right before the stop.
+        orch.range_decoded.decode(peer, 1, rlps.clone());
+        let queued = loop {
+            if let Ok(item) = orch.range_decoded.rx.try_recv() {
+                break item;
+            }
+            tokio::task::yield_now().await;
+        };
+        orch.range_decoded.tx.send(queued).unwrap();
+        orch.range_decoded.decode(peer, 1, rlps);
+        orch.on_range_catchup_stopped(crate::range_catchup::Deactivation::Stalled)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            orch.range_decoded.rx.try_recv().is_err(),
+            "nothing of the stopped round is held"
+        );
+    }
+
+    /// Review item 5: under a leader tenure consecutive blocks share a
+    /// header view. Such a block imports without a forkchoice update, which
+    /// the first version counted as a failure (three stopped the client).
+    #[tokio::test(flavor = "current_thread")]
+    async fn repeated_header_views_import_without_stopping_the_client() {
+        let (mut orch, network, mock, peer, _) =
+            range_catchup_orchestrator(crate::range_catchup::AnchorMode::Observe).await;
+        let mut chain = Vec::new();
+        let mut parent = orch.head_block_hash;
+        for number in 1..=50u64 {
+            // Tenure of four: views 1,1,1,1,2,2,2,2,...; the staged top
+            // block carries a view of its own.
+            let view = if number == 50 {
+                100
+            } else {
+                (number - 1) / 4 + 1
+            };
+            let (hash, rlp) = test_gov5_block_rlp(parent, number, view);
+            chain.push((hash, rlp));
+            parent = hash;
+        }
+        let (top_hash, top_rlp) = chain[49].clone();
+        orch.remember_h2_v4_block_view(top_hash, 100);
+        orch.handle_h2_v4_gov5_block(peer, top_rlp, None).await;
+        assert!(orch.range_catchup.is_active());
+        orch.drive_range_catchup().await;
+        assert_eq!(
+            network.range_requests.lock().unwrap().clone(),
+            vec![(peer, 1, 49)]
+        );
+        let rlps = chain[..49].iter().map(|(_, rlp)| rlp.clone()).collect();
+        deliver_range_reply(&mut orch, peer, 1, rlps).await;
+        for _ in 0..6 {
+            orch.drive_range_catchup().await;
+        }
+        assert_eq!(orch.head_block_number, 50);
+        assert_eq!(orch.head_block_hash, top_hash);
+        let expected: Vec<B256> = chain.iter().map(|(hash, _)| *hash).collect();
+        assert_eq!(
+            mock.new_payload_hashes(),
+            expected,
+            "each height once, in order"
+        );
+    }
+
+    /// Review item 7: a follower whose background import queue is busy
+    /// holds those blocks already; the range client stays idle.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_busy_background_import_keeps_the_range_client_idle() {
+        let (mut orch, network, _mock, peer, chain) =
+            range_catchup_orchestrator(crate::range_catchup::AnchorMode::Observe).await;
+        orch.bg_import_in_flight = true;
+        let (top_hash, top_rlp) = chain[49].clone();
+        orch.remember_h2_v4_block_view(top_hash, 50);
+        orch.handle_h2_v4_gov5_block(peer, top_rlp, None).await;
+        assert!(!orch.range_catchup.is_active());
+        assert!(orch.h2_v4_fetch_requested_at.contains_key(&chain[48].0));
+        orch.drive_range_catchup().await;
+        assert!(network.range_requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_small_gap_keeps_the_reverse_walk_and_the_range_client_idle() {
+        let (mut orch, network, _mock, peer, chain) =
+            range_catchup_orchestrator(crate::range_catchup::AnchorMode::Observe).await;
+        let (hash, rlp) = chain[9].clone();
+        orch.remember_h2_v4_block_view(hash, 10);
+        orch.handle_h2_v4_gov5_block(peer, rlp, None).await;
+        assert!(!orch.range_catchup.is_active());
+        assert!(orch.h2_v4_fetch_requested_at.contains_key(&chain[8].0));
+        orch.drive_range_catchup().await;
+        assert!(network.range_requests.lock().unwrap().is_empty());
     }
 }
