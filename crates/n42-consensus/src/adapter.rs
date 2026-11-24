@@ -238,6 +238,14 @@ where
     /// filled in.
     fn normalize_header(&self, header: &Header) -> Result<Header, N42HeaderProfileError> {
         let mut normalized = normalized_gov5_header(header)?;
+        if self.is_profile1_header(header) {
+            // Profile 1 (B10, AM1): the header carries `slotNumber` while
+            // reth's Amsterdam hardfork is off on the chain spec, so the inner
+            // Ethereum rules would refuse it (`SlotNumberUnexpected`). The
+            // field is authenticated by the Profile-1 block hash and checked
+            // (= number) by the Profile-1 header gate; the inner copy drops it.
+            normalized.slot_number = None;
+        }
         if validate_gov5_replay_v2_header(header).is_err()
             && normalized.requests_hash.is_none()
             && self
@@ -247,6 +255,14 @@ where
             normalized.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
         }
         Ok(normalized)
+    }
+
+    /// Whether `header` is a Profile-1 header on a Profile-1 chain: the
+    /// chain's genesis declares `n42Profile` and the header carries the
+    /// `slotNumber` element (no legacy gov5 layout has it).
+    fn is_profile1_header(&self, header: &Header) -> bool {
+        header.slot_number.is_some()
+            && n42_chainspec::profile1::genesis_declares_profile(self.chain_spec.genesis())
     }
 
     /// Create a new N42 consensus adapter (without validator set).
@@ -449,6 +465,16 @@ where
         block: &SealedBlock<N42Block>,
         transaction_root: Option<B256>,
     ) -> Result<(), ConsensusError> {
+        if n42_chainspec::profile1::genesis_declares_profile(self.chain_spec.genesis()) {
+            // C1-C4: Profile 1 admits transaction types 0x00, 0x01, 0x02 and
+            // 0x04 only; a block carrying any other is invalid.
+            for transaction in &block.body().transactions {
+                n42_chainspec::profile1::check_profile1_tx_type(
+                    alloy_eips::Typed2718::ty(transaction),
+                )
+                .map_err(|reason| ConsensusError::other(std::io::Error::other(reason)))?;
+            }
+        }
         if self.header_profile != N42HeaderProfile::Gov5H2 {
             return self
                 .inner
@@ -576,6 +602,7 @@ where
                     ConsensusError::other(error)
                 })?;
             }
+            let profile1 = self.is_profile1_header(header.header());
             let mut header = self
                 .normalize_header(header.header())
                 .map_err(ConsensusError::other)?;
@@ -585,6 +612,22 @@ where
                 self.normalize_header(parent.header())
                     .map_err(ConsensusError::other)?
             };
+            // Profile 1 (B4) admits a child with its parent's timestamp;
+            // reth's rule is strictly later. The equal case is checked here
+            // and the temporary copy is moved one second on: nothing else the
+            // inner rules read (gas limit, base fee, blob parameters of the
+            // same fork) depends on the timestamp.
+            if profile1 {
+                if header.timestamp < parent.timestamp {
+                    return Err(ConsensusError::TimestampIsInPast {
+                        parent_timestamp: parent.timestamp,
+                        timestamp: header.timestamp,
+                    });
+                }
+                if header.timestamp == parent.timestamp {
+                    header.timestamp += 1;
+                }
+            }
             // The inner Ethereum validator must compare like-for-like normalized headers. The
             // authenticated outer parent link was checked above; rewriting only this temporary
             // copy avoids comparing the Gov5 hash to its Ethereum-normalized hash.

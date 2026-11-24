@@ -144,6 +144,16 @@ where
             validator_builder =
                 validator_builder.with_custom_tx_type(n42_tx_types::ALT_SIG_TX_TYPE_ID);
         }
+        // C2: Profile 1 has no blob transactions. With 0x50 off (Profile 1
+        // has no `altSigTx`) the pool then admits exactly 0x00, 0x01, 0x02
+        // and 0x04 (C1-C4); block import refuses the others as well
+        // (`N42Consensus::validate_block_pre_execution`).
+        if n42_chainspec::profile1::genesis_declares_profile(
+            reth_chainspec::EthChainSpec::genesis(&*ctx.chain_spec()),
+        ) {
+            validator_builder = validator_builder.no_eip4844();
+            info!(target: "n42::pool", "profile 1: blob transactions are not admitted (C2)");
+        }
         let validator = validator_builder
             .with_local_transactions_config(ctx.pool_config().local_transactions_config.clone())
             .set_tx_fee_cap(ctx.config().rpc.rpc_tx_fee_cap)
