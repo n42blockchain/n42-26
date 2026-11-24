@@ -137,11 +137,16 @@ where
                     .ok_or_else(|| {
                         format!("canonical hash is missing for persisted block {number}")
                     })?;
-                let native = n42_consensus::Gov5NativeHeader::recover(&block.header, block_hash)
-                    .ok_or_else(|| {
-                        format!("cannot recover persisted native header {block_hash}")
-                    })?;
-                n42_consensus::remember_gov5_native_header(&native.encode());
+                // Profile 1 (PR 8): the 24-element header is remembered by
+                // hash; the reth header does not hash to it, so no native
+                // header is recovered from it.
+                if n42_consensus::remembered_profile1_header(&block_hash).is_none() {
+                    let native = n42_consensus::Gov5NativeHeader::recover(&block.header, block_hash)
+                        .ok_or_else(|| {
+                            format!("cannot recover persisted native header {block_hash}")
+                        })?;
+                    n42_consensus::remember_gov5_native_header(&native.encode());
+                }
                 let execution = ExecutionData::from_block_unchecked(block_hash, &block);
                 rlps.push(
                     n42_network::encode_gov5_block_rlp(&execution)
@@ -165,9 +170,11 @@ where
         {
             return Ok(None);
         }
-        let native = n42_consensus::Gov5NativeHeader::recover(&block.header, hash)
-            .ok_or_else(|| format!("cannot recover persisted native header {hash}"))?;
-        n42_consensus::remember_gov5_native_header(&native.encode());
+        if n42_consensus::remembered_profile1_header(&hash).is_none() {
+            let native = n42_consensus::Gov5NativeHeader::recover(&block.header, hash)
+                .ok_or_else(|| format!("cannot recover persisted native header {hash}"))?;
+            n42_consensus::remember_gov5_native_header(&native.encode());
+        }
         let execution = ExecutionData::from_block_unchecked(hash, &block);
         n42_network::encode_gov5_block_rlp(&execution)
             .map(Some)
@@ -3021,6 +3028,13 @@ fn main() {
                             .provider
                             .header(observer_head)?
                             .map(|header| (observer_head, header));
+                        // A10 (design 3.8): an observer restarted at a head
+                        // checks the head's child against its own result.
+                        if let Some((hash, header)) = &head {
+                            n42_consensus::require_head_result(header.number, *hash).map_err(
+                                |error| eyre::eyre!("refusing to start: profile 1 observer: {error}"),
+                            )?;
+                        }
                         observer = observer.with_profile1_gate(profile1_import_gate(
                             &full_node.provider.chain_spec().genesis,
                             config,

@@ -20,6 +20,14 @@
 //!     does; 7' on 6' must carry result(6'), and carrying result(6) is
 //!     Invalid.
 //!
+//! (f) range catch-up over a deferred chain (PR 8): the chain is extended
+//!     by 20 blocks; a second node with its own reth tree and its own QMDB
+//!     store, starting from genesis, imports the whole 27-block range in
+//!     height order through the header gate, the deferred check (Phase B)
+//!     and the engine, and every child's carried state root is that node's
+//!     own root of the parent. The results are in the durable log, which a
+//!     restart reopens: the restart head's result is there (design 3.8).
+//!
 //! The whole story is one test: the registry is per process.
 
 use alloy_consensus::{EMPTY_ROOT_HASH, Header};
@@ -314,11 +322,14 @@ async fn v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid() ->
         }
         assert_eq!(store.root_for(headers[0].hash())?, None);
         assert_eq!(n42_consensus::executed_fields(&headers[0].hash()), None);
-        // A6: genesis's result is the genesis header's own fields.
-        n42_consensus::remember_executed_fields(
-            genesis_hash,
-            ExecutedFields::carried_by(&genesis_header.header),
-        )?;
+        // A6: genesis's result is the genesis header's own fields, filed
+        // when the durable log is installed.
+        let log_path = directory.path().join("executed_fields.log");
+        n42_consensus::install_executed_fields_log(&log_path, genesis_hash, &genesis_header.header)?;
+        assert_eq!(
+            n42_consensus::executed_fields(&genesis_hash),
+            Some(ExecutedFields::carried_by(&genesis_header.header))
+        );
 
         let mut chain: Vec<ExecutedBlock<N42Primitives>> = Vec::new();
         let mut parent = genesis_header.clone();
@@ -475,8 +486,182 @@ async fn v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid() ->
         invalid_by_deferred_check(import(&seven(&result6)?, &[]), "7' carrying result(6)");
         // ... its own chain's result(6') is Valid.
         let seven_ok = seven(&result6s)?;
-        valid(import(&seven_ok, &[]), "7' carrying result(6')");
+        let seven_block = valid(import(&seven_ok, &[]), "7' carrying result(6')");
         assert!(n42_consensus::executed_fields(&seven_ok.hash()).is_some());
+        make_head(&seven_block, Vec::new());
+
+        // (f) Twenty more blocks on 7', each carrying its parent's result.
+        let mut range: Vec<Profile1Header> = headers[..5].to_vec();
+        range.extend([six_sibling.clone(), seven_ok.clone()]);
+        let mut parent = seven_ok.clone();
+        for number in 8..=27u64 {
+            let view = number;
+            let leader = (view % config.validators.len() as u64) as usize;
+            let coinbase = config.validators[leader].address;
+            let mut header = Profile1Header {
+                header: Header {
+                    parent_hash: parent.hash(),
+                    ommers_hash: B256::ZERO,
+                    beneficiary: coinbase,
+                    transactions_root: EMPTY_ROOT_HASH,
+                    withdrawals_root: Some(n42_consensus::gov5_native_rewards_root(&rewards(
+                        &config, coinbase,
+                    ))),
+                    number,
+                    gas_limit: config.gas_limit,
+                    timestamp: parent.header.timestamp + 8,
+                    extra_data: n42_chainspec::profile1::profile1_extra(view, &qc),
+                    base_fee_per_gas: parent.header.next_block_base_fee(BaseFeeParams::ethereum()),
+                    blob_gas_used: Some(0),
+                    excess_blob_gas: Some(0),
+                    parent_beacon_block_root: Some(pool.child_beacon_root(
+                        number - 1,
+                        &parent.hash(),
+                        &parent.header.receipts_root,
+                    )?),
+                    slot_number: Some(number),
+                    ..Default::default()
+                },
+                mobile_registry_root: B256::ZERO,
+            };
+            let carried = n42_consensus::executed_fields(&parent.hash()).expect("the parent's result");
+            header = carry(&header, &carried, &keys[leader]);
+            let block = valid(import(&header, &[]), &format!("block {number}"));
+            make_head(&block, Vec::new());
+            range.push(header.clone());
+            parent = header;
+        }
+        assert_eq!(range.len(), 27);
+        let head = range.last().unwrap().clone();
+
+        // Restart (design 3.8): the durable log holds the head's own result,
+        // so a restarted node at this head can build or check its child.
+        let reopened = n42_consensus::executed_fields::ExecutedFieldsRegistry::open(&log_path, genesis_hash)?;
+        for header in &range {
+            assert_eq!(
+                reopened.get(&header.hash()),
+                n42_consensus::executed_fields(&header.hash()),
+                "block {} is in the durable log",
+                header.header.number
+            );
+        }
+        assert!(n42_consensus::require_head_result(27, head.hash()).is_ok());
+
+        // The catching-up node: its own tree, QMDB store and gate.
+        let factory2 = create_test_provider_factory_with_node_types::<n42_node::N42Node>(spec.clone());
+        assert_eq!(reth_db_common::init::init_genesis(&factory2)?, genesis_hash);
+        let overlay2 = factory2.overlay_manager().clone();
+        let provider2 = BlockchainProvider::new(factory2.clone())?;
+        let directory2 = tempfile::tempdir()?;
+        let store2 = Arc::new(Gov5QmdbStateRootStore::persistent(
+            genesis_hash,
+            genesis_root,
+            n42_node::qmdb_state::gov5_qmdb_genesis_tree(&spec.genesis)?.snapshot(),
+            100,
+            directory2.path().join("state.bin"),
+        )?);
+        let mut gate2 = n42_consensus_service::profile1_header::Profile1ImportGate::new(
+            &config,
+            genesis_header.clone(),
+        )
+        .map_err(|e| eyre::eyre!(e))?;
+        let tree_config2 = TreeConfig::default();
+        let mut state2 = EngineApiTreeState::new(
+            10,
+            10,
+            tree_config2.invalid_header_hit_eviction_threshold(),
+            genesis_sealed.num_hash(),
+            reth_engine_tree::engine::EngineApiKind::Ethereum,
+            overlay2.clone(),
+        );
+        let canonical2 = provider2.canonical_in_memory_state();
+        let mut engine2 = BasicEngineValidator::new(
+            provider2.clone(),
+            Arc::new(
+                n42_consensus::N42Consensus::new(spec.clone())
+                    .with_header_profile(N42HeaderProfile::Gov5H2)
+                    .with_committee_pool(pool.clone()),
+            ),
+            evm.clone(),
+            N42EngineValidator::new(spec.clone(), N42HeaderProfile::Gov5H2),
+            tree_config2,
+            Box::new(reth_engine_primitives::NoopInvalidBlockHook::default()),
+            overlay2.clone(),
+            reth_tasks::Runtime::test(),
+        )
+        .with_state_root_strategy(Arc::new(
+            n42_node::qmdb_state_root::Gov5QmdbStateRootStrategy::new(store2.clone())
+                .with_chain_spec(spec.clone()),
+        ));
+        let checker2 = {
+            let provider = provider2.clone();
+            n42_node::el::DeferredChecker::new(spec.clone(), move |hash| {
+                use reth_provider::StateProviderFactory as _;
+                provider.state_by_block_hash(hash).ok()
+            })
+        };
+        let body = |header: &Profile1Header| -> Vec<N42TxEnvelope> {
+            blocks
+                .iter()
+                .find(|block| b256(&block["hash"]) == header.hash())
+                .map(transactions)
+                .unwrap_or_default()
+        };
+        // The range in height order, as the range client releases it.
+        for (index, header) in range.iter().enumerate() {
+            let number = header.header.number;
+            let transactions = body(header);
+            let rewards = rewards(&config, header.header.beneficiary);
+            let wire = n42_network::encode_profile1_block_rlp(header, &transactions, &rewards);
+            let decoded = n42_network::decode_profile1_block_rlp(&wire).expect("decodes");
+            gate2
+                .admit_block(&decoded)
+                .unwrap_or_else(|refusal| panic!("range block {number}: {refusal:?}"));
+            let payload = n42_consensus_service::replay_import::build_gov5_gossip_execution_data(&decoded)
+                .expect("payload");
+            // Phase B: the check needs only the parent's result and state.
+            assert_eq!(checker2.check(&payload), DeferredCheck::Checked, "range block {number}");
+            let imported = match engine2.validate_block_with_state::<N42EngineTypes>(
+                BlockOrPayload::Payload(payload),
+                TreeCtx::new(&mut state2, &canonical2),
+            ) {
+                Ok(checked) => checked.executed_block,
+                Err(error) => panic!("range block {number}: {error:?}"),
+            };
+            // This node's own root of the parent is what the block carries.
+            assert_eq!(
+                store2.root_for(header.header.parent_hash)?,
+                Some(header.header.state_root),
+                "range block {number}: carried root = this node's root of the parent"
+            );
+            overlay2.insert_block(imported.clone());
+            canonical2.update_chain(NewCanonicalChain::Commit { new: vec![imported.clone()] });
+            canonical2.set_canonical_head(imported.recovered_block().clone_sealed_header());
+            if let Some(child) = range.get(index + 1)
+                && child.header.parent_hash == header.hash()
+            {
+                assert_eq!(store2.root_for(header.hash())?, Some(child.header.state_root));
+            }
+        }
+        assert_eq!(
+            store2.root_for(head.hash())?,
+            Some(n42_consensus::executed_fields(&head.hash()).unwrap().state_root),
+            "the catching-up node's head root"
+        );
+        // E14 on the caught-up node: safe = 26, finalized = the persisted
+        // block at or below it.
+        let link = |hash: &B256| {
+            range
+                .iter()
+                .find(|header| header.hash() == *hash)
+                .map(|header| (header.header.number, header.header.parent_hash))
+        };
+        let (safe, finalized) = n42_consensus_service::fcu_tags::deferred_tags(
+            head.hash(),
+            link,
+            Some((20, range[19].hash())),
+        );
+        assert_eq!((safe, finalized), (range[25].hash(), range[19].hash()));
         Ok(())
     })?;
     Ok(())

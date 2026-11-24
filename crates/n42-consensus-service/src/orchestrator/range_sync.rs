@@ -370,6 +370,15 @@ impl ConsensusService {
                     view,
                     "range catch-up block was not executed"
                 );
+                // E12 on a deferred chain: a block below a strict (commit)
+                // anchor is committed. If this node refused it for carrying
+                // a result other than its own, it halts with the evidence.
+                if !block.loose_only
+                    && self.profile1.is_some()
+                    && self.profile1_check_committed(view, block.hash, None)
+                {
+                    return;
+                }
                 if let Some(reason) = self.range_catchup.import_failed(block.number, now) {
                     self.on_range_catchup_stopped(reason).await;
                 }
