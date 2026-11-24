@@ -1419,6 +1419,14 @@ impl RangeCatchup {
         }
         self.stop_at = stop_at;
         self.advance_head(head_number, Some(head_hash));
+        // The execution head's number can lag its hash (a background import
+        // advanced the hash only). A hash this client has a link for names
+        // its true height: continue from there instead of a false Diverged.
+        if let Some(&(_, linked_number)) = self.links.get(&head_hash)
+            && linked_number > self.head_number
+        {
+            self.advance_head(linked_number, Some(head_hash));
+        }
         let mut hash = self.head_hash.unwrap_or(head_hash);
         let mut number = self.head_number;
         let mut ready = Vec::new();
@@ -2135,6 +2143,29 @@ mod tests {
         assert!(client.take_ready(10, abandoned, Some(100), 64).is_empty());
         assert_eq!(client.take_stop(), Some(Deactivation::Diverged));
         assert!(!client.is_active());
+    }
+
+    /// Second review, R2: the execution head's number lags its hash (number
+    /// 100, hash of block 120). The first version declared Diverged.
+    #[test]
+    fn a_head_number_lagging_its_hash_is_not_a_divergence() {
+        let peer = PeerId::random();
+        let (mut client, now) = active(AnchorMode::Observe, &[peer], 200);
+        let blocks = chain(1, GENESIS, 200, 1);
+        bind(&mut client, &blocks[199], true);
+        expect(&mut client, peer, 101, 99, now);
+        let mut calls = 0;
+        client.on_reply(
+            peer,
+            101,
+            reply(&blocks[100..199]),
+            now,
+            &mut verifier(&mut calls),
+        );
+        let ready = client.take_ready(100, blocks[119].hash, Some(199), 8);
+        assert_eq!(client.take_stop(), None);
+        assert!(client.is_active());
+        assert_eq!(ready.first().map(|block| block.number), Some(121));
     }
 
     #[test]
