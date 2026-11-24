@@ -70,3 +70,37 @@ Gov5 在 10-29 之后改了块头布局（`common/block/header.go`）：第 23 �
 - 24 字段编解码（第 23 位 slot number、第 24 位注册根）：Glamsterdam 激活时才需要，本次未做；编解码仍以 23 字段为上限。
 - 本地 Gov5 + n42-26 混合链（Cancun 创世，跨 T）。
 - `N42_GOV5_PRAGUE_TIME` 仍需手工与创世的 `pectraTime` 保持一致，可改为直接读创世。
+
+## 进度记录（2026-11-24 续）：与真实 Gov5 的本地混合链
+
+补上"未验证"一项。单机 loopback，全新 Cancun 创世，不用任何线上数据：3 个 Gov5（N42-gov5 PR #5，`42cacc0e`）+ 4 个本工程节点（`N42_GOV5_NATIVE_PRODUCER=1`、`N42_GOV5_PRAGUE_TIME=0`），七人固定委员会，1 s 出块。创世的 fork 字段取 chain 94 的组合（Shanghai/Cancun/Pectra/Osaka/Fusaka 于 0，`unchangedAccountNoOpTime`、`storageNetChangeTime` 于 0，奖励与 committee pool 开启），`pragueTime = T` 设在起链后数分钟。本工程节点从 Gov5 导出的第 0 块启动（`n42-qmdb-export` 与 `scripts/gov5-export-genesis-range.go`）。每 10 秒经 Gov5 RPC 发一笔零小费转账。
+
+这是轻负载的正确性检查，不是性能数据，也不替代多机或长时间验收。
+
+### 第一轮：T 之后 Gov5 的块无法导入（已修复）
+
+- T 之前 406 块：Gov5 出 174、本工程出 232，全部 20 字段，逐块哈希无差异。本 PR 第 1 部分（原生 profile 与注册根）由此在真实 Gov5 上得到确认。
+- T 之后：本工程出的块为 21 字段且被 Gov5 接受；轮到 Gov5 出块时本工程全部超时（每轮约 45 s），链未分叉。
+- 日志：`could not reconstruct gov5 execution payload … finalized block 411 requires execution requests absent from finalized-range v1`。
+- 原因：`replay_import.rs` 的 `validate_v1_payload_inputs` 对任何带 `requests_hash` 的 live 块头返回 `MissingRequests`，因为 Gov5 的块不带 request 列表。这条检查不在本 PR 原先改动的出块路径上，单元测试覆盖的是"本工程出块"，没有覆盖"导入 Gov5 的块"。
+- 修复：Gov5H2 profile 下 `requests_hash == EMPTY_REQUESTS_HASH` 视为可重建（空列表不需要来源）；其他值仍返回 `MissingRequests`。测试 `a_gov5_block_committing_to_no_requests_becomes_a_prague_payload`。
+- 搭建中的一次失误（与代码无关）：第一版创世的 alloc 缺 Prague 系统合约，Gov5 以 `System contract address 0x0000…7002 has empty code` 拒绝第 1 块；补入 alloc 后正常。
+
+### 第二轮（含修复）：跨 T 正常
+
+| 项目 | 结果 |
+|---|---|
+| 块数 | 380（T 前 224，T 后 156） |
+| Gov5 与本工程逐块哈希 | 0 处不同 |
+| T 前块头 | 全部 20 字段：Gov5 出 96，本工程出 128 |
+| T 后块头 | 全部 21 字段（带 EIP-7685 空哈希）：Gov5 出 67，本工程出 89 |
+| 出块分布 | 七个验证者各 54–55 块 |
+| 跨 T 的块间隔 | T-1 s、T+0 s、T+1 s，无停顿 |
+| 36 笔转账的回执 | 两端完全一致（块号、块哈希、状态、gas） |
+| Gov5 日志中的 BAD BLOCK | 0 |
+
+### 仍未覆盖
+
+- 合约创建与调用、带 execution requests 的块（chain 94 不产生）。
+- 节点重启、停掉部分节点、多机、长时间运行。
+- 三个客户端同在一条链上（本次是 Gov5 + 本工程；Gov5 + n42-rs 另行跑过）。

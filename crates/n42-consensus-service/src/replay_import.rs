@@ -275,7 +275,13 @@ fn validate_v1_payload_inputs(
     if header_profile != N42HeaderProfile::Gov5H2 && header.withdrawals_root.is_some() {
         return Err(ReplayImportPlanError::MissingWithdrawals(number));
     }
-    if !replay_v2_header && header.requests_hash.is_some() {
+    // A gov5 block carries no request list. From gov5's pragueTime its
+    // header commits to one all the same, and a block without requests
+    // commits to the empty list, which needs no source: only a header naming
+    // other requests cannot be rebuilt from this format.
+    let empty_requests = header_profile == N42HeaderProfile::Gov5H2
+        && header.requests_hash == Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
+    if !replay_v2_header && header.requests_hash.is_some() && !empty_requests {
         return Err(ReplayImportPlanError::MissingRequests(number));
     }
     if header.block_access_list_hash.is_some() {
@@ -378,6 +384,39 @@ mod tests {
         assert_eq!(
             validate_v1_payload_inputs(9, &header, N42HeaderProfile::Ethereum),
             Err(ReplayImportPlanError::MissingBlockAccessList(9))
+        );
+    }
+
+    /// A gov5 block from its pragueTime on: the header commits to the empty
+    /// request list, which the payload names without a source for it. A
+    /// header naming other requests still cannot be rebuilt.
+    #[test]
+    fn a_gov5_block_committing_to_no_requests_becomes_a_prague_payload() {
+        let empty = alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
+        let header = Header {
+            ommers_hash: B256::ZERO,
+            number: 411,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: Some(7),
+            extra_data: [b"N42H".as_slice(), &[0_u8; 8]].concat().into(),
+            withdrawals_root: Some(keccak256([])),
+            blob_gas_used: Some(0),
+            excess_blob_gas: Some(0),
+            parent_beacon_block_root: Some(B256::repeat_byte(0x44)),
+            requests_hash: Some(empty),
+            ..Default::default()
+        };
+        let hash = Gov5NativeHeader { header: header.clone(), mobile_registry_root: None }.hash();
+        let payload =
+            build_execution_data(hash, &header, &[], &[], None, N42HeaderProfile::Gov5H2).unwrap();
+        assert_eq!(payload.block_hash(), hash);
+        assert_eq!(payload.sidecar.requests_hash(), Some(empty));
+
+        let other = Header { requests_hash: Some(B256::repeat_byte(0x55)), ..header };
+        let hash = Gov5NativeHeader { header: other.clone(), mobile_registry_root: None }.hash();
+        assert_eq!(
+            build_execution_data(hash, &other, &[], &[], None, N42HeaderProfile::Gov5H2).err(),
+            Some(ReplayImportPlanError::MissingRequests(411))
         );
     }
 
