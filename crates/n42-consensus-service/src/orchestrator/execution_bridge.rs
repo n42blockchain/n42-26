@@ -668,6 +668,12 @@ impl ConsensusService {
         let exec_output_cache = self.exec_output_cache.clone();
         let bad_blocks = self.bad_blocks.clone();
         let h2_v4_participant = self.h2_v4_identity.is_some();
+        // The last CommitQC held when the build starts goes into the header
+        // (sync standard section 3.2). It names a committed block, which is an
+        // ancestor of every block on the locked branch, ahead builds included.
+        let header_qc = h2_v4_participant
+            .then(|| n42_network::Gov5HeaderQc::from_commit_qc(self.engine.last_committed_qc()))
+            .flatten();
 
         let handle = tokio::spawn(async move {
             let build_el = el.clone();
@@ -717,6 +723,7 @@ impl ConsensusService {
                         block_guard,
                         build_start,
                         build_context,
+                        header_qc,
                     )
                     .await;
                 }
@@ -1815,6 +1822,7 @@ async fn handle_built_payload(
     block_guard: Arc<std::sync::atomic::AtomicU64>,
     build_start: Instant,
     build_context: super::PayloadBuildContext,
+    header_qc: Option<n42_network::Gov5HeaderQc>,
 ) {
     let BuiltBlock {
         mut hash,
@@ -1853,6 +1861,7 @@ async fn handle_built_payload(
             gov5_state_root,
             gov5_receipts_root,
             transactions_root,
+            header_qc.as_ref(),
         ) {
             Ok(normalized) => normalized,
             Err(error) => {
