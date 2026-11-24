@@ -649,48 +649,78 @@ pub struct Profile1BuiltBlock {
     pub header: Profile1Header,
 }
 
+/// The block's own execution result as this node's builder produced it: the
+/// QMDB root and native receipts root the builder derived (`state_root`,
+/// `receipts_root`) and, from the builder's payload, its logs bloom, its gas
+/// (the execution result's, EIP-8037 `max(regular, state)`) and its EIP-7685
+/// requests hash. This is what the block's child carries (A10/AM25).
+pub fn profile1_built_own_fields(
+    execution: &ExecutionData,
+    state_root: B256,
+    receipts_root: B256,
+) -> n42_consensus::ExecutedFields {
+    let fields = execution.payload.as_v1();
+    n42_consensus::ExecutedFields {
+        state_root,
+        receipts_root,
+        logs_bloom: fields.logs_bloom,
+        gas_used: fields.gas_used,
+        requests_hash: execution
+            .sidecar
+            .requests_hash()
+            .unwrap_or(n42_chainspec::profile1::PROFILE1_REQUESTS_HASH),
+    }
+}
+
 /// Turns a payload this node's builder assembled and executed into the
 /// Profile-1 block of `view` (mixed production standard B1-B12), sealed by
 /// `key` (B2, the leader of `view`).
 ///
-/// The header carries the block's own execution results: `state_root` (the
-/// QMDB root), `receipts_root` (the native receipts root, B7), and the
-/// payload's own gas used and logs bloom. Deferred execution (A10/B13)
-/// replaces exactly these four with the parent's results at this step and
-/// nowhere else.
+/// Deferred execution (A10/AM25): the header carries `carried`, the parent's
+/// execution result (this node's, from the executed-fields registry; for a
+/// child of genesis, genesis's own fields), in exactly five fields: stateRoot,
+/// receiptsRoot, logsBloom, gasUsed and requestsHash. This is the one place a
+/// leader writes them. The block's own result is the caller's to file under
+/// the returned hash ([`profile1_built_own_fields`]).
 ///
 /// Fields that are execution inputs are checked, never changed: `prevRandao`
-/// must already be zero (B3) and the requests hash `sha256("")` (AM24, B8).
-/// Only header fields that do not enter execution are written: ommers hash
-/// and difficulty zero (B3), the rewards root of the withdrawals (B6),
-/// `slotNumber` = number (B10), the gap and `mobileRegistryRoot` (B11, B12),
-/// and `extraData` = `N42H || view || qc || seal` (B1). `header_qc` is the
-/// last CommitQC the leader holds; it is embedded when it names the parent
-/// or a remembered ancestor and is below `view`, else the QC is absent.
+/// must already be zero (B3). Only header fields that do not enter execution
+/// are written: the five carried fields, ommers hash and difficulty zero
+/// (B3), the rewards root of the withdrawals (B6), `slotNumber` = number
+/// (B10), the gap and `mobileRegistryRoot` (B11, B12), and `extraData` =
+/// `N42H || view || qc || seal` (B1). `header_qc` is the last CommitQC the
+/// leader holds; it is embedded when it names the parent or a remembered
+/// ancestor and is below `view`, else the QC is absent.
 pub fn seal_built_payload_for_profile1(
     execution: &ExecutionData,
     view: u64,
     header_qc: Option<&Gov5HeaderQc>,
-    state_root: B256,
-    receipts_root: B256,
+    carried: &n42_consensus::ExecutedFields,
     mobile_registry_root: B256,
     key: &n42_primitives::BlsSecretKey,
 ) -> Result<Profile1BuiltBlock, Gov5BlockError> {
     let invalid = |reason: String| Gov5BlockError::HeaderProfile(format!("profile 1: {reason}"));
+    let cancun = execution
+        .sidecar
+        .cancun()
+        .cloned()
+        .ok_or_else(|| invalid("the payload has no Cancun fields".to_owned()))?;
+    // The carried requests hash replaces the builder's in the sidecar, which
+    // is where the payload holds it.
+    let sidecar = alloy_rpc_types_engine::ExecutionPayloadSidecar::v4(
+        cancun,
+        alloy_rpc_types_engine::PraguePayloadFields::new(
+            alloy_eips::eip7685::RequestsOrHash::Hash(carried.requests_hash),
+        ),
+    );
     let block = execution
         .payload
         .clone()
-        .into_block_with_sidecar_raw(&execution.sidecar)
+        .into_block_with_sidecar_raw(&sidecar)
         .map_err(|error| Gov5BlockError::PayloadReconstruction(error.to_string()))?;
     let mut header = block.header;
     if header.mix_hash != B256::ZERO {
         return Err(invalid(format!("prevRandao {} is not zero (B3)", header.mix_hash)));
-    }
-    if header.requests_hash != Some(n42_chainspec::profile1::PROFILE1_REQUESTS_HASH) {
-        return Err(invalid(format!(
-            "requestsHash {:?} is not sha256(\"\") (AM24)",
-            header.requests_hash
-        )));
     }
     if header.block_access_list_hash.is_some() {
         return Err(invalid("the payload carries a block access list".to_owned()));
@@ -705,8 +735,11 @@ pub fn seal_built_payload_for_profile1(
     );
     header.ommers_hash = B256::ZERO;
     header.difficulty = U256::ZERO;
-    header.state_root = state_root;
-    header.receipts_root = receipts_root;
+    header.state_root = carried.state_root;
+    header.receipts_root = carried.receipts_root;
+    header.logs_bloom = carried.logs_bloom;
+    header.gas_used = carried.gas_used;
+    header.requests_hash = Some(carried.requests_hash);
     header.withdrawals_root = Some(n42_consensus::gov5_native_rewards_root(&rewards));
     header.slot_number = Some(header.number);
     header.extra_data = n42_chainspec::profile1::profile1_extra(
@@ -722,18 +755,54 @@ pub fn seal_built_payload_for_profile1(
         .map_err(|error| invalid(error.to_string()))?;
     let hash = remember_gov5_native_header(&sealed.encode());
     // The payload carries no ommers hash, difficulty, withdrawals root,
-    // slot or registry root; what changed in it is the two roots, the
+    // slot or registry root; what changed in it is the carried fields, the
     // extra data and the hash.
-    let mut payload = execution.clone();
+    let mut payload = ExecutionData::new(execution.payload.clone(), sidecar);
     let fields = payload.payload.as_v1_mut();
-    fields.state_root = state_root;
-    fields.receipts_root = receipts_root;
+    fields.state_root = carried.state_root;
+    fields.receipts_root = carried.receipts_root;
+    fields.logs_bloom = carried.logs_bloom;
+    fields.gas_used = carried.gas_used;
     fields.extra_data = sealed.header.extra_data.clone();
     fields.block_hash = hash;
     Ok(Profile1BuiltBlock {
         payload,
         header: sealed,
     })
+}
+
+/// [`gov5_normalization_preserves_execution_input`] for a Profile-1 seal:
+/// the seal writes the five carried fields (A10/AM25), so gasUsed, logsBloom
+/// and the requests hash differ from the builder's own and are not compared;
+/// none of them is an EVM input. Everything that is (parent, coinbase,
+/// prevRandao, number, gas limit, time, base fee, transactions, withdrawals,
+/// blob fields, parent beacon root) must be unchanged for the builder's
+/// execution to stand for the sealed block's.
+pub fn profile1_seal_preserves_execution_input(
+    original: &ExecutionData,
+    sealed: &ExecutionData,
+) -> bool {
+    let before = original.payload.as_v1();
+    let after = sealed.payload.as_v1();
+    original.payload.as_v4().is_none()
+        && sealed.payload.as_v4().is_none()
+        && original.payload.blob_gas_used().is_some()
+        && original.payload.excess_blob_gas().is_some()
+        && original.parent_beacon_block_root().is_some()
+        && before.parent_hash == after.parent_hash
+        && before.fee_recipient == after.fee_recipient
+        && before.prev_randao == after.prev_randao
+        && before.block_number == after.block_number
+        && before.gas_limit == after.gas_limit
+        && before.timestamp == after.timestamp
+        && before.base_fee_per_gas == after.base_fee_per_gas
+        && before.transactions == after.transactions
+        && original.withdrawals() == sealed.withdrawals()
+        && original.payload.blob_gas_used() == sealed.payload.blob_gas_used()
+        && original.payload.excess_blob_gas() == sealed.payload.excess_blob_gas()
+        && original.parent_beacon_block_root() == sealed.parent_beacon_block_root()
+        && original.sidecar.versioned_hashes() == sealed.sidecar.versioned_hashes()
+        && original.payload.block_access_list() == sealed.payload.block_access_list()
 }
 
 /// The gov5 wire form of a Profile-1 payload under its remembered header:

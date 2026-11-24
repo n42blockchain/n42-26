@@ -1,5 +1,5 @@
 //! A Profile-1 chain through reth: V1's `genesis_8s.json` (plus V3's funded
-//! sender) -> block 1 -> block 2, each produced the way a leader produces it
+//! sender) -> blocks 1, 2, 3, each produced the way a leader produces it
 //! (executed on the engine's state, QMDB root and native receipts root,
 //! sealed into the 24-element header by
 //! `n42_network::seal_built_payload_for_profile1`), sent over the gov5 wire,
@@ -10,8 +10,11 @@
 //! the provider under their Profile-1 hashes.
 //!
 //! Deferred execution (A10/AM25): each header carries its parent's five
-//! execution fields; the engine's QMDB state-root job checks them against
-//! this node's result for the parent and files the block's own.
+//! execution fields, written by the leader's seal from the executed-fields
+//! registry; the leader files the block's own result under the sealed hash.
+//! The engine's QMDB state-root job checks the carried fields against this
+//! node's result for the parent and files the block's own again, which must
+//! be the same result the leader filed.
 
 use alloy_consensus::{BlockBody, EMPTY_OMMER_ROOT_HASH, Header, proofs};
 use alloy_eips::{eip2718::Decodable2718, eip4895::Withdrawals};
@@ -121,7 +124,6 @@ struct Produced {
     qmdb_root: B256,
     /// The builder's standard payload, before sealing.
     standard: ExecutionData,
-    receipts_root: B256,
     leader: usize,
     /// The block's own result, which its child carries.
     own: n42_consensus::ExecutedFields,
@@ -203,11 +205,10 @@ fn produce(
         gas_used: output.result.gas_used,
         requests_hash: output.result.requests.requests_hash(),
     };
-    // A10/AM25: the header carries the parent's result.
-    let carried = n42_consensus::executed_fields(&parent.hash()).expect("the parent's result");
-    header.gas_used = carried.gas_used;
-    header.logs_bloom = carried.logs_bloom;
-    header.requests_hash = Some(carried.requests_hash);
+    // The builder's payload holds the block's own result.
+    header.gas_used = own.gas_used;
+    header.logs_bloom = own.logs_bloom;
+    header.requests_hash = Some(own.requests_hash);
     let standard = Block {
         header,
         body: BlockBody {
@@ -217,15 +218,28 @@ fn produce(
         },
     };
     let execution = ExecutionData::from_block_unchecked(standard.header.hash_slow(), &standard);
+    assert_eq!(
+        n42_network::profile1_built_own_fields(&execution, qmdb_root, receipts_root),
+        own,
+        "the leader reads its own result from its builder's payload"
+    );
+    // A10/AM25: the seal writes the parent's result.
+    let carried = n42_consensus::executed_fields(&parent.hash()).expect("the parent's result");
     let built = n42_network::seal_built_payload_for_profile1(
         &execution,
         view,
         None,
-        carried.state_root,
-        carried.receipts_root,
+        &carried,
         B256::ZERO,
         &keys[leader],
     )?;
+    assert!(
+        n42_network::profile1_seal_preserves_execution_input(&execution, &built.payload),
+        "the seal changes no execution input: the leader's execution stands for the sealed block"
+    );
+    assert_eq!(n42_consensus::ExecutedFields::carried_by(&built.header.header), carried);
+    // The leader files its own result under the sealed hash at once.
+    n42_consensus::remember_executed_fields(built.header.hash(), own)?;
     built
         .header
         .verify_seal(&keys[leader].public_key())
@@ -237,7 +251,6 @@ fn produce(
         payload: built.payload,
         qmdb_root,
         standard: execution,
-        receipts_root: carried.receipts_root,
         leader,
         own,
     })
@@ -318,7 +331,7 @@ async fn a_profile1_chain_imports_through_reth_and_becomes_canonical() -> eyre::
 
         let mut parent = genesis_header.clone();
         let mut executed: Vec<ExecutedBlock<n42_tx_types::N42Primitives>> = Vec::new();
-        for (view, case) in [(1u64, "plain-transfer"), (2, "contract-create")] {
+        for (view, case) in [(1u64, "plain-transfer"), (2, "contract-create"), (3, "storage-set")] {
             // The leader builds on the canonical head's state.
             let parent_state = provider.state_by_block_hash(parent.hash())?;
             let produced = produce(
@@ -365,15 +378,20 @@ async fn a_profile1_chain_imports_through_reth_and_becomes_canonical() -> eyre::
 
             // The same block carrying a wrong state root is refused by the
             // engine's deferred check, and nothing is committed for it.
+            let mut wrong = n42_consensus::executed_fields(&parent.hash()).unwrap();
+            wrong.state_root = B256::repeat_byte(0xfe);
             let tampered = n42_network::seal_built_payload_for_profile1(
                 &produced.standard,
                 view,
                 None,
-                B256::repeat_byte(0xfe),
-                produced.receipts_root,
+                &wrong,
                 B256::ZERO,
                 &keys[produced.leader],
             )?;
+            // An execution input changed is not the leader's execution.
+            let mut moved = tampered.payload.clone();
+            moved.payload.as_v1_mut().timestamp += 1;
+            assert!(!n42_network::profile1_seal_preserves_execution_input(&produced.standard, &moved));
             let tampered_hash = tampered.payload.block_hash();
             let refused = engine.validate_block_with_state::<N42EngineTypes>(
                 BlockOrPayload::Payload(tampered.payload),
@@ -398,7 +416,8 @@ async fn a_profile1_chain_imports_through_reth_and_becomes_canonical() -> eyre::
             assert_eq!(block.header().slot_number, Some(block.header().number));
             assert_eq!(block.header().requests_hash, Some(PROFILE1_REQUESTS_HASH));
             assert_eq!(store.root_for(hash)?, Some(produced.qmdb_root));
-            // The engine filed the block's own result for its child.
+            // The engine's own result for the block is the one the leader
+            // filed (a different one would have failed the import).
             assert_eq!(n42_consensus::executed_fields(&hash), Some(produced.own));
             assert_eq!(
                 n42_consensus::ExecutedFields::carried_by(block.header()),
@@ -424,10 +443,10 @@ async fn a_profile1_chain_imports_through_reth_and_becomes_canonical() -> eyre::
 
         // Persistence writes the canonical chain to the database.
         let writer = factory.provider_rw()?;
-        writer.save_blocks(&SaveBlocksInput::new(executed.clone(), 0, 0, 2, 2))?;
+        writer.save_blocks(&SaveBlocksInput::new(executed.clone(), 0, 0, 3, 3))?;
         writer.commit()?;
         let reader = factory.provider()?;
-        assert_eq!(reader.last_block_number()?, 2);
+        assert_eq!(reader.last_block_number()?, 3);
         for block in &executed {
             let hash = block.recovered_block().hash();
             let number = block.recovered_block().header().number;

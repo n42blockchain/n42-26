@@ -1818,6 +1818,26 @@ fn copy_payload(
     copy
 }
 
+/// How long a Profile-1 leader waits for its parent's execution result. The
+/// builder could only build on an executed parent, so the result is normally
+/// filed already; the wait covers the job that is still filing it.
+const PROFILE1_PARENT_RESULT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The parent's execution result a Profile-1 header carries (A10/AM25), as
+/// this node filed it; `None` after [`PROFILE1_PARENT_RESULT_WAIT`].
+async fn profile1_parent_result(parent: B256) -> Option<n42_consensus::ExecutedFields> {
+    let deadline = Instant::now() + PROFILE1_PARENT_RESULT_WAIT;
+    loop {
+        if let Some(fields) = n42_consensus::executed_fields(&parent) {
+            return Some(fields);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Leader pipelined import: broadcast block data, trigger consensus, then import eagerly.
 ///
 /// The leader already executed all transactions during payload building.  Instead of calling
@@ -1889,18 +1909,32 @@ async fn handle_built_payload(
             .and_then(|cache| cache.built_transactions_root(original_hash));
         let normalize_started = Instant::now();
         if let Some(seal_key) = profile1_seal {
-            // Profile 1: the 24-element header with the block's own QMDB
-            // and native receipts roots, sealed by this leader (B1-B12).
+            // Profile 1: the 24-element header sealed by this leader
+            // (B1-B12). It carries the parent's execution result (A10/AM25);
+            // the block's own goes to the registry under the sealed hash,
+            // where its child's build and every import look for it.
             let Some(seal_key) = seal_key else {
                 error!(target: "n42::profile1", %original_hash, "refusing to propose: this node holds no sealing key");
                 return;
             };
+            let parent = execution_data.parent_hash();
+            let Some(carried) = profile1_parent_result(parent).await else {
+                // Never guess or zero-fill: the build is dropped and the
+                // view's pacemaker retries once the parent is executed.
+                error!(target: "n42::profile1", %original_hash, %parent, "not proposing: the parent's execution result is not filed here");
+                metrics::counter!("n42_profile1_build_parent_result_missing_total").increment(1);
+                return;
+            };
+            let own = n42_network::profile1_built_own_fields(
+                &execution_data,
+                gov5_state_root,
+                gov5_receipts_root,
+            );
             let sealed = match n42_network::seal_built_payload_for_profile1(
                 &execution_data,
                 current_view,
                 header_qc.as_ref(),
-                gov5_state_root,
-                gov5_receipts_root,
+                &carried,
                 B256::ZERO,
                 &seal_key,
             ) {
@@ -1910,12 +1944,15 @@ async fn handle_built_payload(
                     return;
                 }
             };
-            let preserves_execution_input =
-                n42_network::gov5_normalization_preserves_execution_input(
-                    &execution_data,
-                    &sealed.payload,
-                );
+            let preserves_execution_input = n42_network::profile1_seal_preserves_execution_input(
+                &execution_data,
+                &sealed.payload,
+            );
             hash = sealed.payload.block_hash();
+            if let Err(error) = n42_consensus::remember_executed_fields(hash, own) {
+                error!(target: "n42::profile1", %hash, %error, "refusing to propose: the block's own execution result cannot be filed");
+                return;
+            }
             if let Some(ref cache) = exec_output_cache
                 && (!preserves_execution_input || !cache.rekey_gov5_built(original_hash, hash))
             {
