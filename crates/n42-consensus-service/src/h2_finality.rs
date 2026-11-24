@@ -1,7 +1,7 @@
 //! Read-only verification of chain-bound gov5 H2-v4 consensus traffic.
 
 use alloy_primitives::B256;
-use n42_consensus::ValidatorSet;
+use n42_consensus::{LeaderSchedule, ValidatorSet};
 use n42_network::h2_v4::{
     H2V4Envelope, commit_signing_message, new_view_signing_message, proposal_signing_message,
     timeout_signing_message, vote_signing_message,
@@ -188,15 +188,22 @@ fn verify_decide_fields(decide: &H2Decide) -> Result<(), H2V4FinalityError> {
 /// state. This is the admission gate for mixed-client shadow traffic: sender
 /// signatures, quorum certificates, timeout certificates, leader selection,
 /// and wrapper identities are checked under the Gov5 H2-v4 POP domain.
+///
+/// Leaders and the view a NewView's TC leads to follow `schedule`, the
+/// process's [`n42_consensus::leader_schedule`] in a node; `epoch_length` is
+/// the chain's epoch length in views (0 = a single epoch), which bounds a
+/// rotate-on-timeout jump.
 pub fn verify_h2_v4_shadow_message(
     envelope: &H2V4Envelope,
     validator_set: &ValidatorSet,
+    schedule: LeaderSchedule,
+    epoch_length: u64,
 ) -> Result<H2V4ShadowProof, H2V4ShadowError> {
     let identity = envelope.identity;
     let changes_hash = envelope.changes_hash;
     let (kind, view) = match &envelope.message {
         H2Message::Proposal(proposal) => {
-            verify_leader("Proposal", proposal.view, proposal.proposer, validator_set)?;
+            verify_leader("Proposal", proposal.view, proposal.proposer, validator_set, schedule.tenure)?;
             verify_single_signature(
                 "Proposal",
                 proposal.proposer,
@@ -311,9 +318,12 @@ pub fn verify_h2_v4_shadow_message(
             (H2MessageKind::Timeout, timeout.view)
         }
         H2Message::NewView(new_view) => {
-            verify_leader("NewView", new_view.view, new_view.leader, validator_set)?;
+            verify_leader("NewView", new_view.view, new_view.leader, validator_set, schedule.tenure)?;
+            // The view a TC leads to: TC view + 1, or the next tenure window
+            // under rotate-on-timeout (sync standard 10.2).
             if new_view.view == 0
-                || new_view.timeout_certificate.view.checked_add(1) != Some(new_view.view)
+                || schedule.view_after_tc(new_view.timeout_certificate.view, epoch_length)
+                    != new_view.view
             {
                 return Err(H2V4ShadowError::FieldMismatch {
                     component: "NewView TimeoutCertificate",
@@ -362,6 +372,7 @@ fn verify_leader(
     view: u64,
     actual: u32,
     validator_set: &ValidatorSet,
+    tenure: u64,
 ) -> Result<(), H2V4ShadowError> {
     let set_size = validator_set.len();
     if set_size == 0 {
@@ -371,8 +382,7 @@ fn verify_leader(
             set_size,
         });
     }
-    let expected =
-        n42_consensus::leader_index(view, u64::from(set_size), n42_consensus::leader_tenure());
+    let expected = n42_consensus::leader_index(view, u64::from(set_size), tenure);
     if actual != expected {
         return Err(H2V4ShadowError::WrongLeader {
             kind,
@@ -845,10 +855,57 @@ mod tests {
                 message,
             };
             assert_eq!(
-                verify_h2_v4_shadow_message(&envelope, &validator_set)
+                verify_h2_v4_shadow_message(&envelope, &validator_set, LeaderSchedule::default(), 0)
                     .unwrap()
                     .kind,
                 expected_kind
+            );
+        }
+    }
+
+    /// Sync standard section 10.2 item 5: the H2-v4 NewView check follows
+    /// the view a TC leads to. Tenure 4 over the shadow set: TC(1) leads to
+    /// view 4 (leader 1) under rotation and to view 2 (leader 0) without.
+    #[test]
+    fn shadow_new_view_follows_rotate_on_timeout() {
+        let (keys, validator_set) = shadow_validators();
+        assert_eq!(validator_set.len(), 4);
+        let identity = H2V4ChainIdentity {
+            chain_id: 94,
+            genesis_hash: B256::repeat_byte(0x11),
+        };
+        let tc = aggregate_tc(&keys, identity, 1);
+        let new_view = |view: u64, leader: u32| H2V4Envelope {
+            identity,
+            changes_hash: B256::ZERO,
+            message: H2Message::NewView(H2NewView {
+                view,
+                timeout_certificate: tc.clone(),
+                leader,
+                signature: keys[leader as usize]
+                    .sign_h2_v4(&new_view_signing_message(identity, view)),
+            }),
+        };
+        for active in [true, false] {
+            let schedule = LeaderSchedule {
+                tenure: 4,
+                rotate_on_timeout_from: active.then_some(0),
+            };
+            let (accepted, rejected) = if active {
+                (new_view(4, 1), new_view(2, 0))
+            } else {
+                (new_view(2, 0), new_view(4, 1))
+            };
+            verify_h2_v4_shadow_message(&accepted, &validator_set, schedule, 0)
+                .unwrap_or_else(|error| panic!("active = {active}: {error:?}"));
+            assert!(
+                matches!(
+                    verify_h2_v4_shadow_message(&rejected, &validator_set, schedule, 0),
+                    Err(H2V4ShadowError::FieldMismatch {
+                        component: "NewView TimeoutCertificate"
+                    })
+                ),
+                "active = {active}"
             );
         }
     }
@@ -888,7 +945,7 @@ mod tests {
         };
         envelope.changes_hash[0] ^= 1;
         assert_eq!(
-            verify_h2_v4_shadow_message(&envelope, &validator_set),
+            verify_h2_v4_shadow_message(&envelope, &validator_set, LeaderSchedule::default(), 0),
             Err(H2V4ShadowError::InvalidSignature {
                 component: "Proposal"
             })
@@ -899,7 +956,7 @@ mod tests {
         };
         proposal.proposer = 0;
         assert_eq!(
-            verify_h2_v4_shadow_message(&envelope, &validator_set),
+            verify_h2_v4_shadow_message(&envelope, &validator_set, LeaderSchedule::default(), 0),
             Err(H2V4ShadowError::WrongLeader {
                 kind: "Proposal",
                 actual: 0,

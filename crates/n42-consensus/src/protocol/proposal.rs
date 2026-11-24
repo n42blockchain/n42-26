@@ -4,7 +4,6 @@ use n42_primitives::consensus::{ConsensusMessage, PrepareQC, Proposal, ViewNumbe
 use super::round::Phase;
 use super::state_machine::{ConsensusEngine, EngineOutput};
 use crate::error::{ConsensusError, ConsensusResult};
-use crate::validator::LeaderSelector;
 
 const MAX_IMPORTED_BLOCKS: usize = 64;
 
@@ -65,7 +64,7 @@ impl ConsensusEngine {
         }
 
         let view_set = self.validator_set_for_view(proposal.view);
-        let expected_leader = LeaderSelector::leader_for_view(proposal.view, view_set);
+        let expected_leader = self.leader_in_set(proposal.view, view_set);
         if proposal.proposer != expected_leader {
             tracing::warn!(
                 target: "n42::cl::proposal",
@@ -265,7 +264,7 @@ impl ConsensusEngine {
         }
 
         let view_set = self.validator_set_for_view(view);
-        let expected_leader = LeaderSelector::leader_for_view(view, view_set);
+        let expected_leader = self.leader_in_set(view, view_set);
         if proposal.proposer != expected_leader {
             return Err(ConsensusError::InvalidProposer {
                 view,

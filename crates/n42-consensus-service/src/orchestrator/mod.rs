@@ -3104,7 +3104,11 @@ impl ConsensusService {
             return self.engine.current_leader_index();
         }
         let validator_count = self.engine.validator_count().max(1) as u64;
-        n42_consensus::leader_index(view, validator_count, n42_consensus::leader_tenure())
+        n42_consensus::leader_index(
+            view,
+            validator_count,
+            self.engine.leader_schedule().tenure,
+        )
     }
 
     fn timeout_diag_entry(&mut self, view: u64) -> &mut TimeoutViewDiag {
@@ -3269,8 +3273,16 @@ impl ConsensusService {
 
     fn record_timeout_diag_view_changed(&mut self, new_view: u64) {
         let now = Instant::now();
-        let timed_out_view = new_view.saturating_sub(1);
-        let Some(diag) = self.timeout_view_diags.get(&timed_out_view) else {
+        // The timed-out view whose TC leads to `new_view`: the view before
+        // it, or an earlier view of the window under rotate-on-timeout.
+        let schedule = self.engine.leader_schedule();
+        let epoch_length = self.engine.epoch_manager().epoch_length();
+        let Some((&timed_out_view, diag)) = self
+            .timeout_view_diags
+            .range(..new_view)
+            .rev()
+            .find(|(view, _)| schedule.view_after_tc(**view, epoch_length) == new_view)
+        else {
             return;
         };
         let Some(timeout_at) = diag.timeout_at else {
