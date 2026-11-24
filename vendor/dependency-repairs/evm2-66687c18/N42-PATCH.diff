@@ -1,0 +1,108 @@
+--- upstream-66687c18/src/block/ethereum/execution.rs
++++ n42/src/block/ethereum/execution.rs
+@@ -389,6 +389,33 @@
+     context: BlockExecutionContext<'_>,
+     requests: &mut Requests,
+ ) -> Result<(), BlockExecutionError> {
++    post_execution_system_call_state_changes_with_builder_requests(
++        evm,
++        block_state,
++        stream_state,
++        on_state_update,
++        spec_id,
++        context,
++        requests,
++        true,
++    )
++}
++
++/// N42: [`post_execution_system_call_state_changes`] with the EIP-8282 builder-request calls
++/// under the embedder's control. `builder_requests = false` skips both EIP-8282 calls even
++/// when `spec_id` enables Amsterdam, for chains that run the Amsterdam EVM rules without
++/// Ethereum's Amsterdam hardfork (see vendor/dependency-repairs/evm2-66687c18/N42-PROVENANCE.md).
++#[allow(clippy::too_many_arguments)]
++pub fn post_execution_system_call_state_changes_with_builder_requests<T: EvmTypes>(
++    evm: &mut Evm<'_, T>,
++    block_state: &mut BlockState,
++    stream_state: bool,
++    on_state_update: &mut impl FnMut(StateUpdate),
++    spec_id: SpecId,
++    context: BlockExecutionContext<'_>,
++    requests: &mut Requests,
++    builder_requests: bool,
++) -> Result<(), BlockExecutionError> {
+     if context.system_calls.is_none() || !spec_id.enables(SpecId::PRAGUE) {
+         return Ok(());
+     }
+@@ -419,7 +446,7 @@
+         consolidation_requests.output.iter().copied(),
+     );
+ 
+-    if spec_id.enables(SpecId::AMSTERDAM) {
++    if builder_requests && spec_id.enables(SpecId::AMSTERDAM) {
+         let builder_deposit_requests = execute_system_call(
+             evm,
+             block_state,
+--- upstream-66687c18/src/block/ethereum/mod.rs
++++ n42/src/block/ethereum/mod.rs
+@@ -29,7 +29,8 @@
+     BlockExecutionContext, BlockSystemCalls, block_requests_from_receipts,
+     commit_detached_transaction, commit_pending_state, dao_fork_state_changes,
+     execute_transaction_without_commit, map_transaction_error, post_block_balance_state_changes,
+-    post_execution_system_call_state_changes, pre_execution_system_call_state_changes,
++    post_execution_system_call_state_changes_with_builder_requests,
++    pre_execution_system_call_state_changes,
+ };
+ 
+ #[cfg(test)]
+@@ -184,6 +185,8 @@
+     /// Total blob gas used.
+     pub blob_gas_used: u64,
+     bal_index_offset: u64,
++    /// N42: whether the EIP-8282 builder-request system calls run from Amsterdam on.
++    eip8282_builder_requests: bool,
+ }
+ 
+ impl<'a, T, R> EthBlockExecutor<'a, T, R>
+@@ -219,9 +222,24 @@
+             separate_block_gas,
+             blob_gas_used: 0,
+             bal_index_offset: 0,
++            eip8282_builder_requests: true,
+         }
+     }
+ 
++    /// N42: enables or disables the EIP-8282 builder-request system calls at the end of every
++    /// block this executor finishes, including blocks started with [`Self::start_block`].
++    /// Enabled by default (upstream behaviour); the calls still run only when the spec enables
++    /// Amsterdam. An embedder whose chain runs the Amsterdam EVM rules without Ethereum's
++    /// Amsterdam hardfork disables them, as alloy-evm gates them on the chain's hardfork.
++    pub const fn set_eip8282_builder_requests(&mut self, enabled: bool) {
++        self.eip8282_builder_requests = enabled;
++    }
++
++    /// N42: whether the EIP-8282 builder-request system calls are enabled.
++    pub const fn eip8282_builder_requests(&self) -> bool {
++        self.eip8282_builder_requests
++    }
++
+     const fn block_context<'ctx>(
+         rules: &EthBlockRules,
+         parent_hash: B256,
+@@ -347,7 +365,7 @@
+             context.withdrawals,
+         )?;
+ 
+-        post_execution_system_call_state_changes(
++        post_execution_system_call_state_changes_with_builder_requests(
+             &mut self.evm,
+             &mut self.block_state,
+             stream_state,
+@@ -355,6 +373,7 @@
+             self.spec_id,
+             context,
+             &mut requests,
++            self.eip8282_builder_requests,
+         )?;
+ 
+         Ok(EthPostExecutionOutput {

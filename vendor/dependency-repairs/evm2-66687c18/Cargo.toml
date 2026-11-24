@@ -1,0 +1,198 @@
+# Flattened from evm2 66687c18b34d3bdbb899f5eb7605070615c03475 crates/evm2/Cargo.toml
+# (workspace inheritance resolved from that revision's root Cargo.toml; dev-dependencies,
+# tests, examples and lints dropped; `ark-std/std` removed from `std` because ark-std is
+# only a dev-dependency). See N42-PROVENANCE.md.
+[package]
+name = "evm2"
+description = "Fast, customizable EVM implementation"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+authors = ["DaniPopes <57450786+DaniPopes@users.noreply.github.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/danipopes/evm2"
+categories = ["cryptography::cryptocurrencies", "development-tools", "no-std"]
+keywords = ["bytecode", "ethereum", "evm", "execution", "interpreter"]
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The same evm2-macros the rest of the graph resolves (the workspace [patch] maps this
+# URL to the DaniPopes URL at the same revision).
+evm2-macros = { git = "https://github.com/alloy-rs/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
+
+alloy-consensus = { version = "2.0.4", default-features = false }
+alloy-eip7928 = { version = "0.4.11", default-features = false }
+alloy-eips = { version = "2.0.4", default-features = false }
+alloy-primitives = { version = "1.5.7", default-features = false }
+auto_impl = "1.3"
+bitflags = "2.13"
+derive-where = { version = "1.6", default-features = false }
+thiserror = { version = "2.0", default-features = false }
+typeid = { version = "1.0.3", default-features = false }
+
+# no_std
+once_cell = { version = "1.21", default-features = false, features = ["alloc"] }
+paste = { version = "1.0", default-features = false, optional = true }
+phf = { version = "0.14", default-features = false, features = ["macros"], optional = true }
+
+# "serde"
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"], optional = true }
+
+# "wincode"
+wincode = { version = "0.6.0", default-features = false, features = ["derive"], optional = true }
+
+# "block"
+alloy-hardforks = { version = "0.4", default-features = false, optional = true }
+
+# "async"
+corosensei = { version = "0.3.4", default-features = false, features = ["default-stack", "unwind"], optional = true }
+
+# "account-ext"
+triomphe = { version = "0.1.16", default-features = false, optional = true }
+
+# nightly
+ruint = { version = "1.21.1", default-features = false, optional = true }
+
+# ecrecover
+k256 = { version = "0.14", default-features = false, features = ["ecdsa"] }
+secp256k1 = { version = "0.33.1", default-features = false, features = [
+    "alloc",
+    "recovery",
+    "global-context",
+], optional = true }
+
+# sha256
+sha2 = { version = "0.11.0", default-features = false }
+
+# ripemd160
+ripemd = { version = "0.2.0", default-features = false }
+
+# modexp
+aurora-engine-modexp = { version = "1.2", default-features = false }
+gmp-mpfr-sys = { version = "1.6", default-features = false, optional = true }
+
+# bn254
+bn = { package = "substrate-bn", version = "0.6", default-features = false, optional = true }
+mcl_rust = { version = "1.2.0", default-features = false, optional = true }
+ark-bn254 = { version = "0.6.0", default-features = false, features = ["curve"] }
+ark-ec = { version = "0.6.0", default-features = false }
+ark-ff = { version = "0.6.0", default-features = false, features = ["asm"] }
+ark-serialize = { version = "0.6.0", default-features = false }
+
+# blake2f
+arrayref = "0.3.6"
+
+# kzg point evaluation
+c-kzg = { version = "2.1.7", default-features = false, optional = true, features = [
+    "ethereum_kzg_settings",
+] }
+
+# bls12-381
+blst = { version = "0.3.15", optional = true }
+ark-bls12-381 = { version = "0.6.0", default-features = false, features = ["curve"] }
+
+# p256verify
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa"] }
+aws-lc-rs = { version = "1.16.2", default-features = false, features = ["aws-lc-sys"], optional = true }
+
+[features]
+default = [
+    "std",
+    "map-foldhash",
+    "parse",
+    "asm-keccak",
+    # Precompiles
+    "gmp",
+    "secp256k1",
+    "blst",
+    "portable",
+    "bn254-mcl",
+    "p256-aws-lc-rs",
+]
+std = [
+    "alloy-consensus/std",
+    "alloy-eip7928/std",
+    "alloy-eips/std",
+    "alloy-primitives/std",
+    "ark-bls12-381/std",
+    "ark-bn254/std",
+    "ark-ec/std",
+    "ark-ff/std",
+    "ark-serialize/std",
+    "aurora-engine-modexp/std",
+    "bitflags/std",
+    "k256/std",
+    "once_cell/std",
+    "p256/std",
+    "phf?/std",
+    "thiserror/std",
+    "c-kzg?/std",
+    "secp256k1?/std",
+    "serde?/std",
+    "wincode?/std",
+    "triomphe?/std",
+    "ruint?/std",
+]
+
+async = ["std", "dep:corosensei"]
+
+# Block execution: `evm2::block`.
+block = ["dep:alloy-hardforks"]
+
+wincode = ["dep:wincode"]
+
+serde = [
+    "dep:serde",
+    "alloy-consensus/serde",
+    "alloy-eip7928/serde",
+    "alloy-eips/serde",
+    "alloy-hardforks?/serde",
+    "alloy-primitives/serde",
+    "ark-serialize/serde",
+    "bitflags/serde",
+    "derive-where/serde",
+    "k256/serde",
+    "p256/serde",
+    "phf?/serde",
+    "blst?/serde",
+    "c-kzg?/serde",
+    "secp256k1?/serde",
+    "triomphe?/serde",
+    "ruint?/serde",
+]
+arbitrary = [
+    "alloy-consensus/arbitrary",
+    "alloy-eips/arbitrary",
+    "alloy-primitives/arbitrary",
+]
+
+# Opt-in chain-specific account data; Ethereum builds keep the original account layout.
+account-ext = ["dep:triomphe"]
+
+map-hashbrown = ["alloy-primitives/map-hashbrown"]
+map-foldhash = ["alloy-primitives/map-foldhash"]
+asm-keccak = ["alloy-primitives/asm-keccak"]
+sha3-keccak = ["alloy-primitives/sha3-keccak"]
+
+secp256k1 = ["dep:secp256k1"]
+gmp = ["dep:gmp-mpfr-sys"]
+bn = ["dep:bn"]
+c-kzg = ["dep:c-kzg"]
+blst = ["dep:blst"]
+bn254-mcl = ["std", "dep:mcl_rust"]
+portable = ["c-kzg?/portable", "blst?/portable"]
+p256-aws-lc-rs = ["dep:aws-lc-rs"]
+parse = ["dep:paste", "dep:phf"]
+
+nightly = [
+    "alloy-primitives/nightly",
+    "derive-where/nightly",
+    "dep:ruint",
+    "ruint/nightly",
+]
+no-tco = []
+
+[workspace]
