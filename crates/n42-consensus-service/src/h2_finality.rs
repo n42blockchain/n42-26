@@ -121,6 +121,62 @@ pub fn verify_h2_v4_decide(
     })
 }
 
+/// Verdict of [`verify_h2_v4_sync_anchor`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum H2V4AnchorVerdict {
+    /// A commit-domain QC with a quorum of the given set: a sync anchor.
+    Verified,
+    /// A valid quorum, but in the vote/prepare domain: not an anchor.
+    PrepareDomain,
+    /// Wrong bitmap shape, too few signers, or a signature that verifies in
+    /// no domain. A provable fault of whoever served it.
+    Invalid,
+}
+
+/// Strict sync-anchor check of the N42 sync standard section 3.3: `qc` is an
+/// anchor only when it carries at least `2f+1` signers of `validator_set`
+/// (the set of the QC's own epoch, resolved by the caller with no fallback)
+/// and its aggregate verifies over the H2-v4 COMMIT message with a zero
+/// changes hash. A QC signed over a non-zero changes hash cannot be checked
+/// here and reports `Invalid`, which the caller treats as fail-closed.
+pub fn verify_h2_v4_sync_anchor(
+    qc: &H2QuorumCertificate,
+    identity: n42_network::h2_v4::H2V4ChainIdentity,
+    validator_set: &ValidatorSet,
+) -> H2V4AnchorVerdict {
+    if qc.view == 0 || qc.block_hash == B256::ZERO {
+        return H2V4AnchorVerdict::Invalid;
+    }
+    let n = validator_set.len() as usize;
+    let Some(signers) = canonical_signer_indices(qc, n) else {
+        return H2V4AnchorVerdict::Invalid;
+    };
+    let required = validator_set
+        .quorum_size()
+        .max(2 * (n.saturating_sub(1) / 3) + 1);
+    if signers.len() < required {
+        return H2V4AnchorVerdict::Invalid;
+    }
+    let Ok(public_keys) = validator_set.public_keys_for_signers(&signers) else {
+        return H2V4AnchorVerdict::Invalid;
+    };
+    let Ok(signature_bytes) = <[u8; 96]>::try_from(qc.aggregate_signature.as_slice()) else {
+        return H2V4AnchorVerdict::Invalid;
+    };
+    let Ok(signature) = BlsSignature::from_bytes(&signature_bytes) else {
+        return H2V4AnchorVerdict::Invalid;
+    };
+    let commit = commit_signing_message(identity, qc.view, qc.block_hash, B256::ZERO);
+    if AggregateSignature::verify_h2_v4_aggregate(&commit, &signature, &public_keys).is_ok() {
+        return H2V4AnchorVerdict::Verified;
+    }
+    let vote = vote_signing_message(identity, qc.view, qc.block_hash);
+    if AggregateSignature::verify_h2_v4_aggregate(&vote, &signature, &public_keys).is_ok() {
+        return H2V4AnchorVerdict::PrepareDomain;
+    }
+    H2V4AnchorVerdict::Invalid
+}
+
 fn verify_decide_fields(decide: &H2Decide) -> Result<(), H2V4FinalityError> {
     if decide.view != decide.commit_qc.view || decide.block_hash != decide.commit_qc.block_hash {
         return Err(H2V4FinalityError::DecideQcMismatch);
@@ -619,6 +675,53 @@ mod tests {
                 signers_bitmap: vec![0, 0],
             },
         }
+    }
+
+    #[test]
+    fn sync_anchor_requires_the_commit_domain_and_a_quorum_of_the_given_set() {
+        let (keys, set) = shadow_validators();
+        let identity = H2V4ChainIdentity {
+            chain_id: 1143,
+            genesis_hash: B256::repeat_byte(7),
+        };
+        let hash = B256::repeat_byte(0x55);
+        let commit = aggregate_qc(&keys, identity, B256::ZERO, 12, hash, true);
+        assert_eq!(
+            verify_h2_v4_sync_anchor(&commit, identity, &set),
+            H2V4AnchorVerdict::Verified
+        );
+        let prepare = aggregate_qc(&keys, identity, B256::ZERO, 12, hash, false);
+        assert_eq!(
+            verify_h2_v4_sync_anchor(&prepare, identity, &set),
+            H2V4AnchorVerdict::PrepareDomain
+        );
+        let changes = aggregate_qc(&keys, identity, B256::repeat_byte(1), 12, hash, true);
+        assert_eq!(
+            verify_h2_v4_sync_anchor(&changes, identity, &set),
+            H2V4AnchorVerdict::Invalid,
+            "a non-zero changes hash cannot be checked and fails closed"
+        );
+        let mut forged = commit.clone();
+        forged.block_hash = B256::repeat_byte(0x56);
+        assert_eq!(
+            verify_h2_v4_sync_anchor(&forged, identity, &set),
+            H2V4AnchorVerdict::Invalid
+        );
+        let mut thin = commit.clone();
+        thin.signers_bitmap = signer_bitmap(4, &[0, 1]);
+        assert_eq!(
+            verify_h2_v4_sync_anchor(&thin, identity, &set),
+            H2V4AnchorVerdict::Invalid
+        );
+        // A same-size set of other keys (a retired epoch) is not a match.
+        let other_keys = (11..=14)
+            .map(|seed| BlsSecretKey::key_gen(&[seed; 32]).unwrap())
+            .collect::<Vec<_>>();
+        let retired = aggregate_qc(&other_keys, identity, B256::ZERO, 12, hash, true);
+        assert_eq!(
+            verify_h2_v4_sync_anchor(&retired, identity, &set),
+            H2V4AnchorVerdict::Invalid
+        );
     }
 
     #[test]
