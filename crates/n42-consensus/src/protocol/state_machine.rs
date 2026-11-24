@@ -1,7 +1,7 @@
 use alloy_primitives::B256;
 use n42_primitives::{
     BlsSecretKey,
-    consensus::{ConsensusMessage, H2V4ChainIdentity, QuorumCertificate, ViewNumber},
+    consensus::{ConsensusMessage, H2V4ChainIdentity, PrepareQC, QuorumCertificate, ViewNumber},
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -327,6 +327,12 @@ pub struct ConsensusEngine {
     /// constant: taken from this process's resolved schedule at construction
     /// and never changed by events.
     pub(super) leader_schedule: crate::validator::LeaderSchedule,
+    /// The chain profile's vote rules (Profile 1 or today's). A chain
+    /// constant: taken from the installed profile at construction.
+    pub(super) vote_rules: crate::VoteRules,
+    /// A PrepareQC whose commit vote waits for this node's own execution of
+    /// the block (Profile 1, A13/AM19); `on_block_imported` releases it.
+    pub(super) held_prepare_qc: Option<PrepareQC>,
 }
 
 impl ConsensusEngine {
@@ -411,6 +417,8 @@ impl ConsensusEngine {
             pending_changes_hashes: BoundedFifoMap::new(64),
             vote_log,
             leader_schedule: crate::validator::leader_schedule(),
+            vote_rules: crate::VoteRules::installed(),
+            held_prepare_qc: None,
         }
     }
 
@@ -520,6 +528,8 @@ impl ConsensusEngine {
             pending_changes_hashes: BoundedFifoMap::new(64),
             vote_log,
             leader_schedule: crate::validator::leader_schedule(),
+            vote_rules: crate::VoteRules::installed(),
+            held_prepare_qc: None,
         }
     }
 
@@ -535,6 +545,35 @@ impl ConsensusEngine {
     /// process).
     pub fn set_leader_schedule(&mut self, schedule: crate::validator::LeaderSchedule) {
         self.leader_schedule = schedule;
+    }
+
+    /// The vote rules this engine runs.
+    pub fn vote_rules(&self) -> crate::VoteRules {
+        self.vote_rules
+    }
+
+    /// Replaces the vote rules. A chain constant: call before the engine
+    /// processes its first event (tests run several chains in one process).
+    pub fn set_vote_rules(&mut self, rules: crate::VoteRules) {
+        self.vote_rules = rules;
+    }
+
+    /// A14: refuses to act under a signing profile the chain's rules do not
+    /// reach (on Profile 1 anything but H2-v4), rather than sign or verify
+    /// in another domain.
+    pub(super) fn check_signing_profile(&self) -> ConsensusResult<()> {
+        if self
+            .vote_rules
+            .signing_profile_allowed(self.signing_profile)
+        {
+            return Ok(());
+        }
+        let profile = match self.signing_profile {
+            ConsensusSigningProfile::Native => "native",
+            ConsensusSigningProfile::Gov5Legacy => "gov5 legacy",
+            ConsensusSigningProfile::H2V4(_) => "H2-v4",
+        };
+        Err(ConsensusError::SigningProfileUnreachable { profile })
     }
 
     /// Enables gov5-compatible, chain-bound H2-v4 signatures. This does not
@@ -831,6 +870,7 @@ impl ConsensusEngine {
         &mut self,
         info: n42_chainspec::ValidatorInfo,
     ) -> crate::error::ConsensusResult<()> {
+        self.refuse_set_change_on_profile1()?;
         self.epoch_manager.propose_add_validator(info)
     }
 
@@ -841,7 +881,18 @@ impl ConsensusEngine {
         &mut self,
         addr: alloy_primitives::Address,
     ) -> crate::error::ConsensusResult<()> {
+        self.refuse_set_change_on_profile1()?;
         self.epoch_manager.propose_remove_validator(addr)
+    }
+
+    /// AM5: a Profile-1 chain runs the genesis validator set for good; a
+    /// staged change would only wedge this node's leader views (the H2-v4
+    /// proposal cannot carry it), so it is refused where it enters.
+    fn refuse_set_change_on_profile1(&self) -> crate::error::ConsensusResult<()> {
+        if self.vote_rules.profile1 {
+            return Err(ConsensusError::H2V4ValidatorChangesUnsupported);
+        }
+        Ok(())
     }
 
     /// Returns the timing from the last committed view.
@@ -902,6 +953,7 @@ impl ConsensusEngine {
             kind = kind,
         )
         .entered();
+        self.check_signing_profile()?;
         match event {
             ConsensusEvent::Message(msg) => self.process_message(msg),
             ConsensusEvent::BlockReady(block_hash, tx_root_hash) => {
@@ -921,6 +973,7 @@ impl ConsensusEngine {
         &mut self,
         authenticated: AuthenticatedConsensusMessage,
     ) -> ConsensusResult<()> {
+        self.check_signing_profile()?;
         self.process_message_inner(authenticated.message, Some(authenticated.proof))
     }
 
@@ -1137,13 +1190,22 @@ impl ConsensusEngine {
             | ConsensusMessage::NewView(_) => self.verify_qc_any_domain_or_known(qc),
             ConsensusMessage::Vote(_) | ConsensusMessage::CommitVote(_) => return Ok(false),
         };
-        if verify_result.is_err() {
+        if let Err(error) = verify_result {
             tracing::debug!(target: "n42::cl::engine",
                 current_view,
                 msg_view,
                 qc_view = qc.view,
+                %error,
                 "QC view jump failed: invalid QC signature"
             );
+            // Profile 1 (E6, E13, AM5): a QC that does not verify against the
+            // genesis set is forged, and the message carrying it is refused
+            // rather than buffered for a later view (n42-rs refuses it the
+            // same way). An unknown set is a gap in this node's history, not
+            // the sender's fault, and stays a buffered message.
+            if self.vote_rules.profile1 && self.resolve_qc_validator_set(qc).is_ok() {
+                return Err(error);
+            }
             return Ok(false);
         }
 
@@ -1193,6 +1255,9 @@ impl ConsensusEngine {
 
         // Save current PrepareQC for piggybacking into the next Proposal (chained mode).
         self.previous_prepare_qc = self.prepare_qc.take();
+        // A commit vote held for this node's execution belongs to the view
+        // being left.
+        self.held_prepare_qc = None;
 
         // Epoch numbers follow fixed view ranges even when validator membership
         // is unchanged. Advance every crossed boundary so live execution,

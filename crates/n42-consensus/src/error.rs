@@ -143,6 +143,13 @@ pub enum ConsensusError {
     #[error("H2-v4 participant mode does not support dynamic validator changes")]
     H2V4ValidatorChangesUnsupported,
 
+    /// A14: a Profile-1 chain signs and verifies in the H2-v4 chain-bound
+    /// domains only; the native and gov5 legacy profiles are unreachable.
+    #[error(
+        "Profile 1 signs only in the H2-v4 chain-bound domains (A14); the {profile} signing profile is unreachable"
+    )]
+    SigningProfileUnreachable { profile: &'static str },
+
     /// A validator's BLS public key failed subgroup / non-infinity validation.
     /// Detected at `ValidatorSet::try_new` so all subsequent verifications can
     /// safely skip the per-call subgroup check.

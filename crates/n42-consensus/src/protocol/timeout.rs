@@ -154,6 +154,7 @@ impl ConsensusEngine {
 
     /// Handles a view timeout triggered by the pacemaker.
     pub fn on_timeout(&mut self) -> ConsensusResult<()> {
+        self.check_signing_profile()?;
         let view = self.round_state.current_view();
 
         // Observer guard: if our local key is not a validator for this view
