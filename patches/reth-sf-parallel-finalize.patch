@@ -1,0 +1,176 @@
+diff --git a/crates/storage/provider/src/providers/static_file/manager.rs b/crates/storage/provider/src/providers/static_file/manager.rs
+index d5bb747f2..09758337f 100644
+--- a/crates/storage/provider/src/providers/static_file/manager.rs
++++ b/crates/storage/provider/src/providers/static_file/manager.rs
+@@ -241,6 +241,13 @@ impl<P: AsRef<Path>> StaticFileProviderBuilder<P> {
+ }
+ 
+ impl<N: NodePrimitives> StaticFileProvider<N> {
++    /// Finalizes every segment writer, one after another or in parallel
++    /// (`N42_SF_PARALLEL_FINALIZE`), whatever the switch says.
++    #[cfg(test)]
++    pub(crate) fn finalize_with(&self, parallel: bool) -> ProviderResult<()> {
++        self.writers.finalize_with(parallel)
++    }
++
+     /// Creates a new [`StaticFileProvider`] with the given [`StaticFileAccess`].
+     fn new(path: impl AsRef<Path>, access: StaticFileAccess) -> ProviderResult<Self> {
+         let provider = Self(Arc::new(StaticFileProviderInner::new(path, access)?));
+diff --git a/crates/storage/provider/src/providers/static_file/writer.rs b/crates/storage/provider/src/providers/static_file/writer.rs
+index bd88f096e..34b508a97 100644
+--- a/crates/storage/provider/src/providers/static_file/writer.rs
++++ b/crates/storage/provider/src/providers/static_file/writer.rs
+@@ -67,6 +67,16 @@ enum PruneStrategy {
+     },
+ }
+ 
++/// `N42_SF_PARALLEL_FINALIZE=1`: a commit writes the segments' configurations
++/// each on its own thread instead of one after another. Each write ends in a
++/// file and a directory sync; concurrent syncs share the filesystem's log
++/// flushes instead of queueing one behind the other, which is what the serial
++/// writes cost when the disk is busy.
++fn parallel_finalize() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("N42_SF_PARALLEL_FINALIZE").is_ok_and(|v| v == "1"))
++}
++
+ /// Static file writers for every known [`StaticFileSegment`].
+ ///
+ /// WARNING: Trying to use more than one writer for the same segment type **will result in a
+@@ -187,19 +197,51 @@ impl<N: NodePrimitives> StaticFileWriters<N> {
+         skip_all
+     )]
+     pub(crate) fn finalize(&self) -> ProviderResult<()> {
++        self.finalize_with(parallel_finalize())
++    }
++
++    /// [`Self::finalize`], with the segments' configurations written one after
++    /// another or each on its own thread. Each segment's configuration is
++    /// written atomically either way; only the order between segments differs,
++    /// and every segment is final before this returns.
++    pub(crate) fn finalize_with(&self, parallel: bool) -> ProviderResult<()> {
+         debug!(target: "providers::static_file", "Finalizing all static file segments into disk");
+ 
+-        for writer_lock in [
++        let writers = [
+             &self.headers,
+             &self.transactions,
+             &self.receipts,
+             &self.transaction_senders,
+             &self.account_change_sets,
+             &self.storage_change_sets,
+-        ] {
++        ];
++        let finalize = |writer_lock: &RwLock<Option<StaticFileProviderRW<N>>>| {
+             let mut writer = writer_lock.write();
+-            if let Some(writer) = writer.as_mut() {
+-                writer.finalize()?;
++            match writer.as_mut() {
++                Some(writer) => writer.finalize(),
++                None => Ok(()),
++            }
++        };
++        if parallel {
++            std::thread::scope(|scope| {
++                let handles: Vec<_> = writers
++                    .into_iter()
++                    .map(|writer_lock| scope.spawn(move || finalize(writer_lock)))
++                    .collect();
++                // Every segment is joined before the first error is returned.
++                let results: Vec<_> = handles
++                    .into_iter()
++                    .map(|handle| {
++                        handle.join().unwrap_or_else(|_| {
++                            Err(StaticFileWriterError::ThreadPanic("static file finalize").into())
++                        })
++                    })
++                    .collect();
++                results.into_iter().collect::<ProviderResult<Vec<()>>>()
++            })?;
++        } else {
++            for writer_lock in writers {
++                finalize(writer_lock)?;
+             }
+         }
+ 
+diff --git a/crates/storage/provider/src/providers/static_file/writer_tests.rs b/crates/storage/provider/src/providers/static_file/writer_tests.rs
+index 85d394eee..139f21a55 100644
+--- a/crates/storage/provider/src/providers/static_file/writer_tests.rs
++++ b/crates/storage/provider/src/providers/static_file/writer_tests.rs
+@@ -136,6 +136,76 @@ mod tests {
+         jar_provider.rows() as u64
+     }
+ 
++    // ==================== PARALLEL FINALIZE ====================
++
++    /// The files one segment finalize after another leaves are the files
++    /// finalizing them in parallel leaves, block by block across file
++    /// boundaries, and both read back the same after a reopen.
++    #[test]
++    fn test_parallel_finalize_writes_the_same_files() {
++        use alloy_consensus::Header;
++        use alloy_primitives::B256;
++        use reth_db::models::StorageBeforeTx;
++
++        let write = |parallel: bool| {
++            let dir = tempfile::tempdir().unwrap();
++            let provider = setup_test_provider(&dir, 4);
++            for block in 0..11u64 {
++                {
++                    let mut writer = provider.latest_writer(StaticFileSegment::Headers).unwrap();
++                    let header = Header { number: block, gas_limit: 30_000_000, ..Default::default() };
++                    writer.append_header(&header, &B256::with_last_byte(block as u8)).unwrap();
++                    writer.sync_all().unwrap();
++                }
++                {
++                    let mut writer =
++                        provider.latest_writer(StaticFileSegment::AccountChangeSets).unwrap();
++                    writer
++                        .append_account_changeset(generate_test_changeset(block, 3), block)
++                        .unwrap();
++                    writer.sync_all().unwrap();
++                }
++                {
++                    let mut writer =
++                        provider.latest_writer(StaticFileSegment::StorageChangeSets).unwrap();
++                    let change = StorageBeforeTx {
++                        address: Address::with_last_byte(block as u8),
++                        key: B256::with_last_byte(7),
++                        value: U256::from(block),
++                    };
++                    writer.append_storage_changeset(vec![change], block).unwrap();
++                    writer.sync_all().unwrap();
++                }
++                provider.finalize_with(parallel).unwrap();
++            }
++            let mut files: Vec<_> = std::fs::read_dir(dir.path())
++                .unwrap()
++                .map(|entry| {
++                    let path = entry.unwrap().path();
++                    (path.file_name().unwrap().to_owned(), std::fs::read(&path).unwrap())
++                })
++                .collect();
++            files.sort();
++            let reopened = setup_test_provider(&dir, 4);
++            let read_back: Vec<_> = (0..11u64)
++                .map(|block| reopened.account_block_changeset(block).unwrap())
++                .collect();
++            (dir, files, read_back)
++        };
++        let (_serial_dir, serial, serial_read) = write(false);
++        let (_parallel_dir, parallel, parallel_read) = write(true);
++        assert!(serial.len() > 6, "several files per segment: {}", serial.len());
++        assert_eq!(
++            serial.iter().map(|(name, _)| name).collect::<Vec<_>>(),
++            parallel.iter().map(|(name, _)| name).collect::<Vec<_>>()
++        );
++        for ((name, serial), (_, parallel)) in serial.iter().zip(&parallel) {
++            assert_eq!(serial, parallel, "{name:?}");
++        }
++        assert_eq!(serial_read, parallel_read);
++        assert_eq!(serial_read[10].len(), 3);
++    }
++
+     // ==================== APPEND CRASH SCENARIOS ====================
+ 
+     #[test]

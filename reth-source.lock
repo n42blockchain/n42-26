@@ -3,7 +3,7 @@
   "source": "https://github.com/paradigmxyz/reth",
   "upstream_tag": "v2.11.0",
   "upstream_commit": "b9abbcc1b982755baa9021e6874e2e58936ca65f",
-  "adapted_commit": "48608ed84566e4088d93cc78e780bf8428e55e75",
+  "adapted_commit": "5a81f36296936cc9f1bda1142141861ced558bcf",
   "patch_series": [
     {
       "name": "reth-qmdb-state-reader",
@@ -72,6 +72,14 @@
     {
       "name": "reth-parallel-account-history",
       "commit": "48608ed84566e4088d93cc78e780bf8428e55e75"
+    },
+    {
+      "name": "reth-sorted-tx-hashes",
+      "commit": "f34dbada1680c5ad2d558ceaeafd538830b74172"
+    },
+    {
+      "name": "reth-sf-parallel-finalize",
+      "commit": "5a81f36296936cc9f1bda1142141861ced558bcf"
     }
   ],
   "workspace_dependency_versions": {

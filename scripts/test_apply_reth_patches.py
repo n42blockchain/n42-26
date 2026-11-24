@@ -24,6 +24,8 @@ PATCH_NAMES = (
     "reth-inserted-block-cache-skip",
     "reth-insert-executed-stage-timers",
     "reth-parallel-account-history",
+    "reth-sorted-tx-hashes",
+    "reth-sf-parallel-finalize",
 )
 
 

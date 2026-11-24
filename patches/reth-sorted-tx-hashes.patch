@@ -1,0 +1,136 @@
+diff --git a/crates/storage/provider/src/providers/rocksdb/provider.rs b/crates/storage/provider/src/providers/rocksdb/provider.rs
+index b794ce357..f0d5b50fb 100644
+--- a/crates/storage/provider/src/providers/rocksdb/provider.rs
++++ b/crates/storage/provider/src/providers/rocksdb/provider.rs
+@@ -3,7 +3,7 @@ use crate::providers::{compute_history_rank, needs_prev_shard_check, HistoryInfo
+ use alloy_consensus::transaction::TxHashRef;
+ use alloy_primitives::{
+     map::{AddressMap, HashMap},
+-    Address, BlockNumber, TxNumber, B256,
++    Address, BlockNumber, TxHash, TxNumber, B256,
+ };
+ use itertools::Itertools;
+ use metrics::Label;
+@@ -54,6 +54,39 @@ pub fn parallel_account_history() -> bool {
+     *ON.get_or_init(|| std::env::var("N42_PARALLEL_ACCOUNT_HISTORY").is_ok_and(|v| v == "1"))
+ }
+ 
++/// `N42_SORTED_TX_HASHES=1`: a batch's transaction hashes are put in key
++/// order. Each put then lands next to the previous one in the memtable, which
++/// makes the commit's memtable insert cheaper than for hashes in block order;
++/// the batch holds the same entries.
++fn sorted_tx_hashes() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("N42_SORTED_TX_HASHES").is_ok_and(|v| v == "1"))
++}
++
++/// The `(hash, number)` of every transaction of `blocks`, in block order, or
++/// in hash order when `sorted`.
++fn tx_hash_entries<N: reth_node_types::NodePrimitives>(
++    blocks: &[ExecutedBlock<N>],
++    tx_nums: &[TxNumber],
++    sorted: bool,
++) -> Vec<(TxHash, TxNumber)> {
++    let mut entries = Vec::with_capacity(
++        blocks.iter().map(|block| block.recovered_block().body().transaction_count()).sum(),
++    );
++    for (block, &first_tx_num) in blocks.iter().zip(tx_nums) {
++        let body = block.recovered_block().body();
++        entries.extend(
++            body.transactions_iter()
++                .zip(first_tx_num..)
++                .map(|(transaction, tx_num)| (*transaction.tx_hash(), tx_num)),
++        );
++    }
++    if sorted {
++        entries.par_sort_unstable_by_key(|(hash, _)| *hash);
++    }
++    entries
++}
++
+ /// Pending `RocksDB` batches type alias.
+ pub(crate) type PendingRocksDBBatches = Arc<Mutex<Vec<WriteBatchWithTransaction<true>>>>;
+ 
+@@ -1491,14 +1524,22 @@ impl RocksDBProvider {
+             if write_tx_hash {
+                 s.spawn(|_| {
+                     let _guard = span.enter();
++                    let start = Instant::now();
+                     r_tx_hash = Some(self.write_tx_hash_numbers(blocks, tx_nums, &ctx));
++                    metrics::histogram!("storage.providers.database.save_blocks_rocksdb_tx_hashes")
++                        .record(start.elapsed().as_secs_f64());
+                 });
+             }
+ 
+             if write_account_history {
+                 s.spawn(|_| {
+                     let _guard = span.enter();
++                    let start = Instant::now();
+                     r_account_history = Some(self.write_account_history(blocks, &ctx));
++                    metrics::histogram!(
++                        "storage.providers.database.save_blocks_rocksdb_account_history"
++                    )
++                    .record(start.elapsed().as_secs_f64());
+                 });
+             }
+ 
+@@ -1544,11 +1585,8 @@ impl RocksDBProvider {
+         ctx: &RocksDBWriteCtx,
+     ) -> ProviderResult<()> {
+         let mut batch = self.batch();
+-        for (block, &first_tx_num) in blocks.iter().zip(tx_nums) {
+-            let body = block.recovered_block().body();
+-            for (tx_num, transaction) in (first_tx_num..).zip(body.transactions_iter()) {
+-                batch.put::<tables::TransactionHashNumbers>(*transaction.tx_hash(), &tx_num)?;
+-            }
++        for (hash, tx_num) in tx_hash_entries(blocks, tx_nums, sorted_tx_hashes()) {
++            batch.put::<tables::TransactionHashNumbers>(hash, &tx_num)?;
+         }
+         ctx.pending_batches.lock().push(batch.into_inner());
+         Ok(())
+@@ -4024,6 +4062,45 @@ mod tests {
+         assert_eq!(sentinel_shard.len(), 1, "sentinel shard should have 1 element");
+     }
+ 
++    #[test]
++    fn test_sorted_tx_hashes_write_the_same_entries() {
++        let blocks: Vec<_> =
++            reth_chain_state::test_utils::TestBlockBuilder::eth().get_executed_blocks(1..12).collect();
++        let mut first = 0;
++        let tx_nums: Vec<_> = blocks
++            .iter()
++            .map(|block| {
++                let at = first;
++                first += block.recovered_block().body().transaction_count() as u64;
++                at
++            })
++            .collect();
++        assert!(first > 4, "the blocks carry transactions: {first}");
++
++        let in_block_order = tx_hash_entries(&blocks, &tx_nums, false);
++        let in_hash_order = tx_hash_entries(&blocks, &tx_nums, true);
++        assert!(in_hash_order.windows(2).all(|pair| pair[0].0 < pair[1].0));
++        let mut resorted = in_block_order.clone();
++        resorted.sort_unstable();
++        assert_eq!(resorted, in_hash_order);
++
++        let dump = |entries: Vec<(TxHash, TxNumber)>| {
++            let dir = TempDir::new().unwrap();
++            let provider = RocksDBBuilder::new(dir.path()).with_default_tables().build().unwrap();
++            let mut batch = provider.batch();
++            for (hash, number) in entries {
++                batch.put::<tables::TransactionHashNumbers>(hash, &number).unwrap();
++            }
++            provider.commit_batch(batch.into_inner()).unwrap();
++            provider
++                .iter::<tables::TransactionHashNumbers>()
++                .unwrap()
++                .map(|entry| entry.unwrap())
++                .collect::<Vec<_>>()
++        };
++        assert_eq!(dump(in_block_order), dump(in_hash_order));
++    }
++
+     #[test]
+     fn test_parallel_account_history_shards_match_serial() {
+         let limit = NUM_OF_INDICES_IN_SHARD as u64;
