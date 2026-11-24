@@ -194,3 +194,137 @@ impl ConsensusNetwork for NetworkHandle {
         NetworkHandle::set_validator_context(self, my_index, validator_count).await
     }
 }
+
+/// The network of a Profile-1 follower (AM6: a verifying non-validator). It
+/// receives blocks and consensus messages, fetches blocks by hash and by
+/// range, answers range and status requests and forwards user transactions,
+/// but publishes nothing of consensus: no vote, commit vote, timeout,
+/// NewView, proposal, QC or Decide, and no block or blob announcement. Every
+/// such call is swallowed here and counted in
+/// `n42_follower_publish_refused_total{kind}`, whatever the caller above it
+/// does; it returns `Ok` so a caller's error path never retries it.
+pub struct FollowerNetwork {
+    inner: Arc<dyn ConsensusNetwork>,
+}
+
+impl FollowerNetwork {
+    pub fn new(inner: Arc<dyn ConsensusNetwork>) -> Self {
+        Self { inner }
+    }
+
+    fn refuse(kind: &'static str) -> Result<(), NetworkError> {
+        metrics::counter!("n42_follower_publish_refused_total", "kind" => kind).increment(1);
+        tracing::debug!(target: "n42::follower", kind, "follower: publication refused");
+        Ok(())
+    }
+}
+
+/// The name of a consensus message for the follower's refusal counter.
+pub fn consensus_message_kind(msg: &ConsensusMessage) -> &'static str {
+    match msg {
+        ConsensusMessage::Proposal(_) => "proposal",
+        ConsensusMessage::Vote(_) => "vote",
+        ConsensusMessage::CommitVote(_) => "commit_vote",
+        ConsensusMessage::PrepareQC(_) => "prepare_qc",
+        ConsensusMessage::Timeout(_) => "timeout",
+        ConsensusMessage::NewView(_) => "new_view",
+        ConsensusMessage::Decide(_) => "decide",
+    }
+}
+
+#[async_trait::async_trait]
+impl ConsensusNetwork for FollowerNetwork {
+    fn broadcast_consensus(&self, msg: ConsensusMessage) -> Result<(), NetworkError> {
+        Self::refuse(consensus_message_kind(&msg))
+    }
+
+    fn broadcast_h2_v4(&self, envelope: H2V4Envelope) -> Result<(), NetworkError> {
+        Self::refuse(envelope.message.kind().as_str())
+    }
+
+    fn validator_peer(&self, index: u32) -> Option<PeerId> {
+        self.inner.validator_peer(index)
+    }
+
+    fn send_direct(&self, _peer: PeerId, msg: ConsensusMessage) -> Result<(), NetworkError> {
+        Self::refuse(consensus_message_kind(&msg))
+    }
+
+    fn all_validator_peers(&self) -> Vec<(u32, PeerId)> {
+        self.inner.all_validator_peers()
+    }
+
+    fn forward_tx_batch(&self, peer: PeerId, txs: Vec<Vec<u8>>) -> Result<(), NetworkError> {
+        self.inner.forward_tx_batch(peer, txs)
+    }
+
+    fn request_sync(&self, peer: PeerId, request: BlockSyncRequest) -> Result<(), NetworkError> {
+        self.inner.request_sync(peer, request)
+    }
+
+    fn request_gov5_block_by_hash(
+        &self,
+        peer: PeerId,
+        block_hash: alloy_primitives::B256,
+    ) -> Result<(), NetworkError> {
+        self.inner.request_gov5_block_by_hash(peer, block_hash)
+    }
+
+    fn request_gov5_range(&self, peer: PeerId, start: u64, count: u64) -> Result<(), NetworkError> {
+        self.inner.request_gov5_range(peer, start, count)
+    }
+
+    async fn cancel_gov5_block_fetch_reliable(
+        &self,
+        block_hash: alloy_primitives::B256,
+    ) -> Result<(), NetworkError> {
+        self.inner.cancel_gov5_block_fetch_reliable(block_hash).await
+    }
+
+    fn broadcast_blob_sidecar(&self, _data: Vec<u8>) -> Result<(), NetworkError> {
+        Self::refuse("blob_sidecar")
+    }
+
+    async fn announce_block_reliable(&self, _data: Vec<u8>) -> Result<(), NetworkError> {
+        Self::refuse("block_announce")
+    }
+
+    async fn broadcast_gov5_block_reliable(&self, _rlp: Vec<u8>) -> Result<(), NetworkError> {
+        Self::refuse("gov5_block")
+    }
+
+    async fn send_block_direct_reliable(
+        &self,
+        _peer: PeerId,
+        _data: Arc<Vec<u8>>,
+    ) -> Result<(), NetworkError> {
+        Self::refuse("block_direct")
+    }
+
+    async fn send_sync_response_reliable(
+        &self,
+        request_id: u64,
+        response: BlockSyncResponse,
+    ) -> Result<(), NetworkError> {
+        self.inner.send_sync_response_reliable(request_id, response).await
+    }
+
+    async fn authenticate_validator_peer_reliable(
+        &self,
+        peer: PeerId,
+        validator_index: u32,
+    ) -> Result<(), NetworkError> {
+        self.inner.authenticate_validator_peer_reliable(peer, validator_index).await
+    }
+
+    async fn replace_expected_validator_peers_reliable(
+        &self,
+        peers: HashMap<u32, PeerId>,
+    ) -> Result<(), NetworkError> {
+        self.inner.replace_expected_validator_peers_reliable(peers).await
+    }
+
+    /// A follower holds no validator index: the network keeps treating this
+    /// node as a non-validator (no Rotor relay role).
+    async fn set_validator_context(&self, _my_index: u32, _validator_count: u32) {}
+}

@@ -295,8 +295,13 @@ impl ConsensusService {
         slot_timestamp: Option<u64>,
     ) {
         if self.leader_disabled {
-            info!(target: "n42::cl::exec_bridge", view = self.engine.current_view(),
-                "leader build skipped: this member cannot seal a gov5 block; the view will time out");
+            if self.follower {
+                warn!(target: "n42::follower", view = self.engine.current_view(),
+                    "follower: payload build refused; a follower never builds");
+            } else {
+                info!(target: "n42::cl::exec_bridge", view = self.engine.current_view(),
+                    "leader build skipped: this member cannot seal a gov5 block; the view will time out");
+            }
             self.next_build_at = None;
             self.next_slot_timestamp = None;
             return;

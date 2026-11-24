@@ -139,6 +139,18 @@ impl ConsensusService {
     }
 
     pub(super) async fn handle_engine_output(&mut self, output: EngineOutput) {
+        // AM6: a follower publishes no consensus message. Its engine holds a
+        // key outside the genesis set and signs nothing; this drop is the
+        // second guard (the network wrapper is the third).
+        if self.follower
+            && let EngineOutput::BroadcastMessage(msg) | EngineOutput::SendToValidator(_, msg) =
+                &output
+        {
+            let kind = crate::net_port::consensus_message_kind(msg);
+            counter!("n42_follower_engine_output_dropped_total", "kind" => kind).increment(1);
+            warn!(target: "n42::follower", kind, view = msg.view(), "follower: dropped an outbound consensus message");
+            return;
+        }
         // Profile 1, B4: the Round-1 vote leaves only for a header whose time
         // is at most floor(now) + 2. The engine has recorded the vote for the
         // view, so holding it back means this node does not vote in the view.

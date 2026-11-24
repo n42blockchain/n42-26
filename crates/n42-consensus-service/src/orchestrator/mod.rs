@@ -1462,6 +1462,10 @@ pub struct ConsensusService {
     /// The member cannot seal a gov5 block (no local QMDB root); never start a
     /// payload build, let the view time out like an absent validator.
     leader_disabled: bool,
+    /// Profile-1 follower (AM6): a verifying non-validator. It imports and
+    /// checks every block like a validator but never votes, times out,
+    /// proposes or builds; see [`Self::with_follower`].
+    follower: bool,
     /// Per-block pipeline timing tracker. Populated incrementally as events flow
     /// through the orchestrator. Logged and emitted as metrics at commit time.
     /// Bounded to 32 entries; older entries are evicted.
@@ -3518,6 +3522,7 @@ impl ConsensusService {
             pending_vote_resend: None,
             recent_h2_broadcasts: std::sync::Mutex::new(HashMap::new()),
             leader_disabled: false,
+            follower: false,
             committee_pool: None,
             pipeline_timings: HashMap::new(),
             last_commit_instant: None,
@@ -3795,6 +3800,7 @@ impl ConsensusService {
             pending_vote_resend: None,
             recent_h2_broadcasts: std::sync::Mutex::new(HashMap::new()),
             leader_disabled: false,
+            follower: false,
             committee_pool: None,
             pipeline_timings: HashMap::new(),
             last_commit_instant: None,
@@ -3850,6 +3856,9 @@ impl ConsensusService {
     /// [`validate_profile1_header`]: crate::profile1_header::validate_profile1_header
     pub fn with_profile1_gate(mut self, gate: crate::profile1_header::Profile1ImportGate) -> Self {
         self.profile1 = Some(gate);
+        // §3: a pulled block executes only once a commit-domain CommitQC
+        // names it or a descendant (N42_SYNC_ANCHOR is refused, AM10).
+        self.range_catchup.enforce_anchors();
         self
     }
 
@@ -4004,6 +4013,28 @@ impl ConsensusService {
     pub fn with_leader_disabled(mut self) -> Self {
         self.leader_disabled = true;
         self
+    }
+
+    /// Profile-1 follower (AM6, a verifying non-validator): the node imports
+    /// blocks through the same gate, deferred check, engine import, E14 tags
+    /// and E12 halt as a validator, and follows commits by verified Decides
+    /// and range catch-up, but publishes no consensus message and never builds.
+    ///
+    /// Three guards stand between the follower and the wire: its BLS key is
+    /// not in the genesis set, so the engine signs nothing
+    /// (`is_local_validator_active_for_view`); [`Self::handle_engine_output`]
+    /// drops every outbound consensus message; and the network is wrapped in
+    /// [`crate::net_port::FollowerNetwork`], which swallows every publication.
+    pub fn with_follower(mut self) -> Self {
+        self.follower = true;
+        self.leader_disabled = true;
+        self.network = Arc::new(crate::net_port::FollowerNetwork::new(Arc::clone(&self.network)));
+        self
+    }
+
+    /// Whether this node is a Profile-1 follower ([`Self::with_follower`]).
+    pub fn is_follower(&self) -> bool {
+        self.follower
     }
 
     pub fn with_blob_store(mut self, blob_store: Arc<dyn BlobStorePort>) -> Self {

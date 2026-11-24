@@ -634,3 +634,167 @@ async fn phase_b_check_outcomes_reach_the_engine() {
     // above must simply be accepted without output.
     assert!(orch.output_rx.try_recv().is_err());
 }
+
+/// gov5's V6 messages (every consensus message kind) in the engine's form.
+fn v6_messages() -> Vec<ConsensusMessage> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../n42-chainspec/testdata/profile1/V6/consensus_messages_v6.json");
+    let json: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let identity = n42_network::h2_v4::H2V4ChainIdentity {
+        chain_id: json["chainId"].as_u64().unwrap(),
+        genesis_hash: json["genesisHash"].as_str().unwrap().parse().unwrap(),
+    };
+    json["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| {
+            let envelope =
+                n42_network::h2_v4::decode_gossip(&raw(&message["gossipSnappy"]), identity).unwrap();
+            n42_network::consensus_from_h2_v4(envelope).unwrap()
+        })
+        .collect()
+}
+
+/// A follower (AM6) on Profile 1 with an H2-v4 transport, the halt latch
+/// and a recording network under its follower wrapper.
+fn follower_orchestrator(
+    gate: Profile1ImportGate,
+) -> (ConsensusService, MockConsensusNetwork, Arc<MockExecutionLayer>, Arc<crate::halt::Halt>) {
+    let (engine, output_rx) = make_test_engine();
+    let network = MockConsensusNetwork::default();
+    let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+    let halt = Arc::new(crate::halt::Halt::in_memory());
+    let mut orch = ConsensusService::new(engine, Arc::new(network.clone()), net_event_rx, output_rx)
+        .with_h2_v4_participant(test_h2_identity())
+        .with_profile1_gate(gate)
+        .with_halt(halt.clone())
+        .with_follower();
+    let mock = Arc::new(MockExecutionLayer::new(PayloadStatusEnum::Valid, PayloadStatusEnum::Valid));
+    orch.el = Some(mock.clone());
+    orch.async_finalize_fcu = false;
+    (orch, network, mock, halt)
+}
+
+fn assert_nothing_published(network: &MockConsensusNetwork) {
+    assert!(network.broadcasts().is_empty(), "{:?}", network.broadcasts());
+    assert!(network.h2_v4_broadcasts().is_empty(), "{:?}", network.h2_v4_broadcasts());
+    assert!(network.direct_messages().is_empty(), "{:?}", network.direct_messages());
+}
+
+/// AM6 guard: whatever the engine (or any other caller) asks, a follower
+/// publishes no vote, commit vote, timeout, NewView, proposal, QC or Decide,
+/// and never builds; requests it needs to follow (range fetch) still leave.
+#[tokio::test]
+async fn follower_publishes_no_consensus_message() {
+    let (_, gate) = v1();
+    let (mut orch, network, mock, _halt) = follower_orchestrator(gate);
+    assert!(orch.is_follower());
+    assert_eq!(
+        orch.range_catchup.mode(),
+        crate::range_catchup::AnchorMode::Enforce,
+        "Profile 1 range catch-up enforces anchors (§3)"
+    );
+    let messages = v6_messages();
+    let kinds: std::collections::BTreeSet<_> =
+        messages.iter().map(crate::net_port::consensus_message_kind).collect();
+    assert_eq!(kinds.len(), 7, "every message kind: {kinds:?}");
+    for message in messages {
+        orch.handle_engine_output(EngineOutput::BroadcastMessage(message.clone())).await;
+        orch.handle_engine_output(EngineOutput::SendToValidator(0, message.clone())).await;
+        // The network wrapper refuses the same messages on its own.
+        orch.broadcast_engine_consensus(message.clone()).unwrap();
+        orch.broadcast_via_rotor(message.clone());
+        orch.network.send_direct(libp2p::PeerId::random(), message.clone()).unwrap();
+        orch.network.broadcast_consensus(message).unwrap();
+    }
+    assert!(orch.pending_vote_resend.is_none(), "no vote kept for a resend");
+    orch.network.announce_block_reliable(vec![1]).await.unwrap();
+    orch.network.broadcast_gov5_block_reliable(vec![1]).await.unwrap();
+    orch.network.broadcast_blob_sidecar(vec![1]).unwrap();
+    orch.do_trigger_payload_build(None).await;
+    assert!(mock.build_parents().is_empty(), "a follower never builds");
+    assert_nothing_published(&network);
+
+    let peer = libp2p::PeerId::random();
+    orch.network.request_gov5_range(peer, 1, 8).unwrap();
+    assert_eq!(network.range_requests.lock().unwrap().as_slice(), &[(peer, 1, 8)]);
+}
+
+/// AM6 follower on a Profile-1 chain: it imports and makes canonical the
+/// blocks the validators commit, each carrying its parent's result equal to
+/// this node's own (A10), then halts (E12) on a committed block whose carried
+/// state root is not its own result for the parent, importing nothing more.
+/// It publishes nothing throughout.
+#[tokio::test]
+async fn follower_imports_a_profile1_chain_and_halts_on_a_tampered_carried_field() {
+    let (_, gate) = v1();
+    let (mut orch, network, mock, halt) = follower_orchestrator(gate);
+    let genesis = B256::repeat_byte(0xf0);
+    orch.head_block_hash = genesis;
+    let mut parent = genesis;
+    let mut chain = Vec::new();
+    for number in 71..=74u64 {
+        let header = remembered_header(number, parent, |header| {
+            header.header.gas_limit += number;
+        });
+        // This node's own execution of the parent is what the child carries.
+        n42_consensus::remember_executed_fields(
+            parent,
+            n42_consensus::ExecutedFields::carried_by(&header.header),
+        )
+        .unwrap();
+        chain.push(header.hash());
+        parent = header.hash();
+    }
+    for (view, hash) in (20u64..).zip(chain.iter().copied()) {
+        let parent = orch.head_block_hash;
+        orch.pending_block_data.insert(hash, test_block_data(parent, hash, view).into());
+        orch.handle_engine_output(EngineOutput::BlockCommitted {
+            view,
+            block_hash: hash,
+            commit_qc: QuorumCertificate::genesis(),
+            validator_changes: None,
+        })
+        .await;
+        orch.handle_commit_execution_timeout(view, hash);
+        if let Ok(Some((hash, view, outcome, ts))) =
+            tokio::time::timeout(Duration::from_secs(2), orch.import_done_rx.recv()).await
+        {
+            orch.handle_import_done(hash, view, outcome, ts).await;
+        }
+        assert_eq!(orch.head_block_hash, hash, "view {view}: committed and canonical");
+    }
+    assert!(!halt.is_halted());
+    assert_eq!(mock.new_payload_hashes(), chain, "every block imported, in order");
+    for hash in &chain {
+        assert!(mock.fcu_heads().contains(hash));
+    }
+
+    // The next committed block carries a state root that is not this node's
+    // own result for its parent.
+    let tampered = remembered_header(75, parent, |header| {
+        header.header.state_root = B256::repeat_byte(0xbd);
+    });
+    let mut own = n42_consensus::ExecutedFields::carried_by(&tampered.header);
+    own.state_root = B256::repeat_byte(0x0d);
+    n42_consensus::remember_executed_fields(parent, own).unwrap();
+    let hash = tampered.hash();
+    orch.pending_block_data.insert(hash, test_block_data(parent, hash, 30).into());
+    orch.handle_engine_output(EngineOutput::BlockCommitted {
+        view: 30,
+        block_hash: hash,
+        commit_qc: QuorumCertificate::genesis(),
+        validator_changes: None,
+    })
+    .await;
+    match halt.evidence().expect("E12 halt").reason {
+        crate::halt::HaltReason::CarriedFields { block, field, .. } => {
+            assert_eq!((block, field.as_str()), (hash, "stateRoot"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(mock.new_payload_hashes(), chain, "the tampered block is not imported");
+    assert_eq!(orch.head_block_hash, parent, "nor made canonical");
+    assert_nothing_published(&network);
+}

@@ -1348,3 +1348,101 @@ fn phase_b_check_events_are_profile1_only() {
     engine.process_event(ConsensusEvent::BlockRefused(B256::repeat_byte(1))).expect("ignored");
     assert!(outputs(&mut rx).is_empty());
 }
+
+impl V6 {
+    /// A Profile-1 follower (AM6): the validators' rules and genesis set, a
+    /// key outside the set and the index past its end.
+    fn follower_engine(&self) -> (ConsensusEngine, mpsc::Receiver<EngineOutput>) {
+        let (tx, rx) = mpsc::channel(4096);
+        let key = BlsSecretKey::random().expect("a key");
+        assert!(self.set.index_of_public_key(&key.public_key()).is_none());
+        let mut engine = ConsensusEngine::new(self.set.len(), key, self.set.clone(), 24_000, 96_000, tx);
+        engine.enable_h2_v4_signing(self.identity);
+        engine.set_vote_rules(VoteRules::PROFILE1);
+        engine.set_leader_schedule(LeaderSchedule {
+            tenure: number(&self.json["leaderTenure"]),
+            rotate_on_timeout_from: Some(0),
+        });
+        (engine, rx)
+    }
+}
+
+/// Every consensus message an engine asked to send.
+fn sent(out: &[EngineOutput]) -> Vec<&ConsensusMessage> {
+    out.iter()
+        .filter_map(|o| match o {
+            EngineOutput::BroadcastMessage(m) | EngineOutput::SendToValidator(_, m) => Some(m),
+            _ => None,
+        })
+        .collect()
+}
+
+/// AM6 follower on gov5's V6 messages: it follows the proposal, the
+/// PrepareQC (lock) and the Decide (commit) exactly as a validator does,
+/// checks every certificate against the genesis set, and signs nothing: no
+/// Round-1 vote on the check or the import, no commit vote, no timeout, no
+/// NewView, no proposal, never a leader.
+#[test]
+fn follower_follows_v6_and_sends_nothing() {
+    let v6 = load();
+    let (mut engine, mut rx) = v6.follower_engine();
+    for view in 0..1_000 {
+        assert!(!engine.is_leader_for_view(view), "a follower never leads (view {view})");
+    }
+
+    let proposal = v6.engine_message(v6.wire("proposal_v2")).expect("bridged");
+    let ConsensusMessage::Proposal(p) = &proposal else {
+        panic!("a proposal")
+    };
+    let (block, parent) = (p.block_hash, p.justify_qc.block_hash);
+    engine.process_event(ConsensusEvent::Message(proposal)).expect("proposal_v2 accepted");
+    engine
+        .process_event(ConsensusEvent::BlockChecked { block_hash: block, parent_hash: parent })
+        .expect("checked");
+    engine.process_event(executed(block, parent)).expect("executed");
+    let pqc = v6.engine_message(v6.wire("prepare_qc_v2")).expect("bridged");
+    engine.process_event(ConsensusEvent::Message(pqc)).expect("prepare_qc_v2 accepted");
+    assert_eq!(engine.locked_qc().view, 2, "locked on the PrepareQC like a validator");
+    let decide = v6.engine_message(v6.wire("decide_v2")).expect("bridged");
+    engine.process_event(ConsensusEvent::Message(decide)).expect("decide_v2 accepted");
+    let out = outputs(&mut rx);
+    assert!(
+        out.iter().any(|o| matches!(o, EngineOutput::BlockCommitted { block_hash, .. } if *block_hash == block)),
+        "block 2 committed on the Decide: {out:?}"
+    );
+    assert_eq!(engine.current_view(), 3);
+    assert!(sent(&out).is_empty(), "no vote or commit vote: {:?}", sent(&out));
+
+    // Pacemaker timeouts: no timeout message, however often.
+    for _ in 0..3 {
+        engine.on_timeout().expect("timeout");
+    }
+    assert!(sent(&outputs(&mut rx)).is_empty(), "no timeout message");
+
+    // A TC moves it to the boundary view; it signs no NewView and, given a
+    // block, proposes nothing.
+    engine
+        .process_event(ConsensusEvent::Message(new_view_with(&v6, |_| {})))
+        .expect("the NewView");
+    let H2Message::Proposal(after) = v6.wire("proposal_after_tc") else {
+        panic!("a proposal")
+    };
+    engine
+        .process_event(ConsensusEvent::BlockReady(after.block_hash, None))
+        .expect("block ready");
+    assert!(sent(&outputs(&mut rx)).is_empty(), "no NewView, no proposal");
+
+    // E13: a Decide whose CommitQC is not the genesis set's is refused.
+    let H2Message::Decide(decide) = v6.wire("decide_v2") else {
+        panic!("a Decide")
+    };
+    let preimage =
+        h2_v4_commit_signing_message(v6.identity, decide.view, decide.block_hash, B256::ZERO);
+    let mut foreign = decide.clone();
+    foreign.commit_qc.aggregate_signature = v6.aggregate(&foreign_keys(), &preimage);
+    let (mut engine, mut rx) = v6.follower_engine();
+    let err = refused(&mut engine, v6.engine_message(H2Message::Decide(foreign)).expect("bridged"));
+    assert!(err.contains("invalid quorum certificate for view 2"), "{err}");
+    assert!(!outputs(&mut rx).iter().any(|o| matches!(o, EngineOutput::BlockCommitted { .. })));
+    assert_eq!(engine.current_view(), 1);
+}

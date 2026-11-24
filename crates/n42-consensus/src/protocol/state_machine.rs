@@ -865,8 +865,15 @@ impl ConsensusEngine {
                 );
                 self.my_index = idx;
             }
-        } else {
+        } else if self.my_index < self.epoch_manager.current_validator_set().len() {
             tracing::warn!(
+                target: "n42::cl::engine",
+                "local key not in current validator set (sync)"
+            );
+        } else {
+            // A non-member (a Profile-1 follower, or a joining key) is outside
+            // the set by construction; this runs once per view.
+            tracing::debug!(
                 target: "n42::cl::engine",
                 "local key not in current validator set (sync)"
             );

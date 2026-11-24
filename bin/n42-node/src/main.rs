@@ -1083,6 +1083,32 @@ fn connect_trusted_peers(net_handle: &n42_network::NetworkHandle) {
 /// Opens the TCP/Noise/Yamux listener used by gov5. TCP and QUIC may safely
 /// share the same numeric port; deployments can override it when their legacy
 /// gov5 topology already reserves a separate TCP port.
+/// AM6 entry form: `N42_FOLLOWER_MODE=1` runs this node as a Profile-1
+/// follower, a verifying non-validator. Only a Profile-1 genesis has it; it
+/// excludes the observer, and a follower holds no validator key.
+fn resolve_follower_mode(
+    requested: bool,
+    profile1: bool,
+    observer: bool,
+    validator_key_configured: bool,
+) -> eyre::Result<bool> {
+    if !requested {
+        return Ok(false);
+    }
+    if !profile1 {
+        return Err(eyre::eyre!("N42_FOLLOWER_MODE is a Profile-1 entry form (AM6); this genesis declares no profile"));
+    }
+    if observer {
+        return Err(eyre::eyre!("N42_FOLLOWER_MODE and N42_OBSERVER_MODE are mutually exclusive"));
+    }
+    if validator_key_configured {
+        return Err(eyre::eyre!(
+            "a Profile-1 follower holds no validator key: unset N42_VALIDATOR_KEY and N42_KEYSTORE_PATH"
+        ));
+    }
+    Ok(true)
+}
+
 fn listen_gov5_tcp(net_service: &mut NetworkService, default_port: u16) -> eyre::Result<()> {
     let tcp_port = env_parse("N42_GOV5_TCP_PORT").unwrap_or(default_port);
     let listen_ip = n42_listen_ip()?;
@@ -1622,8 +1648,23 @@ fn main() {
             std::process::exit(1);
         }
 
+        // AM6: a Profile-1 follower is a verifying non-validator: it holds no
+        // validator key, never votes or proposes and imports what the
+        // validators commit.
+        let follower_mode = resolve_follower_mode(
+            env_bool("N42_FOLLOWER_MODE"),
+            profile1.is_some(),
+            env_bool("N42_OBSERVER_MODE"),
+            std::env::var_os("N42_VALIDATOR_KEY").is_some()
+                || std::env::var_os("N42_KEYSTORE_PATH").is_some(),
+        )?;
+
         // Priority: N42_KEYSTORE_PATH (encrypted) > N42_VALIDATOR_KEY (plaintext) > random (dev).
-        let secret_key = if let Ok(ks_path) = std::env::var("N42_KEYSTORE_PATH") {
+        let secret_key = if follower_mode {
+            // Never in the genesis set, so the engine signs nothing with it.
+            info!(target: "n42::cli", "Profile-1 follower: no validator key; this node never votes, times out or proposes");
+            BlsSecretKey::random().map_err(|error| eyre::eyre!("failed to generate a BLS key: {error}"))?
+        } else if let Ok(ks_path) = std::env::var("N42_KEYSTORE_PATH") {
             let password = std::env::var("N42_KEYSTORE_PASSWORD").unwrap_or_else(|_| {
                 eprintln!("ERROR: N42_KEYSTORE_PASSWORD required when using N42_KEYSTORE_PATH");
                 std::process::exit(1);
@@ -2144,13 +2185,20 @@ fn main() {
         // Profile 1 (B2): this validator seals its own blocks with its key.
         let profile1_seal_key = secret_key.clone();
         let resolved_my_index = startup_validator_set.index_of_public_key(&my_pubkey);
-        if h2_v4_participant && resolved_my_index.is_none() {
+        if follower_mode && resolved_my_index.is_some() {
+            return Err(eyre::eyre!("a Profile-1 follower's key must not be in the validator set"));
+        }
+        if h2_v4_participant && resolved_my_index.is_none() && !follower_mode {
             return Err(eyre::eyre!(
-                "N42_GOV5_H2_PARTICIPANT requires N42_VALIDATOR_KEY to match an existing gov5 validator"
+                "N42_GOV5_H2_PARTICIPANT requires N42_VALIDATOR_KEY to match an existing gov5 validator \
+                 (a Profile-1 node without a validator key runs with N42_FOLLOWER_MODE=1)"
             ));
         }
         let my_index = resolved_my_index.unwrap_or_else(|| {
-                if consensus_config.initial_validators.is_empty() {
+                if follower_mode {
+                    // Outside the set: never a leader, never a voter.
+                    startup_validator_set.len()
+                } else if consensus_config.initial_validators.is_empty() {
                     // Dev mode with auto-generated validator set — index 0 is correct.
                     0
                 } else {
@@ -2172,7 +2220,9 @@ fn main() {
             .get_address(my_index)
             .copied()
             .unwrap_or_else(|_| {
-                if resolved_my_index.is_none() {
+                if follower_mode {
+                    info!(target: "n42::cli", "Profile-1 follower: no fee recipient (never builds)");
+                } else if resolved_my_index.is_none() {
                     info!(
                         target: "n42::cli",
                         "joining validator (provisional index {my_index}) — \
@@ -3071,9 +3121,20 @@ fn main() {
                 // ── Normal consensus mode ──────────────────────────────
                 let local_expected_peer_id = resolved_my_index
                     .and_then(|index| configured_validator_peer_ids.get(&index).copied());
-                let keypair = resolve_validator_p2p_keypair(my_index, local_expected_peer_id)?;
+                // A follower has its own identity: N42_P2P_KEY, else random;
+                // never a validator's deterministic one.
+                let keypair = if follower_mode {
+                    match load_explicit_p2p_keypair(None)? {
+                        Some(keypair) => keypair,
+                        None => libp2p::identity::Keypair::generate_ed25519(),
+                    }
+                } else {
+                    resolve_validator_p2p_keypair(my_index, local_expected_peer_id)?
+                };
                 let local_peer_id = keypair.public().to_peer_id();
-                if local_expected_peer_id.is_some() {
+                if follower_mode {
+                    info!(target: "n42::cli", %local_peer_id, configured = std::env::var_os("N42_P2P_KEY").is_some(), "P2P identity (Profile-1 follower)");
+                } else if local_expected_peer_id.is_some() {
                     info!(target: "n42::cli", %local_peer_id, "P2P identity (configured)");
                 } else {
                     info!(target: "n42::cli", %local_peer_id, "P2P identity (legacy deterministic fallback)");
@@ -3094,7 +3155,10 @@ fn main() {
                     genesis_hash,
                     std::env::var("N42_INTEROP_GENESIS_HASH").ok().as_deref(),
                 )?;
-                let swarm = if h2_v4_participant {
+                let swarm = if follower_mode {
+                    // No validator index in Identify: the follower is not in the set.
+                    build_interop_observer_swarm(keypair, transport_config, interop_genesis_hash)
+                } else if h2_v4_participant {
                     build_interop_participant_swarm(
                         keypair,
                         transport_config,
@@ -3163,7 +3227,13 @@ fn main() {
                 // Joining mode (key not in initial set): connect to ALL existing validators
                 // since no existing node will initiate a connection to us.
                 let val_count = startup_validator_set.len() as u32;
-                if !env_bool("N42_NO_AUTO_CONNECT") && val_count > 1 {
+                if follower_mode {
+                    // The validators' addresses are not derivable from a
+                    // follower's ports: it dials N42_TRUSTED_PEERS only.
+                    if std::env::var("N42_TRUSTED_PEERS").map_or(true, |peers| peers.trim().is_empty()) {
+                        warn!(target: "n42::cli", "Profile-1 follower without N42_TRUSTED_PEERS: it only learns of blocks from peers that dial it");
+                    }
+                } else if !env_bool("N42_NO_AUTO_CONNECT") && val_count > 1 {
                     let base_port = consensus_port.saturating_sub(my_index as u16);
                     let connect_range = if resolved_my_index.is_none() {
                         0..val_count
@@ -3727,14 +3797,17 @@ fn main() {
                         .provider
                         .header(consensus_head_hash)?
                         .map(|header| (consensus_head_hash, header));
-                    orchestrator = orchestrator.with_profile1_gate(
-                        profile1_import_gate(
-                            &full_node.provider.chain_spec().genesis,
-                            config,
-                            head,
-                        )?
-                        .with_seal_key(Arc::new(profile1_seal_key.clone())),
-                    );
+                    let gate = profile1_import_gate(
+                        &full_node.provider.chain_spec().genesis,
+                        config,
+                        head,
+                    )?;
+                    // B2: a follower seals nothing.
+                    orchestrator = orchestrator.with_profile1_gate(if follower_mode {
+                        gate
+                    } else {
+                        gate.with_seal_key(Arc::new(profile1_seal_key.clone()))
+                    });
                 }
 
                 if h2_v4_participant {
@@ -3795,6 +3868,10 @@ fn main() {
                         orchestrator = orchestrator.with_gov5_legacy_signing();
                     }
                     info!(target: "n42::cli", chain_id = identity.chain_id, genesis_hash = %identity.genesis_hash, validator_index = my_index, "H2-v4 participant bridge enabled");
+                }
+                if follower_mode {
+                    orchestrator = orchestrator.with_follower();
+                    info!(target: "n42::cli", "Profile-1 follower (AM6): importing and verifying; no votes, timeouts, proposals or builds");
                 }
 
                 // Restore prev_randao derivation from snapshot's last committed QC.
@@ -4228,6 +4305,18 @@ mod observer_identity_tests {
     fn observer_genesis_hash_rejects_malformed_identity() {
         let error = resolve_observer_genesis_hash(B256::ZERO, Some("0x1234")).unwrap_err();
         assert!(error.to_string().contains("N42_INTEROP_GENESIS_HASH"));
+    }
+
+    #[test]
+    fn follower_mode_is_profile1_keyless_and_not_an_observer() {
+        assert!(!resolve_follower_mode(false, true, false, true).unwrap());
+        assert!(resolve_follower_mode(true, true, false, false).unwrap());
+        let refused = |profile1, observer, key| {
+            resolve_follower_mode(true, profile1, observer, key).unwrap_err().to_string()
+        };
+        assert!(refused(false, false, false).contains("Profile-1 entry form"));
+        assert!(refused(true, true, false).contains("N42_OBSERVER_MODE"));
+        assert!(refused(true, false, true).contains("no validator key"));
     }
 
     #[test]
