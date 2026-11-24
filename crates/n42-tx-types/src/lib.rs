@@ -27,9 +27,9 @@ pub use frame_store::{FrameStore, StoredFrame, frame_ref_blocks_enabled};
 pub use primitives::{Block, BlockBody, N42Primitives, Receipt};
 pub use rpc::{AltSigRpcReceipt, N42RpcReceipt};
 pub use sender_cache::{
-    AltSigSenderCache, IngestVerify, alt_sig_enabled, ed25519_batch_size, ingest_shard,
-    ingest_verify_mode, parse_ingest_verify, senders_claimed_at_ingest, set_alt_sig_enabled,
-    shard_owner,
+    AltSigSenderCache, IngestVerify, alt_sig_enabled, bench_unsafe_acknowledged,
+    ed25519_batch_size, ingest_shard, ingest_verify_mode, parse_ingest_verify,
+    senders_claimed_at_ingest, set_alt_sig_enabled, shard_owner, trusting_ingest_refusal,
 };
 
 #[cfg(test)]

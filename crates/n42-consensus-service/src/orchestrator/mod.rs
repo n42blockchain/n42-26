@@ -1457,6 +1457,13 @@ pub struct ConsensusService {
     /// execution-ready deadline must not start a second import of a block
     /// that is already being executed: both would run the same block at once.
     eager_imports_in_flight: Arc<std::sync::Mutex<HashSet<B256>>>,
+    /// Hashes whose cached block data an eager import task found not to be
+    /// that block: bytes that do not decompress or decode, a payload of
+    /// another hash, or one the engine called invalid. The envelope's hash is
+    /// only claimed until then, so the loop drops such an entry
+    /// ([`Self::drop_rejected_block_data`]) before it lets the entry stand in
+    /// for the block.
+    rejected_block_data: Arc<std::sync::Mutex<HashSet<B256>>>,
     /// Fast propose mode: skip slot boundary alignment, build immediately after
     /// ViewChanged/BlockCommitted. Consensus voting naturally paces block production.
     /// Enabled by `N42_FAST_PROPOSE=1`. Default: false (grid-aligned slots).
@@ -1525,6 +1532,7 @@ impl ConsensusService {
 
     fn request_h2_v4_gov5_block(&mut self, peer: PeerId, block_hash: B256) {
         let now = Instant::now();
+        self.drop_rejected_block_data();
         if block_hash == B256::ZERO || self.h2_v4_fetch_fulfilled_recently(block_hash, now) {
             return;
         }
@@ -1853,6 +1861,7 @@ impl ConsensusService {
         requested_hash: Option<B256>,
     ) {
         const MAX_H2_V4_UNBOUND_BLOCKS: usize = 512;
+        self.drop_rejected_block_data();
         // The leader sends each block as native block data and as a Gov5
         // block; the native copy usually arrives first. Hashing the header is
         // enough to recognise it, before the full decode (every transaction
@@ -2384,6 +2393,26 @@ impl ConsensusService {
 
         self.pending_block_data.insert(hash, data);
         true
+    }
+
+    /// Forgets cached block data that an eager import task rejected, so the
+    /// next copy of the block is taken and a fetch for it is not held back:
+    /// the rejected bytes may be a forgery under an honest block's hash.
+    fn drop_rejected_block_data(&mut self) {
+        let rejected = std::mem::take(
+            &mut *self
+                .rejected_block_data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if rejected.is_empty() {
+            return;
+        }
+        counter!("n42_block_data_rejected_dropped_total").increment(rejected.len() as u64);
+        self.pending_block_data
+            .retain(|hash, _| !rejected.contains(hash));
+        self.recent_block_data
+            .retain(|entry| !rejected.contains(&entry.block_hash));
     }
 
     /// Drops cached proposal data up to and including `view`, keeping blocks
@@ -3361,6 +3390,7 @@ impl ConsensusService {
             commit_to_build_recorded_parent: None,
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             eager_imports_in_flight: Arc::default(),
+            rejected_block_data: Arc::default(),
             fast_propose: std::env::var("N42_FAST_PROPOSE")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
@@ -3620,6 +3650,7 @@ impl ConsensusService {
             commit_to_build_recorded_parent: None,
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             eager_imports_in_flight: Arc::default(),
+            rejected_block_data: Arc::default(),
             fast_propose,
             async_finalize_fcu,
             defer_state_root: false,
@@ -9884,6 +9915,56 @@ mod tests {
         assert!(
             !orch.pending_block_data.contains_key(&bad_hash),
             "known bad direct/gossip data must be dropped before consensus notification"
+        );
+    }
+
+    /// An envelope naming an honest block's hash over a payload of another
+    /// hash is dropped once its import task has seen the mismatch, so the
+    /// real copy is taken instead of being treated as a duplicate.
+    #[tokio::test(flavor = "current_thread")]
+    async fn forged_block_data_gives_way_to_the_real_copy() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let parent = B256::repeat_byte(0x51);
+        let block_hash = B256::repeat_byte(0x52);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+
+        // The payload inside is the block of another hash.
+        let payload_json =
+            serde_json::to_vec(&test_execution_data(parent, B256::repeat_byte(0x53))).unwrap();
+        let forged = bincode::serialize(&BlockDataBroadcast {
+            block_hash,
+            view: u64::MAX,
+            payload_json,
+            timestamp: 1,
+            execution_output: None,
+            leader_ready_unix_ms: 0,
+            native_header_rlp: None,
+        })
+        .unwrap();
+        orch.handle_block_data(forged).await;
+        assert!(orch.pending_block_data.contains_key(&block_hash));
+        drain_spawned_tasks().await;
+        assert!(mock.new_payload_hashes().is_empty());
+
+        orch.handle_block_data(test_block_data(parent, block_hash, 1))
+            .await;
+        drain_spawned_tasks().await;
+        assert_eq!(mock.new_payload_hashes(), vec![block_hash]);
+        assert!(orch.pending_block_data.contains_key(&block_hash));
+        assert_eq!(
+            orch.recent_block_data
+                .iter()
+                .filter(|entry| entry.block_hash == block_hash)
+                .count(),
+            1,
+            "the forged envelope is gone from the recent ring too"
         );
     }
 

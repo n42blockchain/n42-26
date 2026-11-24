@@ -89,6 +89,11 @@ const GOV5_BLOCK_REQUEST_COOLDOWN: Duration = Duration::from_millis(750);
 // are redundant and safely ignored after their request id is reaped.
 const GOV5_BLOCK_REQUEST_STALE_AFTER: Duration = Duration::from_millis(1500);
 const MAX_SERVED_GOV5_BLOCKS: usize = 1024;
+/// Bytes of block bodies the serve cache holds. A body is retained with only
+/// its header read and may be 64 MiB, so the entry count alone lets peers pin
+/// 64 GiB; this holds sixteen blocks of the largest size and every block of
+/// an ordinary one.
+const MAX_SERVED_GOV5_BLOCK_BYTES: usize = 1024 * 1024 * 1024;
 const GOV5_RANGE_BLOCKS_PER_SECOND: f64 = 1024.0;
 const GOV5_RANGE_BLOCKS_BURST: f64 = 4096.0;
 const MAX_PENDING_GOV5_RANGES: usize = 8;
@@ -172,6 +177,7 @@ fn cache_gov5_served_block_unverified(
                 held.verified = true;
             } else {
                 held.rlp = rlp.to_vec();
+                evict_served_gov5_blocks_over(blocks, order, MAX_SERVED_GOV5_BLOCK_BYTES);
             }
         }
         Some(_) => {}
@@ -194,6 +200,23 @@ fn insert_served_gov5_block(
         order.push_back(hash);
     }
     blocks.insert(hash, block);
+    evict_served_gov5_blocks_over(blocks, order, MAX_SERVED_GOV5_BLOCK_BYTES);
+}
+
+/// Drops the oldest retained blocks until the bodies held fit in `budget`,
+/// always leaving the newest.
+fn evict_served_gov5_blocks_over(
+    blocks: &mut HashMap<B256, ServedGov5Block>,
+    order: &mut VecDeque<B256>,
+    budget: usize,
+) {
+    let mut held: usize = blocks.values().map(|block| block.rlp.len()).sum();
+    while held > budget && order.len() > 1 {
+        let Some(oldest) = order.pop_front() else { break };
+        if let Some(dropped) = blocks.remove(&oldest) {
+            held -= dropped.rlp.len();
+        }
+    }
 }
 
 /// The body to answer a block-by-hash request with, or empty. An unchecked
@@ -4357,6 +4380,27 @@ mod tests {
         );
         assert!(blocks[&other_hash].verified);
         assert_eq!(order, VecDeque::from([hash, other_hash]));
+    }
+
+    #[test]
+    fn gov5_serve_cache_drops_the_oldest_bodies_over_its_byte_budget() {
+        let mut blocks = HashMap::new();
+        let mut order = VecDeque::new();
+        let hashes: Vec<_> = (1..=4u64)
+            .map(|number| {
+                cache_gov5_served_block(&mut blocks, &mut order, &served_block_fixture(number), None)
+                    .unwrap()
+            })
+            .collect();
+        let size = blocks[&hashes[0]].rlp.len();
+        // Room for two and a half: the two oldest go.
+        evict_served_gov5_blocks_over(&mut blocks, &mut order, size * 5 / 2);
+        assert_eq!(order, VecDeque::from([hashes[2], hashes[3]]));
+        assert_eq!(blocks.len(), 2);
+        // The newest stays even when it alone is over the budget.
+        evict_served_gov5_blocks_over(&mut blocks, &mut order, 0);
+        assert_eq!(order, VecDeque::from([hashes[3]]));
+        assert!(blocks.contains_key(&hashes[3]));
     }
 
     #[test]

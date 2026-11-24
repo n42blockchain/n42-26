@@ -843,6 +843,7 @@ impl ConsensusService {
             return;
         }
         let duplicate_bytes = data.len();
+        self.drop_rejected_block_data();
         let duplicate = self.pending_block_data.contains_key(&hash);
         self.record_timeout_diag_block_data_received(
             broadcast.view,
@@ -937,6 +938,14 @@ impl ConsensusService {
             let block_guard = self.eager_import_block_guard.clone();
             let exec_cache = self.exec_output_cache.clone();
             let bad_blocks = self.bad_blocks.clone();
+            let rejected_block_data = self.rejected_block_data.clone();
+            // The cached envelope turned out not to be the block of `hash`.
+            let reject_block_data = move || {
+                rejected_block_data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(hash);
+            };
             let eager_span = tracing::info_span!(
                 target: "n42.cl.exec_bridge.eager_import",
                 "follower_eager_import",
@@ -950,7 +959,10 @@ impl ConsensusService {
                 let decompress_start = std::time::Instant::now();
                 let payload_wire = match super::decompress_payload(&payload_compressed) {
                     Ok(d) => d,
-                    Err(_) => return,
+                    Err(_) => {
+                        reject_block_data();
+                        return;
+                    }
                 };
                 let decompress_ms = decompress_start.elapsed().as_millis() as u64;
                 // Deserialize first, then use typed accessor for block number.
@@ -975,6 +987,7 @@ impl ConsensusService {
                                 Err(retry_error) => {
                                     metrics::counter!("n42_payload_decode_retry_total", "outcome" => "failed").increment(1);
                                     warn!(target: "n42::cl::exec_bridge", %hash, %error, %retry_error, payload_format, "failed to decode execution payload");
+                                    reject_block_data();
                                     return;
                                 }
                             }
@@ -988,6 +1001,7 @@ impl ConsensusService {
                         "block-data envelope hash does not match execution payload; dropping"
                     );
                     metrics::counter!("n42_block_data_payload_hash_mismatch_total").increment(1);
+                    reject_block_data();
                     return;
                 }
                 let block_ts = execution_data.payload.timestamp();
@@ -1208,6 +1222,12 @@ impl ConsensusService {
                                 &status.status,
                                 "block_data_eager",
                             );
+                        }
+                        // Syncing and Accepted leave the data standing: the
+                        // parent may only be late. An invalid payload is not
+                        // the block a later copy of this hash may carry.
+                        if matches!(status.status, PayloadStatusEnum::Invalid { .. }) {
+                            reject_block_data();
                         }
                         warn!(target: "n42::cl::exec_bridge", %hash, view, %parent_hash, status = ?status.status, compact_injected, elapsed_ms = import_start.elapsed().as_millis() as u64, "follower eager import: not accepted");
                         if compact_injected {

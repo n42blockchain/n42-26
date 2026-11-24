@@ -117,6 +117,7 @@ def main():
         'N42_FAST_TRANSFER':'1', 'N42_FOLLOWER_DIRECT_IMPORT':'1',
         'N42_TX_QUEUE_BATCH':'1024', 'N42_TX_QUEUE_DRAINER':'1', 'N42_TX_QUEUE_RUN':'64',
         'N42_FRAME_GATEWAYS':'0x87f7d242c742c0990ded1018a88b1296dbd89adbab9dff0bda008678beb2aa12',
+        'N42_BENCH_UNSAFE':'1',
         'RAYON_NUM_THREADS':str(args.workers), 'RUST_LOG':'info',
         'MALLOC_CONF':'narenas:2,dirty_decay_ms:2000,muzzy_decay_ms:0,background_thread:true,oversize_threshold:0',
         'RETH_ENGINE_NUM_STATE_MASKING_BLOCKS':'0',

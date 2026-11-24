@@ -1228,6 +1228,23 @@ fn main() {
         unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     }
 
+    // A trusting ingest (shard verification, frame gateways, an ingest server
+    // bound off loopback) lets transactions in under senders no signature
+    // check here established: benchmark probes, refused unless the operator
+    // acknowledges them with N42_BENCH_UNSAFE=1.
+    let ingest_enabled =
+        std::env::var_os("N42_INGEST_PORT").is_some() || std::env::var_os("N42_INJECT_PORT").is_some();
+    let ingest_bind = std::env::var("N42_INGEST_BIND").ok().filter(|_| ingest_enabled);
+    if let Some(refusal) = n42_tx_types::trusting_ingest_refusal(
+        n42_tx_types::ingest_verify_mode(),
+        std::env::var_os("N42_FRAME_GATEWAYS").is_some(),
+        ingest_bind.as_deref(),
+        std::env::var("N42_BENCH_UNSAFE").ok().as_deref(),
+    ) {
+        eprintln!("error: {refusal}");
+        std::process::exit(2);
+    }
+
     // After the environment is final: the watcher is the first extra thread.
     #[cfg(feature = "pprof")]
     pprof_capture::spawn_from_env(

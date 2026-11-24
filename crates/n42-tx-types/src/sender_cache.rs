@@ -195,6 +195,66 @@ pub fn parse_ingest_verify(
     Ok(IngestVerify::Shard { index, count })
 }
 
+/// Whether `N42_BENCH_UNSAFE` holds the operator's acknowledgement that this
+/// node runs a trusting ingest for a benchmark: exactly `1`, nothing else
+/// (not `true`, not ` 1`).
+pub fn bench_unsafe_acknowledged(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Why a node must not start with these ingest settings, or `None` when it
+/// may. `mode` is [`ingest_verify_mode`]'s answer, `gateways` whether
+/// `N42_FRAME_GATEWAYS` is set, `ingest_bind` the address the ingest server
+/// binds when it is enabled, and `bench_unsafe` the value of
+/// `N42_BENCH_UNSAFE`.
+///
+/// Three settings let a transaction into a block under a sender no signature
+/// check on this node established: `N42_INGEST_VERIFY=shard` (other shards'
+/// transactions are recorded under the sender their frame claims and nothing
+/// re-verifies them), `N42_FRAME_GATEWAYS` (an attested frame's 0x50
+/// transactions are admitted under the senders their keys derive, on the
+/// gateways' word), and an ingest server bound off loopback (it takes the
+/// sender from the wire). They are benchmark probes, refused unless the
+/// operator acknowledges them ([`bench_unsafe_acknowledged`]). A malformed
+/// `shard` setting is refused either way. `all` and `leader` always may.
+pub fn trusting_ingest_refusal(
+    mode: Result<IngestVerify, String>,
+    gateways: bool,
+    ingest_bind: Option<&str>,
+    bench_unsafe: Option<&str>,
+) -> Option<String> {
+    let mode = match mode {
+        Ok(mode) => mode,
+        Err(error) => return Some(error),
+    };
+    if bench_unsafe_acknowledged(bench_unsafe) {
+        return None;
+    }
+    let what = if matches!(mode, IngestVerify::Shard { .. }) {
+        "N42_INGEST_VERIFY=shard records other shards' transactions under the sender their \
+         frame claims, and nothing verifies those signatures"
+            .to_string()
+    } else if gateways {
+        "N42_FRAME_GATEWAYS admits 0x50 transactions on a gateway's attestation, without \
+         verifying their signatures"
+            .to_string()
+    } else {
+        let bind = ingest_bind.filter(|bind| !is_loopback_host(bind))?;
+        format!(
+            "N42_INGEST_BIND={bind} is not a loopback address, and the ingest server takes a \
+             transaction's sender from the wire without a signature check"
+        )
+    };
+    Some(format!(
+        "{what}; it is a benchmark probe and is unsafe on a real chain. Set N42_BENCH_UNSAFE=1 \
+         to run it anyway"
+    ))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
+}
+
 /// The shard a transaction belongs to among `count`: the first eight bytes of
 /// its hash, little-endian, modulo `count`.
 pub fn shard_owner(hash: &B256, count: u64) -> u64 {
@@ -325,5 +385,38 @@ mod shard_tests {
         ] {
             assert!(parse_ingest_verify(Some("shard"), bad).is_err(), "{bad:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod trusting_ingest_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn trusting_settings_need_the_acknowledgement() {
+        let shard = || Ok(IngestVerify::Shard { index: 0, count: 3 });
+        // The verifying modes on a loopback ingest always start.
+        for mode in [IngestVerify::All, IngestVerify::Leader] {
+            assert_eq!(trusting_ingest_refusal(Ok(mode), false, None, None), None);
+            assert_eq!(trusting_ingest_refusal(Ok(mode), false, Some("127.0.0.1"), None), None);
+        }
+        // Each trusting setting is refused on its own and names itself.
+        let refused = |mode, gateways, bind, names: &str| {
+            let refusal = trusting_ingest_refusal(mode, gateways, bind, None).unwrap();
+            assert!(refusal.contains(names) && refusal.contains("N42_BENCH_UNSAFE=1"), "{refusal}");
+        };
+        refused(shard(), false, None, "N42_INGEST_VERIFY=shard");
+        refused(Ok(IngestVerify::All), true, None, "N42_FRAME_GATEWAYS");
+        refused(Ok(IngestVerify::All), false, Some("0.0.0.0"), "N42_INGEST_BIND=0.0.0.0");
+        // Exactly `1` acknowledges them; nothing else does.
+        assert_eq!(trusting_ingest_refusal(shard(), true, Some("0.0.0.0"), Some("1")), None);
+        for other in ["true", " 1", "0", ""] {
+            assert!(trusting_ingest_refusal(shard(), false, None, Some(other)).is_some());
+        }
+        // A malformed shard setting is refused even when acknowledged.
+        assert_eq!(
+            trusting_ingest_refusal(Err("bad shard".into()), false, None, Some("1")),
+            Some("bad shard".into())
+        );
     }
 }

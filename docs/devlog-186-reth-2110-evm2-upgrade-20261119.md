@@ -1388,3 +1388,48 @@ PR #31（本分支合入 main）评审中确认的三处缺陷，各附回归测
 - **网关担保的 0x50 帧**：发送方仅由公钥推出即进入 sender cache，导入时不再验签；块是否有效取决于本地缓存。需明确网关是否可信。
 - **serve cache 的总字节上限**：`MAX_SERVED_GOV5_BLOCKS = 1024` × 64 MiB，未加字节预算。
 - 自有块"已入队即 VALID"、`N42_QMDB_ADOPT_BUILT`、构建前等待叠加超过 view 超时、stale own-block tips：均依赖可选开关或特定时序，评审未能完全确认触发路径。
+
+## 进度记录（2026-11-24 续二）：参照 n42-rs / gov5 处理评审余下四项
+
+上一节列为"需维护者决定"的四项，对照另外两个客户端的做法后处理。对照结论：n42-rs 与 gov5 都只按本地算出的头哈希缓存块数据；n42-rs 在导入被拒时清掉该块的所有副本且不标坏哈希（`h2-node/src/service.rs` `forget_rejected_body`）；n42-rs 的"共享执行"只在同进程的多把 key 之间共享导入结论，从不跨进程接受执行输出；网关担保在 n42-rs 同样不验签，但被 `N42_BENCH_UNSAFE=1` 与回环绑定围住；两者的未校验块缓存都只有条数上限，没有字节上限。
+
+### 6. 导入拒绝后清掉缓存的块数据（参照 n42-rs）
+
+- **缺陷**：`pending_block_data` 以信封自报的哈希为键，eager import 任务发现载荷不是该块（解压/解码失败、载荷哈希不同、引擎判 Invalid）后只是返回，条目留在缓存；之后同哈希的真副本被当作重复丢弃，Gov5 副本走提前返回，按哈希抓取也被拦。
+- **修复**：`ConsensusService` 增加 `rejected_block_data: Arc<Mutex<HashSet<B256>>>`，import 任务在上述四处写入；`drop_rejected_block_data()` 在三个把缓存条目当作"已有该块"的入口先执行（`handle_block_data` 去重前、`handle_h2_v4_gov5_block` 提前返回前、`request_h2_v4_gov5_block`），从 `pending_block_data` 和 `recent_block_data` 删除。Syncing / Accepted 不算拒绝（父块可能只是晚到）。
+- **为什么是共享集合而不是新通道**：主循环的 select 不用加分支；驱逐发生在真正需要的时刻（下一份副本或抓取请求到来时）。
+- **测试**：`forged_block_data_gives_way_to_the_real_copy`（去掉修复时失败：真副本未被提交给引擎）。
+- **未处理**：`bad_blocks.insert_if_invalid` 仍会在引擎判 Invalid 时标坏哈希。gov5 只对"交易根已匹配后的执行无效"标坏；这里若头部诚实、正文被改的载荷能让引擎返回 Invalid，诚实哈希仍可能被标坏。未验证引擎对此返回的状态，未改。
+- **未处理**：`prune_pending_block_data_through` 仍按信封里的 view 保留条目。
+
+### 7. 对端执行输出只保留根覆盖的部分
+
+- **缺陷**：QMDB 根只由"已修改的账户、已变更的槽"推导（`push_account_operations`），reth 的 `HashedPostState::from_bundle_state` 却把 bundle 里每个账户和槽都写入。标为未修改的账户（含 `LoadedNotExisting` + `info: None`，会被当作删除）与未变更的槽，值由对端任意给出而不影响任何根。
+- **修复**：`inject_compact_block_with` 在结构检查后调用 `keep_only_changes`：未销毁账户的未变更槽删除；`is_not_modified` 的账户删除；未修改却带已变更槽的账户视为不一致，整份输出拒绝。
+- **为什么是剔除而不是拒绝**：诚实 bundle 本来就带未变更的槽（QMDB 推导里特意跳过它们），整份拒绝等于关掉共享执行。剔除的条目对诚实 bundle 是数据库里已有的值，不改变结果。
+- **测试**：`a_peer_bundle_keeps_only_what_the_root_covers`。
+- **仍然不可校验**：`original_info` 与 reverts（只影响回滚数据）。n42-rs 的做法是根本不跨进程传执行输出；n42-26 若保留该功能，来源应限定为同机。
+
+### 8. 信任式 ingest 需显式确认（参照 n42-rs）
+
+- **内容**：`n42_tx_types::trusting_ingest_refusal`，节点 `main()` 启动时检查；以下任一成立而 `N42_BENCH_UNSAFE` 不是恰好 `1` 时，打印原因并以退出码 2 结束：
+  - `N42_INGEST_VERIFY=shard`（其他分片的交易按帧声明的发送方入 sender cache，无处复验）；
+  - 设置了 `N42_FRAME_GATEWAYS`（担保帧的 0x50 交易不验签）；
+  - ingest 服务启用且 `N42_INGEST_BIND` 不是回环地址（发送方取自线上数据）。
+  - `N42_INGEST_SHARD` 格式错误时无论是否确认都拒绝（`ingest_verify_mode` 的文档早已这样写，但此前没有调用点）。
+- `all` 与 `leader` 不受影响。
+- **对现有流程的影响**：用到上述三项的压测需加 `N42_BENCH_UNSAFE=1`。`scripts/native-fleet-local.py` 已加；`chain94-fleet.py` 通过 `--env` 传入的需自行补上。
+- **与 n42-rs 的差别**：n42-rs 在信任模式下一律拒绝非回环绑定；这里允许经确认后绑定，因为原实现就支持并只给告警。n42-rs 还把 `leader` 归入需确认，这里按本仓 `senders_claimed_at_ingest` 的说明（builder 与投票路径都会复验）未归入。
+- **测试**：`trusting_settings_need_the_acknowledgement`。
+
+### 9. serve cache 的字节预算
+
+- **内容**：`MAX_SERVED_GOV5_BLOCK_BYTES = 1 GiB`，`insert_served_gov5_block` 及替换路径之后按 FIFO 驱逐到预算内，始终保留最新一块。
+- **为什么不照 n42-rs 把条数降到 16**：缓存未命中时的后备（`gov5_canonical_blocks`）只覆盖已上链的块，且并非所有配置都有；直接降条数会让追块节点取不到近期块。字节预算在最坏情况（每块 64 MiB）下等于 16 块，与 n42-rs 最坏情况相同，普通大小的块仍可保留到 1024 条。
+- **测试**：`gov5_serve_cache_drops_the_oldest_bodies_over_its_byte_budget`。
+
+### 状态
+
+- 单元测试：n42-tx-types 36 通过；n42-network 226 通过；n42-consensus-service 268 通过；n42-node 311 通过、1 失败（仍是 macOS 上的 `memory_watch::tests::resident_memory_is_read`）；n42-node-bin 全部通过。
+- clippy（上述五个 crate，`--all-targets -D warnings`）通过。
+- 未跑完整 workspace 测试、E2E 与机群；第 8 项的启动拒绝只有函数级测试，没有起真实节点验证。

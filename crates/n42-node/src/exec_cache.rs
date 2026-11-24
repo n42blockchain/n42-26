@@ -481,6 +481,34 @@ fn validate_compact_structure(compact: &CompactBlockExecution) -> Result<(), &'s
     Ok(())
 }
 
+/// Drops what a peer's bundle carries beyond the block's changes. The QMDB
+/// root is derived from changed accounts and changed slots only
+/// (`push_account_operations`), while reth writes every account and slot of
+/// the bundle to its hashed state, so an entry marked unchanged would be
+/// persisted with whatever value the peer gave it and no root would notice.
+/// An honest bundle loses nothing: its unchanged entries repeat what the
+/// database holds. An account marked unmodified that still claims changed
+/// slots is refused.
+fn keep_only_changes(
+    bundle: &mut reth_trie_common::bundle_state::BundleState,
+) -> Result<(), &'static str> {
+    let mut inconsistent = false;
+    bundle.state.retain(|_, account| {
+        if !account.was_destroyed() {
+            account.storage.retain(|_, slot| slot.is_changed());
+        }
+        if !account.status.is_not_modified() {
+            return true;
+        }
+        inconsistent |= !account.storage.is_empty();
+        false
+    });
+    if inconsistent {
+        return Err("unmodified account carries changed storage");
+    }
+    Ok(())
+}
+
 /// Deserialize compact block execution output and load it into the payload cache.
 pub(crate) fn inject_compact_block(hash: &B256, compressed: &[u8], source: &'static str) -> bool {
     inject_compact_block_with(hash, compressed, source, |_| Ok(()))
@@ -509,7 +537,7 @@ fn inject_compact_block_with(
     let decompress_ms = decompress_start.elapsed().as_millis() as u64;
 
     let deser_start = std::time::Instant::now();
-    let compact = match CompactBlockExecution::decode(&decompressed) {
+    let mut compact = match CompactBlockExecution::decode(&decompressed) {
         Ok(c) => c,
         Err(e) => {
             warn!(target: "n42::cl::exec_bridge", %hash, error = %e, "compact block: failed to deserialize");
@@ -519,6 +547,12 @@ fn inject_compact_block_with(
     let deser_ms = deser_start.elapsed().as_millis() as u64;
 
     if let Err(reason) = validate_compact_structure(&compact) {
+        metrics::counter!("n42_compact_block_structure_rejects_total").increment(1);
+        warn!(target: "n42::cl::exec_bridge", %hash, source, reason, "compact block: refusing peer output");
+        return false;
+    }
+
+    if let Err(reason) = keep_only_changes(&mut compact.bundle_state) {
         metrics::counter!("n42_compact_block_structure_rejects_total").increment(1);
         warn!(target: "n42::cl::exec_bridge", %hash, source, reason, "compact block: refusing peer output");
         return false;
@@ -561,6 +595,67 @@ fn inject_compact_block_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What reth would persist from a peer's bundle beyond the block's
+    /// changes is dropped: an unmodified account (here with a balance the
+    /// peer invented, and one marked absent, which would delete it) and a
+    /// slot whose value did not change. A destroyed account keeps its slots.
+    #[test]
+    fn a_peer_bundle_keeps_only_what_the_root_covers() {
+        use alloy_primitives::U256;
+        use evm2::evm::AccountInfo;
+        use reth_trie_common::bundle_state::{
+            AccountStatus, BundleAccount, BundleState, StorageSlot,
+        };
+        let info = |balance: u64| {
+            Some(AccountInfo { balance: U256::from(balance), ..Default::default() })
+        };
+        let slots = |slots: &[(u64, u64, u64)]| {
+            slots
+                .iter()
+                .map(|(key, was, is)| {
+                    (U256::from(*key), StorageSlot::new_changed(U256::from(*was), U256::from(*is)))
+                })
+                .collect()
+        };
+        let (changed, invented, absent, destroyed) = (
+            Address::repeat_byte(1),
+            Address::repeat_byte(2),
+            Address::repeat_byte(3),
+            Address::repeat_byte(4),
+        );
+        let mut bundle = BundleState::default();
+        bundle.state.insert(
+            changed,
+            BundleAccount::new(info(1), info(2), slots(&[(1, 5, 6), (2, 9, 9)]), AccountStatus::Changed),
+        );
+        bundle.state.insert(
+            invented,
+            BundleAccount::new(info(u64::MAX), info(u64::MAX), slots(&[(1, 7, 7)]), AccountStatus::Loaded),
+        );
+        bundle.state.insert(
+            absent,
+            BundleAccount::new(None, None, Default::default(), AccountStatus::LoadedNotExisting),
+        );
+        bundle.state.insert(
+            destroyed,
+            BundleAccount::new(info(3), None, slots(&[(1, 4, 4)]), AccountStatus::Destroyed),
+        );
+        keep_only_changes(&mut bundle).unwrap();
+        let mut kept: Vec<_> = bundle.state.keys().copied().collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec![changed, destroyed]);
+        assert_eq!(bundle.state[&changed].storage.keys().copied().collect::<Vec<_>>(), vec![U256::from(1)]);
+        assert_eq!(bundle.state[&destroyed].storage.len(), 1);
+
+        // Unmodified, yet claiming a changed slot: the two cannot both hold.
+        let mut bundle = BundleState::default();
+        bundle.state.insert(
+            invented,
+            BundleAccount::new(info(1), info(1), slots(&[(1, 7, 8)]), AccountStatus::Loaded),
+        );
+        assert!(keep_only_changes(&mut bundle).is_err());
+    }
 
     // Reth's broadcast cache is one process-global slot.
     static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
