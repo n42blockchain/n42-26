@@ -31,8 +31,11 @@ use tracing::{debug, info, warn};
 const RANGE_IMPORT_BATCH: usize = 32;
 
 /// Strict header-QC check: the set of the QC's own epoch from the engine
-/// (current, staged next or historical) or the epoch schedule file, with no
-/// fallback to the current or a same-size set (sync standard section 3.3).
+/// (current, staged next or historical) or an entry of the epoch schedule
+/// file for exactly that epoch, with no fallback to the current, the last
+/// scheduled or a same-size set (sync standard section 3.3). The schedule
+/// file does not record validator changes voted on chain, so an earlier
+/// entry says nothing about a later epoch.
 pub(super) fn range_qc_check(
     engine: &ConsensusEngine,
     schedule: Option<&crate::epoch_schedule::EpochSchedule>,
@@ -48,7 +51,7 @@ pub(super) fn range_qc_check(
         .cloned()
         .or_else(|| {
             schedule
-                .and_then(|schedule| schedule.config_at_or_below(epochs.epoch_for_view(qc.view)))
+                .and_then(|schedule| schedule.get_for_epoch(epochs.epoch_for_view(qc.view)))
                 .and_then(|(validators, fault_tolerance)| {
                     ValidatorSet::try_new(validators, fault_tolerance).ok()
                 })

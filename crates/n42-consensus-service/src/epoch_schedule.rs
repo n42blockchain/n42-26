@@ -133,15 +133,6 @@ impl EpochSchedule {
             .map(|(validators, fault_tolerance)| (validators.as_slice(), *fault_tolerance))
     }
 
-    /// The last scheduled entry at or below `epoch`, with no fallback to the
-    /// genesis set (the strict set source of the sync standard section 3.6).
-    pub fn config_at_or_below(&self, epoch: u64) -> Option<(&[ValidatorInfo], u32)> {
-        self.entries
-            .range(..=epoch)
-            .next_back()
-            .map(|(_, (validators, fault_tolerance))| (validators.as_slice(), *fault_tolerance))
-    }
-
     pub fn active_config_for_epoch<'a>(
         &'a self,
         epoch: u64,
