@@ -410,7 +410,9 @@ async fn run_mode(native: bool, reuse_builder_output: bool, follower: bool) -> e
         let encoded = n42_network::encode_gov5_block_rlp(&normalized)?;
         let decoded = n42_network::decode_gov5_block_rlp(&encoded)?;
         assert_eq!(decoded.block_hash, normalized.block_hash());
-        assert_eq!(decoded.mobile_registry_root, Some(B256::ZERO));
+        // The child takes the shape of its parent, a Cancun genesis header
+        // without the registry root, as current Gov5 writes it.
+        assert_eq!(decoded.mobile_registry_root, None);
         assert_eq!(decoded.header.parent_beacon_block_root, Some(B256::ZERO));
         assert_eq!(
             decoded.header.withdrawals_root,

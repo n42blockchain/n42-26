@@ -212,19 +212,18 @@ fn authenticated_native_producer_head(
     if with_zero_registry.hash() == expected_hash {
         return Ok(with_zero_registry);
     }
-    // Gov5's genesis omits the registry field. It is still authenticated by
-    // its exact native hash; only post-genesis heads must carry the zero field.
-    if header.number == 0 {
-        let genesis = n42_consensus::Gov5NativeHeader {
-            header,
-            mobile_registry_root: None,
-        };
-        if genesis.hash() == expected_hash {
-            return Ok(genesis);
-        }
+    // Gov5's genesis omits the registry field, and so does every header of a
+    // chain run by Gov5 since it moved the root behind Glamsterdam. Either is
+    // authenticated by its exact native hash, like the zero-registry form.
+    let without_registry = n42_consensus::Gov5NativeHeader {
+        header,
+        mobile_registry_root: None,
+    };
+    if without_registry.hash() == expected_hash {
+        return Ok(without_registry);
     }
     Err(eyre::eyre!(
-        "native producer requires an authenticated zero-registry head"
+        "native producer requires a head authenticated with a zero registry root or none"
     ))
 }
 
@@ -3750,9 +3749,10 @@ fn main() {
                         if qmdb_execution_store.is_none() || trusted_state_root_base.is_some() {
                             return Err(eyre::eyre!("native producer requires recomputed QMDB roots"));
                         }
-                        // Reth persists the alloy header view, not field 23. Rebuild
-                        // the supported zero-registry form and bind it to the exact
-                        // durable head hash before using it for a leader build.
+                        // Reth persists the alloy header view, not the registry
+                        // field. Rebuild the native form, with the zero root or
+                        // without one, and bind it to the exact durable head hash
+                        // before using it for a leader build.
                         let header = full_node.provider.header(consensus_head_hash)?
                             .ok_or_else(|| eyre::eyre!("native producer head is missing"))?;
                         let native = authenticated_native_producer_head(header, consensus_head_hash)?;
@@ -4050,7 +4050,7 @@ mod observer_identity_tests {
     }
 
     #[test]
-    fn native_producer_accepts_only_authenticated_genesis_without_registry_field() {
+    fn native_producer_accepts_a_head_authenticated_with_a_zero_registry_root_or_none() {
         let genesis = alloy_consensus::Header::default();
         let legacy_genesis = n42_consensus::Gov5NativeHeader {
             header: genesis.clone(),
@@ -4076,11 +4076,27 @@ mod observer_identity_tests {
             number: 1,
             ..Default::default()
         };
-        let unauthenticated_child = n42_consensus::Gov5NativeHeader {
+        // A post-genesis head without the field, as current Gov5 writes it.
+        let current_child = n42_consensus::Gov5NativeHeader {
             header: child.clone(),
             mobile_registry_root: None,
         };
-        assert!(authenticated_native_producer_head(child, unauthenticated_child.hash()).is_err());
+        assert_eq!(
+            authenticated_native_producer_head(child.clone(), current_child.hash())
+                .unwrap()
+                .mobile_registry_root,
+            None
+        );
+        // Any other registry root, or a hash of another header, is refused.
+        let other_root = n42_consensus::Gov5NativeHeader {
+            header: child.clone(),
+            mobile_registry_root: Some(alloy_primitives::B256::repeat_byte(0x77)),
+        };
+        assert!(authenticated_native_producer_head(child.clone(), other_root.hash()).is_err());
+        assert!(
+            authenticated_native_producer_head(child, alloy_primitives::B256::repeat_byte(0x33))
+                .is_err()
+        );
     }
 
     #[test]

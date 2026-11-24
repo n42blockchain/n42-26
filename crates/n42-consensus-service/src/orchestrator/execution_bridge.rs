@@ -1545,6 +1545,12 @@ impl ConsensusService {
         }
 
         self.advance_execution_validated_head(broadcast.view, broadcast.block_hash, "sync import");
+        // The FCU above finalized this exact hash. A commit for it may already
+        // sit in the lifecycle map without an execution-ready mark (its eager
+        // import returned Syncing before sync supplied the parent); close it,
+        // or it blocks every later commit's finalize FCU and reth's head stays
+        // behind consensus until this node builds a block itself.
+        self.mark_catchup_commits_finalized(broadcast.block_hash);
         crate::qualification_abort_at("execution_validated");
         self.complete_deferred_finalization(broadcast).await;
 

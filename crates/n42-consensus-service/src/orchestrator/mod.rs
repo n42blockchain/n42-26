@@ -8478,6 +8478,62 @@ mod tests {
         );
     }
 
+    /// A late-joining follower commits a block whose eager import returned
+    /// Syncing (parent missing); sync then imports and finalizes it. The
+    /// lifecycle entry must close, or the next commit's finalize FCU never
+    /// runs (E2E scenario 4: the last node's head stayed three blocks behind).
+    #[tokio::test(flavor = "current_thread")]
+    async fn sync_import_closes_a_commit_that_was_waiting_for_execution() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+        orch.async_finalize_fcu = false;
+        let parent = B256::repeat_byte(0x60);
+        orch.head_block_hash = parent;
+        orch.execution_validated_head_view = 1;
+
+        let hash = B256::repeat_byte(0x61);
+        orch.handle_block_committed(2, hash, test_commit_qc(2, hash), None)
+            .await;
+        assert_eq!(
+            orch.async_commit_states[&2].stage,
+            AsyncCommitStage::Committed
+        );
+
+        let broadcast = BlockDataBroadcast {
+            block_hash: hash,
+            view: 2,
+            payload_json: serde_json::to_vec(&test_execution_data(parent, hash)).unwrap(),
+            timestamp: 0,
+            execution_output: None,
+            leader_ready_unix_ms: 0,
+            native_header_rlp: None,
+        };
+        assert!(orch.import_and_notify(broadcast).await);
+        assert_eq!(
+            orch.async_commit_states[&2].stage,
+            AsyncCommitStage::Finalized
+        );
+
+        // The next live commit is no longer blocked behind view 2.
+        let next = B256::repeat_byte(0x62);
+        orch.handle_block_committed(3, next, test_commit_qc(3, next), None)
+            .await;
+        orch.handle_eager_import_done(next, 3, hash, 3, false, None)
+            .await;
+        assert_eq!(mock.fcu_heads().last(), Some(&next));
+        assert_eq!(
+            orch.async_commit_states[&3].stage,
+            AsyncCommitStage::Finalized
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn catchup_finalized_hash_history_is_bounded_and_deduplicated() {
         let mut orch = make_test_orchestrator_with_state(None);

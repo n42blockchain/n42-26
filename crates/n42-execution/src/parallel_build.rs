@@ -1570,6 +1570,56 @@ mod tests {
         }
     }
 
+    /// From gov5's `unchangedAccountNoOpTime` the root leaves the touched and
+    /// unchanged accounts out, so no path puts them into the bundle; a chain
+    /// whose rule lies in the future still gets them. Every path agrees
+    /// either way.
+    #[test]
+    fn a_touched_and_unchanged_account_follows_the_gov5_rule_time() {
+        let unchanged = addr(5);
+        let beneficiary = addr(BENEFICIARY);
+        let txs = vec![
+            fee_tx(1, 0, addr(2), 100, 100, 0),
+            fee_tx(3, 0, unchanged, 0, 100, 0),
+            fee_tx(6, 0, addr(7), 400, 100, 0),
+            fee_tx(8, 0, unchanged, 0, 100, 0),
+        ];
+        let block = block_of(&txs);
+        let config_with = |rule: u64| {
+            let mut chain = n42_chainspec::n42_dev_chainspec();
+            let chain_mut = std::sync::Arc::make_mut(&mut chain);
+            chain_mut
+                .hardforks
+                .insert(reth_chainspec::EthereumHardfork::Prague, reth_chainspec::ForkCondition::Timestamp(0));
+            chain_mut.genesis.config.prague_time = Some(0);
+            chain_mut
+                .genesis
+                .config
+                .extra_fields
+                .insert("unchangedAccountNoOpTime".to_string(), serde_json::json!(rule));
+            N42EvmConfig::with_evm_factory(chain, crate::N42EvmFactory::with_fast_transfers(false))
+        };
+        for (rule, kept) in [(0, false), (u64::MAX, true)] {
+            let c = config_with(rule);
+            let reference = stock_on(&c, parent(), &block);
+            for address in [beneficiary, unchanged] {
+                assert_eq!(
+                    reference.state.state.contains_key(&address),
+                    kept,
+                    "rule at {rule}: {address} in the bundle"
+                );
+            }
+            for direct in [false, true] {
+                let what = format!("the batches (direct {direct}, rule at {rule})");
+                let run = run_on(&c, &parent(), &txs, direct).expect("the batches run");
+                let ours = finish_on(&c, parent(), &block, run, CacheScope::All).expect("the commit");
+                assert_same(&ours, &reference, &what);
+            }
+            let (ours, _) = import_on(&c, &parent(), &block).expect("the parallel import");
+            assert_same(&ours, &reference, "import_block");
+        }
+    }
+
     /// The cache half refuses, writing nothing, when the executor already
     /// holds a batch account at another value than the batches' original.
     #[test]

@@ -183,12 +183,45 @@ pub fn restored_slots_for(key: B256) -> Option<Arc<Vec<RestoredSlot>>> {
 #[derive(Clone, Debug)]
 pub struct TrackingBlockExecutorFactory<F> {
     inner: F,
+    /// gov5's `unchangedAccountNoOpTime`: from it a block's root leaves out
+    /// the accounts the block touched and left as they were.
+    unchanged_account_no_op_time: Option<u64>,
+    /// gov5's `storageNetChangeTime`: from it a block's root leaves out the
+    /// slots the block stored to and left at their starting value.
+    storage_net_change_time: Option<u64>,
 }
 
 impl<F> TrackingBlockExecutorFactory<F> {
-    /// Wraps `inner`.
+    /// Wraps `inner`. The executors record what gov5 writes without either
+    /// of its root rules ([`Self::with_gov5_root_rules`]).
     pub const fn new(inner: F) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            unchanged_account_no_op_time: None,
+            storage_net_change_time: None,
+        }
+    }
+
+    /// Follows gov5's two root rules from their activation times, the
+    /// genesis `config` keys `unchangedAccountNoOpTime` and
+    /// `storageNetChangeTime` (`None`: the chain never activates the rule).
+    ///
+    /// Without a rule gov5 writes a leaf for an account a block touched and
+    /// left unchanged, and for a slot a block stored to and restored; the
+    /// executors here put both back for the root job, because the bundle
+    /// holds neither. From `unchangedAccountNoOpTime` gov5 leaves the first
+    /// out, from `storageNetChangeTime` the second
+    /// (`IntraBlockState.ApplyUnchangedAccountRule`), which is what the
+    /// bundle says on its own: an executor of a block at or after a rule's
+    /// time records nothing for it.
+    pub const fn with_gov5_root_rules(
+        mut self,
+        unchanged_account_no_op_time: Option<u64>,
+        storage_net_change_time: Option<u64>,
+    ) -> Self {
+        self.unchanged_account_no_op_time = unchanged_account_no_op_time;
+        self.storage_net_change_time = storage_net_change_time;
+        self
     }
 
     /// The wrapped factory.
@@ -237,6 +270,8 @@ where
             ctx.withdrawals.as_deref(),
             [],
         );
+        let timestamp = evm.block().timestamp.saturating_to::<u64>();
+        let before = |rule: Option<u64>| rule.is_none_or(|time| timestamp < time);
         let builder_requests =
             crate::evm_config::eip8282_builder_requests_active(self.inner.chain_spec().genesis());
         let mut inner = self.inner.create_executor(evm, ctx);
@@ -247,6 +282,8 @@ where
         // created here.
         inner.inner.set_eip8282_builder_requests(builder_requests);
         TrackingExecutor {
+            keeps_touched: before(self.unchanged_account_no_op_time),
+            keeps_restored: before(self.storage_net_change_time),
             inner,
             context_key,
             tx_hashes: Vec::new(),
@@ -275,6 +312,12 @@ where
 #[derive(Debug)]
 pub struct TrackingExecutor<E> {
     inner: E,
+    /// Whether this block's root still counts touched and unchanged accounts
+    /// (the block is before gov5's `unchangedAccountNoOpTime`).
+    keeps_touched: bool,
+    /// Whether this block's root still counts restored slots (the block is
+    /// before gov5's `storageNetChangeTime`).
+    keeps_restored: bool,
     context_key: B256,
     /// The committed transactions, in order.
     tx_hashes: Vec<B256>,
@@ -407,11 +450,15 @@ impl<E> TrackingExecutor<E> {
 
     fn record(&mut self, hash: B256, changed: Vec<RestoredSlot>, touched: Vec<TouchedAccount>) {
         self.tx_hashes.push(hash);
-        for (address, info) in touched {
-            self.touched.entry(address).or_insert(info);
+        if self.keeps_touched {
+            for (address, info) in touched {
+                self.touched.entry(address).or_insert(info);
+            }
         }
-        for (address, slot, original) in changed {
-            self.first_seen.entry((address, slot)).or_insert(original);
+        if self.keeps_restored {
+            for (address, slot, original) in changed {
+                self.first_seen.entry((address, slot)).or_insert(original);
+            }
         }
     }
 
@@ -440,8 +487,10 @@ impl<E: BlockExecutor> TrackingExecutor<E> {
         merged: crate::graft_fold::MergedBatches,
         touched: Vec<TouchedAccount>,
     ) {
-        for (address, info) in touched {
-            self.touched.entry(address).or_insert(info);
+        if self.keeps_touched {
+            for (address, info) in touched {
+                self.touched.entry(address).or_insert(info);
+            }
         }
         self.pending_fold = Some(merged);
     }

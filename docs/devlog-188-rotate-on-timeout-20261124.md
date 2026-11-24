@@ -60,3 +60,34 @@
 - `cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace`（nice、`-j 16`、`--test-threads=16`）1985 通过、0 失败。未跑 E2E 与机群。
 - 机群待做：混合 gov5 + n42-26 在创世设 `leaderTenure`>1 与 `rotateOnTimeoutView` 后，停掉一个 leader，确认两端同一 TC 进入同一 view；
   在所有客户端（含 n42-rs）实现前，混合网络创世不得设置 `rotateOnTimeoutView`。
+
+---
+
+## E2E 场景 4 长期失败的修复：同步导入后关闭提交生命周期（2026-11-24）
+
+### 问题
+
+CI `E2E Correctness - smoke-consensus` 的场景 4（correctness profile 的 5 节点段）至少从 2026-11-03（5847275）起每次失败，
+结果固定为 `heights=[16, 16, 16, 16, 13]`。本地用 11-20 的 release 二进制按 CI 配置可原样复现。
+
+### 根因
+
+- 最后启动的节点 4 收到第 2 块时缺父块，eager `new_payload` 返回 Syncing；随后 Decide 提交第 2 视图，
+  提交生命周期（`async_commit_states`）以 `execution_ready=false` 登记为 Committed。
+- 状态同步随后补上第 1、2 块，`import_and_notify` → `handle_valid_import` 用 FCU 把第 2 块设为 head/safe/finalized，
+  但没有关闭第 2 视图的生命周期记录。
+- `drive_async_commits` 按视图顺序只处理最早未完成的一条：第 2 视图永远停在 Committed，第 3 视图起的 finalize FCU 全被挡住
+  （节点 4 日志 `N42_FCU` 0 次，其他节点 16 次）。节点 4 的执行层 head 只在它自己出块时前进，于是 `eth_blockNumber` 落后约一轮 leader。
+- Gov5 追块路径（`orchestrator/mod.rs` 约 2120 行）早已在 Valid FCU 后调用 `mark_catchup_commits_finalized`，原生同步路径漏了这一步。
+
+### 修复
+
+- `execution_bridge.rs` `handle_valid_import`：Valid FCU 并推进 execution-validated head 后，调用
+  `mark_catchup_commits_finalized(block_hash)`，关闭同一哈希的生命周期记录（并记入已最终化哈希集合，供稍后到达的同哈希提交直接置 Finalized）。
+- 新测试 `sync_import_closes_a_commit_that_was_waiting_for_execution`：先提交未就绪的第 2 视图，再经同步导入，
+  断言其 Finalized，且第 3 视图的 finalize FCU 正常下发。去掉修复时该测试失败。
+
+### 验证
+
+- `n42-consensus-service` + `n42-node` 测试 644 通过、0 失败；clippy `-D warnings` 通过。
+- 本地 E2E 场景 4（`E2E_SCENARIO4_PROFILE=correctness`）：修复前 `[16,16,16,16,13]` 失败；修复后 `[16,16,16,16,16]` 通过，节点 4 `N42_FCU` 14 次。

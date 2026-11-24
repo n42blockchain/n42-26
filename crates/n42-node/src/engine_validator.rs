@@ -651,7 +651,7 @@ mod tests {
         block.header.blob_gas_used = Some(0);
         block.header.excess_blob_gas = Some(0);
         block.header.parent_beacon_block_root = Some(B256::ZERO);
-        block.header.requests_hash = Some(alloy_consensus::constants::EMPTY_ROOT_HASH);
+        block.header.requests_hash = Some(alloy_eips::eip7685::EMPTY_REQUESTS_HASH);
         let expected = block.header.hash_slow();
         let payload = ExecutionData::from_block_unchecked(expected, &block);
         let sealed = <N42EngineValidator<ChainSpec> as PayloadValidator<EthEngineTypes>>::convert_payload_to_block(
