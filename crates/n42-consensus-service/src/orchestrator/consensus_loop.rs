@@ -307,43 +307,49 @@ impl ConsensusService {
                 if let Some(state) = &self.consensus_state {
                     state.update_validator_set(updated_vs);
                 }
-                match expected_validator_peer_ids_with_policy(
-                    &self
-                        .engine
-                        .epoch_manager()
-                        .current_validator_set()
-                        .validator_infos(),
-                    self.allow_deterministic_validator_peers,
-                ) {
-                    Ok(peers) => {
-                        if let Err(error) = self
-                            .network
-                            .replace_expected_validator_peers_reliable(peers)
-                            .await
-                        {
+                if self.unbound_validator_peers {
+                    // Profile 1 without bindings: nothing to rebind; the
+                    // network keeps authenticating by BLS signature.
+                    debug!(target: "n42::cl::consensus_loop", new_epoch, "epoch transition: no validator peer bindings to refresh");
+                } else {
+                    match expected_validator_peer_ids_with_policy(
+                        &self
+                            .engine
+                            .epoch_manager()
+                            .current_validator_set()
+                            .validator_infos(),
+                        self.allow_deterministic_validator_peers,
+                    ) {
+                        Ok(peers) => {
+                            if let Err(error) = self
+                                .network
+                                .replace_expected_validator_peers_reliable(peers)
+                                .await
+                            {
+                                warn!(
+                                    target: "n42::cl::consensus_loop",
+                                    error = %error,
+                                    "failed to refresh validator peer bindings after epoch transition"
+                                );
+                            }
+                        }
+                        Err(error) => {
                             warn!(
                                 target: "n42::cl::consensus_loop",
                                 error = %error,
-                                "failed to refresh validator peer bindings after epoch transition"
+                                "failed to derive validator peer bindings for new epoch"
                             );
-                        }
-                    }
-                    Err(error) => {
-                        warn!(
-                            target: "n42::cl::consensus_loop",
-                            error = %error,
-                            "failed to derive validator peer bindings for new epoch"
-                        );
-                        if let Err(replace_error) = self
-                            .network
-                            .replace_expected_validator_peers_reliable(HashMap::new())
-                            .await
-                        {
-                            warn!(
-                                target: "n42::cl::consensus_loop",
-                                error = %replace_error,
-                                "failed to clear validator peer bindings after epoch transition policy error"
-                            );
+                            if let Err(replace_error) = self
+                                .network
+                                .replace_expected_validator_peers_reliable(HashMap::new())
+                                .await
+                            {
+                                warn!(
+                                    target: "n42::cl::consensus_loop",
+                                    error = %replace_error,
+                                    "failed to clear validator peer bindings after epoch transition policy error"
+                                );
+                            }
                         }
                     }
                 }

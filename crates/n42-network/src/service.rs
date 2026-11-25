@@ -26,7 +26,8 @@ use crate::gossipsub::topics::{
 };
 use crate::gov5_block::{Gov5BlockError, attributable_hash, decode_wire_block_rlp};
 use crate::gov5_rpc::{
-    GOV5_BLOCK_BY_HASH_PROTOCOL, Gov5BlockByHashRequest, Gov5BlockByHashResponse,
+    GOV5_BLOCK_BY_HASH_PROTOCOL, GOV5_BLOCK_PUSH_PROTOCOL, GOV5_HOTSTUFF_DIRECT_PROTOCOL,
+    Gov5BlockByHashRequest, Gov5BlockByHashResponse,
     Gov5BlockPushRequest, Gov5BlockPushResponse, Gov5BodiesByRangeRequest,
     Gov5BodiesByRangeResponse, Gov5CanonicalBlockReader, Gov5HotstuffDirectRequest,
     Gov5HotstuffDirectResponse, Gov5Status,
@@ -327,6 +328,29 @@ fn gov5_direct_source_authorized(
     authenticated_validators: &HashMap<PeerId, u32>,
 ) -> bool {
     trusted || routed_validators.contains_key(&peer) || authenticated_validators.contains_key(&peer)
+}
+
+/// Peers that receive this node's direct H2-v4 fan-out (hotstuff_direct
+/// messages or block pushes). With validator PeerId bindings these are the
+/// routed validators; a Profile-1 node without bindings cannot tell which
+/// transport identity belongs to which validator, so it sends to every
+/// connected peer that advertised the protocol. Receivers verify the BLS
+/// signature (or the leader seal), not the transport source.
+fn h2_v4_direct_fanout_peers(
+    unbound_signed_validators: bool,
+    routed_validators: &HashMap<u32, PeerId>,
+    my_validator_index: Option<u32>,
+    protocol_peers: &HashSet<PeerId>,
+) -> Vec<PeerId> {
+    if unbound_signed_validators {
+        let mut peers: Vec<PeerId> = protocol_peers.iter().copied().collect();
+        peers.sort_unstable();
+        return peers;
+    }
+    routed_validators
+        .iter()
+        .filter_map(|(index, peer)| (Some(*index) != my_validator_index).then_some(*peer))
+        .collect()
 }
 
 fn stale_gov5_block_fetches(
@@ -1189,6 +1213,15 @@ pub struct NetworkService {
     my_validator_index: Option<u32>,
     /// Current validator count for Rotor relay computation
     validator_count: u32,
+    /// Profile 1 without validator PeerId bindings (a mixed-client genesis):
+    /// the BLS signature on an H2-v4 message is the authentication, not the
+    /// transport id. Direct H2-v4 traffic is accepted from any connected peer
+    /// and this node's direct fan-out goes to every capable peer.
+    unbound_signed_validators: bool,
+    /// Connected peers that advertised Gov5 `hotstuff_direct` in Identify.
+    gov5_hotstuff_direct_peers: HashSet<PeerId>,
+    /// Connected peers that advertised Gov5 `block_push` in Identify.
+    gov5_block_push_peers: HashSet<PeerId>,
 }
 
 fn claimed_validator_index(agent_version: &str) -> Option<u32> {
@@ -1501,6 +1534,9 @@ impl NetworkService {
             recent_block_announcements: RecentBlockAnnouncementDedup::default(),
             my_validator_index: None,
             validator_count: 0,
+            unbound_signed_validators: false,
+            gov5_hotstuff_direct_peers: HashSet::new(),
+            gov5_block_push_peers: HashSet::new(),
         };
 
         Ok((service, handle, consensus_event_rx, event_rx))
@@ -1511,6 +1547,59 @@ impl NetworkService {
     /// reject requests until this source is present.
     pub fn set_gov5_canonical_block_reader(&mut self, reader: Gov5CanonicalBlockReader) {
         self.gov5_canonical_blocks = Some(reader);
+    }
+
+    /// Profile 1 only: a validator (or follower) whose genesis carries no
+    /// validator PeerId bindings trusts BLS-signed H2-v4 messages instead of
+    /// transport identities. Direct `hotstuff_direct` and `block_push`
+    /// requests are then accepted from any connected peer (the engine verifies
+    /// the signature, the import gate the leader seal), and this node's own
+    /// direct fan-out reaches every connected peer that supports the protocol.
+    ///
+    /// Refused when bindings exist (or deterministic ids are allowed), or
+    /// outside H2-v4 participant mode, so other chains keep transport-level
+    /// validator authentication.
+    pub fn trust_signed_messages_without_peer_bindings(&mut self) -> eyre::Result<()> {
+        if !self.h2_v4_participant {
+            return Err(eyre::eyre!(
+                "unbound signed-message trust requires the H2-v4 participant network"
+            ));
+        }
+        if !self.expected_validator_peer_ids.is_empty() || self.allow_deterministic_peer_ids {
+            return Err(eyre::eyre!(
+                "unbound signed-message trust is only for a validator set without PeerId bindings"
+            ));
+        }
+        self.unbound_signed_validators = true;
+        Ok(())
+    }
+
+    /// Whether this service trusts BLS-signed messages from unbound peers.
+    pub fn trusts_signed_messages_without_peer_bindings(&self) -> bool {
+        self.unbound_signed_validators
+    }
+
+    fn gov5_direct_inbound_authorized(&self, peer: PeerId) -> bool {
+        self.unbound_signed_validators
+            || gov5_direct_source_authorized(
+                peer,
+                self.reconnection.is_trusted(&peer),
+                &self.peer_validator_map,
+                &self.authenticated_peer_validator_map,
+            )
+    }
+
+    fn h2_v4_direct_peers(&self, protocol_peers: &HashSet<PeerId>) -> Vec<PeerId> {
+        let routed = self.validator_peer_map.read().unwrap_or_else(|error| {
+            tracing::warn!(%error, "validator_peer_map poisoned, recovering");
+            error.into_inner()
+        });
+        h2_v4_direct_fanout_peers(
+            self.unbound_signed_validators,
+            &routed,
+            self.my_validator_index,
+            protocol_peers,
+        )
     }
 
     fn current_gov5_status(&self) -> Option<Gov5Status> {
@@ -1744,12 +1833,18 @@ impl NetworkService {
                 }
                 self.emit_event(NetworkEvent::PeerConnected(peer_id));
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+            SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                 tracing::info!(%peer_id, "peer disconnected");
                 metrics::gauge!("n42_active_peer_connections").decrement(1.0);
                 self.reconnection.on_disconnected(&peer_id);
                 self.pending_gov5_status_peers.remove(&peer_id);
                 self.gov5_block_by_hash_peers.remove(&peer_id);
+                // Identify runs once per connection: keep the direct fan-out
+                // capability while another connection to the peer remains.
+                if num_established == 0 {
+                    self.gov5_hotstuff_direct_peers.remove(&peer_id);
+                    self.gov5_block_push_peers.remove(&peer_id);
+                }
                 self.gov5_chain_authenticated_peers.remove(&peer_id);
                 self.gov5_range_quotas.remove(&peer_id);
                 self.pending_gov5_ranges
@@ -2057,6 +2152,24 @@ impl NetworkService {
             .protocols
             .iter()
             .any(|protocol| protocol.as_ref() == BLOCK_DIRECT_PROTOCOL);
+        if info
+            .protocols
+            .iter()
+            .any(|protocol| protocol.as_ref() == GOV5_HOTSTUFF_DIRECT_PROTOCOL)
+        {
+            self.gov5_hotstuff_direct_peers.insert(peer_id);
+        } else {
+            self.gov5_hotstuff_direct_peers.remove(&peer_id);
+        }
+        if info
+            .protocols
+            .iter()
+            .any(|protocol| protocol.as_ref() == GOV5_BLOCK_PUSH_PROTOCOL)
+        {
+            self.gov5_block_push_peers.insert(peer_id);
+        } else {
+            self.gov5_block_push_peers.remove(&peer_id);
+        }
         let newly_ready_for_block_fetch =
             supports_gov5_block_fetch && self.gov5_block_by_hash_peers.insert(peer_id);
         let newly_ready_for_state_sync =
@@ -2120,6 +2233,16 @@ impl NetworkService {
                         "ignoring validator identify mapping with unexpected peer id"
                     );
                     self.clear_validator_mapping_for_peer(&peer_id);
+                }
+                Err(error) if self.unbound_signed_validators => {
+                    // No bindings by design: an Identify claim is not
+                    // authentication, and nothing is routed by it.
+                    tracing::debug!(
+                        %peer_id,
+                        validator_index = idx,
+                        error = %error,
+                        "ignoring identify validator claim without peer bindings"
+                    );
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -3119,12 +3242,7 @@ impl NetworkService {
                     },
                 ..
             } => {
-                if !gov5_direct_source_authorized(
-                    peer,
-                    self.reconnection.is_trusted(&peer),
-                    &self.peer_validator_map,
-                    &self.authenticated_peer_validator_map,
-                ) {
+                if !self.gov5_direct_inbound_authorized(peer) {
                     metrics::counter!(
                         "n42_gov5_block_push_rejected_total",
                         "reason" => "unauthorized"
@@ -3202,12 +3320,7 @@ impl NetworkService {
                 // or PeerIds already bound to the current validator set. A
                 // routed (but not yet BLS-promoted) validator is allowed so its
                 // first valid signed message can establish full authentication.
-                if !gov5_direct_source_authorized(
-                    peer,
-                    self.reconnection.is_trusted(&peer),
-                    &self.peer_validator_map,
-                    &self.authenticated_peer_validator_map,
-                ) {
+                if !self.gov5_direct_inbound_authorized(peer) {
                     metrics::counter!("n42_gov5_h2_direct_rejected_total", "reason" => "unauthorized")
                         .increment(1);
                     tracing::warn!(
@@ -4017,18 +4130,8 @@ impl NetworkService {
                             data.clone(),
                             "Gov5 H2-v4 consensus message",
                         );
-                        let direct_peers: Vec<PeerId> = self
-                            .validator_peer_map
-                            .read()
-                            .unwrap_or_else(|error| {
-                                tracing::warn!(%error, "validator_peer_map poisoned, recovering");
-                                error.into_inner()
-                            })
-                            .iter()
-                            .filter_map(|(index, peer)| {
-                                (Some(*index) != self.my_validator_index).then_some(*peer)
-                            })
-                            .collect();
+                        let direct_peers =
+                            self.h2_v4_direct_peers(&self.gov5_hotstuff_direct_peers);
                         for peer in &direct_peers {
                             self.swarm
                                 .behaviour_mut()
@@ -4081,18 +4184,7 @@ impl NetworkService {
                 // Fan out the raw RLP to every connected validator before the
                 // gossip fallback; a lone block publisher cannot rely on a
                 // GossipSub mesh being formed for the block topic.
-                let direct_peers: Vec<PeerId> = self
-                    .validator_peer_map
-                    .read()
-                    .unwrap_or_else(|error| {
-                        tracing::warn!(%error, "validator_peer_map poisoned, recovering");
-                        error.into_inner()
-                    })
-                    .iter()
-                    .filter_map(|(index, peer)| {
-                        (Some(*index) != self.my_validator_index).then_some(*peer)
-                    })
-                    .collect();
+                let direct_peers = self.h2_v4_direct_peers(&self.gov5_block_push_peers);
                 for peer in &direct_peers {
                     self.swarm.behaviour_mut().gov5_block_push.send_request(
                         peer,
@@ -4444,6 +4536,205 @@ impl NetworkService {
 mod tests {
     use super::*;
     use crate::transport::deterministic_validator_peer_id;
+
+    #[test]
+    fn h2_v4_direct_fanout_without_bindings_reaches_every_capable_peer() {
+        let routed_peer = PeerId::random();
+        let mine = PeerId::random();
+        let routed = HashMap::from([(0, routed_peer), (1, mine)]);
+        let capable: HashSet<PeerId> = (0..3).map(|_| PeerId::random()).collect();
+
+        // With bindings: the routed validators other than this node.
+        assert_eq!(
+            h2_v4_direct_fanout_peers(false, &routed, Some(1), &capable),
+            vec![routed_peer]
+        );
+        // Profile 1 without bindings: every peer that advertised the protocol.
+        let mut expected: Vec<PeerId> = capable.iter().copied().collect();
+        expected.sort_unstable();
+        assert_eq!(
+            h2_v4_direct_fanout_peers(true, &HashMap::new(), Some(1), &capable),
+            expected
+        );
+        assert!(h2_v4_direct_fanout_peers(true, &routed, Some(1), &HashSet::new()).is_empty());
+    }
+
+    fn h2_v4_fixture_envelope() -> (H2V4ChainIdentity, H2V4Envelope) {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/h2_v4_envelope_v1.json")).unwrap();
+        let identity = H2V4ChainIdentity {
+            chain_id: 94,
+            genesis_hash: B256::repeat_byte(0x11),
+        };
+        let wire = hex::decode(fixture["envelope_hex"].as_str().unwrap()).unwrap();
+        let envelope = crate::h2_v4::decode_envelope(&wire, identity).unwrap();
+        (identity, envelope)
+    }
+
+    fn h2_participant_service(
+        identity: H2V4ChainIdentity,
+        index: u32,
+        expected: HashMap<u32, PeerId>,
+    ) -> (
+        NetworkService,
+        NetworkHandle,
+        mpsc::Receiver<NetworkEvent>,
+        mpsc::Receiver<NetworkEvent>,
+    ) {
+        let swarm = crate::transport::build_interop_participant_swarm(
+            libp2p::identity::Keypair::generate_ed25519(),
+            crate::transport::TransportConfig::for_network_size(4),
+            index,
+            identity.genesis_hash,
+        )
+        .unwrap();
+        NetworkService::new_gov5_h2_participant(
+            swarm,
+            expected,
+            false,
+            identity.chain_id,
+            identity.genesis_hash,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn unbound_signed_trust_is_refused_when_bindings_exist() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (identity, _) = h2_v4_fixture_envelope();
+        let (mut bound, ..) =
+            h2_participant_service(identity, 0, HashMap::from([(1, PeerId::random())]));
+        assert!(bound.trust_signed_messages_without_peer_bindings().is_err());
+        assert!(!bound.trusts_signed_messages_without_peer_bindings());
+
+        let swarm = crate::transport::build_swarm_with_validator_index(
+            libp2p::identity::Keypair::generate_ed25519(),
+            crate::transport::TransportConfig::for_network_size(4),
+            Some(0),
+            identity.genesis_hash,
+        )
+        .unwrap();
+        let (mut native, ..) =
+            NetworkService::new_with_expected_validator_peer_ids(swarm, HashMap::new(), false)
+                .unwrap();
+        assert!(native.trust_signed_messages_without_peer_bindings().is_err());
+
+        let (mut unbound, ..) = h2_participant_service(identity, 0, HashMap::new());
+        unbound.trust_signed_messages_without_peer_bindings().unwrap();
+        assert!(unbound.trusts_signed_messages_without_peer_bindings());
+    }
+
+    /// A Profile-1 validator without bindings exchanges direct H2-v4 traffic
+    /// with a peer whose transport id it cannot bind to a validator (a gov5 or
+    /// n42-rs node): it accepts that peer's `hotstuff_direct` message and its
+    /// own broadcast reaches the peer over `hotstuff_direct` as well. Without
+    /// the Profile-1 rule the same inbound message is refused.
+    async fn unbound_direct_exchange(trust_unbound: bool) -> (bool, bool) {
+        use futures::StreamExt;
+        use libp2p::swarm::SwarmEvent;
+
+        let (identity, envelope) = h2_v4_fixture_envelope();
+        let (mut service, handle, mut consensus_rx, _data_rx) =
+            h2_participant_service(identity, 3, HashMap::new());
+        if trust_unbound {
+            service.trust_signed_messages_without_peer_bindings().unwrap();
+        }
+        let service_peer = *service.swarm.local_peer_id();
+        service
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let listen_addr = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let SwarmEvent::NewListenAddr { address, .. } =
+                    service.swarm.select_next_some().await
+                {
+                    break address;
+                }
+            }
+        })
+        .await
+        .expect("listener ready");
+        let service_task = tokio::spawn(service.run());
+
+        // The "foreign" validator: a bare participant swarm, not subscribed to
+        // any H2 topic, so only the direct stream can carry messages.
+        let mut foreign = crate::transport::build_interop_participant_swarm(
+            libp2p::identity::Keypair::generate_ed25519(),
+            crate::transport::TransportConfig::for_network_size(4),
+            0,
+            identity.genesis_hash,
+        )
+        .unwrap();
+        foreign.dial(listen_addr).unwrap();
+        let data = encode_gov5_gossip_message(&envelope.message).unwrap();
+
+        let mut inbound_accepted = false;
+        let mut outbound_received = false;
+        let mut sent_direct = false;
+        let mut broadcast_sent = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            tokio::select! {
+                event = foreign.select_next_some() => match event {
+                    SwarmEvent::Behaviour(crate::transport::N42BehaviourEvent::Identify(
+                        libp2p::identify::Event::Received { peer_id, .. },
+                    )) if peer_id == service_peer && !sent_direct => {
+                        sent_direct = true;
+                        foreign.behaviour_mut().gov5_hotstuff_direct.send_request(
+                            &service_peer,
+                            Gov5HotstuffDirectRequest { data: data.clone() },
+                        );
+                    }
+                    SwarmEvent::Behaviour(crate::transport::N42BehaviourEvent::Gov5HotstuffDirect(
+                        libp2p::request_response::Event::Message {
+                            peer,
+                            message: libp2p::request_response::Message::Request { request, channel, .. },
+                            ..
+                        },
+                    )) if peer == service_peer => {
+                        assert_eq!(decode_gov5_gossip_message(&request.data).unwrap(), envelope.message);
+                        outbound_received = true;
+                        let _ = foreign
+                            .behaviour_mut()
+                            .gov5_hotstuff_direct
+                            .send_response(channel, Gov5HotstuffDirectResponse);
+                    }
+                    _ => {}
+                },
+                Some(event) = consensus_rx.recv() => {
+                    if let NetworkEvent::Gov5H2Message { source, message } = event {
+                        assert_eq!(*message, envelope.message);
+                        if source == *foreign.local_peer_id() {
+                            inbound_accepted = true;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
+            // Broadcast once the service has identified the foreign peer.
+            if sent_direct && !broadcast_sent {
+                broadcast_sent = true;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                handle.broadcast_h2_v4(envelope.clone()).unwrap();
+            }
+            if (inbound_accepted && outbound_received) || tokio::time::Instant::now() > deadline {
+                break;
+            }
+        }
+        service_task.abort();
+        (inbound_accepted, outbound_received)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn profile1_unbound_validator_exchanges_direct_h2_v4_with_an_unbound_peer() {
+        assert_eq!(unbound_direct_exchange(true).await, (true, true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bound_validator_refuses_direct_h2_v4_from_an_unbound_peer() {
+        assert_eq!(unbound_direct_exchange(false).await, (false, false));
+    }
 
     fn served_block_fixture(number: u64) -> Vec<u8> {
         use alloy_consensus::{Block, Header, TxEnvelope, proofs::calculate_transaction_root};

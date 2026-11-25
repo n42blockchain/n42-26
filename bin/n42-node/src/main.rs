@@ -1109,6 +1109,23 @@ fn resolve_follower_mode(
     Ok(true)
 }
 
+/// Profile 1 (agreed with n42-rs): a validator on a multi-validator
+/// Profile-1 genesis without any `p2p_peer_id` binding trusts BLS-signed
+/// H2-v4 messages instead of transport ids, as the follower does. Mixed
+/// geneses list validators as `{address, blsKey}` only, and gov5/n42-rs do
+/// not send n42-26's authentication frame. `N42_ALLOW_DETERMINISTIC_P2P=1`
+/// keeps the n42-26-only deterministic identities; other chains are
+/// unchanged.
+fn profile1_unbound_validator(
+    profile1: bool,
+    observer_or_follower: bool,
+    validator_count: usize,
+    no_bindings: bool,
+    deterministic_opt_in: bool,
+) -> bool {
+    profile1 && !observer_or_follower && validator_count > 1 && no_bindings && !deterministic_opt_in
+}
+
 fn listen_gov5_tcp(net_service: &mut NetworkService, default_port: u16) -> eyre::Result<()> {
     let tcp_port = env_parse("N42_GOV5_TCP_PORT").unwrap_or(default_port);
     let listen_ip = n42_listen_ip()?;
@@ -2162,12 +2179,36 @@ fn main() {
         let startup_validator_infos = startup_validator_set.validator_infos();
         let configured_validator_peer_ids =
             configured_validator_peer_ids(&startup_validator_infos)?;
+        // Profile 1 (agreed with n42-rs): a validator whose genesis carries no
+        // PeerId bindings authenticates validators by the BLS signatures on
+        // H2-v4 messages, like the follower, instead of by transport ids. The
+        // explicit N42_ALLOW_DETERMINISTIC_P2P opt-in keeps the old
+        // n42-26-only deterministic identities.
+        let profile1_unbound_validator = profile1_unbound_validator(
+            profile1_node,
+            observer_mode || follower_mode,
+            startup_validator_set.len() as usize,
+            configured_validator_peer_ids.is_empty(),
+            env_bool("N42_ALLOW_DETERMINISTIC_P2P"),
+        );
+        let allow_deterministic_validator_peers =
+            allow_deterministic_validator_peers && !profile1_unbound_validator;
+        if profile1_unbound_validator {
+            info!(
+                target: "n42::cli",
+                validator_count = startup_validator_set.len(),
+                "Profile 1 without validator p2p_peer_id bindings: validators are authenticated by BLS-signed H2-v4 messages, not transport ids"
+            );
+        }
         // An observer or a Profile-1 follower sends no consensus message and
         // authenticates what it imports by BLS (QCs, Decides, seals), so it
         // needs no validator PeerId bindings. The genesis of a mixed round
         // carries none, and the other clients' PeerIds are not the
         // deterministic ones.
-        let expected_validator_peer_ids = if observer_mode || follower_mode {
+        let expected_validator_peer_ids = if observer_mode
+            || follower_mode
+            || profile1_unbound_validator
+        {
             Default::default()
         } else {
             expected_validator_peer_ids_with_policy(
@@ -2176,6 +2217,8 @@ fn main() {
             )?
         };
         if !observer_mode
+            && !profile1_unbound_validator
+            && !follower_mode
             && startup_validator_set.len() > 1
             && configured_validator_peer_ids.is_empty()
         {
@@ -3126,9 +3169,10 @@ fn main() {
                 // ── Normal consensus mode ──────────────────────────────
                 let local_expected_peer_id = resolved_my_index
                     .and_then(|index| configured_validator_peer_ids.get(&index).copied());
-                // A follower has its own identity: N42_P2P_KEY, else random;
-                // never a validator's deterministic one.
-                let keypair = if follower_mode {
+                // A follower, or a Profile-1 validator without bindings, has
+                // its own identity: N42_P2P_KEY, else random; never a
+                // validator's deterministic one.
+                let keypair = if follower_mode || profile1_unbound_validator {
                     match load_explicit_p2p_keypair(None)? {
                         Some(keypair) => keypair,
                         None => libp2p::identity::Keypair::generate_ed25519(),
@@ -3139,6 +3183,8 @@ fn main() {
                 let local_peer_id = keypair.public().to_peer_id();
                 if follower_mode {
                     info!(target: "n42::cli", %local_peer_id, configured = std::env::var_os("N42_P2P_KEY").is_some(), "P2P identity (Profile-1 follower)");
+                } else if profile1_unbound_validator {
+                    info!(target: "n42::cli", %local_peer_id, configured = std::env::var_os("N42_P2P_KEY").is_some(), "P2P identity (Profile-1 validator without peer bindings)");
                 } else if local_expected_peer_id.is_some() {
                     info!(target: "n42::cli", %local_peer_id, "P2P identity (configured)");
                 } else {
@@ -3202,6 +3248,15 @@ fn main() {
                         full_node.provider.clone(),
                     ));
                 }
+                if profile1_unbound_validator
+                    || (follower_mode
+                        && expected_validator_peer_ids.is_empty()
+                        && !allow_deterministic_validator_peers)
+                {
+                    net_service
+                        .trust_signed_messages_without_peer_bindings()
+                        .map_err(|e| eyre::eyre!("Profile-1 unbound validator network: {e}"))?;
+                }
 
                 let consensus_port: u16 = env_parse("N42_CONSENSUS_PORT").unwrap_or(9400);
                 let listen_addr: libp2p::Multiaddr = format!(
@@ -3232,11 +3287,11 @@ fn main() {
                 // Joining mode (key not in initial set): connect to ALL existing validators
                 // since no existing node will initiate a connection to us.
                 let val_count = startup_validator_set.len() as u32;
-                if follower_mode {
-                    // The validators' addresses are not derivable from a
-                    // follower's ports: it dials N42_TRUSTED_PEERS only.
+                if follower_mode || profile1_unbound_validator {
+                    // The validators' addresses and PeerIds are not derivable
+                    // from this node's ports or index: dial N42_TRUSTED_PEERS only.
                     if std::env::var("N42_TRUSTED_PEERS").map_or(true, |peers| peers.trim().is_empty()) {
-                        warn!(target: "n42::cli", "Profile-1 follower without N42_TRUSTED_PEERS: it only learns of blocks from peers that dial it");
+                        warn!(target: "n42::cli", "Profile-1 node without N42_TRUSTED_PEERS: it only learns of blocks from peers that dial it");
                     }
                 } else if !env_bool("N42_NO_AUTO_CONNECT") && val_count > 1 {
                     let base_port = consensus_port.saturating_sub(my_index as u16);
@@ -3975,7 +4030,8 @@ fn main() {
                     orchestrator = orchestrator.with_epoch_schedule(schedule);
                 }
                 orchestrator = orchestrator
-                    .with_allow_deterministic_validator_peers(allow_deterministic_validator_peers);
+                    .with_allow_deterministic_validator_peers(allow_deterministic_validator_peers)
+                    .with_unbound_validator_peers(profile1_unbound_validator);
                 if let Some(ref jmt) = jmt {
                     orchestrator = orchestrator.with_jmt(std::sync::Arc::new(
                         n42_node::sinks::SbmtStateSink(Arc::clone(jmt)),
@@ -4310,6 +4366,22 @@ mod observer_identity_tests {
     fn observer_genesis_hash_rejects_malformed_identity() {
         let error = resolve_observer_genesis_hash(B256::ZERO, Some("0x1234")).unwrap_err();
         assert!(error.to_string().contains("N42_INTEROP_GENESIS_HASH"));
+    }
+
+    #[test]
+    fn profile1_unbound_validator_only_on_profile1_without_bindings() {
+        // Profile-1 validator, several validators, no bindings, no opt-in.
+        assert!(profile1_unbound_validator(true, false, 4, true, false));
+        // Other chains keep transport-level authentication.
+        assert!(!profile1_unbound_validator(false, false, 4, true, false));
+        // Explicit bindings keep the PeerId check.
+        assert!(!profile1_unbound_validator(true, false, 4, false, false));
+        // The explicit deterministic opt-in keeps the old n42-26-only runs.
+        assert!(!profile1_unbound_validator(true, false, 4, true, true));
+        // A single validator needs no peer authentication; observers and
+        // followers have their own (signing-free) handling.
+        assert!(!profile1_unbound_validator(true, false, 1, true, false));
+        assert!(!profile1_unbound_validator(true, true, 4, true, false));
     }
 
     #[test]

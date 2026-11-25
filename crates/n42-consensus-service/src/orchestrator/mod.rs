@@ -1521,6 +1521,9 @@ pub struct ConsensusService {
     /// Whether deterministic validator PeerIds may be derived when no explicit
     /// `p2p_peer_id` bindings are configured.
     allow_deterministic_validator_peers: bool,
+    /// Profile 1 without PeerId bindings: validators are authenticated by
+    /// BLS-signed messages only, so an epoch change installs no bindings.
+    unbound_validator_peers: bool,
     /// Admin command receiver for RPC-originated validator reconfig requests.
     admin_rx: Option<mpsc::Receiver<crate::consensus_state::AdminCommand>>,
     /// MDBX-backed store for per-block consensus evidence (QC + mobile attestation).
@@ -2796,6 +2799,13 @@ impl ConsensusService {
     }
 
     fn connected_validator_peer_count(&self) -> usize {
+        // Profile 1 without PeerId bindings: no transport id maps to a
+        // validator, so every connected peer counts towards the leader's
+        // "do not build into the void" check. Votes are still counted by
+        // BLS signature in the engine.
+        if self.unbound_validator_peers {
+            return self.connected_peers.len();
+        }
         let connected_peers: HashSet<_> = self.connected_peers.iter().copied().collect();
         self.network
             .all_validator_peers()
@@ -3571,6 +3581,7 @@ impl ConsensusService {
             twig: None,
             zk_scheduler: None,
             allow_deterministic_validator_peers: true,
+            unbound_validator_peers: false,
             admin_rx: None,
             evidence_store: None,
             view_jump_throttle: view_jump_throttle::ViewJumpThrottle::default(),
@@ -3846,6 +3857,7 @@ impl ConsensusService {
             twig: None,
             zk_scheduler: None,
             allow_deterministic_validator_peers: true,
+            unbound_validator_peers: false,
             admin_rx: None,
             evidence_store: None,
             view_jump_throttle: view_jump_throttle::ViewJumpThrottle::default(),
@@ -4174,6 +4186,14 @@ impl ConsensusService {
 
     pub fn with_allow_deterministic_validator_peers(mut self, allow: bool) -> Self {
         self.allow_deterministic_validator_peers = allow;
+        self
+    }
+
+    /// Profile 1 without validator PeerId bindings: the network trusts
+    /// BLS-signed H2-v4 messages, and an epoch transition keeps the (empty)
+    /// binding table instead of deriving deterministic PeerIds.
+    pub fn with_unbound_validator_peers(mut self, unbound: bool) -> Self {
+        self.unbound_validator_peers = unbound;
         self
     }
 
@@ -4880,7 +4900,10 @@ impl ConsensusService {
                 .map(|v| v == "1")
                 .unwrap_or(false)
         });
-        if disabled {
+        // Profile 1 without PeerId bindings: no transport id is known to be
+        // the leader's, so transactions stay in the local pool and this node
+        // includes them when it leads.
+        if disabled || self.unbound_validator_peers {
             self.tx_forward_missing_leader_warned_view = None;
             // Feed all buffered txs into local pool and return (no forwarding).
             let txs = std::mem::take(&mut self.tx_forward_buffer);
@@ -9027,6 +9050,26 @@ mod tests {
         assert!(!orch.has_quorum_peers());
         orch.connected_peers.insert(mock_peers[4].1);
         assert!(orch.has_quorum_peers());
+    }
+
+    #[test]
+    fn unbound_profile1_leader_counts_connected_peers_for_quorum() {
+        // A Profile-1 validator without PeerId bindings has an empty
+        // validator routing table: the build gate must not wait on it forever.
+        let (engine, output_rx) = make_test_engine_with_validator_count(4, 1);
+        let network = Arc::new(MockConsensusNetwork::default());
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, network, net_event_rx, output_rx);
+        assert_eq!(orch.quorum_peers_needed(), 2);
+        orch.connected_peers.insert(Keypair::generate_ed25519().public().to_peer_id());
+        orch.connected_peers.insert(Keypair::generate_ed25519().public().to_peer_id());
+        assert!(!orch.has_quorum_peers(), "bound mode counts routed validators only");
+
+        let mut orch = orch.with_unbound_validator_peers(true);
+        assert!(orch.has_quorum_peers());
+        orch.connected_peers.clear();
+        orch.connected_peers.insert(Keypair::generate_ed25519().public().to_peer_id());
+        assert!(!orch.has_quorum_peers());
     }
 
     #[test]
