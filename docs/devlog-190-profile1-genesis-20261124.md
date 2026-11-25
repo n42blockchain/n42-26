@@ -859,3 +859,90 @@ AM19 与检查早于提案；被拒块无 Round 1；非 Profile 1 无效果）�
   chainspec 解码测试把 "requestsHash absent" 归入解码错误。
 - 只改测试和测试数据，未改产品代码，因此 06:30 前发布的二进制（5679751，sha256 d0a11c27…f5c9）仍然有效。
 - 门禁：clippy 通过；workspace 2100 passed / 0 failed / 38 ignored。
+
+## 15. Gate 6：n42-26 作为混合验证者集合中的验证者（无 peer 绑定，按 BLS 签名认证）（2026-11-25 追加）
+
+分支 `feat/profile1-mixed-validator`（基于 origin/main 0d51c07），改动未提交。
+
+### 15.1 设计决策
+
+- **与 n42-rs 约定的规则**：只在 Profile 1 上，创世中没有任何验证者 `p2p_peer_id` 绑定（混合创世只列 `{address, blsKey}`）
+  的验证者，与 follower 一样以 H2-v4 消息上的 BLS 签名认证验证者，而不以传输层 PeerId 认证。gov5/n42-rs 不发送 n42-26 的
+  认证帧，它们的 PeerId 也不是确定性 PeerId，原有规则下多验证者节点会以
+  "multi-validator peer authentication requires explicit p2p_peer_id…" 拒绝启动。
+- 判定函数 `profile1_unbound_validator(profile1, observer_or_follower, n, no_bindings, deterministic_opt_in)`：
+  Profile 1、非观察者/follower、n > 1、无绑定、未显式设置 `N42_ALLOW_DETERMINISTIC_P2P=1`。显式设置该变量时保持旧的
+  n42-26-only 确定性身份（此前四验证者本地演练的方式）。有绑定或非 Profile 1 的链行为不变。
+- 发现的阻塞点（逐项处理）：
+  1. 启动：`expected_validator_peer_ids_with_policy` 报错 → 无绑定模式下期望表为空，`allow_deterministic` 置 false；
+  2. libp2p 身份：原来无绑定时回退到按索引派生的确定性密钥 → 改为 `N42_P2P_KEY`，否则随机（同 follower）；
+  3. 自动连接按端口与确定性 PeerId 推算 → 跳过，只拨 `N42_TRUSTED_PEERS`；
+  4. 网络层 H2-v4 直连扇出（`hotstuff_direct` 与 `block_push`）按 `validator_peer_map` 选目标，无绑定时为空 → 改为发给所有在
+     Identify 中声明该协议的已连接 peer（gossip 照旧）；
+  5. 入站直连（`hotstuff_direct`/`block_push`）只接受受信或已绑定 peer → 无绑定模式下接受任意已连接 peer（消息由引擎验
+     BLS 签名，块由导入门验 leader 封印；gossip 本来就不做来源认证）；
+  6. leader 出块前的 "validator peer quorum" 检查按已路由验证者计数，无绑定时永远为 0，leader 永不出块 → 无绑定模式下按已连接
+     peer 数计（只是“不对空网出块”的启发式，投票仍由引擎按 BLS 计数）；
+  7. 交易转发按 leader 的 PeerId 发送，无绑定时找不到 → 无绑定模式下交易留在本地池（同 `N42_DISABLE_TX_FORWARD`），本节点
+     轮到出块时打包；
+  8. epoch 切换时重算绑定会走错误分支并 WARN → 无绑定模式下跳过；Identify 中 `n42/1.0.0/v{i}` 声明在无绑定模式下降为 debug。
+- n42-26 原生 `consensus_direct`/Rotor 中继在 H2-v4 参与者路径上不使用（`h2_v4_identity.is_some()` 时只走 `BroadcastH2V4`），无需改。
+- follower（期望表为空且未允许确定性 id 时）也打开同一网络开关：入站直连同样只按 BLS/封印认证。follower 的出站仍由
+  `FollowerNetwork` 全部拦截，不受影响。
+- bodies_by_range/state-sync 的服务授权未放宽：仍只对 `N42_TRUSTED_PEERS` 中的 peer 提供（演练中把对端全部列为受信）。
+
+### 15.2 实施细节（文件）
+
+- `bin/n42-node/src/main.rs`：`profile1_unbound_validator`（~1119）及单测；启动处计算并覆盖 `allow_deterministic_validator_peers`、
+  空期望表（~2187-2215）；身份（~3175）；`trust_signed_messages_without_peer_bindings()`（~3257）；跳过自动连接（~3290）；
+  `orchestrator.with_unbound_validator_peers`（~4034）。
+- `crates/n42-network/src/service.rs`：`h2_v4_direct_fanout_peers`（~339）；字段 `unbound_signed_validators`、
+  `gov5_hotstuff_direct_peers`、`gov5_block_push_peers`；`trust_signed_messages_without_peer_bindings()`（有绑定、允许确定性 id
+  或非 H2-v4 参与者时拒绝）、`gov5_direct_inbound_authorized`、`h2_v4_direct_peers`；Identify 记录两类协议；连接全部关闭
+  （`num_established == 0`）时才移除；两处入站检查与两处出站扇出改用新函数。
+- `crates/n42-consensus-service/src/orchestrator/mod.rs`：字段 `unbound_validator_peers`、`with_unbound_validator_peers`；
+  `connected_validator_peer_count`；`flush_tx_forward_buffer`。`consensus_loop.rs`：epoch 切换跳过重绑定。
+
+### 15.3 测试与门禁
+
+- `service.rs`：`h2_v4_direct_fanout_without_bindings_reaches_every_capable_peer`；`unbound_signed_trust_is_refused_when_bindings_exist`
+  （有绑定、原生网络拒绝）；`profile1_unbound_validator_exchanges_direct_h2_v4_with_an_unbound_peer`（真实 QUIC：服务端无绑定，
+  对端是未订阅任何 H2 topic 的裸 swarm，只能走直连——服务端接受其 `hotstuff_direct`，自身广播经 `hotstuff_direct` 到达对端）；
+  `bound_validator_refuses_direct_h2_v4_from_an_unbound_peer`（不开开关时两方向都不通，对照）。
+- `orchestrator`：`unbound_profile1_leader_counts_connected_peers_for_quorum`。`main.rs`：`profile1_unbound_validator_only_on_profile1_without_bindings`。
+- `cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace --no-fail-fast`：2109 passed / 0 failed / 38 ignored。
+
+### 15.4 演练 A：4 个 n42-26 验证者，无 peer id，无确定性身份（`/tmp/p1-g6/runA.sh`）
+
+- 创世 `/tmp/p1-run/genesis_now.json` 改时间戳（G = 1795621687，G mod 8 = 7），验证者条目只有 `address`/`blsKey`；
+  `N42_ALLOW_DETERMINISTIC_P2P` 未设置；每节点 `openssl rand` 生成 `N42_P2P_KEY`；`N42_TRUSTED_PEERS` 为另外三个节点。
+  端口 reth 30400+i、HTTP 18545+i、共识 19400+i。
+- 日志确认 "Profile 1 without validator p2p_peer_id bindings…"；leader 直推块 `peers=3`（验证者 2 停机期间 `peers=2`）。
+- 高度 8 停验证者 2 约 60 s 后重启，经认证 catch-up 补齐。23 块：4 节点哈希一致；携带字段与各节点 `executed_fields.log` 92 次比较 0 不符；
+  E14 标签 latest=23 safe=22 finalized=22；出块者 {0:6, 1:7, 2:4, 3:6}；AM27 网格 0 违规（停机导致块 10、13 跳 slot，dt=32）。
+- 四节点 ERROR 0、E12 停机 0、panic 0；WARN 只有重复投票抑制、停机期间的超时与断连。
+
+### 15.5 演练 B：3 个 gov5 验证者 + 1 个 n42-26 验证者（`/tmp/p1-g6/B/runB.sh`）
+
+- gov5 二进制 `n42-p1.am27`（sha256 3b7da0a2…39be，复制到 `/tmp/p1-g6/B/` 并校验）；gate4a 的 `run-p1mixed.sh` 只改端口行
+  （TCP 30430、UDP 30440、HTTP 18570、MOBILE 18580、PPROF 6100）、P1_DIR、P1_BIN、P1_GENESIS；`P1_SET=smoke`，只启动 0、1、2，
+  gov5 node 3 不启动；创世 `genesis-gate4a.json`，init 把时间戳改为当时（G = 1795621929），G+10 s 同时启动。
+  n42-26 为验证者 3（同一 BLS 推导），`N42_P2P_KEY` 固定（12D3KooWMTTa…），经 `P1_EXTRA_PEERS` 加入 gov5 的 `--p2p.peer`；
+  n42-26 的 `N42_TRUSTED_PEERS` 为三个 gov5 的 TCP 地址。两边创世哈希一致 `0xef0c96…bc8282`。
+- 期间：gov5 node 1 按 pid 停 ~60 s 后重启（高度 17→22 由其余三家继续出块；重启后 gov5 node 1 从 n42-26 拉 range 补齐）；
+  两路负载（gov5 v0 RPC 800 笔、n42-26 RPC 600 笔，4 tx/s）；随后 n42-26 自身停 ~60 s 后重启，认证 catch-up 补齐后继续出块、投票。
+- 结果（113 块）：4 节点每个高度哈希一致；1432 笔交易；n42-26 `executed_fields.log` 与每个头携带的五个延迟字段 113 次比较 0 不符
+  （gov5 产出的块同样被比较，跨客户端一致）；出块者 {0:29, 1:27, 2:30, 3:27}，n42-26 的 27 个块全部被 gov5 接受（同一链）；
+  头中携带的 111 个 QC 里 n42-26（索引 3）签名出现 56 次（停机期间的 QC 为 {0,1,2}）；AM27 网格 0 违规。
+- n42-26 日志：ERROR 0、E12 停机 0、panic 0，"rejected Gov5 direct" 0；WARN 只有超时、断连与已知启动提示。
+- gov5 日志（`/tmp/p1-g6/B/logs/`）：error 全部为 "Failed to reconnect to peer"——对象是未启动的 gov5 node 3（30433）以及停机期间的 node 1；
+  另有 node 1 的 2 条 "sync anchor: catch-up range not fully anchored"（catch-up 时区间末块尚未锚定，随后补齐）。
+- 经 n42-26 RPC 提交的交易只由 n42-26 自己出块时打包（无转发），gov5 node 1 重启后未打包任何交易（gov5 侧行为，未深究）。
+  gov5 RPC 的 `safe`/`finalized` 标签返回 null（gov5 侧未实现或不同语义，未核实）。
+
+### 15.6 未完成 / 后续
+
+- 未与 n42-rs 混跑（本次只有 gov5 + n42-26）；n42-rs 是否声明 `hotstuff_direct`/`block_push`、是否接受 n42-26 的 ed25519 PeerId 未验证。
+- bodies_by_range/state-sync 仍要求对端列入 `N42_TRUSTED_PEERS`；是否在无绑定模式下对完成同创世 status 握手的 peer 放开需要讨论。
+- 无绑定模式下入站直连对任意已连接 peer 开放，只受 BLS/封印校验与现有 gossip 级 DoS 限制约束。
+- 交易不转发给其他客户端的 leader；如需要应改为 mempool gossip 或按 BLS 身份映射 leader。
