@@ -795,3 +795,67 @@ AM19 与检查早于提案；被拒块无 Round 1；非 Profile 1 无效果）�
 ### 13.6 后续
 
 - 8282 用例的头只是执行输入；若 gov5 以后公布其内部头哈希，可直接用它代替从 EIP-2935 写入回推 parentHash。
+
+## 14. AM27：从创世时间戳起算的 slot 网格（rc4 A17/B4）（2026-11-25 追加）
+
+### 14.1 设计决策
+
+- 规则（标准 rc4，n42-rs `f9272d937`）：slot s 起点 `G + s·I`，G 为创世头 timestamp，I 为
+  `config.hotstuff.blockIntervalMs`（取自创世，不写死 8）。导入时检查 `(time − G) mod I = 0` 与
+  `time ≥ parent.time + I`（允许跳 slot）；投票前的未来界 `time ≤ floor(now) + 2` 不变。取代 AM26 与 rc3 的
+  `max(parent.time, floor(now))`。
+- 检查放在 `validate_profile1_header`（`Profile1ImportGate` 唯一入口），因此跟随者、验证者、range 同步、
+  catch-up/replay、观察者全部路径自动生效；非 Profile 1 不经过该 gate，无变化。
+- 网格以毫秒计算，I 不是整秒时也精确；只有整秒的 slot 起点可盖戳。
+- leader：在父块 slot 之后、且不在过去的第一个 slot 出块：`s = max(sP + 1, ceil((now − G)/I))`，
+  到点前不建块，时间戳就是 `G + s·I`。已排定的 slot 若定时器晚到不超过 1 s（`PROFILE1_SLOT_START_GRACE_MS`）
+  仍沿用，否则顺延到下一个边界。旧实现按 unix 纪元对齐边界、并在 `timestamp <= last_committed` 时 +1/+2，
+  在 Profile 1 上都会离开网格，已关闭。
+
+### 14.2 实施细节
+
+- `crates/n42-consensus-service/src/profile1_header.rs`：新增 `Profile1SlotGrid`（`is_on_grid`、`slot_of`、
+  `proposal_slot`、`plan_proposal`）、`check_profile1_import_time`、错误 `TimeOffGrid`/`TimeSameSlot`（规则 id B4）；
+  `Profile1HeaderRules.grid`、`Profile1ImportGate::grid()`，gate 从创世头与配置构造网格。
+- `orchestrator/execution_bridge.rs`：`profile1_proposal_plan`（父块时间取自 gate / 已记住的头）；
+  `do_trigger_payload_build_on` 在 Profile 1 上先算 slot，起点未到则挂 `next_build_at` 并返回，到点后以该戳建块；
+  `build_payload_attributes` 不再改动 Profile-1 戳；FCU 重试在 Profile 1 上不抬戳；build-on-output 也用网格戳。
+- `orchestrator/consensus_loop.rs`：`next_slot_boundary` 在 Profile 1 上用 G 网格与父块 slot。
+- 测试：网格单测（在网格/偏 ±1 s；parent+0 拒、parent+8/+16 收；I=12 s、I=1.5 s）、leader 计划单测（含超时后
+  mid-slot 进入）、gate 对 V1 块 2 的六个重签变体；跟随者、同步、catch-up、观察者四条路径各自用同一组变体；
+  leader 端到点前不建块、到点建块且 attributes.timestamp 等于网格戳。
+
+### 14.3 问题与向量冲突
+
+- **V5（rc3，gov5 2026-11-24 发布）块 2 `sstore-clear-equal-timestamp` 与父块同时间**，AM27 下被 B4 拒。未改向量、
+  未放宽规则：`v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid` 标 `#[ignore]`，新增
+  `v5_block2_equal_timestamp_is_refused_under_am27` 记录冲突，待 gov5 按 AM27 重发 V5。
+- V3（`G+1..G+7`）与 V4（`G+1`）时间戳也不在网格上；它们只作执行向量，不经过头 gate，测试仍通过，但作为
+  真实块会被拒，同样需要 gov5 重发。V1 在网格上（G+8、G+16），全部通过。qs-scratch 与 n42-rs 均未见 AM27 重发的向量。
+- 测试自造链：`profile1_import.rs` 由 parent+1 改为 parent+I；`profile1_deferred.rs` 的 6' 由 +1 改为 +8。
+- clippy `manual_is_multiple_of`：改用 `is_multiple_of`。
+
+### 14.4 本地演练
+
+4 验证者 + 1 跟随者（`/tmp/p1-am27/run_am27.sh`，G = 1795593997，G mod 8 = 5，故网格不与 unix 纪元对齐），
+块 8 后停验证者 2 约 65 s 再启动。27 块：全部 `(t − G) mod 8 = 0` 且 `t ≥ parent + 8`；两次超时后块 10、13
+分别落在 slot 13、19（dt = 32）；各节点建块起点均在 slot 起点后 0.6–2.5 ms，无累计漂移；5 节点哈希一致，
+携带字段不符 0，头拒绝 0，E14 标签全部正常。
+
+### 14.5 后续
+
+- gov5 按 AM27 重发 V3/V4/V5 后，恢复被忽略的 V5 延迟执行测试。
+- build-ahead（`N42_BUILD_ON_OUTPUT`，默认关）在 Profile 1 上已用网格戳，但提前建好的块在本视图开始即发布，
+  若早于 slot 起点 2 s 以上会被投票前未来界拒；Profile 1 上开启前需再加发布等待。
+
+### 14.x 换用 gov5 的 AM27 版 V1/V5（2026-11-25 03:4x）
+
+- gov5 03:04 重新发布 V1/V5（qs-scratch/profile1/vectors；旧版在 vectors.bak-pre-am27-20261125）。
+  sha256：V1 `header_profile_v1.json` 13e53897…890c，V5 `header_validity.json` aeeb8357…2060，与 n42-rs 转告一致。
+- V5：块 2 不再与父块同一时间戳，`v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid` 取消 ignore，通过；
+  只针对 rc3 V5 的 `v5_block2_equal_timestamp_is_refused_under_am27` 删除。
+- V1：新增 "timestamp equal to parent"、"timestamp off the slot grid" 两个导入拒绝；"requestsHash absent" 改成解码期（B8）拒绝，
+  不再由延迟检查拒绝。导入拒绝从 21 个增至 24 个，静态检查总数 25（含一个投票期）；四处计数和 requestsHash 特例已相应更新，
+  chainspec 解码测试把 "requestsHash absent" 归入解码错误。
+- 只改测试和测试数据，未改产品代码，因此 06:30 前发布的二进制（5679751，sha256 d0a11c27…f5c9）仍然有效。
+- 门禁：clippy 通过；workspace 2100 passed / 0 failed / 38 ignored。

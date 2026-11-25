@@ -491,7 +491,8 @@ async fn v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid() ->
         // EIP-4788 write depends on the time).
         let six = &headers[5];
         let mut six_sibling = six.clone();
-        six_sibling.header.timestamp += 1;
+        // AM27: the next slot, so the sibling stays on the grid.
+        six_sibling.header.timestamp += 8;
         let signer6 = &keys[blocks[5]["signerIndex"].as_u64().unwrap() as usize];
         six_sibling.seal(signer6)?;
         let six_sibling_block = valid(import(&six_sibling, &[]), "6'");

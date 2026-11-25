@@ -237,7 +237,10 @@ impl ConsensusService {
         // Without this guard, fast block production (slot_time=0, or single-node f=0)
         // can produce two blocks within the same wall-clock second, causing
         // "Invalid payload attributes: invalid timestamp" errors.
-        if timestamp <= self.last_committed_timestamp {
+        // Profile 1 (A17, AM27): the caller's stamp is a slot start after the
+        // parent's slot; moving it would take it off the grid (B4).
+        let profile1_stamp = self.profile1.is_some() && slot_timestamp.is_some();
+        if !profile1_stamp && timestamp <= self.last_committed_timestamp {
             let bumped = self.last_committed_timestamp + 1;
             warn!(
                 target: "n42::cl::exec_bridge",
@@ -370,6 +373,35 @@ impl ConsensusService {
             return;
         }
 
+        // Profile 1 (A17, AM27): the leader proposes in the first slot after
+        // the parent's that is not in the past, no earlier than its start
+        // `G + s·I`, and stamps that start. A view entered mid-slot (after a
+        // TC, or a late parent) waits for the next boundary.
+        let slot_timestamp = if self.profile1.is_some() {
+            let Some((stamp, start_ms)) = self.profile1_proposal_plan(parent, slot_timestamp) else {
+                warn!(target: "n42::cl::exec_bridge", view = build_context.view, %parent,
+                    "profile 1: the parent's timestamp is not known; cannot place the proposal on the slot grid, retrying");
+                if !is_ahead {
+                    self.schedule_build_retry();
+                }
+                return;
+            };
+            let now_ms = u128::from(now_unix_ms());
+            if !is_ahead && start_ms > now_ms {
+                let wait = Duration::from_millis(u64::try_from(start_ms - now_ms).unwrap_or(u64::MAX));
+                self.clear_leader_build_wait();
+                self.next_build_at = Some(Instant::now() + wait);
+                self.next_slot_timestamp = Some(stamp);
+                info!(target: "n42::cl::exec_bridge", view = build_context.view, %parent,
+                    slot_timestamp = stamp, wait_ms = wait.as_millis() as u64,
+                    "profile 1: waiting for the slot start before building (A17)");
+                return;
+            }
+            Some(stamp)
+        } else {
+            slot_timestamp
+        };
+
         // This build supersedes any retry timer left behind by an earlier FCU
         // Syncing result. Catch-up completion can invoke this method before that
         // timer fires; leaving it armed would build a second child after the first
@@ -486,10 +518,16 @@ impl ConsensusService {
                 // Retry: bump timestamp aggressively to guarantee > head.timestamp.
                 // Use +2 because consecutive fast blocks bump by +1 each, and our
                 // last_committed_timestamp tracking can be 1 behind the actual head.
-                let bumped_ts = self.last_committed_timestamp.max(attrs.timestamp) + 2;
-                warn!(target: "n42::cl::exec_bridge", bumped_ts, "retrying FCU with bumped timestamp");
                 let mut retry_attrs = attrs.clone();
-                retry_attrs.timestamp = bumped_ts;
+                if self.profile1.is_none() {
+                    let bumped_ts = self.last_committed_timestamp.max(attrs.timestamp) + 2;
+                    warn!(target: "n42::cl::exec_bridge", bumped_ts, "retrying FCU with bumped timestamp");
+                    retry_attrs.timestamp = bumped_ts;
+                } else {
+                    // Profile 1 (B4, AM27): the stamp stays the slot start.
+                    warn!(target: "n42::cl::exec_bridge", timestamp = attrs.timestamp,
+                        "retrying FCU with the same slot stamp");
+                }
                 retry_attrs
             };
             let used_ts = try_attrs.timestamp;
@@ -589,7 +627,14 @@ impl ConsensusService {
                 return;
             }
         };
-        let attributes = self.build_payload_attributes(None, parent_beacon_block_root);
+        // Profile 1 (A17, AM27): the child's stamp is its slot start.
+        let stamp = self
+            .profile1_proposal_plan(parent, None)
+            .map(|(stamp, _)| stamp);
+        if self.profile1.is_some() && stamp.is_none() {
+            return;
+        }
+        let attributes = self.build_payload_attributes(stamp, parent_beacon_block_root);
         self.last_committed_timestamp = self.last_committed_timestamp.max(attributes.timestamp);
         self.ahead.start_building(context);
         self.ahead.start_output_build(context);
@@ -642,6 +687,31 @@ impl ConsensusService {
         self.next_build_at = Some(retry_at);
         // Clear slot_timestamp to indicate this is a retry, not a scheduled slot.
         self.next_slot_timestamp = None;
+    }
+
+    /// Profile 1 (A17, AM27): `(stamp, start_ms)` of the slot a leader
+    /// building on `parent` proposes in; `None` off Profile 1, or when the
+    /// parent's header (its timestamp) is not known.
+    pub(super) fn profile1_proposal_plan(
+        &self,
+        parent: B256,
+        scheduled: Option<u64>,
+    ) -> Option<(u64, u128)> {
+        let gate = self.profile1.as_ref()?;
+        let parent_time = gate
+            .header(&parent)
+            .map(|header| header.header.timestamp)
+            .or_else(|| {
+                n42_consensus::remembered_profile1_header(&parent).map(|header| header.header.timestamp)
+            })
+            .or_else(|| {
+                n42_consensus::remembered_gov5_native_header(&parent)
+                    .map(|native| native.header.timestamp)
+            })?;
+        Some(
+            gate.grid()
+                .plan_proposal(parent_time, scheduled, u128::from(now_unix_ms())),
+        )
     }
 
     /// Returns the only parent an honest leader may build on in the current

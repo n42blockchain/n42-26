@@ -316,7 +316,8 @@ fn layout_refusals_of_v1_are_decode_errors() {
         let raw = bytes(&refusal["rlp"]);
         let decoded = Profile1Header::decode(&raw);
         match name {
-            "withdrawalsRoot absent" => assert!(
+            // rc4 V1: "requestsHash absent" (B8) drops element 21's value.
+            "withdrawalsRoot absent" | "requestsHash absent" => assert!(
                 matches!(decoded, Err(Profile1HeaderError::Missing { .. }) | Err(Profile1HeaderError::Field { .. })),
                 "{name}: {decoded:?}"
             ),

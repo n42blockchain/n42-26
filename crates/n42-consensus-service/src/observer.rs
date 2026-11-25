@@ -2644,11 +2644,7 @@ mod tests {
 
         let mut refused = 0;
         for refusal in vector["refusals"].as_array().unwrap() {
-            // AM25: requestsHash is a deferred field, refused by the
-            // engine's deferred check, not by the header gate.
-            if refusal["check"] != "import"
-                || refusal["name"].as_str().unwrap().starts_with("requestsHash")
-            {
+            if refusal["check"] != "import" {
                 continue;
             }
             let header = raw(&refusal["rlp"]);
@@ -2659,6 +2655,18 @@ mod tests {
             );
             refused += 1;
         }
-        assert_eq!(refused, 21);
+        assert_eq!(refused, 24);
+
+        // AM27 (B4): off-grid and same-slot timestamps are refused on the
+        // observer's import too; on-grid and skip-slot ones pass the gate.
+        for (name, header, admitted) in crate::profile1_header::am27_block2_variants() {
+            observer.import_block_data(broadcast(&header, 2), None).await;
+            let hash = alloy_primitives::keccak256(&header);
+            assert_eq!(
+                observer.profile1.as_ref().unwrap().header(&hash).is_some(),
+                admitted,
+                "observer: {name}"
+            );
+        }
     }
 }

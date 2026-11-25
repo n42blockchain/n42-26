@@ -54,10 +54,9 @@ impl V1 {
     /// field, refused by the engine's deferred check (`n42-node`'s
     /// `profile1_deferred.rs`), not by the static header rules.
     fn import_refusals(&self) -> Vec<(String, Vec<u8>)> {
+        // rc4 V1 (AM27): every import refusal, "requestsHash absent"
+        // included, is refused statically; none is left to the deferred check.
         self.refusals("import")
-            .into_iter()
-            .filter(|(name, _)| !name.starts_with("requestsHash"))
-            .collect()
     }
 
     fn refusals(&self, check: &str) -> Vec<(String, Vec<u8>)> {
@@ -141,7 +140,7 @@ async fn follower_import_admits_v1_and_refuses_every_import_refusal() {
     }
 
     let refusals = f.import_refusals();
-    assert_eq!(refusals.len(), 21);
+    assert_eq!(refusals.len(), 24);
     for (name, header) in refusals {
         let (hash, broadcast) = block_data(&header, 2);
         orch.handle_block_data(bincode::serialize(&broadcast).unwrap()).await;
@@ -261,7 +260,7 @@ async fn catchup_import_refuses_before_new_payload() {
         assert!(!admitted(&orch, decoded.hash()), "{name}");
         refused += 1;
     }
-    assert_eq!(refused, 21);
+    assert_eq!(refused, 24);
 
     let wire2 = gov5_wire_block(&f.block2, block2.header.beneficiary);
     let decoded2 = orch.decode_wire_block(&wire2).unwrap();
@@ -272,6 +271,131 @@ async fn catchup_import_refuses_before_new_payload() {
         vec![block1.hash(), block2.hash()],
         "only the two valid blocks reach new_payload"
     );
+}
+
+/// AM27 (B4): the slot-grid checks hold on every orchestrator import path:
+/// follower import (block data), sync import and the authenticated catch-up
+/// import (reverse walk and range client). Off-grid and same-slot variants of
+/// V1 block 2 never reach `new_payload`; on-grid and skip-slot ones do.
+#[tokio::test]
+async fn am27_slot_grid_is_checked_on_every_import_path() {
+    let variants = crate::profile1_header::am27_block2_variants();
+    assert_eq!(variants.iter().filter(|(_, _, admitted)| !admitted).count(), 4);
+
+    // Follower import.
+    let (f, gate) = v1();
+    let mut orch = profile1_orchestrator(gate);
+    let (_, broadcast) = block_data(&f.block1, 1);
+    orch.handle_block_data(bincode::serialize(&broadcast).unwrap()).await;
+    for (name, header, admitted) in &variants {
+        let (hash, broadcast) = block_data(header, 2);
+        orch.handle_block_data(bincode::serialize(&broadcast).unwrap()).await;
+        assert_eq!(orch.pending_block_data.contains_key(&hash), *admitted, "follower: {name}");
+        assert_eq!(orch.profile1.as_ref().unwrap().header(&hash).is_some(), *admitted, "{name}");
+    }
+
+    // Sync import.
+    let (f, gate) = v1();
+    let mut orch = profile1_orchestrator(gate);
+    let mock = Arc::new(MockExecutionLayer::new(PayloadStatusEnum::Valid, PayloadStatusEnum::Valid));
+    orch.el = Some(mock.clone());
+    orch.async_finalize_fcu = false;
+    let (hash1, mut broadcast) = block_data(&f.block1, 1);
+    broadcast.payload_json = compress_payload(&broadcast.payload_json);
+    assert!(orch.import_and_notify(broadcast).await);
+    let mut expected = vec![hash1];
+    for (name, header, admitted) in &variants {
+        let (hash, mut broadcast) = block_data(header, 2);
+        broadcast.payload_json = compress_payload(&broadcast.payload_json);
+        assert_eq!(orch.import_and_notify(broadcast).await, *admitted, "sync: {name}");
+        if *admitted {
+            expected.push(hash);
+        }
+    }
+    assert_eq!(mock.new_payload_hashes(), expected, "only grid-valid blocks reach execution");
+
+    // Catch-up import (reverse walk and range client).
+    let (f, gate) = v1();
+    let mut orch = profile1_orchestrator(gate);
+    let mock = Arc::new(MockExecutionLayer::new(PayloadStatusEnum::Valid, PayloadStatusEnum::Valid));
+    orch.el = Some(mock.clone());
+    let source = n42_network::PeerId::random();
+    let block1 = Profile1Header::decode(&f.block1).unwrap();
+    let wire1 = gov5_wire_block(&f.block1, block1.header.beneficiary);
+    let decoded1 = orch.decode_wire_block(&wire1).unwrap();
+    assert!(orch.import_h2_v4_catchup_block(source, decoded1, 1).await);
+    let mut expected = vec![block1.hash()];
+    for (name, header, admitted) in &variants {
+        let decoded = Profile1Header::decode(header).unwrap();
+        let wire = gov5_wire_block(header, decoded.header.beneficiary);
+        let block = orch.decode_wire_block(&wire).unwrap();
+        assert_eq!(orch.import_h2_v4_catchup_block(source, block, 2).await, *admitted, "catch-up: {name}");
+        if *admitted {
+            expected.push(decoded.hash());
+        }
+    }
+    assert_eq!(mock.new_payload_hashes(), expected);
+}
+
+/// A17 (AM27): a Profile-1 leader builds only at its slot start and stamps
+/// it, on the grid counted from genesis, after a timeout too.
+#[tokio::test]
+async fn am27_leader_waits_for_the_slot_and_stamps_its_start() {
+    let (f, gate) = v1();
+    let genesis_time = Profile1Header::decode(&f.vector["genesis"]["rlp"].as_str().map(|s| hex::decode(s).unwrap()).unwrap())
+        .unwrap()
+        .header
+        .timestamp;
+    let grid = gate.grid();
+    assert_eq!(grid.genesis_time, genesis_time);
+    let genesis_hash = f.vector["genesisHash"].as_str().unwrap().parse::<B256>().unwrap();
+    let mut orch = profile1_orchestrator(gate);
+    let mock = Arc::new(MockExecutionLayer::new(PayloadStatusEnum::Valid, PayloadStatusEnum::Valid));
+    orch.el = Some(mock.clone());
+    orch.head_block_hash = genesis_hash;
+
+    // The plan for a build on genesis right now: on G's grid, in the future
+    // (V1's genesis is in 2026-11 ... the plan never goes back before now).
+    let now_ms = u128::from(crate::now_unix_ms());
+    let (stamp, start_ms) = orch.profile1_proposal_plan(genesis_hash, None).unwrap();
+    assert!(grid.is_on_grid(stamp));
+    assert!(stamp > genesis_time);
+    assert!(start_ms >= now_ms && start_ms < now_ms + 8_000 + 50);
+
+    // next_slot_boundary (the scheduled build) uses the same grid.
+    let (boundary, delay) = orch.next_slot_boundary();
+    assert!(grid.is_on_grid(boundary), "{boundary} is on G's grid");
+    assert!(delay <= Duration::from_millis(8_000));
+
+    // Payload attributes keep the slot stamp (no +1 bump off the grid), even
+    // when the last committed timestamp is ahead of it.
+    let committed = orch.last_committed_timestamp;
+    orch.last_committed_timestamp = stamp + 3;
+    let attrs = orch.build_payload_attributes(Some(stamp), B256::ZERO);
+    assert_eq!(attrs.timestamp, stamp);
+    orch.last_committed_timestamp = committed;
+
+    // A build asked for mid-slot (a view entered after a timeout or a late
+    // parent) does not start: it waits for the slot start, armed with the
+    // grid stamp.
+    let built_before = mock.build_parents().len();
+    orch.do_trigger_payload_build(None).await;
+    let (planned, _) = orch.profile1_proposal_plan(genesis_hash, None).unwrap();
+    if u128::from(crate::now_unix_ms()) < start_ms {
+        assert_eq!(mock.build_parents().len(), built_before, "no build before the slot start");
+        assert!(orch.next_build_at.is_some());
+        assert!(matches!(orch.next_slot_timestamp, Some(t) if t == stamp || t == planned));
+    }
+    // At the slot start the armed build runs and stamps exactly G + s·I.
+    let armed = orch.next_slot_timestamp.take().unwrap_or(planned);
+    orch.next_build_at = None;
+    let wait = (u128::from(armed) * 1000).saturating_sub(u128::from(crate::now_unix_ms()));
+    tokio::time::sleep(Duration::from_millis(wait as u64 + 5)).await;
+    orch.do_trigger_payload_build(Some(armed)).await;
+    assert_eq!(mock.build_parents().last(), Some(&genesis_hash));
+    assert_eq!(mock.build_timestamps().last(), Some(&armed));
+    assert!(grid.is_on_grid(armed));
+    crate::profile1_header::check_profile1_import_time(armed, genesis_time, grid).unwrap();
 }
 
 #[tokio::test]

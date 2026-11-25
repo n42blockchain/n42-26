@@ -27,5 +27,5 @@ chain) and `crates/n42-node/tests/profile1_vectors.rs` (`v5_builder_request_cont
 | `0c3f7add34f3f75ec41ef05fe09b8f9f47718751e6906828d2a907f5516a7dda` | `V4/README.md` |
 | `a68635cf58031de3852c99d6914eac2a0ba817b072c3f1e402fd9a891bcc3ca4` | `V4/transactions.json` |
 | `da1b12316579531035a7ede9b9b6287d7f1832b102416f808a625c64db062c48` | `V5/README.md` |
-| `02c957da2c0bd025c7043db118a1b2359014c86ac4b84285f75994a86465107d` | `V5/header_validity.json` |
+| `aeeb8357911471bdc83755bbb231aa6bf86deeb284d9d9618b3105e1b53d2060` | `V5/header_validity.json` |
 | `da4a57beff885502b065b7e7ac5611cf3229db7b0f1ce71396140f90a7496457` | `V5/builder_request_contracts.json` |

@@ -119,6 +119,17 @@ impl ConsensusService {
 
     /// Returns `(slot_timestamp_secs, delay_until_boundary)`.
     pub(super) fn next_slot_boundary(&self) -> (u64, Duration) {
+        // Profile 1 (A17, AM27): slots are counted from the genesis
+        // timestamp, and the slot follows the parent's.
+        if self.profile1.is_some()
+            && let Some(context) = self.required_payload_build_context()
+            && let Some((stamp, start_ms)) =
+                self.profile1_proposal_plan(context.parent_hash, None)
+        {
+            let now_ms = u128::from(crate::now_unix_ms());
+            let delay_ms = u64::try_from(start_ms.saturating_sub(now_ms)).unwrap_or(u64::MAX);
+            return (stamp, Duration::from_millis(delay_ms));
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();

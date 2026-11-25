@@ -5537,6 +5537,8 @@ mod tests {
         new_payload_statuses: Arc<Mutex<VecDeque<PayloadStatusEnum>>>,
         fcu_statuses: Arc<Mutex<VecDeque<PayloadStatusEnum>>>,
         build_parents: Arc<Mutex<Vec<B256>>>,
+        /// The timestamp of every build's payload attributes.
+        build_timestamps: Arc<Mutex<Vec<u64>>>,
         build_forkchoices: Arc<Mutex<Vec<(B256, B256, B256)>>>,
         /// Every attribute-less forkchoiceUpdated head - the canonical-writer
         /// audit trail (import paths must NEVER appear here).
@@ -5553,6 +5555,7 @@ mod tests {
                 new_payload_statuses: Arc::new(Mutex::new(VecDeque::from([new_payload_status]))),
                 fcu_statuses: Arc::new(Mutex::new(VecDeque::from([fcu_status]))),
                 build_parents: Arc::new(Mutex::new(Vec::new())),
+                build_timestamps: Arc::new(Mutex::new(Vec::new())),
                 build_forkchoices: Arc::new(Mutex::new(Vec::new())),
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
                 fcu_states: Arc::new(Mutex::new(Vec::new())),
@@ -5573,6 +5576,7 @@ mod tests {
                 new_payload_statuses: Arc::new(Mutex::new(VecDeque::from([new_payload_status]))),
                 fcu_statuses: Arc::new(Mutex::new(fcu_statuses)),
                 build_parents: Arc::new(Mutex::new(Vec::new())),
+                build_timestamps: Arc::new(Mutex::new(Vec::new())),
                 build_forkchoices: Arc::new(Mutex::new(Vec::new())),
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
                 fcu_states: Arc::new(Mutex::new(Vec::new())),
@@ -5593,6 +5597,7 @@ mod tests {
                 new_payload_statuses: Arc::new(Mutex::new(new_payload_statuses)),
                 fcu_statuses: Arc::new(Mutex::new(VecDeque::from([fcu_status]))),
                 build_parents: Arc::new(Mutex::new(Vec::new())),
+                build_timestamps: Arc::new(Mutex::new(Vec::new())),
                 build_forkchoices: Arc::new(Mutex::new(Vec::new())),
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
                 fcu_states: Arc::new(Mutex::new(Vec::new())),
@@ -5616,6 +5621,13 @@ mod tests {
 
         fn new_payload_hashes(&self) -> Vec<B256> {
             self.new_payload_hashes
+                .lock()
+                .expect("mock execution-layer lock")
+                .clone()
+        }
+
+        fn build_timestamps(&self) -> Vec<u64> {
+            self.build_timestamps
                 .lock()
                 .expect("mock execution-layer lock")
                 .clone()
@@ -5685,8 +5697,12 @@ mod tests {
         async fn fork_choice_updated_with_attrs(
             &self,
             state: ForkchoiceState,
-            _attrs: PayloadAttributes,
+            attrs: PayloadAttributes,
         ) -> Result<ForkchoiceUpdated, crate::el::ElError> {
+            self.build_timestamps
+                .lock()
+                .expect("mock execution-layer lock")
+                .push(attrs.timestamp);
             self.build_forkchoices
                 .lock()
                 .expect("mock execution-layer lock")
