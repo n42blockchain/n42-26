@@ -2660,5 +2660,17 @@ mod tests {
             refused += 1;
         }
         assert_eq!(refused, 21);
+
+        // AM27 (B4): off-grid and same-slot timestamps are refused on the
+        // observer's import too; on-grid and skip-slot ones pass the gate.
+        for (name, header, admitted) in crate::profile1_header::am27_block2_variants() {
+            observer.import_block_data(broadcast(&header, 2), None).await;
+            let hash = alloy_primitives::keccak256(&header);
+            assert_eq!(
+                observer.profile1.as_ref().unwrap().header(&hash).is_some(),
+                admitted,
+                "observer: {name}"
+            );
+        }
     }
 }

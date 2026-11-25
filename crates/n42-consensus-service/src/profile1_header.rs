@@ -30,6 +30,124 @@ pub struct Profile1HeaderRules<'a> {
     pub schedule: LeaderSchedule,
     /// `config.hotstuff.gasLimit` (A23).
     pub gas_limit: u64,
+    /// The slot grid (A17, AM27): the genesis timestamp G and the slot
+    /// length I (`config.hotstuff.blockIntervalMs`).
+    pub grid: Profile1SlotGrid,
+}
+
+/// How late after its slot start a scheduled proposal still takes that slot
+/// (timer jitter); later, the leader waits for the next boundary (A17: the
+/// first slot boundary that is not in the past).
+pub const PROFILE1_SLOT_START_GRACE_MS: u64 = 1000;
+
+/// The Profile-1 slot grid (A17, AM27): slot `s` starts at `G + s·I`, where
+/// `G` is the genesis timestamp (unix seconds) and `I` is
+/// `config.hotstuff.blockIntervalMs`. Kept in milliseconds so a slot length
+/// that is not a whole number of seconds is still exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Profile1SlotGrid {
+    /// The genesis timestamp G, unix seconds.
+    pub genesis_time: u64,
+    /// The slot length I, milliseconds; positive.
+    pub interval_ms: u64,
+}
+
+impl Profile1SlotGrid {
+    /// The grid of the chain `config` describes, whose genesis header is
+    /// stamped `genesis_time`.
+    pub const fn new(genesis_time: u64, interval_ms: u64) -> Self {
+        Self { genesis_time, interval_ms }
+    }
+
+    /// `(time − G)·1000` in milliseconds, or `None` before genesis.
+    fn offset_ms(&self, time: u64) -> Option<u128> {
+        time.checked_sub(self.genesis_time)
+            .map(|offset| u128::from(offset) * 1000)
+    }
+
+    /// Whether `time` (unix seconds) is a slot start: `(time − G) mod I = 0`.
+    pub fn is_on_grid(&self, time: u64) -> bool {
+        self.interval_ms > 0
+            && self
+                .offset_ms(time)
+                .is_some_and(|offset| offset.is_multiple_of(u128::from(self.interval_ms)))
+    }
+
+    /// The slot that starts at `time`, when `time` is on the grid.
+    pub fn slot_of(&self, time: u64) -> Option<u64> {
+        if !self.is_on_grid(time) {
+            return None;
+        }
+        u64::try_from(self.offset_ms(time)? / u128::from(self.interval_ms)).ok()
+    }
+
+    /// The start of slot `slot`, `G + slot·I`, in unix milliseconds.
+    pub fn slot_start_ms(&self, slot: u64) -> u128 {
+        u128::from(self.genesis_time) * 1000 + u128::from(slot) * u128::from(self.interval_ms)
+    }
+
+    /// The start of slot `slot` in unix seconds, when it is a whole second.
+    pub fn slot_start(&self, slot: u64) -> Option<u64> {
+        let ms = self.slot_start_ms(slot);
+        ms.is_multiple_of(1000).then(|| u64::try_from(ms / 1000).ok()).flatten()
+    }
+
+    /// A17: the slot a leader holding a parent stamped `parent_time`
+    /// proposes in at `now_ms` (unix milliseconds): the first slot after the
+    /// parent's that is not in the past,
+    /// `max(sP + 1, ceil((now − G)/I))`. A parent off the grid (genesis is
+    /// slot 0 by definition) counts as the slot it falls in.
+    pub fn proposal_slot(&self, parent_time: u64, now_ms: u128) -> u64 {
+        let interval = u128::from(self.interval_ms.max(1));
+        let parent_slot = self.offset_ms(parent_time).map_or(0, |offset| offset / interval);
+        let genesis_ms = u128::from(self.genesis_time) * 1000;
+        let now_slot = now_ms.saturating_sub(genesis_ms).div_ceil(interval);
+        let slot = (parent_slot + 1).max(now_slot);
+        u64::try_from(slot).unwrap_or(u64::MAX)
+    }
+
+    /// The first slot at or after `slot` whose start is a whole second (a
+    /// header time is in seconds). With I a whole number of seconds that is
+    /// `slot` itself.
+    fn stampable(&self, mut slot: u64) -> u64 {
+        for _ in 0..1000 {
+            if self.slot_start(slot).is_some() {
+                break;
+            }
+            slot = slot.saturating_add(1);
+        }
+        slot
+    }
+
+    /// A17 (AM27): the slot a leader holding a parent stamped `parent_time`
+    /// proposes in, and its start. `scheduled` is a stamp chosen earlier
+    /// (when the build was scheduled for a slot boundary); it is kept when it
+    /// is on the grid, after the parent's slot, and `now_ms` is at most
+    /// [`PROFILE1_SLOT_START_GRACE_MS`] past its start, so a build timer
+    /// firing a few milliseconds after the boundary keeps the slot it was
+    /// armed for instead of skipping to the next. Otherwise the slot is
+    /// [`Self::proposal_slot`]. Returns `(stamp, start_ms)`: the leader
+    /// publishes no earlier than `start_ms` and stamps `stamp = start_ms/1000`.
+    pub fn plan_proposal(
+        &self,
+        parent_time: u64,
+        scheduled: Option<u64>,
+        now_ms: u128,
+    ) -> (u64, u128) {
+        let parent_slot = self.offset_ms(parent_time).map_or(0, |offset| {
+            u64::try_from(offset / u128::from(self.interval_ms.max(1))).unwrap_or(u64::MAX)
+        });
+        let kept = scheduled.and_then(|time| self.slot_of(time)).filter(|&slot| {
+            slot > parent_slot
+                && now_ms
+                    <= self.slot_start_ms(slot)
+                        + u128::from(PROFILE1_SLOT_START_GRACE_MS.min(self.interval_ms))
+        });
+        let slot = self.stampable(kept.unwrap_or_else(|| self.proposal_slot(parent_time, now_ms)));
+        let start_ms = self.slot_start_ms(slot);
+        let stamp = u64::try_from(start_ms / 1000).unwrap_or(u64::MAX);
+        (stamp, start_ms)
+    }
 }
 
 /// Why a Profile-1 header is invalid. The rule id is the standard's.
@@ -57,6 +175,18 @@ pub enum Profile1HeaderInvalid {
     OmmersHash(B256),
     #[error("profile 1 (B4): timestamp before parent: {time} < parent {parent}")]
     TimeBeforeParent { time: u64, parent: u64 },
+    #[error("profile 1 (B4, AM27): timestamp {time} is not on the slot grid: (time - genesis {genesis}) mod {interval_ms} ms != 0")]
+    TimeOffGrid {
+        time: u64,
+        genesis: u64,
+        interval_ms: u64,
+    },
+    #[error("profile 1 (B4, AM27): timestamp {time} is not in a later slot than the parent's {parent}: want >= parent + {interval_ms} ms")]
+    TimeSameSlot {
+        time: u64,
+        parent: u64,
+        interval_ms: u64,
+    },
     #[error("profile 1 (B4): timestamp too far ahead of the local clock: {time} > floor(now) + 2 = {bound}")]
     TimeFuture { time: u64, bound: u64 },
     #[error("profile 1 (B8): requestsHash is missing")]
@@ -156,13 +286,9 @@ pub fn validate_profile1_header(
         });
     }
 
-    // B4 (import half): equal timestamps are allowed.
-    if h.timestamp < p.timestamp {
-        return Err(Profile1HeaderInvalid::TimeBeforeParent {
-            time: h.timestamp,
-            parent: p.timestamp,
-        });
-    }
+    // B4 (import half, AM27): not before the parent, on the slot grid, and
+    // in a later slot than the parent's (`time >= parent.time + I`).
+    check_profile1_import_time(h.timestamp, p.timestamp, rules.grid)?;
     // B8: present. Its value is a deferred field (AM25: N−1's EIP-7685
     // requests hash), compared with this node's execution of the parent on
     // import (the QMDB state-root job), not here.
@@ -264,6 +390,36 @@ pub fn validate_profile1_header(
     })
 }
 
+/// B4, import half (AM27): `time >= parent.time`, `(time − G) mod I = 0` and
+/// `time >= parent.time + I`. Clock-free; checked on every import path.
+pub fn check_profile1_import_time(
+    time: u64,
+    parent_time: u64,
+    grid: Profile1SlotGrid,
+) -> Result<(), Profile1HeaderInvalid> {
+    if time < parent_time {
+        return Err(Profile1HeaderInvalid::TimeBeforeParent {
+            time,
+            parent: parent_time,
+        });
+    }
+    if !grid.is_on_grid(time) {
+        return Err(Profile1HeaderInvalid::TimeOffGrid {
+            time,
+            genesis: grid.genesis_time,
+            interval_ms: grid.interval_ms,
+        });
+    }
+    if u128::from(time) * 1000 < u128::from(parent_time) * 1000 + u128::from(grid.interval_ms) {
+        return Err(Profile1HeaderInvalid::TimeSameSlot {
+            time,
+            parent: parent_time,
+            interval_ms: grid.interval_ms,
+        });
+    }
+    Ok(())
+}
+
 /// B4, vote half: `time <= floor(now) + 2`, checked before the Round-1 vote
 /// only (never on import of a committed block).
 pub fn check_profile1_vote_time(
@@ -291,7 +447,10 @@ impl Profile1HeaderInvalid {
             | Self::Nonce
             | Self::MixHash(_)
             | Self::OmmersHash(_) => "B3",
-            Self::TimeBeforeParent { .. } | Self::TimeFuture { .. } => "B4",
+            Self::TimeBeforeParent { .. }
+            | Self::TimeOffGrid { .. }
+            | Self::TimeSameSlot { .. }
+            | Self::TimeFuture { .. } => "B4",
             Self::RequestsHash(_) => "B8",
             Self::BlobGas { .. } => "B9",
             Self::SlotNumber { .. } => "B10",
@@ -368,6 +527,7 @@ pub struct Profile1ImportGate {
     validators: ValidatorSet,
     schedule: LeaderSchedule,
     gas_limit: u64,
+    grid: Profile1SlotGrid,
     admitted: std::collections::HashMap<B256, Profile1Header>,
     order: std::collections::VecDeque<B256>,
     refused: std::collections::HashMap<B256, Profile1Refusal>,
@@ -403,6 +563,7 @@ impl Profile1ImportGate {
             validators,
             schedule,
             gas_limit: config.gas_limit,
+            grid: Profile1SlotGrid::new(genesis.header.timestamp, config.block_interval_ms),
             admitted: Default::default(),
             order: Default::default(),
             refused: Default::default(),
@@ -429,6 +590,11 @@ impl Profile1ImportGate {
     pub fn with_clock(mut self, clock: fn() -> u64) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// The slot grid the gate checks timestamps against (A17, AM27).
+    pub const fn grid(&self) -> Profile1SlotGrid {
+        self.grid
     }
 
     /// The H2-v4 identity the gate checks QCs in.
@@ -483,6 +649,7 @@ impl Profile1ImportGate {
             validators: &self.validators,
             schedule: self.schedule,
             gas_limit: self.gas_limit,
+            grid: self.grid,
         };
         let admitted = &self.admitted;
         let is_ancestor = |target: B256| {
@@ -614,6 +781,51 @@ impl Profile1ImportGate {
     }
 }
 
+/// AM27 variants of V1's block 2 (parent: block 1 at `G + 8`), resealed by
+/// view 2's leader: `(name, header encoding, admitted on import)`.
+#[cfg(test)]
+pub(crate) fn am27_block2_variants() -> Vec<(&'static str, Vec<u8>, bool)> {
+    use alloy_primitives::hex;
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../n42-chainspec/testdata/profile1/V1/header_profile_v1.json");
+    let vector: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let decode = |value: &serde_json::Value| {
+        Profile1Header::decode(&hex::decode(value.as_str().unwrap()).unwrap()).unwrap()
+    };
+    let block1 = decode(&vector["headers"][0]["rlp"]);
+    let block2 = decode(&vector["headers"][1]["rlp"]);
+    let signer = vector["headers"][1]["signerIndex"].as_u64().unwrap() as usize;
+    let key: [u8; 32] = hex::decode(
+        vector["validators"][signer]["blsSecretKey"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("0x"),
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    let key = n42_primitives::BlsSecretKey::from_bytes(&key).unwrap();
+    let parent = block1.header.timestamp;
+    assert_eq!(block2.header.timestamp, parent + 8, "V1 block 2 is parent + 8");
+    [
+        ("on grid, parent + 8 (V1 block 2)", parent + 8, true),
+        ("skip slot, parent + 16", parent + 16, true),
+        ("off grid by +1 s, parent + 9", parent + 9, false),
+        ("off grid by -1 s, parent + 7", parent + 7, false),
+        ("same slot, parent + 0", parent, false),
+        ("before the parent, parent - 8", parent - 8, false),
+    ]
+    .into_iter()
+    .map(|(name, time, admitted)| {
+        let mut header = block2.clone();
+        header.header.timestamp = time;
+        header.seal(&key).unwrap();
+        (name, header.encode(), admitted)
+    })
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,6 +886,7 @@ mod tests {
                 validators: &self.validators,
                 schedule: self.schedule,
                 gas_limit: self.gas_limit,
+                grid: Profile1SlotGrid::new(self.genesis.header.timestamp, 8000),
             }
         }
 
@@ -766,6 +979,116 @@ mod tests {
         }
         assert_eq!(checked, 22);
         assert_eq!(deferred, 2, "V1's two requestsHash refusals");
+    }
+
+    /// B4 (AM27), import half: on the grid and in a later slot than the
+    /// parent's; a skipped slot is allowed.
+    #[test]
+    fn am27_import_time_checks() {
+        let grid = Profile1SlotGrid::new(1_000, 8_000);
+        let ok = |time, parent| check_profile1_import_time(time, parent, grid);
+        // On the grid, parent + 8.
+        ok(1_016, 1_008).unwrap();
+        // Skip slot: parent + 16.
+        ok(1_024, 1_008).unwrap();
+        // Off the grid by one second either way.
+        assert!(matches!(ok(1_017, 1_008), Err(Profile1HeaderInvalid::TimeOffGrid { .. })));
+        assert!(matches!(ok(1_015, 1_008), Err(Profile1HeaderInvalid::TimeOffGrid { .. })));
+        // Same slot as the parent (parent + 0): refused.
+        assert!(matches!(ok(1_008, 1_008), Err(Profile1HeaderInvalid::TimeSameSlot { .. })));
+        // Before the parent; before genesis is off the grid.
+        assert!(matches!(ok(1_000, 1_008), Err(Profile1HeaderInvalid::TimeBeforeParent { .. })));
+        assert!(matches!(ok(992, 0), Err(Profile1HeaderInvalid::TimeOffGrid { .. })));
+        // Block 1 on genesis: G + 8 is slot 1.
+        ok(1_008, 1_000).unwrap();
+        assert!(matches!(ok(1_000, 1_000), Err(Profile1HeaderInvalid::TimeSameSlot { .. })));
+        // The grid is G's, not the unix epoch's: G = 1003.
+        let shifted = Profile1SlotGrid::new(1_003, 8_000);
+        check_profile1_import_time(1_011, 1_003, shifted).unwrap();
+        assert!(check_profile1_import_time(1_016, 1_003, shifted).is_err());
+        // Every refusal is a B4 refusal.
+        assert_eq!(ok(1_017, 1_008).unwrap_err().rule(), "B4");
+        assert_eq!(ok(1_008, 1_008).unwrap_err().rule(), "B4");
+    }
+
+    /// The slot length is the genesis's, not a constant: I = 12 s.
+    #[test]
+    fn am27_grid_uses_the_genesis_interval() {
+        let grid = Profile1SlotGrid::new(1_000, 12_000);
+        check_profile1_import_time(1_012, 1_000, grid).unwrap();
+        assert!(check_profile1_import_time(1_008, 1_000, grid).is_err());
+        assert!(check_profile1_import_time(1_016, 1_000, grid).is_err());
+        check_profile1_import_time(1_036, 1_012, grid).unwrap();
+        // A slot length that is not whole seconds: I = 1.5 s, slots at
+        // 0, 1.5, 3, ...; only the whole-second starts can be stamped.
+        let half = Profile1SlotGrid::new(1_000, 1_500);
+        check_profile1_import_time(1_003, 1_000, half).unwrap();
+        assert!(check_profile1_import_time(1_002, 1_000, half).is_err());
+        assert_eq!(half.plan_proposal(1_000, None, 1_000_000), (1_003, 1_003_000));
+    }
+
+    /// A17 (AM27): the leader's stamp is the start of the first slot after
+    /// the parent's that is not in the past, whatever the clock's phase.
+    #[test]
+    fn am27_leader_stamps_the_slot_start() {
+        let g = 1_795_564_803_u64; // not a multiple of 8: the grid is G's
+        let grid = Profile1SlotGrid::new(g, 8_000);
+        let ms = |seconds: u64, millis: u64| u128::from(seconds) * 1000 + u128::from(millis);
+        // Parent in slot 1, now early in slot 1: propose in slot 2.
+        assert_eq!(grid.plan_proposal(g + 8, None, ms(g + 9, 300)), (g + 16, ms(g + 16, 0)));
+        // Parent in slot 1, now late in slot 2 (a slow parent): the next
+        // boundary, slot 3, not the past start of slot 2.
+        assert_eq!(grid.plan_proposal(g + 8, None, ms(g + 17, 1)), (g + 24, ms(g + 24, 0)));
+        // Exactly on a boundary: that slot.
+        assert_eq!(grid.plan_proposal(g + 8, None, ms(g + 24, 0)), (g + 24, ms(g + 24, 0)));
+        // After a timeout (24 s base timeout and a TC), the view is entered
+        // mid-slot: the next boundary, still on the grid and later than the
+        // parent's slot.
+        let (stamp, start) = grid.plan_proposal(g + 8, None, ms(g + 8 + 24, 4_321));
+        assert_eq!(stamp, g + 40);
+        assert_eq!(start, ms(g + 40, 0));
+        check_profile1_import_time(stamp, g + 8, grid).unwrap();
+        // A scheduled stamp keeps its slot when the timer fires a few ms
+        // late, and is dropped when it is in the parent's slot or long past.
+        assert_eq!(grid.plan_proposal(g + 8, Some(g + 16), ms(g + 16, 7)), (g + 16, ms(g + 16, 0)));
+        assert_eq!(grid.plan_proposal(g + 8, Some(g + 8), ms(g + 9, 0)), (g + 16, ms(g + 16, 0)));
+        assert_eq!(grid.plan_proposal(g + 8, Some(g + 16), ms(g + 19, 0)), (g + 24, ms(g + 24, 0)));
+        // An off-grid scheduled stamp (the old epoch-aligned boundary) is
+        // replaced by the grid's.
+        assert_eq!(grid.plan_proposal(g + 8, Some(g + 13), ms(g + 12, 0)), (g + 16, ms(g + 16, 0)));
+        // Genesis is slot 0: block 1 goes in slot 1 or later.
+        assert_eq!(grid.plan_proposal(g, None, ms(g, 1)), (g + 8, ms(g + 8, 0)));
+        // Every planned stamp, at any clock phase, passes the import check.
+        for parent in [g, g + 8, g + 80] {
+            for now in (ms(g, 0)..ms(g + 120, 0)).step_by(997) {
+                let (stamp, start) = grid.plan_proposal(parent, None, now);
+                check_profile1_import_time(stamp, parent, grid).unwrap();
+                assert!(start >= now, "never a slot in the past");
+                assert!(start < now + 8_000 || stamp == parent + 8, "the first such slot");
+            }
+        }
+    }
+
+    /// The gate refuses AM27's off-grid and same-slot variants of V1 block 2
+    /// and admits the on-grid and skip-slot ones.
+    #[test]
+    fn am27_gate_checks_block2_variants() {
+        let f = Fixture::load();
+        let (_, config, _) = profile1_chain_spec(&testdata("genesis_8s.json")).unwrap();
+        let mut gate = Profile1ImportGate::new(&config, f.genesis.clone()).unwrap();
+        assert_eq!(gate.grid(), Profile1SlotGrid::new(f.genesis.header.timestamp, 8000));
+        gate.admit(f.block1.clone()).unwrap();
+        for (name, raw, admitted) in am27_block2_variants() {
+            let hash = alloy_primitives::keccak256(&raw);
+            let result = gate.admit_raw(hash, &raw);
+            if admitted {
+                assert_eq!(result, Ok(hash), "{name}");
+            } else {
+                let refusal = result.expect_err(name);
+                assert_eq!(refusal.rule(), "B4", "{name}: {refusal}");
+                assert!(refusal.is_permanent(), "{name}");
+            }
+        }
     }
 
     /// A leader's own block reaches its gate through no import path. Its

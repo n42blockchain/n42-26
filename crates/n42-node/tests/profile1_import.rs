@@ -146,7 +146,8 @@ fn produce(
     let rewards = rewards(config, coinbase);
     let withdrawals = n42_consensus::gov5_rewards_to_withdrawals(&rewards)?;
     let number = parent.header.number + 1;
-    let timestamp = parent.header.timestamp + 1;
+    // AM27 (A17/B4): the next slot on the genesis grid.
+    let timestamp = parent.header.timestamp + config.block_interval_ms / 1000;
     let base_fee = parent
         .header
         .next_block_base_fee(spec.base_fee_params_at_timestamp(timestamp))
