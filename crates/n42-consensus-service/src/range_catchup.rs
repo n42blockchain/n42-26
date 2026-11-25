@@ -422,6 +422,14 @@ pub struct RangeCatchup {
 }
 
 impl RangeCatchup {
+    /// Profile 1 (§3, SYNC §3.3): anchors are enforced; there is no observe
+    /// mode. Leaves a disabled client (`Off`, delegated execution) off.
+    pub fn enforce_anchors(&mut self) {
+        if self.mode == AnchorMode::Observe {
+            self.mode = AnchorMode::Enforce;
+        }
+    }
+
     pub fn new(config: RangeCatchupConfig, mode: AnchorMode) -> Self {
         Self {
             config,

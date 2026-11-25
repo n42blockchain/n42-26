@@ -639,3 +639,95 @@ AM19 与检查早于提案；被拒块无 Round 1；非 Profile 1 无效果）�
   `crates/n42-execution/src/restored_slots.rs` `create_executor`。
 - 升级 evm2 时按 `N42-PROVENANCE.md` 重放；若上游提供开关（例如 `EthBlockRules` 上的 builder_requests），删除 vendor。
 - gov5 发布含 8282 代码与排队请求的 V5 用例（n42-rs S8）后加入本仓库。
+
+## 12. Profile 1 跟随者（AM6 入口形式：验证型非验证者）（2026-11-24 追加）
+
+分支 `feat/profile1-follower`（基于 main 5d82240）。owner 已授权 n42-26 以 follower、validator 或 producer 身份加入混合轮次；
+本节实现 follower：不持有验证者密钥，不投票、不发 NewView/timeout、不提案，导入验证者产出的链。
+
+### 12.1 设计决策
+
+- **选 (b)：参与者模式下无验证者索引、永不签名**，不选 (a)（在 Profile 1 上开启 `N42_OBSERVER_MODE`）。
+  - 观察者（`observer.rs`）是另一条导入路径：有 Profile-1 头门和启动时的 `require_head_result`（PR 8），但没有 Phase B 的
+    延迟检查、没有 E12 停机（10.4 已列为后续项）、没有 range 客户端（它用自己的 gov5 finalized catch-up），QC 检查也是它自己的
+    `verify_sync_block_qc`。走 (a) 等于把这些再在观察者里实现一遍，follower 检查的东西也不再与验证者完全相同。
+  - (b) 复用验证者的编排器（`ConsensusOrchestrator`）与引擎：同一个导入门（含 B2 封印）、Phase B 延迟检查、引擎导入
+    （QMDB 根任务比对五个携带字段）、`executed_fields.log`、E14 标签、E12 停机锁存、range 客户端与反向祖先遍历；
+    Proposal/PrepareQC/Decide/NewView 由同一个 `ConsensusEngine` 按 genesis 集合（E13）验证。
+  - 引擎本来就有非成员守卫：`is_local_validator_active_for_view` 按本地公钥是否在该视图集合中决定能否投票/超时；
+    `is_leader_for_view` 也按公钥。follower 的索引取 `n`（集合之外），因此永远不是 leader。
+- **三道不发送守卫**：
+  1. follower 不加载验证者密钥，用随机 BLS 密钥（不在 genesis 集合中），引擎因此不签任何东西；
+  2. `handle_engine_output` 在 follower 模式下丢弃一切 `BroadcastMessage`/`SendToValidator`（计数
+     `n42_follower_engine_output_dropped_total{kind}`，WARN；正常运行应为 0）；
+  3. 网络端口包一层 `FollowerNetwork`（`net_port.rs`）：投票、提交投票、超时、NewView、提案、QC、Decide 的 gossip/直连，
+     区块公告、gov5 区块推送、直连区块、blob sidecar 一律吞掉（计数 `n42_follower_publish_refused_total{kind}`），
+     只放行拉取类请求（by-hash、range、sync）、sync 应答、交易转发；`set_validator_context` 为空操作（不承担 Rotor 中继角色）。
+  另外 `with_follower()` 置 `leader_disabled`，出块入口直接返回。
+- **入口开关 `N42_FOLLOWER_MODE=1`**（显式开启，不因密钥不在集合中自动降级）：只在 Profile-1 创世上允许；与
+  `N42_OBSERVER_MODE` 互斥；设置了 `N42_VALIDATOR_KEY` 或 `N42_KEYSTORE_PATH` 时拒绝启动。拼错密钥的验证者仍然按原规则拒绝启动
+  （错误信息提示 follower 开关），不会悄悄变成 follower。
+- **网络**：swarm 用不带验证者索引的 interop swarm（`build_interop_observer_swarm`，Identify 不声明 `v{index}`），
+  网络服务仍是 H2 参与者模式（H2 消息走共识通道，供引擎处理）。libp2p 身份取 `N42_P2P_KEY`，否则随机，绝不用验证者的确定性身份。
+  不做自动连接（端口推算只对验证者成立），只拨 `N42_TRUSTED_PEERS`。
+- **range 锚定强制（§3）**：四节点运行中发现 Profile 1 上 range 客户端默认是 `observe`（`N42_SYNC_ANCHOR` 又被 AM10 禁用，
+  无法改成 `enforce`），而标准要求“Anchors enforced，没有 observe 模式”。`with_profile1_gate` 现在把 range 客户端改为
+  `Enforce`（`RangeCatchup::enforce_anchors`，`Off` 保持不变）。这同时作用于验证者。
+- **AM10**：禁用环境变量规则不变。注意 `N42_GOV5_TCP_PORT` 属于 `N42_GOV5_` 前缀，Profile 1 上被拒绝；TCP 监听端口即
+  `N42_CONSENSUS_PORT`（QUIC 与 TCP 同号）。
+- 顺带：引擎 `sync_local_validator_index` 对“本就不在集合中”的节点（索引 ≥ n）把每视图一次的
+  "local key not in current validator set (sync)" 降为 debug。
+
+### 12.2 实施细节（文件）
+
+- `bin/n42-node/src/main.rs`：`resolve_follower_mode`（含单测 `follower_mode_is_profile1_keyless_and_not_an_observer`）；
+  follower 的随机 BLS 密钥、索引 `n`、无手续费地址；p2p 身份；无索引 swarm；跳过自动连接；导入门不带封印密钥；
+  `orchestrator.with_follower()`。
+- `crates/n42-consensus-service/src/net_port.rs`：`FollowerNetwork`、`consensus_message_kind`。
+- `orchestrator/mod.rs`：字段 `follower`、`with_follower()`、`is_follower()`；`with_profile1_gate` 强制 range 锚定。
+- `orchestrator/consensus_loop.rs`：follower 丢弃引擎的出站共识消息。`execution_bridge.rs`：follower 的出块拒绝日志。
+- `range_catchup.rs`：`enforce_anchors()`。`n42-consensus/src/protocol/state_machine.rs`：日志级别。
+- `tests/e2e/README.md`：follower 所需环境变量表。
+
+### 12.3 测试
+
+- `profile1_v6.rs::follower_follows_v6_and_sends_nothing`（gov5 V6 报文，引擎级）：follower 引擎对 proposal_v2、检查与执行事件、
+  prepare_qc_v2（锁到 view 2）、decide_v2（提交区块 2，view 3）与验证者行为一致；没有 Round-1、CommitVote；三次超时不发 timeout；
+  NewView（TC）推进到边界视图后给它区块也不提案；0..1000 视图都不是 leader；外来集合聚合的 Decide 被拒绝（E13）。
+- `orchestrator/tests/profile1.rs`：
+  - `follower_publishes_no_consensus_message`：V6 的 7 种消息分别经 `handle_engine_output`（广播与定向）、`broadcast_engine_consensus`、
+    `broadcast_via_rotor`、网络端口直发，再加区块公告、gov5 区块推送、blob、出块触发——记录网络收到 0 条共识发布、0 次构建，
+    无待重发投票；range 请求照常发出；range 客户端为 `Enforce`。
+  - `follower_imports_a_profile1_chain_and_halts_on_a_tampered_carried_field`：follower 编排器导入并定案 4 个 Profile-1 块
+    （每块携带父块的本节点结果），然后一个携带错误 stateRoot 的已提交块触发 E12 停机（证据字段 stateRoot），不导入、不定案；全程 0 发布。
+- 真实执行的导入（独立 reth 树与 QMDB、Phase B 检查、引擎）沿用 10.3 的 `profile1_deferred.rs` (f)，follower 走的正是这条路径。
+
+### 12.4 四验证者 + 两 follower 本地运行（`/tmp/p1-run/run4f.sh`，`check_follower.py`）
+
+- 端口：验证者 reth 30400-30403、HTTP 18545-18548、共识（QUIC+TCP）19400-19403；follower 1 为 30410/18555/19410，
+  follower 2 为 30411/18556/19411。未碰 3070x/2014x。数据在 `/tmp/p1-run/data4f`，genesis 为 `genesis_now.json` 改当前时间戳。
+- 验证者的 `N42_TRUSTED_PEERS` 列出两个 follower（固定 `N42_P2P_KEY` 的 peer id），因为 n42-26 验证者只对受信或验证者
+  peer 提供 `bodies_by_range`；follower 的 `N42_TRUSTED_PEERS` 是四个验证者的 `/ip4/127.0.0.1/tcp/1940i/p2p/<id>`。
+- 第一轮（含最终代码前的二进制）：follower 1 与验证者同时启动；follower 2 晚 2 分钟（高度 16）启动，经认证 catch-up（反向祖先遍历，
+  缺口 < 32）补 1-17 后跟随；清空 follower 2 数据在高度 41 重启，range 客户端 `head=0 target=42`，3 秒 `CaughtUp released=40`。
+  到 47 块 6 节点一致，0 不符。
+- 最终二进制（range 强制锚定后）重跑：10 笔 V3 交易；follower 2 在高度 16 晚启动，补 17 块后跟随；在高度 34 清空重启，
+  `range catch-up started mode="enforce" head=0 target=34` → 3 秒 `stopped reason=CaughtUp released=32 released_loose_only=0 faults=0 conflicts=0`。
+  `check_follower.py 1 2`：区块 1-41 六个节点哈希相同，每块携带的五个字段等于每个节点（含两个 follower）`executed_fields.log`
+  中为父块登记的结果，0 处不符；六个节点标签均为 latest=41 safe=40 finalized=40；10 笔交易在 follower 2 上 status 1（区块 3-12）。
+- 日志：六个节点 ERROR 0、HALT 0；follower 的 "sending vote to leader" 0 次、"follower: dropped" 0 次（引擎根本没产生出站消息）；
+  follower 唯一的拒绝是启动瞬间 gossip 块的 `parent_unknown`（非永久，随后由 catch-up 补齐）。
+
+### 12.5 门禁
+
+- `cargo clippy --workspace --all-targets -- -D warnings` 通过。
+- `cargo test --workspace`（`--test-threads=12`）：2092 通过、0 失败、38 忽略。
+- 构建说明：`/data` 在运行期间被同机的 gov5 qs 节点（`/data/blockchain/qs-node*`）以约 10 MB/s 写满，本次后半段构建改到 tmpfs
+  `/tmp/n42-26-p1f-target`（`CARGO_INCREMENTAL=0`，dev/test 无 debuginfo），并删除了 `/data/n42-build/n42-26-p1f/target`。
+
+### 12.6 后续 / 缺口
+
+- 对外部验证者（gov5、n42-rs）：follower 能否拉 range 取决于对方的授权规则；n42-26 验证者要求把 follower 列入 `N42_TRUSTED_PEERS`。
+- follower 不发布 Decide（task 要求不发任何共识消息）；E12 的 "Decide is broadcast" 由验证者完成。
+- follower 仍按 GossipSub 规则在 mesh 中转发它收到的验证者消息（传输层转发，不是自己发起或签名）。
+- Profile-1 头只在进程内登记表中（10.3 的限制）：follower 重启后无法向他人提供重启前的块。
