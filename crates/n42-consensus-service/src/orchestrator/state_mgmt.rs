@@ -400,6 +400,7 @@ impl ConsensusService {
         if self.h2_v4_identity.is_none() || self.gov5_execution_pull_target().is_none() {
             return;
         }
+        self.refetch_natively_cached_ancestry_gap();
         if self
             .gov5_execution_pull_last_at
             .is_some_and(|last| last.elapsed() < super::H2_V4_FETCH_RETRY_TIMEOUT)
@@ -407,6 +408,65 @@ impl ConsensusService {
             return;
         }
         self.initiate_gov5_execution_pull("view_change_execution_lag");
+    }
+
+    /// Recovers a reverse walk stalled on a parent held only as native block
+    /// data. Such a body normally reaches execution through its own import,
+    /// so the walk does not fetch it. A copy that arrived while this node was
+    /// still catching up is different: its import returned Syncing, and when
+    /// the node then jumped over its view no commit offers it to execution
+    /// again. The staged child can only be released above the Gov5 copy, so
+    /// once the execution head has stood still for a fetch deadline, fetch
+    /// that copy past the native cache.
+    fn refetch_natively_cached_ancestry_gap(&mut self) {
+        let now = Instant::now();
+        match self.gov5_ancestry_stall_probe {
+            Some((since, head)) if head == self.head_block_hash => {
+                if now.duration_since(since) < super::H2_V4_FETCH_RETRY_TIMEOUT {
+                    return;
+                }
+            }
+            _ => {
+                self.gov5_ancestry_stall_probe = Some((now, self.head_block_hash));
+                return;
+            }
+        }
+        self.gov5_ancestry_stall_probe = Some((now, self.head_block_hash));
+        let mut cached_parents = Vec::new();
+        for (height, (_, rlp, _)) in &self.h2_v4_catchup_blocks {
+            let below = height.saturating_sub(1);
+            if below <= self.head_block_number || self.h2_v4_catchup_blocks.contains_key(&below) {
+                continue;
+            }
+            if let Ok(block) = self.decode_wire_block(rlp)
+                && self
+                    .pending_block_data
+                    .contains_key(&block.header.parent_hash)
+            {
+                cached_parents.push(block.header.parent_hash);
+            }
+        }
+        if cached_parents.is_empty() {
+            return;
+        }
+        let mut peers: Vec<PeerId> = self.connected_peers.iter().copied().collect();
+        if peers.is_empty() {
+            return;
+        }
+        peers.sort();
+        let peer = peers[(self.gov5_execution_pull_rounds as usize) % peers.len()];
+        self.gov5_execution_pull_rounds = self.gov5_execution_pull_rounds.wrapping_add(1);
+        for parent_hash in cached_parents {
+            counter!("n42_gov5_native_cached_parent_refetch_total").increment(1);
+            warn!(
+                target: "n42::interop::h2v4",
+                %peer,
+                %parent_hash,
+                execution_head_number = self.head_block_number,
+                "reverse walk stalled on a parent held only as native block data; fetching its Gov5 copy"
+            );
+            self.request_h2_v4_gov5_block_inner(peer, parent_hash, false);
+        }
     }
 
     /// Requests an execution lineage from every connected peer.

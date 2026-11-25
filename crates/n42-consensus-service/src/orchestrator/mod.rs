@@ -1229,6 +1229,11 @@ pub struct ConsensusService {
     /// When the last gov5 execution pull was issued; throttles the per-view
     /// re-arm to one pull per fetch deadline.
     gov5_execution_pull_last_at: Option<Instant>,
+    /// The execution head last seen by the per-view re-arm and when it was
+    /// first seen there. A head unchanged for a fetch deadline while a staged
+    /// block waits for its parent marks the reverse walk as stalled
+    /// (see `state_mgmt::refetch_natively_cached_ancestry_gap`).
+    gov5_ancestry_stall_probe: Option<(Instant, B256)>,
     /// Recently delivered block hashes. This mirrors the network-layer
     /// fulfillment tombstones because request commands are fire-and-forget:
     /// a network-side suppression cannot otherwise stop this orchestrator from
@@ -1560,13 +1565,30 @@ impl ConsensusService {
     }
 
     fn request_h2_v4_gov5_block(&mut self, peer: PeerId, block_hash: B256) {
+        self.request_h2_v4_gov5_block_inner(peer, block_hash, true);
+    }
+
+    /// `native_copy_counts = false` fetches the Gov5 copy of a hash although
+    /// native block data for it is cached (and its fetch was retired for that
+    /// reason): the reverse walk can stage only the Gov5 copy.
+    fn request_h2_v4_gov5_block_inner(
+        &mut self,
+        peer: PeerId,
+        block_hash: B256,
+        native_copy_counts: bool,
+    ) {
         let now = Instant::now();
         self.drop_rejected_block_data();
-        if block_hash == B256::ZERO || self.h2_v4_fetch_fulfilled_recently(block_hash, now) {
+        if block_hash == B256::ZERO {
+            return;
+        }
+        if native_copy_counts
+            && (self.h2_v4_fetch_fulfilled_recently(block_hash, now)
+                || self.pending_block_data.contains_key(&block_hash))
+        {
             return;
         }
         if block_hash == self.head_block_hash
-            || self.pending_block_data.contains_key(&block_hash)
             || self.h2_v4_unbound_blocks.contains_key(&block_hash)
             || self
                 .h2_v4_block_numbers
@@ -1975,7 +1997,11 @@ impl ConsensusService {
         // enough to recognise it, before the full decode (every transaction
         // and the transaction root) runs on the consensus loop. A requested
         // body keeps the full path: its fetch bookkeeping needs the decode.
+        // So does every body while a reverse walk waits: the staged suffix is
+        // released only when it is contiguous, and the native copy of a block
+        // above a missing parent is not executable, so it cannot stand in.
         if requested_hash.is_none()
+            && !self.h2_v4_catchup_active
             && let Some(hash) = n42_network::gov5_attributable_hash(&rlp)
             && self.pending_block_data.contains_key(&hash)
         {
@@ -3435,6 +3461,7 @@ impl ConsensusService {
             h2_v4_fetch_requested_at: HashMap::new(),
             gov5_execution_pull_rounds: 0,
             gov5_execution_pull_last_at: None,
+            gov5_ancestry_stall_probe: None,
             h2_v4_fetch_fulfilled_at: HashMap::new(),
             network,
             consensus_event_rx: None,
@@ -3713,6 +3740,7 @@ impl ConsensusService {
             h2_v4_fetch_requested_at: HashMap::new(),
             gov5_execution_pull_rounds: 0,
             gov5_execution_pull_last_at: None,
+            gov5_ancestry_stall_probe: None,
             h2_v4_fetch_fulfilled_at: HashMap::new(),
             network,
             consensus_event_rx: Some(consensus_event_rx),
@@ -8168,6 +8196,132 @@ mod tests {
         assert!(!orch.initiate_gov5_execution_pull("execution_catchup"));
         orch.rearm_gov5_execution_pull();
         assert!(drain_commands(&mut cmd_rx).is_empty());
+    }
+
+    /// A parent held only as native block data does not count as delivered
+    /// once the execution head has stood still for a fetch deadline: its
+    /// import returned Syncing during catch-up and its view was jumped over,
+    /// so nothing offers it to execution again. The staged child then needs
+    /// the Gov5 copy, which only a fetch past the native cache can bring.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stalled_reverse_walk_refetches_a_parent_held_only_as_native_block_data() {
+        let (mut orch, mut cmd_rx, peer, _committed_hash) = gov5_lag_orchestrator(true);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        orch.el = Some(mock.clone());
+        orch.async_finalize_fcu = false;
+        let head = orch.head_block_hash;
+        let number = orch.head_block_number;
+        let (parent_hash, parent_rlp) = test_gov5_block_rlp(head, number + 1, 11);
+        let (child_hash, child_rlp) = test_gov5_block_rlp(parent_hash, number + 2, 12);
+        let parent_fetches = |commands: &[NetworkCommand]| {
+            commands
+                .iter()
+                .filter(|command| {
+                    matches!(
+                        command,
+                        NetworkCommand::RequestGov5BlockByHash { block_hash, .. } if *block_hash == parent_hash
+                    )
+                })
+                .count()
+        };
+
+        orch.pending_block_data
+            .insert(parent_hash, test_block_data(head, parent_hash, 11).into());
+        orch.remember_h2_v4_fetch_fulfilled(parent_hash, Instant::now());
+        orch.remember_h2_v4_block_view(child_hash, 12);
+        orch.handle_h2_v4_gov5_block(peer, child_rlp, None).await;
+        assert!(orch.h2_v4_catchup_blocks.contains_key(&(number + 2)));
+        assert_eq!(
+            parent_fetches(&drain_commands(&mut cmd_rx)),
+            0,
+            "the native copy is trusted while its import can still complete"
+        );
+
+        // First observation of this execution head: nothing is known to be
+        // stalled yet.
+        orch.rearm_gov5_execution_pull();
+        assert_eq!(parent_fetches(&drain_commands(&mut cmd_rx)), 0);
+
+        // A fetch deadline later the head has not moved.
+        orch.gov5_ancestry_stall_probe = Some((
+            Instant::now() - H2_V4_FETCH_RETRY_TIMEOUT - Duration::from_millis(1),
+            head,
+        ));
+        orch.rearm_gov5_execution_pull();
+        assert_eq!(
+            parent_fetches(&drain_commands(&mut cmd_rx)),
+            1,
+            "the stalled walk fetches the Gov5 copy of the cached parent"
+        );
+
+        // The fetched body closes the gap although the native copy is still
+        // cached: parent and child reach execution in order.
+        orch.handle_h2_v4_gov5_block(peer, parent_rlp, Some(parent_hash))
+            .await;
+        assert_eq!(mock.new_payload_hashes(), vec![parent_hash, child_hash]);
+        assert_eq!(orch.head_block_hash, child_hash);
+        assert_eq!(orch.head_block_number, number + 2);
+    }
+
+    /// While a reverse walk waits for a parent, a later block that arrives as
+    /// native block data first must still be staged from its Gov5 copy.
+    /// Dropping that copy as a duplicate leaves a hole in the staged suffix at
+    /// every such height, and the suffix can then never be released.
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiting_reverse_walk_stages_the_gov5_copy_of_a_natively_cached_block() {
+        let (mut orch, _cmd_rx, peer, _committed_hash) = gov5_lag_orchestrator(true);
+        let head = orch.head_block_hash;
+        let number = orch.head_block_number;
+        let (parent_hash, _) = test_gov5_block_rlp(head, number + 1, 11);
+        let (child_hash, child_rlp) = test_gov5_block_rlp(parent_hash, number + 2, 12);
+        let (later_hash, later_rlp) = test_gov5_block_rlp(child_hash, number + 3, 13);
+        orch.remember_h2_v4_block_view(child_hash, 12);
+        orch.handle_h2_v4_gov5_block(peer, child_rlp, None).await;
+        assert!(orch.h2_v4_catchup_active);
+
+        orch.pending_block_data.insert(
+            later_hash,
+            test_block_data(child_hash, later_hash, 13).into(),
+        );
+        orch.remember_h2_v4_block_view(later_hash, 13);
+        orch.handle_h2_v4_gov5_block(peer, later_rlp, None).await;
+
+        assert!(
+            orch.h2_v4_catchup_blocks.contains_key(&(number + 3)),
+            "the waiting walk keeps a contiguous staged suffix"
+        );
+    }
+
+    /// While the execution head keeps moving, a natively cached parent is
+    /// left to its own import: no Gov5 fetch is spent on it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn advancing_execution_head_does_not_refetch_a_natively_cached_parent() {
+        let (mut orch, mut cmd_rx, peer, _committed_hash) = gov5_lag_orchestrator(true);
+        let head = orch.head_block_hash;
+        let number = orch.head_block_number;
+        let (parent_hash, _) = test_gov5_block_rlp(head, number + 1, 11);
+        let (child_hash, child_rlp) = test_gov5_block_rlp(parent_hash, number + 2, 12);
+        orch.pending_block_data
+            .insert(parent_hash, test_block_data(head, parent_hash, 11).into());
+        orch.remember_h2_v4_block_view(child_hash, 12);
+        orch.handle_h2_v4_gov5_block(peer, child_rlp, None).await;
+
+        // The probe saw an older head a deadline ago; execution has moved.
+        orch.gov5_ancestry_stall_probe = Some((
+            Instant::now() - H2_V4_FETCH_RETRY_TIMEOUT - Duration::from_millis(1),
+            B256::repeat_byte(0xA9),
+        ));
+        orch.rearm_gov5_execution_pull();
+        assert!(
+            !drain_commands(&mut cmd_rx).iter().any(|command| matches!(
+                command,
+                NetworkCommand::RequestGov5BlockByHash { block_hash, .. } if *block_hash == parent_hash
+            )),
+            "a moving head is not a stalled walk"
+        );
     }
 
     /// A pull whose fetch retired without moving the execution head is
