@@ -2644,11 +2644,7 @@ mod tests {
 
         let mut refused = 0;
         for refusal in vector["refusals"].as_array().unwrap() {
-            // AM25: requestsHash is a deferred field, refused by the
-            // engine's deferred check, not by the header gate.
-            if refusal["check"] != "import"
-                || refusal["name"].as_str().unwrap().starts_with("requestsHash")
-            {
+            if refusal["check"] != "import" {
                 continue;
             }
             let header = raw(&refusal["rlp"]);
@@ -2659,7 +2655,7 @@ mod tests {
             );
             refused += 1;
         }
-        assert_eq!(refused, 21);
+        assert_eq!(refused, 24);
 
         // AM27 (B4): off-grid and same-slot timestamps are refused on the
         // observer's import too; on-grid and skip-slot ones pass the gate.

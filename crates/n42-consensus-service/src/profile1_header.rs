@@ -924,7 +924,6 @@ mod tests {
         let f = Fixture::load();
         let rules = f.rules();
         let mut checked = 0;
-        let mut deferred = 0;
         for refusal in f.vector["refusals"].as_array().unwrap() {
             let name = refusal["name"].as_str().unwrap();
             let raw = hex::decode(refusal["rlp"].as_str().unwrap()).unwrap();
@@ -936,26 +935,6 @@ mod tests {
                             validate_profile1_header(&header, &f.block1, &rules, f.is_ancestor())
                                 .map_err(|error| error.to_string())
                         });
-                    if name.starts_with("requestsHash") {
-                        // AM25: requestsHash is a deferred field. The header
-                        // passes the static rules; it is refused because it
-                        // is not block 1's executed requests hash (block 1
-                        // produced no requests: sha256("")).
-                        result.expect(name);
-                        let header = Profile1Header::decode(&raw).unwrap();
-                        let mut executed_parent =
-                            n42_consensus::ExecutedFields::carried_by(&header.header);
-                        executed_parent.requests_hash =
-                            n42_chainspec::profile1::PROFILE1_REQUESTS_HASH;
-                        assert_eq!(
-                            n42_consensus::ExecutedFields::carried_by(&header.header)
-                                .first_difference(&executed_parent),
-                            Some("requestsHash"),
-                            "{name}"
-                        );
-                        deferred += 1;
-                        continue;
-                    }
                     let error = result.expect_err(name);
                     eprintln!("{name}: {error}  [gov5: {}]", refusal["gov5Message"]);
                     checked += 1;
@@ -977,8 +956,9 @@ mod tests {
                 other => panic!("{name}: unknown check {other}"),
             }
         }
-        assert_eq!(checked, 22);
-        assert_eq!(deferred, 2, "V1's two requestsHash refusals");
+        // rc4 V1: 24 import refusals (AM27 adds the equal-time and off-grid
+        // cases; "requestsHash absent" is static, B8) plus one vote refusal.
+        assert_eq!(checked, 25);
     }
 
     /// B4 (AM27), import half: on the grid and in a later slot than the

@@ -35,12 +35,14 @@ B1 extraData layout `N42H || view u64 LE || [QC] || seal(96)`, at most 4096 byte
 QC is zero bytes; the QC is a commit-domain QC of the genesis set, below the header's view,
 naming an ancestor. B2 seal by the leader of the view over sealHash. B3 difficulty, nonce,
 mixHash, ommersHash zero (the empty-list hash is refused), coinbase = leader. B4
-parent.time <= time (import) and time <= floor(now)+2 (vote time only). B6 withdrawalsRoot
+(AM27) (time - G) mod 8 = 0 and time >= parent.time + 8 (import), time <= floor(now)+2
+(vote time only). B6 withdrawalsRoot
 present and equal to keccak(concat(rlp([address, amount]))) of the rewards. B8 requestsHash
-= 0xe3b0c442...b855 (AM24). B9 blobGasUsed = excessBlobGas = 0. B12 element 22 = 0x80.
+present (its value is a deferred field, AM25; genesis and block 1 carry sha256("") =
+0xe3b0c442...b855). B9 blobGasUsed = excessBlobGas = 0. B12 element 22 = 0x80.
 B14 EIP-1559 baseFee from the parent header. A23 gasLimit = hotstuff.gasLimit.
 
-Deferred fields (A10/B13: stateRoot, receiptsRoot, logsBloom, gasUsed) of blocks 1 and 2
-are genesis's (an idle chain); their checks belong to V5. parentBeaconRoot is zero on block 1
+Deferred fields (A10/B13: stateRoot, receiptsRoot, logsBloom, gasUsed; AM25: requestsHash) of
+blocks 1 and 2 are genesis's (an idle chain); their checks belong to V5. parentBeaconRoot is zero on block 1
 (B5) and Blake3 of block 1's committee evidence (the genesis committee pool) on block 2; the
 evidence derivation itself is vector V2.

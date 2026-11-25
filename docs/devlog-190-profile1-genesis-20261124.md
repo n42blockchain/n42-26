@@ -847,3 +847,15 @@ AM19 与检查早于提案；被拒块无 Round 1；非 Profile 1 无效果）�
 - gov5 按 AM27 重发 V3/V4/V5 后，恢复被忽略的 V5 延迟执行测试。
 - build-ahead（`N42_BUILD_ON_OUTPUT`，默认关）在 Profile 1 上已用网格戳，但提前建好的块在本视图开始即发布，
   若早于 slot 起点 2 s 以上会被投票前未来界拒；Profile 1 上开启前需再加发布等待。
+
+### 14.x 换用 gov5 的 AM27 版 V1/V5（2026-11-25 03:4x）
+
+- gov5 03:04 重新发布 V1/V5（qs-scratch/profile1/vectors；旧版在 vectors.bak-pre-am27-20261125）。
+  sha256：V1 `header_profile_v1.json` 13e53897…890c，V5 `header_validity.json` aeeb8357…2060，与 n42-rs 转告一致。
+- V5：块 2 不再与父块同一时间戳，`v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid` 取消 ignore，通过；
+  只针对 rc3 V5 的 `v5_block2_equal_timestamp_is_refused_under_am27` 删除。
+- V1：新增 "timestamp equal to parent"、"timestamp off the slot grid" 两个导入拒绝；"requestsHash absent" 改成解码期（B8）拒绝，
+  不再由延迟检查拒绝。导入拒绝从 21 个增至 24 个，静态检查总数 25（含一个投票期）；四处计数和 requestsHash 特例已相应更新，
+  chainspec 解码测试把 "requestsHash absent" 归入解码错误。
+- 只改测试和测试数据，未改产品代码，因此 06:30 前发布的二进制（5679751，sha256 d0a11c27…f5c9）仍然有效。
+- 门禁：clippy 通过；workspace 2100 passed / 0 failed / 38 ignored。

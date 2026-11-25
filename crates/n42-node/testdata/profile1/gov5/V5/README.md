@@ -28,7 +28,7 @@ refunds") and n42-rs.
 | Block | Case | executed: regular / state / receipts -> gasUsed |
 | --- | --- | --- |
 | 1 | `contract-create` | 48852 / 293760 / 332612 -> 293760 (state gas larger) |
-| 2 | `sstore-clear-equal-timestamp` | 27380 / 0 / 21904 -> 27380 (refund ignored) |
+| 2 | `sstore-clear` | 27380 / 0 / 21904 -> 27380 (refund ignored) |
 | 3 | `new-account-transfer` | 21000 / 183600 / 204600 -> 183600 (state gas larger) |
 | 4 | `plain-transfer` | 21000 / 0 / 21000 -> 21000 |
 | 5 | `idle` | 0 -> 0 |
@@ -57,13 +57,13 @@ consolidation request (source 0xa1 x 48, target 0xb2 x 48); its end-of-block cal
 - `0x02 || source address || source pubkey || target pubkey`
 
 requestsHash of block 7 = `0x9f1fcb7b3b6e10fad1344d450d67c357d0b1f510ab20d21fe87245441395a2c4`, carried by block 8
-(`0xa189a6c3...a7a9`). Block 8's own queues are empty: it produces sha256("").
+(`0xf2b73c40...fb6a`). Block 8's own queues are empty: it produces sha256("").
 
-## B4: equal timestamps
+## B4: slot grid (AM27)
 
-Blocks 1 and 2 have the same timestamp (`parent.time == time` is valid, on import and at vote time). Both run the
-EIP-4788 system call with that timestamp; block 2's write lands in the same ring-buffer index and is part of block
-2's executed stateRoot, which block 3 carries.
+Every block is stamped one slot after its parent on the genesis grid, `time = G + s*8`. Import and vote refuse a
+timestamp off the grid (`(time - G) mod 8 != 0`) or below `parent.time + 8`; equal timestamps are invalid (rc4
+supersedes the rc3 equal-timestamp case, so blocks 2-8 differ from the rc3 vector).
 
 ## Refusals
 
@@ -78,7 +78,7 @@ one; `gov5Message` is its full message.
 | B13 | deferred | block 3 carrying block 2's post-refund receipts gas (21904) |
 | B13 | deferred | block 4 carrying block 3's regular + state gas (204600) |
 | B13 | import | gasUsed = gasLimit + 1 (above the parent's gasLimit) |
-| B4 | import | time = parent.time - 1 |
+| B4 | import | time = parent.time - 8 (on the grid, earlier slot) |
 | B4 | vote | time > floor(now) + 2 |
 | B9 | import | blobGasUsed = 1; excessBlobGas = 1 |
 | B14 | import | baseFee derived from a parent gasUsed equal to the receipts' gas; baseFee + 1 |
@@ -87,6 +87,8 @@ one; `gov5Message` is its full message.
 | AM25 | deferred | block 7 carrying its own requestsHash instead of block 6's sha256("") |
 | B8 | deferred | block 3 carrying the empty-trie root 0x56e81f17...b421 (AM3) instead of block 2's sha256("") |
 | B8 | import | requestsHash absent |
+| B4 | import | time = parent.time (same slot, AM27) |
+| B4 | import | time = parent.time + 9 (off the grid, AM27) |
 
 The four AM25/B8 refusals follow the earlier ones (appended; the earlier order is unchanged).
 

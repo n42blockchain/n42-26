@@ -181,42 +181,7 @@ fn invalid_by_deferred_check(verdict: Verdict, what: &str) {
     }
 }
 
-/// AM27 (B4, rc4): a header must be in a later slot than its parent
-/// (`time >= parent.time + I`). V5 as published (rc3, 2026-11-24) has block 2
-/// `sstore-clear-equal-timestamp` at its parent's time, valid under rc3's
-/// `parent.time <= time` and refused under rc4. The vector is not changed
-/// and the rule is not weakened: this records the conflict until gov5
-/// republishes V5 for AM27.
-#[test]
-fn v5_block2_equal_timestamp_is_refused_under_am27() {
-    let v5 = v5();
-    let (_, config, genesis_header) =
-        n42_chainspec::profile1::profile1_chain_spec(&genesis(&v5)).expect("Profile-1 genesis");
-    let mut gate =
-        n42_consensus_service::profile1_header::Profile1ImportGate::new(&config, genesis_header)
-            .unwrap();
-    let blocks = v5["blocks"].as_array().unwrap();
-    let header = |index: usize| Profile1Header::decode(&hex_bytes(&blocks[index]["rlp"])).unwrap();
-    let (block1, block2) = (header(0), header(1));
-    assert_eq!(blocks[1]["name"], "sstore-clear-equal-timestamp");
-    assert_eq!(block2.header.timestamp, block1.header.timestamp, "V5 block 2 is at its parent's time");
-    gate.admit(block1).expect("V5 block 1 is on the grid, G + 8");
-    let refusal = gate.admit(block2).expect_err("same slot as the parent");
-    assert_eq!(refusal.rule(), "B4");
-    assert!(
-        matches!(
-            refusal,
-            n42_consensus_service::profile1_header::Profile1Refusal::Invalid(
-                n42_consensus_service::profile1_header::Profile1HeaderInvalid::TimeSameSlot { .. }
-            )
-        ),
-        "{refusal}"
-    );
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "V5 (rc3) block 2 is at its parent's time, refused by AM27's B4 later-slot check; \
-            re-enable when gov5 republishes V5 for AM27 (see v5_block2_equal_timestamp_is_refused_under_am27)"]
 async fn v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid() -> eyre::Result<()> {
     let v5 = v5();
     assert_eq!(v5["blocks"].as_array().map(Vec::len), Some(8), "V5 (AM25) has eight blocks");
