@@ -2162,7 +2162,12 @@ fn main() {
         let startup_validator_infos = startup_validator_set.validator_infos();
         let configured_validator_peer_ids =
             configured_validator_peer_ids(&startup_validator_infos)?;
-        let expected_validator_peer_ids = if observer_mode {
+        // An observer or a Profile-1 follower sends no consensus message and
+        // authenticates what it imports by BLS (QCs, Decides, seals), so it
+        // needs no validator PeerId bindings. The genesis of a mixed round
+        // carries none, and the other clients' PeerIds are not the
+        // deterministic ones.
+        let expected_validator_peer_ids = if observer_mode || follower_mode {
             Default::default()
         } else {
             expected_validator_peer_ids_with_policy(
