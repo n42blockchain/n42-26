@@ -1914,12 +1914,26 @@ impl NetworkService {
                 return;
             }
             Err(error) => {
-                tracing::warn!(
-                    %peer_id,
-                    validator_index,
-                    %error,
-                    "refusing validator authentication without a trusted peer binding"
-                );
+                // With no binding at all (an observer or a Profile-1
+                // follower, which route no direct consensus traffic) this
+                // fires for every verified message; it is expected there.
+                if self.expected_validator_peer_ids.is_empty()
+                    && !self.allow_deterministic_peer_ids
+                {
+                    tracing::debug!(
+                        %peer_id,
+                        validator_index,
+                        %error,
+                        "no validator peer bindings; not authenticating validator peer"
+                    );
+                } else {
+                    tracing::warn!(
+                        %peer_id,
+                        validator_index,
+                        %error,
+                        "refusing validator authentication without a trusted peer binding"
+                    );
+                }
                 return;
             }
         }
