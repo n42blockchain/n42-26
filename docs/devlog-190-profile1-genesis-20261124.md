@@ -731,3 +731,67 @@ AM19 与检查早于提案；被拒块无 Round 1；非 Profile 1 无效果）�
 - follower 不发布 Decide（task 要求不发任何共识消息）；E12 的 "Decide is broadcast" 由验证者完成。
 - follower 仍按 GossipSub 规则在 mesh 中转发它收到的验证者消息（传输层转发，不是自己发起或签名）。
 - Profile-1 头只在进程内登记表中（10.3 的限制）：follower 重启后无法向他人提供重启前的块。
+
+## 13. V5 重新发布（AM25，8 块）与 EIP-8282 builder 合约向量（2026-11-25 追加）
+
+### 13.1 来源
+
+- gov5 feat/profile1 590d9673（"docs(profile1): document the V5 EIP-8282 builder request case"）或更新；
+  `/data/blockchain/wr-logs/qs-scratch/profile1/vectors/V5/` 下三个文件与 gov5 仓库
+  `internal/testdata/profile1/vectors/V5/` 在 590d9673 及 feat/profile1 6a3e1eb9 上逐字节相同。
+- 复制到 `crates/n42-node/testdata/profile1/gov5/V5/`：`header_validity.json`（6 块 → 8 块）、
+  `builder_request_contracts.json`（新）、`README.md`。vectors/ 下没有 SHA-256 清单；按 V3/V4 的做法，
+  在 `testdata/profile1/gov5/README.md` 的 SHA-256 表中补记 V5 三个文件。
+
+### 13.2 设计决策
+
+- 生产代码不改：AM25（requestsHash 为延迟字段，块 N 携带 N−1 的 EIP-7685 requests hash）此前已在
+  `N42Consensus::validate_block_post_execution` 与登记表中实现；之前测试只用常量 `PROFILE1_REQUESTS_HASH`
+  作为 gov5 的期望，现改为读取向量的 `executed.requestsHash`，不放宽任何比较。
+- EIP-8282 "强制开启"的对照沿用已有 `non_native_amsterdam_chain_keeps_the_eip8282_calls` 的做法，与 gov5
+  的 sensitivity 运行一致（把链配置改成非原生）：去掉 `n42Profile`/`consensus`/`hotstuff`，reth Amsterdam 从 0 开始；
+  写集仍按原生链的规则与创世 QMDB 树计算。未新增生产代码中的测试开关。
+- 8282 向量的块没有封装头，只给 number/timestamp；其余输入按 gov5 `v3Runner.run`：coinbase = 验证者 0、
+  gasLimit = 创世、baseFee 1 gwei、parentBeaconBlockRoot 0x11..11。gov5 内部头的哈希未公布，块 2 的 parentHash
+  取自该块自己的 EIP-2935 写入（slot 1），块 1 的同一写入必须等于本节点的创世哈希（已断言）。
+
+### 13.3 实施细节
+
+- `crates/n42-node/tests/profile1_deferred.rs`：8 块全部经真实导入路径（gov5 线格式 → Profile-1 解码 →
+  头 gate → Engine payload → reth engine validator + QMDB 状态根策略）；断言原生开关关闭；每块 RLP 重编码、
+  哈希、携带的五字段、登记的五字段、requests 原文、receipts 累计 gas 均等于 gov5；块 7 也是 state-gas 块；
+  块 8 携带块 7 的 requestsHash。新增的 B8 "requestsHash absent" 拒绝在 Profile-1 头解码时即被拒（元素 21
+  必须是 32 字节），测试将其计为 import 拒绝（只允许这一条无法解码）。兄弟链 6' 现在 reorg 掉 6-8。
+- `crates/n42-node/tests/profile1_vectors.rs`：
+  - `v5_builder_request_contracts_equal_gov5_without_eip8282_calls`：创世 = V1 + allocAdditions（gov5 把 code
+    写成 base64，测试内解码为 hex，并核对 `5f546001015f5500` 与 builderCodeHash）；创世 QMDB 根、每块 stateRoot、
+    receiptsRoot、gasUsed、requests（只有 0x01/0x02）、requestsHash 与完整 QMDB 写集都等于 gov5；两个 8282
+    账户不在 bundle、不在任何写集，执行后 code/nonce/balance/slot 0 不变。
+  - `v5_builder_request_contracts_with_eip8282_calls_write_the_slots`：开关强制开启时两地址 slot 0 每块被写
+    （1、2），进入写集，stateRoot 与 gov5 不同；receipts/gas/requests 不受影响。
+
+### 13.4 结果
+
+| 块 | 本节点哈希 = gov5 哈希 | executed stateRoot | 携带/产生的 requestsHash |
+| --- | --- | --- | --- |
+| 1 contract-create | `0x9b5b7c1a…a921d` | `0x63baa78a…af74` | sha256("") |
+| 2 sstore-clear-equal-timestamp | `0xfc85cbcc…69ff5` | `0x9daa4f18…780d` | sha256("") |
+| 3 new-account-transfer | `0xb2b01293…e22c7` | `0x4c08a0ca…afcb` | sha256("") |
+| 4 plain-transfer | `0x88f4c28f…ec1e0` | `0xb8fbeee0…9884` | sha256("") |
+| 5 idle | `0x4a62bdd5…cff52` | `0xb20942ec…b448` | sha256("") |
+| 6 carries-idle | `0x1534b303…b94ae` | `0x5a2a4b1c…cb24` | sha256("") |
+| 7 withdrawal-and-consolidation-requests | `0x7eb1ca7d…d52c4` | `0xf6fd81de…904e` | 产生 `0x9f1fcb7b…a2c4` |
+| 8 carries-requests | `0xa189a6c3…ba7a9` | `0x9967ae8b…f0b8` | 携带 `0x9f1fcb7b…a2c4`，自身 sha256("") |
+
+8282 用例：块 1 stateRoot `0x959b5e91…538b`、receiptsRoot `0xc5d24601…a470`、gasUsed 0；块 2 stateRoot
+`0x63456d12…0ed8`、receiptsRoot `0x1ac6d164…1066`、gasUsed 1077120、requestsHash `0x9f1fcb7b…a2c4`，全部等于 gov5。
+无任何字段差异，未改生产代码。
+
+### 13.5 门禁
+
+- `cargo clippy --workspace --all-targets -- -D warnings` 通过。
+- `cargo test --workspace`（`--test-threads=12`）：2094 通过、0 失败、38 忽略（比 §12 多 2 个新测试）。
+
+### 13.6 后续
+
+- 8282 用例的头只是执行输入；若 gov5 以后公布其内部头哈希，可直接用它代替从 EIP-2935 写入回推 parentHash。

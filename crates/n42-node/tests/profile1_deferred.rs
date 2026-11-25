@@ -8,17 +8,22 @@
 //! operations and files N's own result; a header carrying anything else is
 //! Invalid.
 //!
-//! (a) V5's six blocks import, each filing exactly gov5's `executed` result;
+//! (a) V5's eight blocks import, each filing exactly gov5's `executed` result
+//!     (the five fields, and the block's EIP-7685 requests and receipts'
+//!     cumulative gas); block 7 sends an EIP-7002 withdrawal and an EIP-7251
+//!     consolidation request, its end-of-block calls dequeue both and block 8
+//!     carries their requests hash (AM25). The EIP-8282 switch stays off (the
+//!     default on a Profile-1 genesis), as on every native chain;
 //! (b) block 2 resealed with any one of the five carried fields changed is
 //!     Invalid, and so are V5's `deferred` refusals;
 //! (c) a block whose parent's result is not filed is not refused: the import
 //!     fails with a provider error, which reth does not remember, and
 //!     succeeds once the result is filed;
-//! (d) EIP-8037: blocks 1 and 3 are state-gas blocks; the filed (and
+//! (d) EIP-8037: blocks 1, 3 and 7 are state-gas blocks; the filed (and
 //!     carried) gasUsed is max(regular, state), not the receipts' cumulative;
 //! (e) a sibling chain: 6' (block 6 at another time) carries result(5) as 6
 //!     does; 7' on 6' must carry result(6'), and carrying result(6) is
-//!     Invalid.
+//!     Invalid. 6' reorgs out V5's blocks 6 to 8.
 //!
 //! (f) range catch-up over a deferred chain (PR 8): the chain is extended
 //!     by 20 blocks; a second node with its own reth tree and its own QMDB
@@ -115,8 +120,13 @@ fn executed(block: &Value) -> ExecutedFields {
         receipts_root: b256(&executed["receiptsRoot"]),
         logs_bloom: executed["logsBloom"].as_str().unwrap().parse::<Bloom>().unwrap(),
         gas_used: executed["gasUsed"].as_u64().unwrap(),
-        requests_hash: PROFILE1_REQUESTS_HASH,
+        requests_hash: b256(&executed["requestsHash"]),
     }
+}
+
+/// gov5's `executed.requests` of a V5 block (EIP-7685 `type || data`).
+fn executed_requests(block: &Value) -> Vec<Vec<u8>> {
+    block["executed"]["requests"].as_array().expect("requests").iter().map(hex_bytes).collect()
 }
 
 fn rewards(config: &Profile1Config, coinbase: Address) -> Vec<n42_consensus::Gov5Reward> {
@@ -174,11 +184,14 @@ fn invalid_by_deferred_check(verdict: Verdict, what: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid() -> eyre::Result<()> {
     let v5 = v5();
+    assert_eq!(v5["blocks"].as_array().map(Vec::len), Some(8), "V5 (AM25) has eight blocks");
     let (spec, config, genesis_header) =
         n42_chainspec::profile1::profile1_chain_spec(&genesis(&v5)).expect("Profile-1 genesis");
     let spec = Arc::new(spec);
     let genesis_hash = genesis_header.hash();
     assert_eq!(genesis_hash, b256(&v5["genesisHash"]), "V5's genesis");
+    // The native switch: no EIP-8282 end-of-block calls on this chain.
+    assert!(!n42_execution::eip8282_builder_requests_active(&spec.genesis));
     n42_consensus::remember_gov5_native_header(&genesis_header.encode());
     let keys = validator_keys();
     let blocks = v5["blocks"].as_array().unwrap().clone();
@@ -186,7 +199,8 @@ async fn v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid() ->
         .iter()
         .map(|block| {
             let header = Profile1Header::decode(&hex_bytes(&block["rlp"])).expect("a V5 header");
-            assert_eq!(header.hash(), b256(&block["hash"]));
+            assert_eq!(header.encode(), hex_bytes(&block["rlp"]), "{}: re-encodes", block["name"]);
+            assert_eq!(header.hash(), b256(&block["hash"]), "{}: hash", block["name"]);
             header
         })
         .collect();
@@ -331,6 +345,19 @@ async fn v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid() ->
             Some(ExecutedFields::carried_by(&genesis_header.header))
         );
 
+        // B8 "requestsHash absent": the Profile-1 header decoder already
+        // refuses it (element 21 must be a 32-byte hash), so it never reaches
+        // the gate or the engine. Only `import` refusals may end here.
+        let mut undecodable = Vec::new();
+        for refusal in v5["refusals"].as_array().unwrap() {
+            if let Err(error) = Profile1Header::decode(&hex_bytes(&refusal["rlp"])) {
+                assert_eq!(refusal["check"], "import", "{}: {error:?}", refusal["name"]);
+                assert!(format!("{error:?}").contains("requestsHash"), "{}: {error:?}", refusal["name"]);
+                undecodable.push(refusal["name"].as_str().unwrap().to_owned());
+            }
+        }
+        assert_eq!(undecodable, ["requestsHash absent"]);
+
         let mut chain: Vec<ExecutedBlock<N42Primitives>> = Vec::new();
         let mut parent = genesis_header.clone();
         for (index, (block, header)) in blocks.iter().zip(&headers).enumerate() {
@@ -342,7 +369,10 @@ async fn v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid() ->
             // V5's refusals at this height: `deferred` ones are Invalid, the
             // `import` ones never reach the engine.
             for refusal in v5["refusals"].as_array().unwrap() {
-                let refused = Profile1Header::decode(&hex_bytes(&refusal["rlp"])).expect("decodes");
+                // Undecodable refusals are judged once, before the chain.
+                let Ok(refused) = Profile1Header::decode(&hex_bytes(&refusal["rlp"])) else {
+                    continue;
+                };
                 if refused.header.number != number {
                     continue;
                 }
@@ -404,8 +434,32 @@ async fn v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid() ->
             let imported = valid(import(header, &transactions(block)), name);
             assert_eq!(imported.recovered_block().hash(), header.hash());
             let filed = n42_consensus::executed_fields(&header.hash()).expect("filed");
+            if let Some(field) = filed.first_difference(&executed(block)) {
+                panic!(
+                    "block {number} ({name}): {field} differs: ours {filed:?}, gov5 {:?}",
+                    executed(block)
+                );
+            }
             assert_eq!(filed, executed(block), "block {number} ({name}): this node's result is gov5's");
             assert_eq!(store.root_for(header.hash())?, Some(filed.state_root));
+            // The EIP-7685 requests themselves and the receipts' cumulative
+            // gas, as gov5 recorded them.
+            let output = imported.execution_outcome();
+            let requests: Vec<Vec<u8>> = output.result.requests.iter().map(|r| r.to_vec()).collect();
+            assert_eq!(requests, executed_requests(block), "block {number} ({name}): requests");
+            assert_eq!(output.result.requests.requests_hash(), filed.requests_hash, "{name}");
+            assert_eq!(
+                output.result.receipts.last().map_or(0, |r| r.cumulative_gas_used),
+                block["executed"]["receiptsCumulativeGasUsed"].as_u64().unwrap(),
+                "block {number} ({name}): receipts' cumulative gas"
+            );
+            println!(
+                "V5 block {number} ({name}): hash ours {} gov5 {}; stateRoot {}; requestsHash {}",
+                imported.recovered_block().hash(),
+                block["hash"].as_str().unwrap(),
+                filed.state_root,
+                filed.requests_hash
+            );
 
             // (d) EIP-8037: the block's gas is max(regular, state).
             let gas = &block["executed"];
@@ -415,7 +469,7 @@ async fn v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid() ->
                 gas["receiptsCumulativeGasUsed"].as_u64().unwrap(),
             );
             assert_eq!(filed.gas_used, regular.max(state_gas), "{name}");
-            if matches!(number, 1 | 3) {
+            if matches!(number, 1 | 3 | 7) {
                 assert!(state_gas > regular, "{name} is a state-gas block");
                 assert_ne!(filed.gas_used, cumulative, "{name}: not the receipts' gas");
             }
@@ -424,7 +478,13 @@ async fn v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid() ->
             chain.push(imported);
             parent = header.clone();
         }
-        assert_eq!(chain.len(), 6);
+        assert_eq!(chain.len(), 8);
+        // AM25: block 7 produced the two requests; block 8 carries their hash.
+        assert_eq!(
+            headers[7].header.requests_hash,
+            Some(n42_consensus::executed_fields(&headers[6].hash()).unwrap().requests_hash)
+        );
+        assert_ne!(headers[7].header.requests_hash, Some(PROFILE1_REQUESTS_HASH));
 
         // (e) A sibling of block 6: the same idle block at a later time. It
         // carries result(5), as block 6 does, but executes differently (the
@@ -443,7 +503,7 @@ async fn v5_deferred_chain_imports_and_every_wrong_carried_field_is_invalid() ->
             ExecutedFields::carried_by(&six.header),
             "6 and 6' both carry result(5)"
         );
-        make_head(&six_sibling_block, vec![chain[5].clone()]);
+        make_head(&six_sibling_block, chain[5..].to_vec());
 
         // 7' on 6', view 7: its leader is validator 3.
         let view = 7u64;

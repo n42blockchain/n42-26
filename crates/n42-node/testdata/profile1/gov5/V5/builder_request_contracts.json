@@ -1,0 +1,262 @@
+{
+  "vector": "V5",
+  "case": "builder-request-contract-code-no-call",
+  "description": "Code at the EIP-8282 builder deposit and exit request addresses on a native profile-1 chain: no end-of-block EIP-8282 call is made, state and results equal the same blocks without the calls.",
+  "genesis": "../V1/genesis_8s.json",
+  "allocAdditions": {
+    "0x000064d678505ad48f8ccb093bc65613800e8282": {
+      "balance": "0x0",
+      "code": "X1RgAQFfVQA=",
+      "nonce": 1
+    },
+    "0x0000bff46984e3725691fa540a8c7589300d8282": {
+      "balance": "0x0",
+      "code": "X1RgAQFfVQA=",
+      "nonce": 1
+    },
+    "0xbbe8de86315808f7d16c5ae2650a17bbb22355f7": {
+      "balance": "0x56bc75e2d63100000"
+    }
+  },
+  "builderDepositAddress": "0x0000bff46984e3725691fa540a8c7589300d8282",
+  "builderExitAddress": "0x000064d678505ad48f8ccb093bc65613800e8282",
+  "builderCodeHash": "0x7229351fba5bacfb493ac7423bbd736f88bb0debc78b192bd1ec041c4fbdf39f",
+  "slot0OfBothAddressesAfterEveryBlock": "0x0 (unchanged, both addresses, after every block)",
+  "genesisQmdbStateRoot": "0xa5d212fac16843221bdcb15cbe62e8a06851de1c0c8877d70372486a867d2369",
+  "blocks": [
+    {
+      "name": "idle-with-builder-code",
+      "description": "No transactions; both EIP-8282 addresses hold code. No call: no write to either address.",
+      "number": 1,
+      "timestamp": 1795564801,
+      "transactions": [],
+      "stateRoot": "0x959b5e9166f9e62f9e3f7d393a54928cba3ab91ba03109734599e491f8c1538b",
+      "receiptsRoot": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+      "gasUsed": 0,
+      "requests": [],
+      "requestsHash": "0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "accountOps": [
+        {
+          "address": "0x42e9819036f61bf665d5f727e8c03121f12f586e",
+          "qmdbKeyHash": "0x1498372ce1bf264018ebf4e033f4dfd8e83ea6e344e068b572ab4435388e70f3",
+          "op": "write",
+          "nonce": 0,
+          "balance": "0x33b2e3cadb136f08f640000",
+          "codeHash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+          "qmdbValue": "0x020c033b2e3cadb136f08f640000"
+        },
+        {
+          "address": "0x0000f90827f1c53a10cb7a02335b175320002935",
+          "qmdbKeyHash": "0x2c9213778d67108f6cf8ef9e9571660b96c336f1f56c717053dc51c7495841ec",
+          "op": "write",
+          "nonce": 1,
+          "balance": "0x0",
+          "codeHash": "0x6e49e66782037c0555897870e29fa5e552daf4719552131a0abce779daec0a5d",
+          "qmdbValue": "0x09016e49e66782037c0555897870e29fa5e552daf4719552131a0abce779daec0a5d"
+        },
+        {
+          "address": "0x0af682426022f37276f3576c7560158a4070d8b2",
+          "qmdbKeyHash": "0x322c3b1004ad3b4bab6e704c0fee7bd8496d79c27d6c44808702402e3361789e",
+          "op": "write",
+          "nonce": 0,
+          "balance": "0xde0b6b3a7640000",
+          "codeHash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+          "qmdbValue": "0x02080de0b6b3a7640000"
+        },
+        {
+          "address": "0x000f3df6d732807ef1319fb7b8bb8522d0beac02",
+          "qmdbKeyHash": "0x605cb59505588c1ebecee051d8a102041630c2f11dd4ab81a3aa1a058efa3d78",
+          "op": "write",
+          "nonce": 1,
+          "balance": "0x0",
+          "codeHash": "0xf57acd40259872606d76197ef052f3d35588dadf919ee1f0e3cb9b62d3f4b02c",
+          "qmdbValue": "0x0901f57acd40259872606d76197ef052f3d35588dadf919ee1f0e3cb9b62d3f4b02c"
+        }
+      ],
+      "storageOps": [
+        {
+          "address": "0x000f3df6d732807ef1319fb7b8bb8522d0beac02",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000001d4c",
+          "qmdbKeyHash": "0x2e318b3db5a32ab375781db4528f19b0d2f59eb056fbd229deaa41d5190c7bbb",
+          "op": "write",
+          "value": "0x000000000000000000000000000000000000000000000000000000006b062501"
+        },
+        {
+          "address": "0x0000f90827f1c53a10cb7a02335b175320002935",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+          "qmdbKeyHash": "0x66082e0d73cb1333d5e46aa267c519ab33646316ed39d28372de378ae742a32f",
+          "op": "write",
+          "value": "0x4df9b399c66c8a6fdf74189687de671fd8b699a257b0c779e92bee5ffd6651b2"
+        },
+        {
+          "address": "0x000f3df6d732807ef1319fb7b8bb8522d0beac02",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000003d4b",
+          "qmdbKeyHash": "0xdb3e58263a052650e39189c176fbc7f510d700d16d91348f988671b04f3b228e",
+          "op": "write",
+          "value": "0x1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ]
+    },
+    {
+      "name": "requests-with-builder-code",
+      "description": "EIP-7002 and EIP-7251 requests as V5 block 7: their end-of-block calls run, the EIP-8282 ones do not; requests hold only types 0x01 and 0x02.",
+      "number": 2,
+      "timestamp": 1795564802,
+      "transactions": [
+        "0x02f8a682047880843b9aca008477359400839896809400000961ef480eb55e80d19ad83579a64c00700201b838a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1000000003b9aca00c080a0e8d861540fdb763af46deb29a353049e692e0eceaba5143e46f129c5ef96a20aa0603dc2b01e583541f0b81c4da37a8dab035b9b1ce83f42b416b745957d672cdb",
+        "0x02f8ce82047801843b9aca00847735940083989680940000bbddc7ce488642fb579f8b00f3a59000725101b860a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2c001a055a2ba66c976cd0c57063bcc6c267174f927df3309abba3b5055dfd45b655514a05b0883dd10c4f715fa2df80c0b8f41bd05d413991c6516d3e042aa7e398dfd5f"
+      ],
+      "stateRoot": "0x63456d12b952fa73c212a817434f5cf85018f28d13ebd203d483ec3a499a0ed8",
+      "receiptsRoot": "0x1ac6d1642eec08e873469cfb9bd106eefbddc17694546c589d7c0c6ff8511066",
+      "gasUsed": 1077120,
+      "requests": [
+        "0x01bbe8de86315808f7d16c5ae2650a17bbb22355f7a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a100ca9a3b00000000",
+        "0x02bbe8de86315808f7d16c5ae2650a17bbb22355f7a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+      ],
+      "requestsHash": "0x9f1fcb7b3b6e10fad1344d450d67c357d0b1f510ab20d21fe87245441395a2c4",
+      "accountOps": [
+        {
+          "address": "0x42e9819036f61bf665d5f727e8c03121f12f586e",
+          "qmdbKeyHash": "0x1498372ce1bf264018ebf4e033f4dfd8e83ea6e344e068b572ab4435388e70f3",
+          "op": "write",
+          "nonce": 0,
+          "balance": "0x33b2e3cbb91eda436c80000",
+          "codeHash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+          "qmdbValue": "0x020c033b2e3cbb91eda436c80000"
+        },
+        {
+          "address": "0x0000f90827f1c53a10cb7a02335b175320002935",
+          "qmdbKeyHash": "0x2c9213778d67108f6cf8ef9e9571660b96c336f1f56c717053dc51c7495841ec",
+          "op": "write",
+          "nonce": 1,
+          "balance": "0x0",
+          "codeHash": "0x6e49e66782037c0555897870e29fa5e552daf4719552131a0abce779daec0a5d",
+          "qmdbValue": "0x09016e49e66782037c0555897870e29fa5e552daf4719552131a0abce779daec0a5d"
+        },
+        {
+          "address": "0x0af682426022f37276f3576c7560158a4070d8b2",
+          "qmdbKeyHash": "0x322c3b1004ad3b4bab6e704c0fee7bd8496d79c27d6c44808702402e3361789e",
+          "op": "write",
+          "nonce": 0,
+          "balance": "0x1bc5e9638052d600",
+          "codeHash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+          "qmdbValue": "0x02081bc5e9638052d600"
+        },
+        {
+          "address": "0x000f3df6d732807ef1319fb7b8bb8522d0beac02",
+          "qmdbKeyHash": "0x605cb59505588c1ebecee051d8a102041630c2f11dd4ab81a3aa1a058efa3d78",
+          "op": "write",
+          "nonce": 1,
+          "balance": "0x0",
+          "codeHash": "0xf57acd40259872606d76197ef052f3d35588dadf919ee1f0e3cb9b62d3f4b02c",
+          "qmdbValue": "0x0901f57acd40259872606d76197ef052f3d35588dadf919ee1f0e3cb9b62d3f4b02c"
+        },
+        {
+          "address": "0x00000961ef480eb55e80d19ad83579a64c007002",
+          "qmdbKeyHash": "0x69d95f63c55d38fd90bd2b3d2190d1982c3cd9425bea0d5284d403d275c71edb",
+          "op": "write",
+          "nonce": 1,
+          "balance": "0x1",
+          "codeHash": "0x0345a365d2f4c5975b9f1599abe0a2ee76b7a3a731bc68781bd04c84e4858f50",
+          "qmdbValue": "0x0b0101010345a365d2f4c5975b9f1599abe0a2ee76b7a3a731bc68781bd04c84e4858f50"
+        },
+        {
+          "address": "0x0000bbddc7ce488642fb579f8b00f3a590007251",
+          "qmdbKeyHash": "0x711be8b4f19541c69b379750464302fd5dea41c3dc9705ca609138a56dc22b1a",
+          "op": "write",
+          "nonce": 1,
+          "balance": "0x1",
+          "codeHash": "0x78c6cb5202685228bbcbfb992b1c4e116c7ec5ef11e25b8e92716cfc628ddd60",
+          "qmdbValue": "0x0b01010178c6cb5202685228bbcbfb992b1c4e116c7ec5ef11e25b8e92716cfc628ddd60"
+        },
+        {
+          "address": "0xbbe8de86315808f7d16c5ae2650a17bbb22355f7",
+          "qmdbKeyHash": "0x7b9f464e5f70f81fd28673248bb188687abf958dd13e44e38d73d5462b7d1e63",
+          "op": "write",
+          "nonce": 2,
+          "balance": "0x56bbe6634fffa53fe",
+          "codeHash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+          "qmdbValue": "0x030209056bbe6634fffa53fe"
+        }
+      ],
+      "storageOps": [
+        {
+          "address": "0x00000961ef480eb55e80d19ad83579a64c007002",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000000005",
+          "qmdbKeyHash": "0x13fce84530b0a913bf30618f7a211b04f651176986b95c16e9716ca67c9783bb",
+          "op": "write",
+          "value": "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        },
+        {
+          "address": "0x0000bbddc7ce488642fb579f8b00f3a590007251",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000000007",
+          "qmdbKeyHash": "0x224385f6ef4be16ca479ca5eee8237ed32b382c91ef3e1ce55ee07d377e911df",
+          "op": "write",
+          "value": "0xb2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+        },
+        {
+          "address": "0x0000f90827f1c53a10cb7a02335b175320002935",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000000001",
+          "qmdbKeyHash": "0x2cad6c7c5dbe324a93304f9313598374a5a62da7ebb9779e39e35a60130a8b53",
+          "op": "write",
+          "value": "0x10cdcec4116f49ed99a986201113e0ecd9d29c795cdb9d7ea2e529986fa90431"
+        },
+        {
+          "address": "0x0000bbddc7ce488642fb579f8b00f3a590007251",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000000004",
+          "qmdbKeyHash": "0x7c02624495baa9ef8061d6b774874991136fc451d2cb57f828b75de4c055c9e2",
+          "op": "write",
+          "value": "0x000000000000000000000000bbe8de86315808f7d16c5ae2650a17bbb22355f7"
+        },
+        {
+          "address": "0x0000bbddc7ce488642fb579f8b00f3a590007251",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000000006",
+          "qmdbKeyHash": "0x8a3c1ac53f02c43c25f8775f6f9186acd3cb536575d17bb518794403bde28e30",
+          "op": "write",
+          "value": "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+        },
+        {
+          "address": "0x000f3df6d732807ef1319fb7b8bb8522d0beac02",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000003d4c",
+          "qmdbKeyHash": "0x94a173b541f5026bf466a6d28714aa8baa1cd2842a2ce26640446cbaced9c5da",
+          "op": "write",
+          "value": "0x1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        {
+          "address": "0x0000bbddc7ce488642fb579f8b00f3a590007251",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000000005",
+          "qmdbKeyHash": "0xc123fe65ea795645ac7ebef8dd42ca771dc322076c43cb0c626c721d9e8be7eb",
+          "op": "write",
+          "value": "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+        },
+        {
+          "address": "0x00000961ef480eb55e80d19ad83579a64c007002",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000000004",
+          "qmdbKeyHash": "0xde88f8dbbe360442a8f42e28a4c71eaa7746af1ab2aa3e57db0f60d5f65cf5f1",
+          "op": "write",
+          "value": "0x000000000000000000000000bbe8de86315808f7d16c5ae2650a17bbb22355f7"
+        },
+        {
+          "address": "0x00000961ef480eb55e80d19ad83579a64c007002",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000000006",
+          "qmdbKeyHash": "0xe31d673bb768ea5a54e6b30a6d34557cc0b221cddc9bf92198251321322d3a56",
+          "op": "write",
+          "value": "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1000000003b9aca000000000000000000"
+        },
+        {
+          "address": "0x000f3df6d732807ef1319fb7b8bb8522d0beac02",
+          "slot": "0x0000000000000000000000000000000000000000000000000000000000001d4d",
+          "qmdbKeyHash": "0xef2f498bba42f64b6acf355b1f8f6a362e9bd29575fd1fb468622337bda821d7",
+          "op": "write",
+          "value": "0x000000000000000000000000000000000000000000000000000000006b062502"
+        }
+      ]
+    }
+  ],
+  "notes": [
+    "The code is placed through allocAdditions: the real contracts are deployed by Nick's method (keyless pre-signed CREATE) and a test cannot sign that transaction, so it is not deployed mid-chain. Both addresses get nonce 1, balance 0 and the same code (builderCodeHash): PUSH0 SLOAD PUSH1 1 ADD PUSH0 SSTORE STOP, which increments slot 0 if called.",
+    "Per block: stateRoot (QMDB), receiptsRoot, gasUsed (EIP-8037), requests and requestsHash are the block's own execution; accountOps/storageOps are its QMDB write set and name neither builder address.",
+    "Control: the same genesis without the two accounts and the same blocks give identical accountOps and storageOps (but the EIP-2935 slot, which holds the parent hash), receiptsRoot, gasUsed, requests and requestsHash; only stateRoot differs, by the two static accounts. gov5 asserts this.",
+    "Sensitivity: executing the same blocks with the chain config made non-native (EIP-8282 calls on) writes slot 0 of both addresses and changes stateRoot; gov5 asserts it, so the case would catch a client that makes the calls."
+  ]
+}
