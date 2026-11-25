@@ -14,6 +14,11 @@
 //! node's root job and builder apply, over the QMDB tree of the genesis alloc.
 //! The block rewards (A8) are the withdrawals `devBlockReward` to the
 //! coinbase and to `devFaucetAddress`.
+//!
+//! V5's `builder_request_contracts.json` (EIP-8282 code at both builder
+//! request addresses, no call on a native chain) runs the same way
+//! (`v5_builder_request_contracts_*`); V5's header chain runs through the
+//! import path in `profile1_deferred.rs`.
 
 use alloy_consensus::{BlockBody, Header};
 use alloy_eips::{Typed2718, eip2718::Decodable2718};
@@ -652,5 +657,277 @@ fn non_native_amsterdam_chain_keeps_the_eip8282_calls() {
             first.requests.iter().any(|r| r.first() == Some(&request_type) && r.len() > 1),
             "no {request_type:#04x} request"
         );
+    }
+}
+
+// ------------------------------------------ V5 builder request contracts --
+
+/// Standard base64 (gov5 marshals `[]byte` genesis code as base64).
+fn base64(text: &str) -> Vec<u8> {
+    let value = |c: u8| -> u32 {
+        match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a') as u32 + 26,
+            b'0'..=b'9' => (c - b'0') as u32 + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => panic!("not base64: {c:#04x}"),
+        }
+    };
+    let text = text.trim_end_matches('=').as_bytes();
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &c in text {
+        acc = (acc << 6) | value(c);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// `builder_request_contracts.json`'s `allocAdditions` with the code as the
+/// hex our genesis parser reads (gov5 writes it as base64).
+fn v5_builder_alloc(vector: &Value) -> Value {
+    let mut additions = vector["allocAdditions"].clone();
+    for account in additions.as_object_mut().expect("allocAdditions").values_mut() {
+        if let Some(code) = account.get("code").and_then(Value::as_str) {
+            let code = alloy_primitives::hex::encode_prefixed(base64(code));
+            account["code"] = Value::String(code);
+        }
+    }
+    additions
+}
+
+/// What one block of the builder-request case came to on this node.
+struct V5BuilderBlock {
+    ops: Vec<Op>,
+    root: B256,
+    state: BundleState,
+    receipts_root: B256,
+    gas_used: u64,
+    requests: alloy_eips::eip7685::Requests,
+}
+
+/// The block header gov5's V3 runner builds for the case's block: its
+/// number, time and parent, the first validator as coinbase, the genesis gas
+/// limit, base fee 1 gwei and parentBeaconBlockRoot 0x11..11.
+fn v5_builder_header(spec: &ChainSpec, config: &Profile1Config, block: &Value, parent: B256) -> Value {
+    serde_json::json!({
+        "number": block["number"],
+        "timestamp": block["timestamp"],
+        "parentHash": parent,
+        "coinbase": config.validators[0].address,
+        "gasLimit": spec.genesis.gas_limit,
+        "baseFeePerGas": 1_000_000_000u64,
+        "parentBeaconBlockRoot": B256::repeat_byte(0x11),
+        "prevRandao": B256::ZERO,
+    })
+}
+
+/// The parent hash of each block of the case. gov5's runner hashes its own
+/// unsealed headers, which the vector does not list; each block's EIP-2935
+/// write (slot `(n - 1) % 8191` = the parent hash) names it. Block 1's
+/// parent is the genesis, which the same write must name.
+fn v5_builder_parents(spec: &ChainSpec, vector: &Value) -> Vec<B256> {
+    let history = alloy_eips::eip2935::HISTORY_STORAGE_ADDRESS;
+    vector["blocks"]
+        .as_array()
+        .expect("blocks")
+        .iter()
+        .map(|block| {
+            let slot = B256::from(U256::from(u64_of(&block["number"]) - 1));
+            let written = block["storageOps"]
+                .as_array()
+                .expect("storageOps")
+                .iter()
+                .find(|op| address(&op["address"]) == history && b256(&op["slot"]) == slot)
+                .map(|op| b256(&op["value"]))
+                .expect("the EIP-2935 parent-hash write");
+            if u64_of(&block["number"]) == 1 {
+                assert_eq!(written, spec.genesis_hash(), "block 1's parent is this genesis");
+            }
+            written
+        })
+        .collect()
+}
+
+/// Runs the case's blocks in turn on the genesis state of `spec` with `evm`;
+/// the write sets are taken by the rules of `rules` (the native chain), over
+/// its genesis QMDB tree.
+fn run_v5_builder(
+    vector: &Value,
+    rules: &Arc<ChainSpec>,
+    config: &Profile1Config,
+    evm: &N42EvmConfig,
+) -> (Vec<V5BuilderBlock>, CacheDB<EmptyDB>) {
+    let mut tree = gov5_qmdb_genesis_tree(&rules.genesis).expect("the genesis tree");
+    let mut db = genesis_state(rules);
+    let parents = v5_builder_parents(rules, vector);
+    let mut out = Vec::new();
+    for (block, parent) in vector["blocks"].as_array().expect("blocks").iter().zip(parents) {
+        let txs = block["transactions"]
+            .as_array()
+            .expect("transactions")
+            .iter()
+            .map(|raw| decode(&hex(raw)).expect("a V5 transaction decodes"))
+            .collect();
+        let fields = v5_builder_header(rules, config, block, parent);
+        let recovered = block_of(config, &fields, txs).expect("a V5 block");
+        let env_key =
+            n42_execution::restored_slots_env_key(&evm.evm_env(recovered.header()).expect("env").block);
+        let output = BasicBlockExecutor::new(evm.clone(), db.clone())
+            .execute(&recovered)
+            .unwrap_or_else(|e| panic!("{}: execution: {e}", block["name"]));
+        let restored = restored_slots_for(gov5_restored_slots_key(recovered.sealed_block(), env_key))
+            .map(|restored| restored.as_ref().clone())
+            .unwrap_or_default();
+        let operations =
+            gov5_block_operations(&output.state, &restored, rules, recovered.header().timestamp);
+        let mut ops: Vec<Op> = operations.iter().map(|op| (B256::from(op.key), op.value.clone())).collect();
+        ops.sort();
+        let root = B256::from(tree.apply_sorted_ops(operations).expect("the block applies"));
+        apply(&mut db, &output.state);
+        out.push(V5BuilderBlock {
+            ops,
+            root,
+            receipts_root: n42_consensus::gov5_native_receipts_root(&output.result.receipts),
+            gas_used: output.result.gas_used,
+            requests: output.result.requests,
+            state: output.state,
+        });
+    }
+    (out, db)
+}
+
+/// QMDB key of slot 0 of `who`.
+fn slot0_key(who: Address) -> B256 {
+    B256::from(n42_twig_core::qmdb_compat::gov5_storage_key(&who.0.0, &[0u8; 32]))
+}
+
+/// V5 `builder_request_contracts.json` (gov5 `TestProfile1VectorV5BuilderRequestContracts`):
+/// code at both EIP-8282 addresses from the genesis on a native Profile-1
+/// chain. With the native switch off (the default here) the code never runs:
+/// every block's QMDB write set and root, receipts root, gasUsed (EIP-8037),
+/// requests (types 0x01 / 0x02 only) and requestsHash equal gov5's, and both
+/// accounts stay as the genesis made them, in no write set.
+#[test]
+fn v5_builder_request_contracts_equal_gov5_without_eip8282_calls() {
+    let vector = vector("V5/builder_request_contracts.json");
+    assert_eq!(vector["case"], "builder-request-contract-code-no-call");
+    assert_eq!(
+        [address(&vector["builderDepositAddress"]), address(&vector["builderExitAddress"])],
+        EIP8282_ADDRESSES
+    );
+    let additions = v5_builder_alloc(&vector);
+    let code = alloy_primitives::hex!("5f546001015f5500");
+    let code_hash = b256(&vector["builderCodeHash"]);
+    assert_eq!(alloy_primitives::keccak256(code), code_hash);
+    for who in EIP8282_ADDRESSES {
+        let account = &additions[who.to_string().to_lowercase()];
+        assert_eq!(hex(&account["code"]), code, "{who}");
+        assert_eq!(account["nonce"], 1, "{who}");
+    }
+    let (spec, config) = chain(&additions);
+    assert!(!n42_execution::eip8282_builder_requests_active(&spec.genesis));
+    assert_eq!(
+        B256::from(gov5_qmdb_genesis_tree(&spec.genesis).expect("tree").root()),
+        b256(&vector["genesisQmdbStateRoot"]),
+        "genesis QMDB root"
+    );
+    let evm = N42EvmConfig::new(spec.clone());
+    let (blocks, db) = run_v5_builder(&vector, &spec, &config, &evm);
+    let theirs = vector["blocks"].as_array().expect("blocks");
+    assert_eq!(blocks.len(), 2);
+
+    let mut differences = Vec::new();
+    for (ours, theirs) in blocks.iter().zip(theirs) {
+        let name = theirs["name"].as_str().unwrap();
+        let mut differ = |field: &str, ours: String, gov5: String| {
+            if ours != gov5 {
+                differences.push(format!("{name}: {field} ours {ours} gov5 {gov5}"));
+            }
+        };
+        differ("stateRoot", ours.root.to_string(), theirs["stateRoot"].as_str().unwrap().to_owned());
+        differ(
+            "receiptsRoot",
+            ours.receipts_root.to_string(),
+            theirs["receiptsRoot"].as_str().unwrap().to_owned(),
+        );
+        differ("gasUsed", ours.gas_used.to_string(), u64_of(&theirs["gasUsed"]).to_string());
+        differ(
+            "requestsHash",
+            ours.requests.requests_hash().to_string(),
+            theirs["requestsHash"].as_str().unwrap().to_owned(),
+        );
+        let requests: Vec<Vec<u8>> = ours.requests.iter().map(|r| r.to_vec()).collect();
+        let gov5_requests: Vec<Vec<u8>> = theirs["requests"].as_array().unwrap().iter().map(hex).collect();
+        differ("requests", format!("{requests:02x?}"), format!("{gov5_requests:02x?}"));
+        differ("write set", format!("{:?}", ours.ops), format!("{:?}", expected_ops(theirs)));
+        println!("V5 8282 {name}: stateRoot {} receiptsRoot {} gasUsed {}", ours.root, ours.receipts_root, ours.gas_used);
+
+        assert!(
+            requests.iter().all(|r| matches!(r.first(), Some(0x01 | 0x02))),
+            "{name}: only EIP-7002 / EIP-7251 requests"
+        );
+        for who in EIP8282_ADDRESSES {
+            assert!(!ours.state.state.contains_key(&who), "{name}: {who} changed");
+            let account_key = B256::from(n42_twig_core::qmdb_compat::gov5_account_key(&who.0.0));
+            assert!(!ours.ops.iter().any(|(key, _)| *key == account_key || *key == slot0_key(who)), "{name}: {who}");
+            for op in theirs["accountOps"].as_array().unwrap().iter().chain(theirs["storageOps"].as_array().unwrap()) {
+                assert_ne!(address(&op["address"]), who, "{name}: gov5's write set names {who}");
+            }
+        }
+    }
+    assert!(differences.is_empty(), "{}", differences.join("\n"));
+    assert_eq!(theirs[1]["requests"].as_array().map(Vec::len), Some(2), "both requests in block 2");
+
+    // After every block: code, nonce and slot 0 of both as the genesis made them.
+    for who in EIP8282_ADDRESSES {
+        let info = db.cache.accounts.get(&who).cloned().flatten().expect("in the state");
+        assert_eq!((info.nonce, info.code_hash, info.balance), (1, code_hash, U256::ZERO), "{who}");
+        let slot0 = db.cache.storage.get(&who).and_then(|storage| storage.slots.get(&U256::ZERO).copied());
+        assert_eq!(slot0.unwrap_or_default(), U256::ZERO, "{who}: slot 0");
+    }
+}
+
+/// The same case with the switch forced on, as gov5's sensitivity run does
+/// ("chain config made non-native"): the genesis without `n42Profile`,
+/// `consensus` and `hotstuff` (so `eip8282_builder_requests_active` is true)
+/// and reth's Amsterdam from 0 (so evm2 runs the Amsterdam spec). Each block
+/// then calls both addresses: slot 0 of each is written (1 after block 1, 2
+/// after block 2) and every stateRoot differs from gov5's.
+#[test]
+fn v5_builder_request_contracts_with_eip8282_calls_write_the_slots() {
+    use reth_chainspec::{EthereumHardfork, ForkCondition};
+
+    let vector = vector("V5/builder_request_contracts.json");
+    let (spec, config) = chain(&v5_builder_alloc(&vector));
+    let mut plain = (*spec).clone();
+    for key in ["n42Profile", "consensus", "hotstuff"] {
+        plain.genesis.config.extra_fields.remove(key);
+    }
+    plain.hardforks.insert(EthereumHardfork::Amsterdam, ForkCondition::Timestamp(0));
+    assert!(n42_execution::eip8282_builder_requests_active(&plain.genesis));
+    let flipped = N42EvmConfig::new(Arc::new(plain));
+
+    let (blocks, _) = run_v5_builder(&vector, &spec, &config, &flipped);
+    for (index, (ours, theirs)) in blocks.iter().zip(vector["blocks"].as_array().unwrap()).enumerate() {
+        let name = theirs["name"].as_str().unwrap();
+        let calls = U256::from(index + 1);
+        for who in EIP8282_ADDRESSES {
+            let account = ours.state.state.get(&who).unwrap_or_else(|| panic!("{name}: {who} not called"));
+            let slot = account.storage.get(&U256::ZERO).expect("slot 0 written");
+            assert_eq!(slot.present_value, calls, "{name}: {who}");
+            let written = ours.ops.iter().find(|(key, _)| *key == slot0_key(who));
+            assert!(written.is_some_and(|(_, value)| value.is_some()), "{name}: {who} slot 0 not in the write set");
+        }
+        assert_ne!(ours.root, b256(&theirs["stateRoot"]), "{name}: stateRoot");
+        // The rest of the case is not the switch's: receipts, gas, requests as gov5's.
+        assert_eq!(ours.receipts_root, b256(&theirs["receiptsRoot"]), "{name}");
+        assert_eq!(ours.gas_used, u64_of(&theirs["gasUsed"]), "{name}");
+        assert_eq!(ours.requests.requests_hash(), b256(&theirs["requestsHash"]), "{name}");
     }
 }

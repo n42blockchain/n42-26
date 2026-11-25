@@ -7,11 +7,11 @@ The test fails if a file differs from what gov5 computes, if a listed block is r
 
 ## File
 
-`header_validity.json`: a sealed six-block chain on V1's `genesis_8s.json` plus `allocAdditions` (the V3 test
+`header_validity.json`: a sealed eight-block chain on V1's `genesis_8s.json` plus `allocAdditions` (the V3 test
 sender, key = keccak256("n42-profile1-vectors-sender")), the genesis header, per block its header (fields, RLP, hash),
 transactions (EIP-2718 bytes) and `executed` (its own result, carried by the next header), then the refusals.
 Blocks are built as in V1 (extraData `N42H || view || CommitQC of the parent || seal`, leader(v) = v mod 4,
-requestsHash = sha256("") 0xe3b0c442...b855 (AM24), element 22 = 0x80).
+element 22 = 0x80). requestsHash is the parent's executed EIP-7685 requests hash (AM25, below).
 
 ## gasUsed (A10, B13, EIP-8037)
 
@@ -33,8 +33,31 @@ refunds") and n42-rs.
 | 4 | `plain-transfer` | 21000 / 0 / 21000 -> 21000 |
 | 5 | `idle` | 0 -> 0 |
 | 6 | `carries-idle` | 0 -> 0 |
+| 7 | `withdrawal-and-consolidation-requests` | 185103 / 1077120 / 1262223 -> 1077120 (state gas larger) |
+| 8 | `carries-requests` | 0 -> 0 |
 
 Each header's `gasUsed` is its parent's row; B14's baseFee uses that field as written.
+
+## requestsHash (AM25, A10, B8)
+
+AM25 (owner, 2026-11-24) makes requestsHash a deferred field: header N carries the EIP-7685 `requests_hash` of
+block N-1's execution; genesis and block 1 carry sha256("") = 0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.
+Requests are produced exactly as on Ethereum Prague (EIP-6110 deposit log scan, then the EIP-7002 and EIP-7251
+end-of-block system calls) and are otherwise ignored by the native chain. A block that produces requests is valid.
+
+    requests_hash = sha256(sha256(r_1) || ... || sha256(r_n)),  r_i = type || data, non-empty only, in type order
+                  = sha256("") when there are none
+
+Each block's `executed` now also lists its `requests` (EIP-7685 `type || data`) and `requestsHash`. Blocks 1-6
+produce none (sha256(""); their headers and hashes are unchanged from the first V5). Block 7 sends a fee-paying
+(1 wei) EIP-7002 withdrawal request (pubkey 0xa1 x 48, amount 1000000000 gwei) and a fee-paying EIP-7251
+consolidation request (source 0xa1 x 48, target 0xb2 x 48); its end-of-block calls dequeue both:
+
+- `0x01 || source address || pubkey || amount` (the contract emits the amount as 8 bytes little-endian)
+- `0x02 || source address || source pubkey || target pubkey`
+
+requestsHash of block 7 = `0x9f1fcb7b3b6e10fad1344d450d67c357d0b1f510ab20d21fe87245441395a2c4`, carried by block 8
+(`0xa189a6c3...a7a9`). Block 8's own queues are empty: it produces sha256("").
 
 ## B4: equal timestamps
 
@@ -60,5 +83,35 @@ one; `gov5Message` is its full message.
 | B9 | import | blobGasUsed = 1; excessBlobGas = 1 |
 | B14 | import | baseFee derived from a parent gasUsed equal to the receipts' gas; baseFee + 1 |
 | A23 | import | gasLimit != hotstuff.gasLimit |
+| AM25 | deferred | block 8 carrying sha256("") instead of block 7's requestsHash |
+| AM25 | deferred | block 7 carrying its own requestsHash instead of block 6's sha256("") |
+| B8 | deferred | block 3 carrying the empty-trie root 0x56e81f17...b421 (AM3) instead of block 2's sha256("") |
+| B8 | import | requestsHash absent |
 
-V1 has the remaining header-profile rules (B1-B3, B6, B8, B12).
+The four AM25/B8 refusals follow the earlier ones (appended; the earlier order is unchanged).
+
+V1 has the remaining header-profile rules (B1-B3, B6, B12, B8 presence).
+
+## Builder request contracts (EIP-8282): `builder_request_contracts.json`
+
+Case `builder-request-contract-code-no-call`: code at the EIP-8282 builder deposit
+(`0x0000BFF46984E3725691FA540A8C7589300D8282`) and exit request (`0x000064D678505AD48F8CCB093BC65613800E8282`)
+addresses on a native profile-1 chain. Native chains make no end-of-block EIP-8282 call (gov5:
+`UsesEIP8282BuilderRequests` is off), so the code never runs: no storage write, no request, state and results as without the calls.
+A client that makes the calls (evm2 on an AMSTERDAM spec id) splits from this vector.
+
+The code is placed through `allocAdditions` (V1 `genesis_8s.json` + the V5 sender + both addresses with nonce 1, balance 0, code
+`5f546001015f5500` = PUSH0 SLOAD PUSH1 1 ADD PUSH0 SSTORE STOP, codeHash
+`0x7229351fba5bacfb493ac7423bbd736f88bb0debc78b192bd1ec041c4fbdf39f`), not mid-chain: the real contracts come from a keyless pre-signed
+CREATE (Nick's method) that a test cannot sign. Two unsealed blocks, each with its executed `stateRoot`, `receiptsRoot`, `gasUsed`, `requests`,
+`requestsHash` and QMDB write set:
+
+| Block | Case | stateRoot | receiptsRoot | gasUsed | requestsHash |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `idle-with-builder-code` | `0x959b5e91...538b` | empty | 0 | sha256("") |
+| 2 | `requests-with-builder-code` (V5 block 7's two txs) | `0x63456d12...0ed8` | `0x1ac6d164...1066` | 1077120 | `0x9f1fcb7b...a2c4` (types 0x01, 0x02 only) |
+
+Asserted by gov5: neither address nor its storage is in any block's write set; slot 0 of both stays 0 and code, nonce unchanged.
+Control: the same genesis without the two accounts and the same blocks give the same account and storage writes (but the EIP-2935 parent-hash slot),
+receiptsRoot, gasUsed, requests and requestsHash; only stateRoot differs, by the two static accounts.
+Sensitivity: the same blocks executed with the config made non-native write slot 0 of both addresses and change stateRoot.
