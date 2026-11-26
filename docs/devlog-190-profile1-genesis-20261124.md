@@ -946,3 +946,74 @@ AM19 与检查早于提案；被拒块无 Round 1；非 Profile 1 无效果）�
 - bodies_by_range/state-sync 仍要求对端列入 `N42_TRUSTED_PEERS`；是否在无绑定模式下对完成同创世 status 握手的 peer 放开需要讨论。
 - 无绑定模式下入站直连对任意已连接 peer 开放，只受 BLS/封印校验与现有 gossip 级 DoS 限制约束。
 - 交易不转发给其他客户端的 leader；如需要应改为 mempool gossip 或按 BLS 身份映射 leader。
+
+## 16. gov5 交易 gossip（`transaction_v2`）：n42-26 leader 打包混合集群的交易（2026-11-25 追加）
+
+第 15 节演练 B 中 n42-26 领导的块在混合轮次里交易数为 0：gov5 不说 `tx_forward`，n42-26 也不在 gov5 的交易 topic 上。
+本节按 n42-rs（`h2-net/src/tx_gossip.rs`、`h2-node/src/service.rs` 的 `publish_transactions` / `TransportEvent::Transactions`）实现同一协议。
+
+### 16.1 设计决策
+
+- **Topic 与线格式**：`/n42/<genesis_hash[..4] hex>/transaction_v2/ssz_snappy`，与 `gov5_h2_topic` 同一 fork digest 规则。
+  消息为 raw snappy，内容是单笔 EIP-2718 交易，或 `0x7e` 标记字节 + EIP-2718 交易的 RLP 列表；每批 ≤256 笔、≤256 KiB（未压缩）。
+  编码与 n42-rs `encode_tx_batch` 逐字节一致（`0x7e || rlp_list(bytes...)`）。
+- **只在 H2-v4 参与者模式启用**（Profile 1 节点总是参与者，`N42_GOV5_H2_PARTICIPANT=1` 亦然）；observer 与原生链不订阅、不发布。
+- **入站**：每条消息解码后逐笔转成 n42-26 内部的 RLP network 形式，交给现有 `TxPoolBridge` 导入本地 reth 池（与 RPC 提交同样经池校验，
+  无效交易被池拒绝）。`TxPoolBridge` 对网络导入的交易记入 `recently_imported`，pending 监听跳过它们，因此 **不会回传（echo）** 到 topic。
+- **出站**：本地池 pending 监听（只含本地/RPC 提交，网络导入的已被跳过）→ orchestrator 的 `tx_forward_buffer`（512 笔或 50 ms 刷新）→
+  参与者模式下改为 `publish_gov5_transactions`，由网络服务按 256 笔 / 256 KiB 切批、压缩并发布。
+  **在参与者模式下 gossip 取代转发给 leader**：gov5 leader 不说 `tx_forward`，同时发两路会重复；交易本已在本地池，本节点当 leader 时自己打包。
+  这同时覆盖 `profile1_unbound_validator`（PR #45 的“留在本地池”路径），该路径只在 `N42_DISABLE_TX_FORWARD=1` 或非参与者时仍生效。
+- **形式转换放在网络层**：内部（池桥接、`tx_forward`）一直用 `alloy_rlp::encode(N42TxEnvelope)` 的 network 形式（typed 交易外包 RLP 字符串），
+  topic 用 EIP-2718 原文。转换用 `N42TxEnvelope` 的 `Decodable`/`decode_2718_exact` 完成，不认识的条目在网络层丢弃并计数。
+  考虑过让 `TxPoolBridge` 直接吃 2718，但它也服务 `tx_forward` 与旧 mempool topic，改动面更大。
+- 跟随者（follower）的 `FollowerNetwork` 也透传发布：它自己不出块，但它收到的 RPC 交易需要让 leader 们打包。
+
+### 16.2 实施细节（文件）
+
+- 新增 `crates/n42-network/src/gov5_tx_gossip.rs`：`encode_tx_batch` / `decode_tx_batch`（与 n42-rs 同名同义）、
+  `encode_gossip_messages`（按两种上限切批并 snappy 压缩，单笔超限的跳过）、`decode_gossip_message`（先按 `decompress_len` 限长再解压）、
+  `network_rlp_to_eip2718` / `eip2718_to_network_rlp`、`decode_gossip_to_network_rlp`。
+- `crates/n42-network/src/gossipsub/topics.rs`：`gov5_tx_topic(genesis_hash)`。
+- `crates/n42-network/src/service.rs`：`NetworkCommand::PublishGov5Transactions`、`NetworkEvent::Gov5TransactionsReceived`、
+  `NetworkHandle::publish_gov5_transactions`；字段 `gov5_tx_topic(_hash)`，`new_with_options` 中仅参与者订阅；
+  `handle_gossipsub_message` 新分支（走数据通道，满则丢，与旧 mempool 事件一致）；`handle_command` 发布分支（非参与者拒绝）。
+  指标：`n42_gov5_tx_gossip_{received,undecodable,rejected,published}_total`。
+- `crates/n42-consensus-service/src/net_port.rs`：`ConsensusNetwork::publish_gov5_transactions`（`NetworkHandle`、`FollowerNetwork` 实现）。
+- `crates/n42-consensus-service/src/orchestrator/mod.rs`：`flush_tx_forward_buffer` 中 `h2_v4_identity.is_some()` 时发布到 topic 并返回；
+  `NetworkEvent::Gov5TransactionsReceived` → `enqueue_tx_import_batch`（指标 `n42_gov5_tx_gossip_imported`）。
+
+### 16.3 测试与门禁
+
+- `gov5_tx_gossip` 8 个单测：单笔/批量往返、与 n42-rs 的固定向量逐字节一致、畸形批（尾随字节、非列表、嵌套列表、截断、空列表、坏 snappy）、
+  两种上限（入站拒绝、压缩后膨胀超限在解压前拒绝）、按笔数/字节切批、network↔2718 转换（EIP-1559 与 legacy）、gov5 批到池形式。
+- `service.rs`：`gov5_transaction_topic_carries_batches_both_ways`（真实 QUIC：参与者服务 + 裸 swarm 扮演 gov5，裸 swarm 发布 gov5 格式批 →
+  服务的数据通道收到 network 形式；服务发布 → 裸 swarm 收到 2718 形式）；topic 字符串测试加一条。
+- `orchestrator`：`h2_v4_participant_publishes_local_txs_on_the_gov5_topic_instead_of_forwarding`（非参与者转发给 leader；参与者只发布、不转发、
+  不重复导入；无绑定模式同路径）、`gov5_gossiped_transactions_land_in_the_pool_import_channel`（入站进导入通道、无回传）。
+- `cargo clippy --workspace --all-targets -- -D warnings` 通过；`cargo test --workspace --no-fail-fast`：2120 passed / 0 failed / 38 ignored。
+- 问题：`cargo fmt --all` 在稳定版 rustfmt 下会改动 80 余个无关文件（仓库不是 fmt-clean）；已全部还原，只保留本节改动。
+
+### 16.4 演练：3 个 gov5 验证者 + 1 个 n42-26 验证者（`/tmp/p1-txg/R/runR.sh`）
+
+- 沿用第 15.5 节脚本：gov5 二进制 `n42-p1.am27`（sha256 3b7da0a2…39be，校验通过），`run-p1mixed.sh` 原样复制，只经环境变量给
+  P1_DIR/P1_BIN/P1_GENESIS，`P1_SET=smoke`，gov5 node 3 不启动，G+10 s 启动。n42-26 为验证者 3，端口改为 reth 30410、HTTP 18553、
+  authrpc 18556、共识 19410、StarHub 19411。n42-26 二进制 sha256 `9bba532a…844335`。G = 1795660455。
+- 阶段 1（块 1..35）：负载只经 gov5 v0 RPC（800 笔 + 24 笔注资，4 tx/s，8 个发送者）。每 leader 交易数：
+  v0 216、v1 0、v2 221、**n42-26 387**（7/9 个块有交易）。
+- 阶段 2（块 36..67）：负载只经 n42-26 RPC（800 笔 + 8 笔注资，发送者偏移 8）。每 leader 交易数：
+  **v0 215、v2 195**（gov5 leader 打包了 n42-26 提交的交易）、v1 5、n42-26 393。负载结束后三个 gov5 池均清空。
+- 68 块：4 节点每个高度哈希一致；1632 笔；n42-26 `executed_fields.log` 与头携带字段 68 次比较 0 不符；出块者 {0:17,1:17,2:17,3:17}；
+  AM27 网格 0 违规。n42-26 日志 ERROR 0、panic 0、停机 0（logscan 的 1 次 "halt" 为地址中的 "E12" 误报），WARN 3 条均为启动提示。
+  gov5 日志 error 全部为对未启动 node 3 的 "Failed to reconnect to peer"；gov5 的 "tx broadcaster: publishing … failed=0" 可见。
+- **每 leader 不均衡的原因（gov5 侧）**：gov5 node 1、2 做投机构建（`speculative build hit/parked` 各 17/16 次），在区间开始、上一块刚清空池时取池快照；
+  node 0 与 n42-26 在 slot 时刻构建。于是 v1 总是空块，v2 拿到 v1 区间的交易，n42-26 拿到 v2 区间与自身区间两份（约 2×），v0 一份。
+  gov5 v0 与 v2 之间相差 <10%；每 4 块恰好打包 4 个区间的全部交易，没有交易滞留。与 gossip 无关（第 15.5 节已见 v1 不打包的现象）。
+- 链数据已删除，日志与脚本保留在 `/tmp/p1-txg/R/`（`logs/`、`n3.log`、`phase*.count`、`check.txt`、`logscan.txt`）。
+
+### 16.5 后续
+
+- 未与 n42-rs 混跑；字节一致性以固定向量对照 n42-rs 源码实现，未跨进程互发验证。
+- 交易在 topic 上不按 leader 定向，O(n) 扇出由 gossipsub 承担；高 TPS 下（>数千 tx/s）的 topic 带宽与池导入开销未测。
+- 入站交易不再经 `recently_imported` 以外的去重；大量重复批（gov5 再广播）靠 `pool.contains` 早退。
+- 15.6 节“交易不转发给其他客户端的 leader”一项由本节解决。

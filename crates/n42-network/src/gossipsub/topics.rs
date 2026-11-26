@@ -28,6 +28,14 @@ pub fn gov5_block_topic(genesis_hash: B256) -> IdentTopic {
     IdentTopic::new(format!("/n42/{fork_digest}/block/ssz_snappy"))
 }
 
+/// Gov5's transaction topic. The payload is raw Snappy around one EIP-2718
+/// transaction or a `0x7e`-marked RLP batch of them; see
+/// [`crate::gov5_tx_gossip`].
+pub fn gov5_tx_topic(genesis_hash: B256) -> IdentTopic {
+    let fork_digest = hex::encode(&genesis_hash.as_slice()[..4]);
+    IdentTopic::new(format!("/n42/{fork_digest}/transaction_v2/ssz_snappy"))
+}
+
 pub fn h2_v4_topic() -> IdentTopic {
     IdentTopic::new("/n42/h2/4/ssz_snappy")
 }
@@ -92,6 +100,10 @@ mod tests {
         assert_eq!(
             gov5_block_topic(B256::repeat_byte(0xab)).hash(),
             IdentTopic::new("/n42/abababab/block/ssz_snappy").hash()
+        );
+        assert_eq!(
+            gov5_tx_topic(B256::repeat_byte(0xab)).hash(),
+            IdentTopic::new("/n42/abababab/transaction_v2/ssz_snappy").hash()
         );
         assert_eq!(
             h2_v4_topic().hash(),

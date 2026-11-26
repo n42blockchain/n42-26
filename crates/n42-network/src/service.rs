@@ -22,7 +22,7 @@ use crate::gossipsub::handlers::{
 };
 use crate::gossipsub::topics::{
     blob_sidecar_topic, block_announce_topic, consensus_topic, gov5_block_topic, gov5_h2_topic,
-    h2_v4_topic, mempool_topic, verification_receipts_topic,
+    gov5_tx_topic, h2_v4_topic, mempool_topic, verification_receipts_topic,
 };
 use crate::gov5_block::{Gov5BlockError, attributable_hash, decode_wire_block_rlp};
 use crate::gov5_rpc::{
@@ -557,6 +557,10 @@ pub enum NetworkCommand {
     },
     AnnounceBlock(Vec<u8>),
     BroadcastTransaction(Vec<u8>),
+    /// Publish transactions (RLP network form, as the pool bridge emits them)
+    /// on gov5's `transaction_v2` topic, batched to gov5's caps. Participant
+    /// mode only; elsewhere the command is dropped.
+    PublishGov5Transactions(Vec<Vec<u8>>),
     BroadcastBlobSidecar(Vec<u8>),
     /// Send block data directly to a specific peer (leader → validator).
     SendBlockDirect {
@@ -684,6 +688,13 @@ pub enum NetworkEvent {
         source: PeerId,
         data: Vec<u8>,
     },
+    /// Transactions heard on gov5's `transaction_v2` topic, already converted
+    /// to the RLP network form the pool bridge imports. Undecodable entries
+    /// are dropped by the network service.
+    Gov5TransactionsReceived {
+        source: PeerId,
+        txs: Vec<Vec<u8>>,
+    },
     BlobSidecarReceived {
         source: PeerId,
         data: Vec<u8>,
@@ -794,6 +805,12 @@ impl NetworkHandle {
 
     pub fn broadcast_transaction(&self, data: Vec<u8>) -> Result<(), NetworkError> {
         self.send(NetworkCommand::BroadcastTransaction(data))
+    }
+
+    /// Publish locally admitted transactions (RLP network form) on gov5's
+    /// transaction topic; see [`crate::gov5_tx_gossip`].
+    pub fn publish_gov5_transactions(&self, txs: Vec<Vec<u8>>) -> Result<(), NetworkError> {
+        self.send(NetworkCommand::PublishGov5Transactions(txs))
     }
 
     pub fn broadcast_blob_sidecar(&self, data: Vec<u8>) -> Result<(), NetworkError> {
@@ -1107,6 +1124,9 @@ pub struct NetworkService {
     consensus_topic_hash: gossipsub::TopicHash,
     gov5_h2_topic_hash: Option<gossipsub::TopicHash>,
     gov5_block_topic_hash: Option<gossipsub::TopicHash>,
+    /// Gov5's `transaction_v2` topic, joined in H2-v4 participant mode only.
+    gov5_tx_topic: Option<gossipsub::IdentTopic>,
+    gov5_tx_topic_hash: Option<gossipsub::TopicHash>,
     h2_v4_topic_hash: Option<gossipsub::TopicHash>,
     h2_v4_identity: Option<H2V4ChainIdentity>,
     h2_v4_participant: bool,
@@ -1443,6 +1463,20 @@ impl NetworkService {
                 .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
             tracing::info!(topic = %topic.hash(), "subscribed to gov5 block observer topic");
         }
+        // Transaction gossip is a participant's business: an observer seals
+        // nothing and takes no submissions to pass on.
+        let gov5_tx_topic = h2_v4_identity
+            .filter(|_| h2_v4_participant)
+            .map(|identity| gov5_tx_topic(identity.genesis_hash));
+        if let Some(topic) = gov5_tx_topic.as_ref() {
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(topic)
+                .map_err(|e| NetworkError::Subscribe(e.to_string()))?;
+            tracing::info!(topic = %topic.hash(), "subscribed to gov5 transaction topic");
+        }
+        let gov5_tx_topic_hash = gov5_tx_topic.as_ref().map(|topic| topic.hash());
         let h2_v4_observer_topic = h2_v4_identity.map(|_| h2_v4_topic());
         let gov5_status = h2_v4_identity.map(|identity| Gov5Status {
             genesis_hash: identity.genesis_hash,
@@ -1491,6 +1525,8 @@ impl NetworkService {
             consensus_topic_hash,
             gov5_h2_topic_hash,
             gov5_block_topic_hash,
+            gov5_tx_topic,
+            gov5_tx_topic_hash,
             h2_v4_topic_hash,
             h2_v4_identity,
             h2_v4_participant,
@@ -2434,6 +2470,32 @@ impl NetworkService {
                 NetworkEvent::BlockAnnouncement {
                     source,
                     data: message.data,
+                }
+            }
+            _ if self
+                .gov5_tx_topic_hash
+                .as_ref()
+                .is_some_and(|hash| topic == hash) =>
+            {
+                match crate::gov5_tx_gossip::decode_gossip_to_network_rlp(&message.data) {
+                    Ok((txs, dropped)) => {
+                        metrics::counter!("n42_gov5_tx_gossip_received_total")
+                            .increment(txs.len() as u64);
+                        if dropped > 0 {
+                            metrics::counter!("n42_gov5_tx_gossip_undecodable_total")
+                                .increment(dropped as u64);
+                        }
+                        tracing::debug!(target: "n42::interop::tx", %source, count = txs.len(), dropped, "gov5 transaction gossip received");
+                        if txs.is_empty() {
+                            return;
+                        }
+                        NetworkEvent::Gov5TransactionsReceived { source, txs }
+                    }
+                    Err(error) => {
+                        metrics::counter!("n42_gov5_tx_gossip_rejected_total").increment(1);
+                        tracing::debug!(target: "n42::interop::tx", %source, %error, "dropped a gov5 transaction message");
+                        return;
+                    }
                 }
             }
             _ if *topic == self.mempool_topic_hash => NetworkEvent::TransactionReceived {
@@ -4423,6 +4485,22 @@ impl NetworkService {
                     self.gossipsub_publish(mempool_topic(), data, "transaction");
                 }
             }
+            NetworkCommand::PublishGov5Transactions(txs) => {
+                let Some(topic) = self.gov5_tx_topic.clone() else {
+                    tracing::debug!(target: "n42::interop::tx", "refusing gov5 transaction publish outside participant mode");
+                    return;
+                };
+                let raws: Vec<alloy_primitives::Bytes> = txs
+                    .iter()
+                    .filter_map(|rlp| crate::gov5_tx_gossip::network_rlp_to_eip2718(rlp))
+                    .collect();
+                metrics::counter!("n42_gov5_tx_gossip_published_total")
+                    .increment(raws.len() as u64);
+                for message in crate::gov5_tx_gossip::encode_gossip_messages(&raws) {
+                    self.gossipsub_publish(topic.clone(), message, "gov5 transaction batch");
+                }
+                tracing::debug!(target: "n42::interop::tx", count = raws.len(), "published transactions on the gov5 topic");
+            }
             NetworkCommand::BroadcastBlobSidecar(data) => {
                 self.gossipsub_publish(blob_sidecar_topic(), data, "blob sidecar");
             }
@@ -4724,6 +4802,135 @@ mod tests {
         }
         service_task.abort();
         (inbound_accepted, outbound_received)
+    }
+
+    /// A participant and a bare gov5-like swarm share `transaction_v2`: a
+    /// batch the foreign member publishes in gov5's wire form reaches the
+    /// participant's data lane in the pool bridge's RLP form, and a
+    /// transaction the participant publishes arrives at the foreign member
+    /// in gov5's wire form.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gov5_transaction_topic_carries_batches_both_ways() {
+        use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+        use alloy_eips::eip2718::{Decodable2718, Encodable2718};
+        use futures::StreamExt;
+        use libp2p::swarm::SwarmEvent;
+
+        fn tx(nonce: u64) -> TxEnvelope {
+            let tx = TxEip1559 {
+                chain_id: 94,
+                nonce,
+                gas_limit: 21_000,
+                max_fee_per_gas: 2_000_000_000,
+                max_priority_fee_per_gas: 1,
+                to: alloy_primitives::TxKind::Call(alloy_primitives::Address::repeat_byte(0x33)),
+                ..Default::default()
+            };
+            let sig = alloy_primitives::Signature::new(
+                alloy_primitives::U256::from(1u64),
+                alloy_primitives::U256::from(2u64),
+                false,
+            );
+            TxEnvelope::Eip1559(tx.into_signed(sig))
+        }
+
+        let (identity, _) = h2_v4_fixture_envelope();
+        let topic = gov5_tx_topic(identity.genesis_hash);
+        let (mut service, handle, _consensus_rx, mut data_rx) =
+            h2_participant_service(identity, 3, HashMap::new());
+        service
+            .trust_signed_messages_without_peer_bindings()
+            .unwrap();
+        service
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let listen_addr = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let SwarmEvent::NewListenAddr { address, .. } =
+                    service.swarm.select_next_some().await
+                {
+                    break address;
+                }
+            }
+        })
+        .await
+        .expect("listener ready");
+        let service_task = tokio::spawn(service.run());
+
+        let mut foreign = crate::transport::build_interop_participant_swarm(
+            libp2p::identity::Keypair::generate_ed25519(),
+            crate::transport::TransportConfig::for_network_size(4),
+            0,
+            identity.genesis_hash,
+        )
+        .unwrap();
+        foreign.behaviour_mut().gossipsub.subscribe(&topic).unwrap();
+        foreign.dial(listen_addr).unwrap();
+
+        let inbound: Vec<alloy_primitives::Bytes> = [tx(0), tx(1)]
+            .iter()
+            .map(|t| t.encoded_2718().into())
+            .collect();
+        let inbound_message = crate::snappy_pool::raw_compress(
+            &crate::gov5_tx_gossip::encode_tx_batch(&inbound).unwrap(),
+        )
+        .unwrap();
+        let local = tx(7);
+        let local_network_rlp = alloy_rlp::encode(
+            n42_tx_types::N42TxEnvelope::decode_2718_exact(&local.encoded_2718()).unwrap(),
+        );
+
+        let mut heard_inbound = false;
+        let mut heard_outbound = false;
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !(heard_inbound && heard_outbound) && tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                event = foreign.select_next_some() => {
+                    if let SwarmEvent::Behaviour(crate::transport::N42BehaviourEvent::Gossipsub(
+                        libp2p::gossipsub::Event::Message { message, .. },
+                    )) = event
+                        && message.topic == topic.hash()
+                    {
+                        let txs = crate::gov5_tx_gossip::decode_gossip_message(&message.data).unwrap();
+                        assert_eq!(txs, vec![alloy_primitives::Bytes::from(local.encoded_2718())]);
+                        heard_outbound = true;
+                    }
+                }
+                Some(event) = data_rx.recv() => {
+                    if let NetworkEvent::Gov5TransactionsReceived { source, txs } = event {
+                        assert_eq!(source, *foreign.local_peer_id());
+                        let expected: Vec<Vec<u8>> = [tx(0), tx(1)]
+                            .iter()
+                            .map(|t| alloy_rlp::encode(
+                                n42_tx_types::N42TxEnvelope::decode_2718_exact(&t.encoded_2718()).unwrap(),
+                            ))
+                            .collect();
+                        assert_eq!(txs, expected);
+                        heard_inbound = true;
+                    }
+                }
+                _ = tick.tick() => {
+                    // Until the meshes know of each other a publish has no
+                    // peers; repeat (gossipsub drops duplicates by id).
+                    if !heard_inbound {
+                        let _ = foreign
+                            .behaviour_mut()
+                            .gossipsub
+                            .publish(topic.clone(), inbound_message.clone());
+                    }
+                    if !heard_outbound {
+                        handle.publish_gov5_transactions(vec![local_network_rlp.clone()]).unwrap();
+                    }
+                }
+            }
+        }
+        service_task.abort();
+        assert!(heard_inbound, "the participant heard the gov5 batch");
+        assert!(
+            heard_outbound,
+            "the gov5 member heard the participant's transaction"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
