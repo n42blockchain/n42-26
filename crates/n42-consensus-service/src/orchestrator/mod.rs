@@ -4900,6 +4900,28 @@ impl ConsensusService {
                 .map(|v| v == "1")
                 .unwrap_or(false)
         });
+        // An H2-v4 participant shares its fleet's transaction topic: every
+        // buffered transaction came from the local pool's pending listener,
+        // so it is already pooled here (and sealed when this node leads); the
+        // topic carries it to every other member, gov5 leaders included, who
+        // do not speak tx_forward. This replaces forwarding, so nothing goes
+        // out twice; it also covers Profile 1 without PeerId bindings.
+        if !disabled && self.h2_v4_identity.is_some() {
+            self.tx_forward_missing_leader_warned_view = None;
+            let txs = std::mem::take(&mut self.tx_forward_buffer);
+            let count = txs.len();
+            match self.network.publish_gov5_transactions(txs) {
+                Ok(()) => {
+                    counter!("n42_gov5_tx_gossip_batches").increment(1);
+                    counter!("n42_gov5_tx_gossip_txs").increment(count as u64);
+                }
+                Err(error) => {
+                    warn!(target: "n42::cl::orchestrator", count, error = %error, "failed to hand transactions to the gov5 topic");
+                }
+            }
+            return;
+        }
+
         // Profile 1 without PeerId bindings: no transport id is known to be
         // the leader's, so transactions stay in the local pool and this node
         // includes them when it leads.
@@ -5423,6 +5445,15 @@ impl ConsensusService {
                 self.enqueue_tx_import(data, "p2p transaction received")
                     .await;
             }
+            NetworkEvent::Gov5TransactionsReceived { source: _, txs } => {
+                // Into the local pool like eth_sendRawTransaction; the pool
+                // rejects what is invalid. The bridge marks these hashes as
+                // imported, so they are never published back to the topic.
+                let count = txs.len();
+                self.enqueue_tx_import_batch(txs, "gov5 transaction gossip received")
+                    .await;
+                counter!("n42_gov5_tx_gossip_imported").increment(count as u64);
+            }
             NetworkEvent::TxForwardReceived { source: _, txs } => {
                 // Leader receives forwarded txs from validators — feed into local pool.
                 let count = txs.len();
@@ -5542,6 +5573,8 @@ mod tests {
         (block_hash, rlp)
     }
 
+    type MockTxForward = (n42_network::PeerId, Vec<Vec<u8>>);
+
     #[derive(Clone, Default)]
     struct MockConsensusNetwork {
         peers: Arc<RwLock<HashMap<u32, n42_network::PeerId>>>,
@@ -5550,6 +5583,8 @@ mod tests {
         direct_messages: Arc<Mutex<Vec<(n42_network::PeerId, n42_primitives::ConsensusMessage)>>>,
         cancelled_gov5_fetches: Arc<Mutex<Vec<B256>>>,
         range_requests: Arc<Mutex<Vec<(n42_network::PeerId, u64, u64)>>>,
+        forwarded_tx_batches: Arc<Mutex<Vec<MockTxForward>>>,
+        gov5_tx_publishes: Arc<Mutex<Vec<Vec<Vec<u8>>>>>,
     }
 
     impl MockConsensusNetwork {
@@ -6086,11 +6121,27 @@ mod tests {
 
         fn forward_tx_batch(
             &self,
-            _peer: n42_network::PeerId,
-            _txs: Vec<Vec<u8>>,
+            peer: n42_network::PeerId,
+            txs: Vec<Vec<u8>>,
         ) -> Result<(), n42_network::NetworkError> {
+            self.forwarded_tx_batches
+                .lock()
+                .expect("mock forwarded tx lock")
+                .push((peer, txs));
             Ok(())
         }
+
+        fn publish_gov5_transactions(
+            &self,
+            txs: Vec<Vec<u8>>,
+        ) -> Result<(), n42_network::NetworkError> {
+            self.gov5_tx_publishes
+                .lock()
+                .expect("mock gov5 tx publish lock")
+                .push(txs);
+            Ok(())
+        }
+
 
         fn request_sync(
             &self,
@@ -9050,6 +9101,79 @@ mod tests {
         assert!(!orch.has_quorum_peers());
         orch.connected_peers.insert(mock_peers[4].1);
         assert!(orch.has_quorum_peers());
+    }
+
+    #[tokio::test]
+    async fn h2_v4_participant_publishes_local_txs_on_the_gov5_topic_instead_of_forwarding() {
+        // A known, connected leader that is not us: bound mode would forward.
+        let (engine, output_rx) = make_test_engine_with_validator_count(4, 1);
+        let leader = engine.current_leader_index();
+        let leader_peer = Keypair::generate_ed25519().public().to_peer_id();
+        let network = Arc::new(MockConsensusNetwork::with_peers(vec![(
+            leader,
+            leader_peer,
+        )]));
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(engine, network.clone(), net_event_rx, output_rx);
+        let (import_tx, mut import_rx) = mpsc::channel(8);
+        let (_broadcast_tx, broadcast_rx) = mpsc::channel(8);
+        orch = orch.with_tx_pool_bridge(import_tx, broadcast_rx);
+
+        // Not a participant: the old path forwards to the leader.
+        if !orch.engine.is_current_leader() {
+            orch.tx_forward_buffer = vec![vec![0xaa]];
+            orch.flush_tx_forward_buffer().await;
+            assert_eq!(network.forwarded_tx_batches.lock().unwrap().len(), 1);
+            assert!(network.gov5_tx_publishes.lock().unwrap().is_empty());
+        }
+
+        orch.h2_v4_identity = Some(test_h2_identity());
+        orch.tx_forward_buffer = vec![vec![0x01], vec![0x02]];
+        let forwarded_before = network.forwarded_tx_batches.lock().unwrap().len();
+        orch.flush_tx_forward_buffer().await;
+        assert_eq!(
+            *network.gov5_tx_publishes.lock().unwrap(),
+            vec![vec![vec![0x01], vec![0x02]]]
+        );
+        assert_eq!(
+            network.forwarded_tx_batches.lock().unwrap().len(),
+            forwarded_before,
+            "nothing goes out twice"
+        );
+        assert!(orch.tx_forward_buffer.is_empty());
+        // The transactions came from the local pool: no re-import.
+        assert!(import_rx.try_recv().is_err());
+
+        // Unbound Profile 1 takes the same path.
+        let mut orch = orch.with_unbound_validator_peers(true);
+        orch.tx_forward_buffer = vec![vec![0x03]];
+        orch.flush_tx_forward_buffer().await;
+        assert_eq!(network.gov5_tx_publishes.lock().unwrap().len(), 2);
+        assert!(import_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn gov5_gossiped_transactions_land_in_the_pool_import_channel() {
+        let (engine, output_rx) = make_test_engine_with_validator_count(4, 1);
+        let network = Arc::new(MockConsensusNetwork::default());
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let orch = ConsensusService::new(engine, network.clone(), net_event_rx, output_rx);
+        let (import_tx, mut import_rx) = mpsc::channel(8);
+        let (_broadcast_tx, broadcast_rx) = mpsc::channel(8);
+        let mut orch = orch.with_tx_pool_bridge(import_tx, broadcast_rx);
+        orch.h2_v4_identity = Some(test_h2_identity());
+
+        let txs = vec![vec![0xf8, 0x01], vec![0xb8, 0x02]];
+        orch.handle_network_event(NetworkEvent::Gov5TransactionsReceived {
+            source: Keypair::generate_ed25519().public().to_peer_id(),
+            txs: txs.clone(),
+        })
+        .await;
+        assert_eq!(import_rx.try_recv().unwrap(), txs);
+        assert!(
+            network.gov5_tx_publishes.lock().unwrap().is_empty(),
+            "no echo"
+        );
     }
 
     #[test]

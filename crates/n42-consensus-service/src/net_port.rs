@@ -33,6 +33,10 @@ pub trait ConsensusNetwork: Send + Sync {
     /// Forward a batch of RLP-encoded transactions to the leader peer.
     fn forward_tx_batch(&self, peer: PeerId, txs: Vec<Vec<u8>>) -> Result<(), NetworkError>;
 
+    /// Publish RLP-encoded (network form) transactions on gov5's
+    /// `transaction_v2` topic; H2-v4 participant mode only.
+    fn publish_gov5_transactions(&self, txs: Vec<Vec<u8>>) -> Result<(), NetworkError>;
+
     /// Send a block-sync request to a peer (standard channel).
     fn request_sync(&self, peer: PeerId, request: BlockSyncRequest) -> Result<(), NetworkError>;
 
@@ -122,6 +126,10 @@ impl ConsensusNetwork for NetworkHandle {
 
     fn forward_tx_batch(&self, peer: PeerId, txs: Vec<Vec<u8>>) -> Result<(), NetworkError> {
         NetworkHandle::forward_tx_batch(self, peer, txs)
+    }
+
+    fn publish_gov5_transactions(&self, txs: Vec<Vec<u8>>) -> Result<(), NetworkError> {
+        NetworkHandle::publish_gov5_transactions(self, txs)
     }
 
     fn request_sync(&self, peer: PeerId, request: BlockSyncRequest) -> Result<(), NetworkError> {
@@ -256,6 +264,12 @@ impl ConsensusNetwork for FollowerNetwork {
 
     fn forward_tx_batch(&self, peer: PeerId, txs: Vec<Vec<u8>>) -> Result<(), NetworkError> {
         self.inner.forward_tx_batch(peer, txs)
+    }
+
+    /// A follower seals nothing but still passes its RPC submissions on, so
+    /// the fleet's leaders seal them.
+    fn publish_gov5_transactions(&self, txs: Vec<Vec<u8>>) -> Result<(), NetworkError> {
+        self.inner.publish_gov5_transactions(txs)
     }
 
     fn request_sync(&self, peer: PeerId, request: BlockSyncRequest) -> Result<(), NetworkError> {

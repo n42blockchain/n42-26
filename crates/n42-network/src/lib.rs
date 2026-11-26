@@ -8,6 +8,7 @@ pub mod finalized_range;
 pub mod gossipsub;
 pub mod gov5_block;
 pub mod gov5_rpc;
+pub mod gov5_tx_gossip;
 pub mod h2_bridge;
 pub mod h2_v4;
 pub mod h2_wire;
