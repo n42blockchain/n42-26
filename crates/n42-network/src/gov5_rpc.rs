@@ -22,15 +22,16 @@ pub const GOV5_HOTSTUFF_DIRECT_PROTOCOL: &str = "/rpc/hotstuff_direct/1";
 
 /// Decoded bound for by-hash and push block chunks; the N42 sync standard
 /// (W1) sets every block chunk to 64 MiB, the range chunk bound.
-const MAX_GOV5_BLOCK_SIZE: usize = 64 * 1024 * 1024;
-const MAX_SNAPPY_FRAME_SIZE: usize = MAX_GOV5_BLOCK_SIZE + (MAX_GOV5_BLOCK_SIZE / 6) + 1024;
+pub(crate) const MAX_GOV5_BLOCK_SIZE: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_SNAPPY_FRAME_SIZE: usize =
+    MAX_GOV5_BLOCK_SIZE + (MAX_GOV5_BLOCK_SIZE / 6) + 1024;
 const MAX_GOV5_HOTSTUFF_SIZE: usize = 16 * 1024;
 
 /// Gov5's `maxRequestBlocks` / `rangeLimit`.
 pub const MAX_GOV5_RANGE_BLOCKS: u64 = 1024;
 /// Gov5 uses a dedicated 64 MiB decoded limit for block response chunks.
 pub const MAX_GOV5_RANGE_BLOCK_SIZE: usize = 64 * 1024 * 1024;
-const MAX_GOV5_RANGE_WIRE_SIZE: usize =
+pub(crate) const MAX_GOV5_RANGE_WIRE_SIZE: usize =
     MAX_GOV5_RANGE_BLOCK_SIZE + (MAX_GOV5_RANGE_BLOCK_SIZE / 6) + 1024;
 /// Decoded-bytes budget for one whole bodies-by-range response. Each chunk is
 /// bounded at 64 MiB and a response at 1024 chunks, so per-chunk limits alone
@@ -44,10 +45,20 @@ type Gov5BlockRlpByHash = dyn Fn(B256) -> Result<Option<Vec<u8>>, String> + Send
 type Gov5BlockRlpByNumber = dyn Fn(u64) -> Result<Option<Vec<u8>>, String> + Send + Sync;
 type Gov5BlockRlpsByRange =
     dyn Fn(std::ops::RangeInclusive<u64>) -> Result<Vec<Vec<u8>>, String> + Send + Sync;
+type Gov5CanonicalNumberOf = dyn Fn(B256) -> Result<Option<u64>, String> + Send + Sync;
+
+/// The committed tip a serving node reports through
+/// [`Gov5CanonicalBlockReader::note_committed`], and the highest committed
+/// block already seen canonical in storage.
+#[derive(Debug, Default)]
+struct Gov5CommittedTip {
+    latest: Option<B256>,
+    confirmed: Option<(u64, B256)>,
+}
 /// Blocks read, validated and encoded per blocking batch while the previous
 /// batch is being written to the peer. One batch is one consistent storage
 /// view on the node side, so the view never spans socket writes.
-const GOV5_RANGE_BATCH_BLOCKS: u64 = 32;
+pub(crate) const GOV5_RANGE_BATCH_BLOCKS: u64 = 32;
 
 /// A persistent canonical-chain reader installed by the node layer.
 ///
@@ -63,6 +74,15 @@ pub struct Gov5CanonicalBlockReader {
     /// Contiguous blocks from the start of the range up to the first missing
     /// one, all read from one consistent view.
     block_rlps_by_range: Arc<Gov5BlockRlpsByRange>,
+    /// Exact header encodings (the first item of the block wire form) for a
+    /// range, stopping at the first missing one. When unset, headers are cut
+    /// out of the block RLPs.
+    header_rlps_by_range: Option<Arc<Gov5BlockRlpsByRange>>,
+    /// The canonical number of a block hash (`None` when the hash is not
+    /// canonical). When set, [`Self::committed_head`] follows the committed
+    /// tip instead of the storage head.
+    canonical_number_of: Option<Arc<Gov5CanonicalNumberOf>>,
+    committed: Arc<std::sync::Mutex<Gov5CommittedTip>>,
 }
 
 impl fmt::Debug for Gov5CanonicalBlockReader {
@@ -85,6 +105,9 @@ impl Gov5CanonicalBlockReader {
             best_block_number: Arc::new(best_block_number),
             block_rlp_by_hash: None,
             block_rlp_by_number,
+            header_rlps_by_range: None,
+            canonical_number_of: None,
+            committed: Arc::default(),
             block_rlps_by_range: Arc::new(move |numbers| {
                 let mut rlps = Vec::new();
                 for number in numbers {
@@ -117,7 +140,100 @@ impl Gov5CanonicalBlockReader {
                 Ok(per_range(number..=number)?.into_iter().next())
             }),
             block_rlps_by_range,
+            header_rlps_by_range: None,
+            canonical_number_of: None,
+            committed: Arc::default(),
         }
+    }
+
+    /// Installs a header-only source used by `HEADERS_ONLY` range replies and
+    /// by `commit_qc/1`, so they do not read whole bodies. It must serve the
+    /// same canonical chain as the block source, in the exact wire encoding.
+    pub fn with_header_reader<R>(mut self, reader: R) -> Self
+    where
+        R: Fn(std::ops::RangeInclusive<u64>) -> Result<Vec<Vec<u8>>, String>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.header_rlps_by_range = Some(Arc::new(reader));
+        self
+    }
+
+    /// Canonical header encodings for `numbers`, in order, stopping at the
+    /// first missing one.
+    pub fn header_rlps_by_range(
+        &self,
+        numbers: std::ops::RangeInclusive<u64>,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        if let Some(reader) = &self.header_rlps_by_range {
+            return reader(numbers);
+        }
+        self.block_rlps_by_range(numbers)?
+            .iter()
+            .map(|block| {
+                crate::sync_v11::header_rlp_of_block(block)
+                    .map(<[u8]>::to_vec)
+                    .ok_or_else(|| "stored block has no decodable header".to_owned())
+            })
+            .collect()
+    }
+
+    /// Bounds every served range by the committed tip instead of the storage
+    /// head. The storage head can be an uncommitted block (a leader builds
+    /// on its locked, prepare-certified block), so a participant installs
+    /// this; `canonical_number_of` returns a hash's number only when that
+    /// block is canonical. Until a committed block has been reported with
+    /// [`Self::note_committed`] and seen canonical, nothing is served.
+    pub fn with_committed_resolver<R>(mut self, canonical_number_of: R) -> Self
+    where
+        R: Fn(B256) -> Result<Option<u64>, String> + Send + Sync + 'static,
+    {
+        self.canonical_number_of = Some(Arc::new(canonical_number_of));
+        self
+    }
+
+    /// The consensus layer committed `hash`. Shared by every clone.
+    pub fn note_committed(&self, hash: B256) {
+        self.committed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .latest = Some(hash);
+    }
+
+    /// The highest block this node may serve as committed: the reported
+    /// committed tip once it is canonical in storage, else the last committed
+    /// block that was (re-checked to still be canonical). It never runs ahead
+    /// of a committed block and never moves down. Without a resolver (an
+    /// observer, whose forkchoice only follows verified Decides) it is the
+    /// storage head.
+    pub fn committed_head(&self) -> Result<u64, String> {
+        let Some(resolve) = &self.canonical_number_of else {
+            return self.best_block_number();
+        };
+        let (latest, confirmed) = {
+            let tip = self
+                .committed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (tip.latest, tip.confirmed)
+        };
+        if let Some(hash) = latest
+            && let Some(number) = resolve(hash)?
+            && confirmed.is_none_or(|(held, _)| number >= held)
+        {
+            self.committed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .confirmed = Some((number, hash));
+            return Ok(number);
+        }
+        if let Some((number, hash)) = confirmed
+            && resolve(hash)? == Some(number)
+        {
+            return Ok(number);
+        }
+        Err("no committed block is canonical yet".to_owned())
     }
 
     pub fn with_hash_reader<R>(mut self, reader: R) -> Self
@@ -527,7 +643,7 @@ async fn read_bounded<T: AsyncRead + Unpin>(io: &mut T, max: usize) -> io::Resul
     Ok(encoded)
 }
 
-fn decode_uvarint(input: &[u8]) -> io::Result<(usize, usize)> {
+pub(crate) fn decode_uvarint(input: &[u8]) -> io::Result<(usize, usize)> {
     let mut value = 0u64;
     for (index, byte) in input.iter().copied().take(10).enumerate() {
         if index == 9 && byte > 1 {
@@ -550,7 +666,7 @@ fn decode_uvarint(input: &[u8]) -> io::Result<(usize, usize)> {
     ))
 }
 
-fn encode_uvarint(mut value: usize, output: &mut Vec<u8>) {
+pub(crate) fn encode_uvarint(mut value: usize, output: &mut Vec<u8>) {
     while value >= 0x80 {
         output.push((value as u8) | 0x80);
         value >>= 7;
@@ -808,7 +924,7 @@ fn encode_chunked_block(rlp: &[u8], fork_digest: [u8; 4]) -> io::Result<Vec<u8>>
     Ok(encoded)
 }
 
-fn encode_framed_payload(payload: &[u8], max_decoded: usize) -> io::Result<Vec<u8>> {
+pub(crate) fn encode_framed_payload(payload: &[u8], max_decoded: usize) -> io::Result<Vec<u8>> {
     if payload.len() > max_decoded {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -823,9 +939,9 @@ fn encode_framed_payload(payload: &[u8], max_decoded: usize) -> io::Result<Vec<u
 }
 
 /// Error text of a framed payload refused at its declared length.
-const FRAMED_PAYLOAD_OVER_LIMIT: &str = "Gov5 framed payload exceeds decoded size limit";
+pub(crate) const FRAMED_PAYLOAD_OVER_LIMIT: &str = "Gov5 framed payload exceeds decoded size limit";
 
-async fn read_framed_payload<T>(
+pub(crate) async fn read_framed_payload<T>(
     io: &mut T,
     max_wire: usize,
     max_decoded: usize,
@@ -937,7 +1053,7 @@ where
     Ok(decoded)
 }
 
-fn encode_range_chunk(chunk: &Gov5RangeBlockChunk) -> io::Result<Vec<u8>> {
+pub(crate) fn encode_range_chunk(chunk: &Gov5RangeBlockChunk) -> io::Result<Vec<u8>> {
     let mut encoded = Vec::with_capacity(5 + chunk.rlp.len());
     encoded.push(0);
     encoded.extend_from_slice(&chunk.fork_digest);
@@ -948,7 +1064,7 @@ fn encode_range_chunk(chunk: &Gov5RangeBlockChunk) -> io::Result<Vec<u8>> {
     Ok(encoded)
 }
 
-fn encode_range_error(code: u8, message: &str) -> io::Result<Vec<u8>> {
+pub(crate) fn encode_range_error(code: u8, message: &str) -> io::Result<Vec<u8>> {
     let mut encoded = vec![code];
     encoded.extend_from_slice(&encode_framed_payload(
         message.as_bytes(),
@@ -1133,10 +1249,30 @@ impl request_response::Codec for Gov5BodiesByRangeCodec {
                 // This deliberately matches gov5: validate the requested
                 // step/span first, then normalize any step > 1 to a
                 // contiguous response. Current gov5 clients always send 1.
-                let end = request
+                let requested_end = request
                     .start
                     .checked_add(request.count - 1)
                     .expect("validated range cannot overflow");
+                // Committed blocks only: the storage head may be a block
+                // built on a prepare-certified parent.
+                let head_reader = reader.clone();
+                let head = match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => handle
+                        .spawn_blocking(move || head_reader.committed_head())
+                        .await
+                        .map_err(io::Error::other)?,
+                    Err(_) => head_reader.committed_head(),
+                };
+                let end = match head {
+                    Ok(head) if request.start <= head => requested_end.min(head),
+                    // As before for a start above the storage head: no
+                    // chunks (the requester sees an empty range).
+                    Ok(_) => return io.close().await,
+                    Err(error) => {
+                        io.write_all(&encode_range_error(2, &error)?).await?;
+                        return io.close().await;
+                    }
+                };
                 // Batches are prepared one ahead on a blocking thread: while
                 // batch k streams to the peer, batch k+1 is already being read
                 // and encoded.

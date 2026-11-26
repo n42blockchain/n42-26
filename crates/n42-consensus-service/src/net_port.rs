@@ -52,6 +52,26 @@ pub trait ConsensusNetwork: Send + Sync {
     /// arrives as `NetworkEvent::Gov5RangeResponse`.
     fn request_gov5_range(&self, peer: PeerId, start: u64, count: u64) -> Result<(), NetworkError>;
 
+    /// Ask a peer for a CommitQC anchoring `(number, hash)` over
+    /// `/rpc/commit_qc/1`; the answer arrives as
+    /// `NetworkEvent::Gov5CommitQcResponse`.
+    fn request_gov5_commit_qc(
+        &self,
+        _peer: PeerId,
+        _number: u64,
+        _hash: alloy_primitives::B256,
+    ) -> Result<(), NetworkError> {
+        Err(NetworkError::ChannelClosed)
+    }
+
+    /// Hand the network the CommitQC (gov5 QC wire) of the block just
+    /// committed; `commit_qc/1` serves it as the persisted committed QC.
+    fn note_committed_qc(&self, _wire: Vec<u8>) {}
+
+    /// Hand the network a committed block imported without its own CommitQC
+    /// (range catch-up below a commit anchor), for the served committed head.
+    fn note_committed_block(&self, _hash: alloy_primitives::B256) {}
+
     /// Retire a hash fetch whose body arrived through another authenticated
     /// delivery path before the request-response stream completed.
     async fn cancel_gov5_block_fetch_reliable(
@@ -146,6 +166,23 @@ impl ConsensusNetwork for NetworkHandle {
 
     fn request_gov5_range(&self, peer: PeerId, start: u64, count: u64) -> Result<(), NetworkError> {
         NetworkHandle::request_gov5_range(self, peer, start, count)
+    }
+
+    fn request_gov5_commit_qc(
+        &self,
+        peer: PeerId,
+        number: u64,
+        hash: alloy_primitives::B256,
+    ) -> Result<(), NetworkError> {
+        NetworkHandle::request_gov5_commit_qc(self, peer, number, hash)
+    }
+
+    fn note_committed_qc(&self, wire: Vec<u8>) {
+        let _ = NetworkHandle::note_committed_qc(self, wire);
+    }
+
+    fn note_committed_block(&self, hash: alloy_primitives::B256) {
+        let _ = NetworkHandle::note_committed_block(self, hash);
     }
 
     async fn cancel_gov5_block_fetch_reliable(
@@ -286,6 +323,23 @@ impl ConsensusNetwork for FollowerNetwork {
 
     fn request_gov5_range(&self, peer: PeerId, start: u64, count: u64) -> Result<(), NetworkError> {
         self.inner.request_gov5_range(peer, start, count)
+    }
+
+    fn request_gov5_commit_qc(
+        &self,
+        peer: PeerId,
+        number: u64,
+        hash: alloy_primitives::B256,
+    ) -> Result<(), NetworkError> {
+        self.inner.request_gov5_commit_qc(peer, number, hash)
+    }
+
+    fn note_committed_qc(&self, wire: Vec<u8>) {
+        self.inner.note_committed_qc(wire);
+    }
+
+    fn note_committed_block(&self, hash: alloy_primitives::B256) {
+        self.inner.note_committed_block(hash);
     }
 
     async fn cancel_gov5_block_fetch_reliable(

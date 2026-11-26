@@ -19,6 +19,10 @@ use crate::gov5_rpc::{
     Gov5BodiesByRangeCodec, Gov5HotstuffDirectCodec, Gov5StatusCodec,
 };
 use crate::state_sync::StateSyncCodec;
+use crate::sync_v11::{
+    GOV5_BODIES_BY_RANGE_V2_PROTOCOL, GOV5_COMMIT_QC_PROTOCOL, Gov5BodiesByRangeV2Codec,
+    Gov5CommitQcCodec,
+};
 use crate::tx_forward::TxForwardCodec;
 
 /// Largest message GossipSub will publish or accept.
@@ -93,6 +97,11 @@ pub struct N42Behaviour {
     pub gov5_block_by_hash: libp2p::request_response::Behaviour<Gov5BlockByHashCodec>,
     /// Gov5 canonical range retrieval, enabled inbound on TCP interop swarms.
     pub gov5_bodies_by_range: libp2p::request_response::Behaviour<Gov5BodiesByRangeCodec>,
+    /// Sync standard `bodies_by_range/2`, registered next to `/1` on TCP
+    /// interop swarms; the catch-up client prefers it when a peer lists it.
+    pub gov5_bodies_by_range_v2: libp2p::request_response::Behaviour<Gov5BodiesByRangeV2Codec>,
+    /// Sync standard `commit_qc/1`, on TCP interop swarms.
+    pub gov5_commit_qc: libp2p::request_response::Behaviour<Gov5CommitQcCodec>,
     /// Gov5 chain-status handshake, enabled only on the TCP interop observer.
     pub gov5_status: libp2p::request_response::Behaviour<Gov5StatusCodec>,
     /// Gov5 raw one-way Rotor/direct consensus stream.
@@ -565,6 +574,33 @@ fn build_swarm_with_transports(
                 .with_request_timeout(Duration::from_secs(30)),
         );
 
+        // Section 6.2 allows a whole v2 range 60 s, but the catch-up client
+        // gives a request 35 s (`RangeCatchupConfig::request_timeout`) before
+        // it reassigns the range and backs the peer off; a transport deadline
+        // after that only turns a late honest reply into a dropped one. 30 s,
+        // as for `/1`, ends the stream first, which is 2.1 MiB/s for the
+        // default 64 MiB budget. commit_qc gets 10 s.
+        let gov5_bodies_by_range_v2 = libp2p::request_response::Behaviour::new(
+            enable_gov5_tcp.then(|| {
+                (
+                    libp2p::StreamProtocol::new(GOV5_BODIES_BY_RANGE_V2_PROTOCOL),
+                    libp2p::request_response::ProtocolSupport::Full,
+                )
+            }),
+            libp2p::request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(30)),
+        );
+        let gov5_commit_qc = libp2p::request_response::Behaviour::new(
+            enable_gov5_tcp.then(|| {
+                (
+                    libp2p::StreamProtocol::new(GOV5_COMMIT_QC_PROTOCOL),
+                    libp2p::request_response::ProtocolSupport::Full,
+                )
+            }),
+            libp2p::request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(10)),
+        );
+
         let gov5_status_protocols = enable_gov5_tcp
             .then(|| {
                 (
@@ -645,6 +681,8 @@ fn build_swarm_with_transports(
             gov5_block_push,
             gov5_block_by_hash,
             gov5_bodies_by_range,
+            gov5_bodies_by_range_v2,
+            gov5_commit_qc,
             gov5_status,
             gov5_hotstuff_direct,
             tx_forward,

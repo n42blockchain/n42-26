@@ -439,6 +439,17 @@ impl ConsensusService {
         if self.profile1_check_committed(view, block_hash, Some(&commit_qc)) {
             return;
         }
+        // Sync standard 5.2: `commit_qc/1` serves this as the persisted
+        // committed QC, next to the QCs in committed headers.
+        if self.h2_v4_identity.is_some()
+            && let Some(header_qc) = n42_network::Gov5HeaderQc::from_commit_qc(&commit_qc)
+        {
+            self.network.note_committed_qc(header_qc.wire);
+        }
+        // Range and commit_qc servers serve up to the committed tip. Every
+        // commit advances it, whatever this node's role, so a follower or a
+        // QC that has no header wire form never leaves the tip behind.
+        self.network.note_committed_block(block_hash);
         let commit_now = Instant::now();
         let pool_depth = self.pool_depth_snapshot();
         // The leader receives its own raw payload through a local feedback

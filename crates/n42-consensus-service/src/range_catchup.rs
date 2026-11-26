@@ -71,6 +71,8 @@ const UNSUPPORTED_BACKOFF: Duration = Duration::from_secs(3600);
 const MAX_QC_CACHE: usize = 4096;
 const MAX_ANCHORS: usize = 1 << 16;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Spacing of `commit_qc/1` requests for an unanchored tail.
+const TAIL_ANCHOR_INTERVAL: Duration = Duration::from_secs(5);
 
 /// `N42_SYNC_ANCHOR`: off | observe | enforce.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,6 +176,18 @@ pub enum RangeReply {
     Blocks(Vec<Result<RangeBlock, String>>),
     Refused,
     Failed { unsupported: bool },
+    /// A reply the network layer proved inconsistent (a `bodies_by_range/2`
+    /// END that contradicts its chunks): a provable fault, nothing kept.
+    Fault(&'static str),
+    /// A `/2` peer legitimately served nothing (zero blocks with END reason
+    /// 3-6, or RATE_LIMITED). No score and no escalating back-off (sections
+    /// 3.5, 6.3).
+    Unavailable {
+        /// The peer's committed head lies below the requested start.
+        canonical_end: bool,
+        /// The server asked to wait this long (RATE_LIMITED).
+        retry_after: Option<Duration>,
+    },
 }
 
 /// A request the caller must send.
@@ -253,7 +267,8 @@ impl Default for RangeCatchupConfig {
             tail_bytes: 512 << 20,
             max_links: 1 << 16,
             max_window: 1 << 20,
-            stall_timeout: Duration::from_secs(90),
+            // Above the request timeout, so one slow reply is not a stall.
+            stall_timeout: Duration::from_secs(45),
             stall_cooldown: Duration::from_secs(120),
         }
     }
@@ -412,12 +427,20 @@ pub struct RangeCatchup {
     stop_at: Option<u64>,
     last_progress: Option<Instant>,
     progress_head: u64,
-    progress_anchors: u64,
+    /// `stats.blocks_received` at the last progress.
+    progress_received: u64,
+    /// When [`Self::poll`] last ran: the next poll is due a fixed interval
+    /// after it, however often the caller asks for the deadline.
+    last_poll: Option<Instant>,
     cooldown_until: Option<Instant>,
     stopped: Option<Deactivation>,
     avg_block_bytes: usize,
     /// Highest height handed to the importer by [`Self::take_ready`].
     released_to: u64,
+    /// When the last tail-anchor `commit_qc/1` request was issued.
+    last_tail_anchor_request: Option<Instant>,
+    /// Peers that do not serve `commit_qc/1` (asked once, refused locally).
+    no_commit_qc: HashSet<PeerId>,
     stats: RangeCatchupStats,
 }
 
@@ -461,11 +484,14 @@ impl RangeCatchup {
             stop_at: None,
             last_progress: None,
             progress_head: 0,
-            progress_anchors: 0,
+            progress_received: 0,
+            last_poll: None,
             cooldown_until: None,
             stopped: None,
             avg_block_bytes: 0,
             released_to: 0,
+            last_tail_anchor_request: None,
+            no_commit_qc: HashSet::new(),
             stats: RangeCatchupStats::default(),
         }
     }
@@ -583,8 +609,9 @@ impl RangeCatchup {
         self.head_hash = None;
         self.planned_to = head_number;
         self.last_progress = Some(now);
+        self.last_poll = None;
         self.progress_head = head_number;
-        self.progress_anchors = self.anchored_total;
+        self.progress_received = self.stats.blocks_received;
         self.kick = true;
         true
     }
@@ -617,6 +644,61 @@ impl RangeCatchup {
         }
     }
 
+    /// The next `commit_qc/1` request that would release an unanchored tail
+    /// (sync standard 3.4 step 6): `head + 1` is buffered but not anchored, so
+    /// the importer is waiting for an anchor. Asks the peer that served it
+    /// (it holds the chain above) for a QC reaching it, at most every
+    /// [`TAIL_ANCHOR_INTERVAL`].
+    pub fn tail_anchor_request(&mut self, now: Instant) -> Option<(PeerId, u64, B256)> {
+        if !self.active
+            || self
+                .last_tail_anchor_request
+                .is_some_and(|at| now.saturating_duration_since(at) < TAIL_ANCHOR_INTERVAL)
+        {
+            return None;
+        }
+        let number = self.head_number.checked_add(1)?;
+        let block = self.buffer.get(&number)?;
+        // A loose anchor does not release it in enforce mode.
+        if self.executable(number, &block.hash) {
+            return None;
+        }
+        let usable = |peer: &PeerId, state: &PeerState| {
+            state.available(now) && !self.no_commit_qc.contains(peer)
+        };
+        let peer = Some(block.source)
+            .filter(|source| {
+                self.peers
+                    .get(source)
+                    .is_some_and(|state| usable(source, state))
+            })
+            .or_else(|| {
+                self.peers
+                    .iter()
+                    .filter(|(peer, state)| usable(peer, state) && state.height >= number)
+                    .map(|(peer, _)| *peer)
+                    .min()
+            })?;
+        self.last_tail_anchor_request = Some(now);
+        Some((peer, number, block.hash))
+    }
+
+    /// `peer` does not speak `commit_qc/1`: no tail-anchor request goes to it
+    /// again in this run.
+    pub fn note_commit_qc_unsupported(&mut self, peer: PeerId) {
+        self.no_commit_qc.insert(peer);
+    }
+
+    /// A `commit_qc/1` reply checked by [`verify_commit_qc_reply`]: its
+    /// header links join the fetched chain and its QC is a strict anchor.
+    pub fn note_commit_qc_anchor(&mut self, anchor: &n42_network::CommitQcAnchor) {
+        for pair in anchor.chain.windows(2) {
+            let ((number, hash), (_, parent)) = (pair[0], pair[1]);
+            self.record_link(hash, parent, number);
+        }
+        self.note_strict_anchor(anchor.qc.block_hash);
+    }
+
     /// The caller executed a released block (with or without moving its
     /// execution head: a repeated header view imports without a forkchoice
     /// update). The next release builds on it.
@@ -631,7 +713,11 @@ impl RangeCatchup {
         if !self.active {
             return None;
         }
-        let mut deadline = now + POLL_INTERVAL;
+        // Anchored to the last poll, not to `now`: the caller recomputes the
+        // deadline after every event, and a deadline of `now + interval`
+        // would never expire under steady traffic (transactions arrive many
+        // times a second), starving the poll, its retries and its stall check.
+        let mut deadline = self.last_poll.map_or(now, |at| at + POLL_INTERVAL);
         for flight in self.in_flight.values() {
             deadline = deadline.min(flight.sent + self.config.request_timeout);
         }
@@ -665,6 +751,7 @@ impl RangeCatchup {
             return (Vec::new(), None);
         }
         self.kick = false;
+        self.last_poll = Some(now);
         self.stop_at = stop_at;
         self.advance_head(head_number, None);
         if let Some(height) = self.quorum_height(status_quorum) {
@@ -689,10 +776,14 @@ impl RangeCatchup {
             }
         }
 
-        // Progress is the head moving or the authenticated chain growing.
-        if self.head_number > self.progress_head || self.anchored_total > self.progress_anchors {
+        // Progress is the head moving or bodies arriving. Anchors do not
+        // count: live commits above the gap keep adding them while the gap
+        // itself does not move.
+        if self.head_number > self.progress_head
+            || self.stats.blocks_received > self.progress_received
+        {
             self.progress_head = self.head_number;
-            self.progress_anchors = self.anchored_total;
+            self.progress_received = self.stats.blocks_received;
             self.last_progress = Some(now);
         }
 
@@ -1041,10 +1132,40 @@ impl RangeCatchup {
                 self.add_work(start, end);
                 return report;
             }
-            RangeReply::Blocks(blocks) if blocks.is_empty() => {
-                // A clean empty reply: the peer does not hold the range.
-                self.soft_fail(&peer, now, false);
+            RangeReply::Fault(reason) => {
+                report.fault = Some(reason);
+                report.peer_excluded = self.fault(&peer, now);
                 self.add_work(start, end);
+                return report;
+            }
+            RangeReply::Unavailable {
+                canonical_end,
+                retry_after,
+            } => {
+                self.add_work(start, end);
+                if let Some(state) = self.peers.get_mut(&peer) {
+                    if canonical_end {
+                        // It holds nothing from `start`: rank it below peers
+                        // that may (until its next Status).
+                        state.height = state.height.min(start.saturating_sub(1));
+                    }
+                    // A fixed pause (the server's, or the base one) keeps a
+                    // lone peer from being asked again at once; failures do
+                    // not grow, so it never escalates.
+                    state.backoff_until = Some(now + retry_after.unwrap_or(BACKOFF_BASE));
+                }
+                return report;
+            }
+            RangeReply::Blocks(blocks) if blocks.is_empty() => {
+                // A clean empty reply: the peer does not hold the range yet
+                // (a server serves committed blocks only, so its head trails
+                // the live chain). As `/2`'s CANONICAL_END: a fixed pause, no
+                // escalation, so it is asked again once it has committed more.
+                self.add_work(start, end);
+                if let Some(state) = self.peers.get_mut(&peer) {
+                    state.height = state.height.min(start.saturating_sub(1));
+                    state.backoff_until = Some(now + BACKOFF_BASE);
+                }
                 return report;
             }
             RangeReply::Blocks(blocks) => blocks,
@@ -1540,6 +1661,35 @@ fn qc_key(qc: &H2QuorumCertificate) -> B256 {
     keccak256(bytes)
 }
 
+/// Why a `commit_qc/1` reply is not an anchor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommitQcRejection {
+    /// The reply is inconsistent (undecodable QC, a header chain that does not
+    /// reach the request) or its QC fails against a known set: a provable fault.
+    Fault(&'static str),
+    /// A well-formed reply whose QC is not an anchor here: a prepare-domain
+    /// quorum or an unknown epoch (fail closed, no fault).
+    NotAnchor(QcCheck),
+}
+
+/// The `commit_qc/1` client check (sync standard section 5.2): the header
+/// chain from the QC's block down to the requested `(number, hash)`, then the
+/// QC itself under `verify` (section 3.3: commit domain, the set of the QC's
+/// own epoch, no fallback).
+pub fn verify_commit_qc_reply(
+    request: &n42_network::CommitQcRequest,
+    payload: &n42_network::CommitQcPayload,
+    verify: impl FnOnce(&H2QuorumCertificate) -> QcCheck,
+) -> Result<n42_network::CommitQcAnchor, CommitQcRejection> {
+    let anchor =
+        n42_network::check_commit_qc_reply(request, payload).map_err(CommitQcRejection::Fault)?;
+    match verify(&anchor.qc) {
+        QcCheck::Verified => Ok(anchor),
+        QcCheck::Invalid => Err(CommitQcRejection::Fault("QC fails verification")),
+        check => Err(CommitQcRejection::NotAnchor(check)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1823,6 +1973,352 @@ mod tests {
                 assert_eq!(report.accepted, 3, "observe keeps the linked prefix");
             }
         }
+    }
+
+    #[test]
+    fn an_inconsistent_v2_reply_is_scored_and_asked_for_again() {
+        let peer = PeerId::random();
+        let (mut client, now) = active(AnchorMode::Enforce, &[peer], 40);
+        expect(&mut client, peer, 1, 16, now);
+        let mut calls = 0;
+        let report = client.on_reply(
+            peer,
+            1,
+            RangeReply::Fault("END next does not match the chunks"),
+            now,
+            &mut verifier(&mut calls),
+        );
+        assert_eq!(report.fault, Some("END next does not match the chunks"));
+        assert_eq!(report.accepted, 0);
+        assert_eq!(client.stats().faults, 1);
+        assert_eq!(
+            client.work.get(&1),
+            Some(&17),
+            "the range is asked for again"
+        );
+    }
+
+    /// A `/2` peer that legitimately served nothing (END reason 3-6, or
+    /// RATE_LIMITED) is neither scored nor backed off exponentially:
+    /// CANONICAL_END ranks it below peers that may hold the range, and
+    /// RATE_LIMITED waits exactly the server's `retry_after_ms`.
+    #[test]
+    fn an_empty_v2_reply_is_neither_scored_nor_escalated() {
+        let (short, other) = (PeerId::random(), PeerId::random());
+        let (mut client, now) = active(AnchorMode::Enforce, &[short, other], 40);
+        let mut calls = 0;
+        for _ in 0..4 {
+            expect(&mut client, short, 1, 16, now);
+            let report = client.on_reply(
+                short,
+                1,
+                RangeReply::Unavailable {
+                    canonical_end: false,
+                    retry_after: Some(Duration::from_millis(1500)),
+                },
+                now,
+                &mut verifier(&mut calls),
+            );
+            assert_eq!(report.fault, None);
+            assert_eq!(client.work.get(&1), Some(&17), "asked for again");
+            client.take_work(1, 17);
+        }
+        let state = &client.peers[&short];
+        assert_eq!(state.failures, 0, "no escalation");
+        assert_eq!(
+            state.backoff_until,
+            Some(now + Duration::from_millis(1500)),
+            "the server's retry_after_ms, exactly"
+        );
+        assert_eq!(client.stats().faults, 0);
+        assert_eq!(client.stats().soft_failures, 0);
+
+        // CANONICAL_END: its head lies below the range; another peer is
+        // picked as soon as the short one's pause is over.
+        expect(&mut client, short, 1, 16, now);
+        client.on_reply(
+            short,
+            1,
+            RangeReply::Unavailable {
+                canonical_end: true,
+                retry_after: None,
+            },
+            now,
+            &mut verifier(&mut calls),
+        );
+        assert_eq!(client.peers[&short].height, 0);
+        assert_eq!(client.peers[&short].failures, 0);
+        let later = now + BACKOFF_BASE;
+        assert_eq!(client.pick_peer(1, 16, later), Some(other));
+    }
+
+    /// What the orchestrator's select loop does with this client, at 10
+    /// unrelated events a second (transaction gossip in the live run): the
+    /// range timer is rebuilt from [`RangeCatchup::next_deadline`] after every
+    /// event and fires only when that deadline passes; a reply drives the
+    /// client at once. One server, whose committed head is `committed(t)`.
+    /// Returns how the client stopped, when, and the head it reached.
+    fn run_select_loop(
+        client: &mut RangeCatchup,
+        blocks: &[RangeBlock],
+        stop_at: u64,
+        server: PeerId,
+        committed: &dyn Fn(Duration) -> u64,
+        on_tick: &mut dyn FnMut(&mut RangeCatchup, Duration),
+    ) -> (Option<Deactivation>, Duration, u64) {
+        let t0 = Instant::now();
+        let (mut head, mut head_hash) = (0u64, GENESIS);
+        let mut calls = 0;
+        let mut deadline = client.next_deadline(t0);
+        let mut elapsed = Duration::ZERO;
+        while elapsed < Duration::from_secs(600) {
+            elapsed += Duration::from_millis(100);
+            let now = t0 + elapsed;
+            on_tick(client, elapsed);
+            if deadline.is_some_and(|due| now >= due) {
+                // drive_range_catchup: poll, then every reply drives again.
+                loop {
+                    let (requests, stopped) = client.poll(now, head, 1, Some(stop_at));
+                    if let Some(reason) = stopped {
+                        return (Some(reason), elapsed, head);
+                    }
+                    let asked = !requests.is_empty();
+                    for request in requests {
+                        assert_eq!(request.peer, server);
+                        let top = committed(elapsed);
+                        let served: Vec<RangeBlock> = blocks
+                            .iter()
+                            .filter(|block| {
+                                block.number >= request.start
+                                    && block.number < request.start + request.count
+                                    && block.number <= top
+                            })
+                            .cloned()
+                            .collect();
+                        let reply = if served.is_empty() {
+                            RangeReply::Unavailable {
+                                canonical_end: true,
+                                retry_after: None,
+                            }
+                        } else {
+                            reply(&served)
+                        };
+                        client.on_reply(
+                            server,
+                            request.start,
+                            reply,
+                            now,
+                            &mut verifier(&mut calls),
+                        );
+                    }
+                    let ready = client.take_ready(head, head_hash, Some(stop_at), 64);
+                    let imported = !ready.is_empty();
+                    for block in ready {
+                        client.imported(block.number, block.hash);
+                        (head, head_hash) = (block.number, block.hash);
+                    }
+                    if !asked && !imported {
+                        break;
+                    }
+                }
+            }
+            deadline = client.next_deadline(now);
+        }
+        (None, elapsed, head)
+    }
+
+    /// The live mixed run of 2026-11-26: v3 restarted with an empty datadir
+    /// at chain head 59 (target 59 > activate_gap). Its one range server
+    /// serves committed blocks only, and its committed head (57) trails the
+    /// live path's staged block (59) by two: 1..=57 arrive at once, 58 is
+    /// "nothing yet" and the server is paused. With nothing in flight the
+    /// next poll was due `now + 1 s`, recomputed after every event, so under
+    /// 10 transactions a second it never came: no retry, no hand-off, no
+    /// stall check, for six minutes. Now the poll is due a second after the
+    /// last one: the client hands the two-block tail to the reverse walk
+    /// within seconds.
+    #[test]
+    fn a_tail_beyond_the_servers_committed_head_is_handed_off_under_steady_traffic() {
+        let server = PeerId::random();
+        let mut client = RangeCatchup::new(RangeCatchupConfig::default(), AnchorMode::Enforce);
+        client.note_peer_status(server, 59);
+        let blocks = chain(1, GENESIS, 59, 1);
+        assert!(client.activate(0, 59, Instant::now()));
+        // The staged block 59 (loose: its proposal) and the engine's commit
+        // QC from the view jump, naming 57.
+        bind(&mut client, &blocks[58], false);
+        client.note_strict_anchor(blocks[56].hash);
+        let (stopped, at, head) =
+            run_select_loop(&mut client, &blocks, 58, server, &|_| 57, &mut |_, _| {});
+        assert_eq!(head, 57, "1..=57 imported");
+        assert_eq!(
+            stopped,
+            Some(Deactivation::CaughtUp),
+            "handed to the reverse walk"
+        );
+        assert!(
+            at <= Duration::from_secs(5),
+            "within seconds, not minutes: {at:?}"
+        );
+    }
+
+    /// The same, with the live path's staged block further up (63): the
+    /// client keeps the tail, asks the server again every couple of seconds
+    /// without escalating, and releases the tail once the server has
+    /// committed it and a later commit QC (a live Decide) anchors it.
+    #[test]
+    fn a_trailing_server_is_asked_again_until_a_later_qc_anchors_the_tail() {
+        let server = PeerId::random();
+        let mut client = RangeCatchup::new(RangeCatchupConfig::default(), AnchorMode::Enforce);
+        client.note_peer_status(server, 64);
+        let blocks = chain(1, GENESIS, 64, 1);
+        assert!(client.activate(0, 64, Instant::now()));
+        bind(&mut client, &blocks[63], false);
+        client.note_strict_anchor(blocks[58].hash);
+        let tail_anchor = blocks[62].hash;
+        let (stopped, at, head) = run_select_loop(
+            &mut client,
+            &blocks,
+            63,
+            server,
+            // Committed head 59 until the next commit, eight seconds later.
+            &|elapsed| {
+                if elapsed < Duration::from_secs(8) {
+                    59
+                } else {
+                    63
+                }
+            },
+            &mut |client, elapsed| {
+                if elapsed == Duration::from_secs(9) {
+                    // A Decide whose block is 63 (later QC).
+                    client.note_strict_anchor(tail_anchor);
+                }
+            },
+        );
+        assert_eq!(
+            head, 63,
+            "the tail is fetched and released ({stopped:?} at {at:?})"
+        );
+        assert_eq!(stopped, Some(Deactivation::CaughtUp));
+        assert!(at <= Duration::from_secs(15), "{at:?}");
+        assert_eq!(client.stats().faults, 0);
+    }
+
+    /// Sync standard 3.4 step 6: with the next block buffered but not
+    /// anchored, a `commit_qc/1` request goes to the peer that served it
+    /// (unless it does not speak commit_qc), at most every few seconds.
+    #[test]
+    fn an_unanchored_tail_asks_for_a_commit_qc() {
+        let (source, other) = (PeerId::random(), PeerId::random());
+        let (mut client, now) = active(AnchorMode::Enforce, &[source, other], 40);
+        assert_eq!(client.tail_anchor_request(now), None, "nothing buffered");
+        let blocks = chain(1, GENESIS, 16, 1);
+        expect(&mut client, source, 1, 16, now);
+        let mut calls = 0;
+        client.on_reply(source, 1, reply(&blocks), now, &mut verifier(&mut calls));
+        assert_eq!(
+            client.tail_anchor_request(now),
+            Some((source, 1, blocks[0].hash))
+        );
+        assert_eq!(client.tail_anchor_request(now), None, "spaced");
+        client.note_commit_qc_unsupported(source);
+        let later = now + TAIL_ANCHOR_INTERVAL;
+        assert_eq!(
+            client.tail_anchor_request(later),
+            Some((other, 1, blocks[0].hash))
+        );
+        // Once anchored, nothing more is asked.
+        bind(&mut client, &blocks[15], true);
+        assert_eq!(
+            client.tail_anchor_request(later + TAIL_ANCHOR_INTERVAL),
+            None
+        );
+    }
+
+    /// gov5's `commit_qc/1` golden vectors (sync standard 5.2), checked as a
+    /// client would: the header chain, then the QC under the H2-v4 commit
+    /// domain against the fixture chain's validators. gov5 derives them as
+    /// `sha256("n42-profile1-test-validator-<i>")` with the first byte cleared.
+    #[test]
+    fn commit_qc_vectors_verify_against_the_fixture_validators() {
+        use crate::h2_finality::{H2V4AnchorVerdict, verify_h2_v4_sync_anchor};
+        use alloy_primitives::Address;
+        use n42_chainspec::ValidatorInfo;
+        use n42_consensus::ValidatorSet;
+        use n42_network::h2_v4::H2V4ChainIdentity;
+        use n42_primitives::BlsSecretKey;
+        use sha2::{Digest, Sha256};
+
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../n42-network/tests/fixtures/sync-v11/commit_qc_1.json"
+        ))
+        .unwrap();
+        let bytes = |value: &serde_json::Value| {
+            hex::decode(value.as_str().unwrap().trim_start_matches("0x")).unwrap()
+        };
+        let identity = H2V4ChainIdentity {
+            chain_id: vectors["chain_id"].as_u64().unwrap(),
+            genesis_hash: B256::from_slice(&bytes(&vectors["genesis_hash"])),
+        };
+        let validators: Vec<ValidatorInfo> = (0..4)
+            .map(|index| {
+                let mut seed: [u8; 32] =
+                    Sha256::digest(format!("n42-profile1-test-validator-{index}")).into();
+                seed[0] = 0;
+                ValidatorInfo {
+                    address: Address::with_last_byte(index as u8 + 1),
+                    bls_public_key: BlsSecretKey::from_bytes(&seed).unwrap().public_key(),
+                    p2p_peer_id: None,
+                }
+            })
+            .collect();
+        let set = ValidatorSet::new(&validators, 1);
+        let check = |qc: &H2QuorumCertificate| match verify_h2_v4_sync_anchor(qc, identity, &set) {
+            H2V4AnchorVerdict::Verified => QcCheck::Verified,
+            H2V4AnchorVerdict::PrepareDomain => QcCheck::PrepareDomain,
+            H2V4AnchorVerdict::Invalid => QcCheck::Invalid,
+        };
+        let mut verified = 0;
+        for case in vectors["cases"].as_array().unwrap() {
+            let chunk = &case["response_chunks"][0];
+            if chunk["code"] != "0x00" {
+                continue;
+            }
+            let request = n42_network::CommitQcRequest {
+                number: case["request_fields"]["number"].as_u64().unwrap(),
+                hash: B256::from_slice(&bytes(&case["request_fields"]["hash"])),
+            };
+            let payload = n42_network::CommitQcPayload::decode(&bytes(&chunk["payload"])).unwrap();
+            let anchor = verify_commit_qc_reply(&request, &payload, check).unwrap();
+            assert_eq!(anchor.qc_block.map(|(number, _)| number), Some(9));
+            verified += 1;
+
+            // A signature by other keys is a provable fault, an unknown epoch
+            // is not.
+            let mut forged = payload.clone();
+            let mut qc = decode_h2_qc(&forged.qc_wire).unwrap();
+            qc.aggregate_signature = BlsSecretKey::key_gen(&[7; 32])
+                .unwrap()
+                .sign_h2_v4(b"other")
+                .to_bytes()
+                .to_vec();
+            forged.qc_wire = n42_network::h2_wire::encode_h2_qc(&qc).unwrap();
+            assert_eq!(
+                verify_commit_qc_reply(&request, &forged, check),
+                Err(CommitQcRejection::Fault("QC fails verification"))
+            );
+            assert_eq!(
+                verify_commit_qc_reply(&request, &payload, |_| QcCheck::UnknownEpoch),
+                Err(CommitQcRejection::NotAnchor(QcCheck::UnknownEpoch))
+            );
+
+            // The anchor joins the client's chain as a strict anchor.
+            let mut client = RangeCatchup::new(config(), AnchorMode::Enforce);
+            client.note_commit_qc_anchor(&anchor);
+            assert!(client.strict.contains(&anchor.qc.block_hash));
+        }
+        assert_eq!(verified, 3);
     }
 
     #[test]
