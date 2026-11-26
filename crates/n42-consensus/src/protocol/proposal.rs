@@ -2,7 +2,7 @@ use alloy_primitives::B256;
 use n42_primitives::consensus::{ConsensusMessage, PrepareQC, Proposal, ViewNumber};
 
 use super::round::Phase;
-use super::state_machine::{ConsensusEngine, EngineOutput};
+use super::state_machine::{ConsensusEngine, EngineOutput, EquivocationKind, SignedMessage};
 use crate::error::{ConsensusError, ConsensusResult};
 
 const MAX_IMPORTED_BLOCKS: usize = 64;
@@ -303,8 +303,14 @@ impl ConsensusEngine {
         // sets for the same block are also equivocation. Record only after BLS
         // verification so a forged first message cannot poison the tracker.
         let proposal_commitment = B256::from(*blake3::hash(&prop_msg).as_bytes());
-        if let Some(&(previous_commitment, previous_block_hash)) =
-            self.proposal_equivocation_tracker.get(&proposal.proposer)
+        let signed = SignedMessage {
+            signed: prop_msg,
+            signature: proposal.signature.to_bytes(),
+        };
+        if let Some((previous_commitment, previous_block_hash, first)) = self
+            .proposal_equivocation_tracker
+            .get(&proposal.proposer)
+            .cloned()
             && previous_commitment != proposal_commitment
         {
             // Preserve the existing block-hash evidence shape for ordinary
@@ -318,17 +324,17 @@ impl ConsensusEngine {
             tracing::warn!(target: "n42::cl::proposal", view,
                 proposer = proposal.proposer, %hash1, %hash2,
                 "proposal equivocation detected");
-            self.emit(EngineOutput::EquivocationDetected {
+            self.emit_equivocation(
+                EquivocationKind::Proposal,
                 view,
-                validator: proposal.proposer,
-                hash1,
-                hash2,
-            })?;
+                proposal.proposer,
+                (hash1, hash2, first, signed),
+            )?;
             return Ok(());
         }
         self.proposal_equivocation_tracker
             .entry(proposal.proposer)
-            .or_insert((proposal_commitment, proposal.block_hash));
+            .or_insert((proposal_commitment, proposal.block_hash, signed));
 
         // Verify the justify_qc's aggregate BLS signature to prevent a Byzantine leader
         // from injecting a forged QC that manipulates honest nodes' locked_qc.

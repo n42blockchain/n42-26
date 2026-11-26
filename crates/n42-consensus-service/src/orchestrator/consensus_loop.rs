@@ -280,18 +280,22 @@ impl ConsensusService {
                 validator,
                 hash1,
                 hash2,
+                proof,
             } => {
                 counter!("n42_equivocations_detected_total").increment(1);
                 warn!(
                     target: "n42::cl::consensus_loop",
                     view,
                     validator,
+                    kind = proof.kind.as_str(),
                     %hash1,
                     %hash2,
                     "EQUIVOCATION: validator signed two conflicting consensus values in same view"
                 );
                 if let Some(ref state) = self.consensus_state {
-                    state.record_equivocation(view, validator, hash1, hash2);
+                    state.record_equivocation(crate::consensus_state::EquivocationEvidence::new(
+                        view, validator, hash1, hash2, &proof,
+                    ));
                 }
             }
             EngineOutput::EpochTransition {

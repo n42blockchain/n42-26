@@ -193,6 +193,48 @@ impl AuthenticatedVoteProof {
     }
 }
 
+/// What a validator signed twice in one view (E15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EquivocationKind {
+    /// Two Round-1 votes.
+    Vote,
+    /// Two Round-2 commit votes.
+    CommitVote,
+    /// Two proposals.
+    Proposal,
+}
+
+impl EquivocationKind {
+    /// The AM28 JSON name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vote => "vote",
+            Self::CommitVote => "commitVote",
+            Self::Proposal => "proposal",
+        }
+    }
+}
+
+/// One signed consensus message: the exact bytes the validator signed and
+/// its BLS signature over them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignedMessage {
+    pub signed: Vec<u8>,
+    pub signature: [u8; 96],
+}
+
+/// Two conflicting signed messages by one validator in one view, verifiable
+/// on their own against `public_key` (E15, AM28).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EquivocationProof {
+    pub kind: EquivocationKind,
+    pub public_key: [u8; 48],
+    /// The message seen first.
+    pub first: SignedMessage,
+    /// The conflicting message.
+    pub second: SignedMessage,
+}
+
 /// Actions the consensus engine requests from the outer node.
 #[derive(Debug)]
 pub enum EngineOutput {
@@ -232,6 +274,8 @@ pub enum EngineOutput {
         validator: u32,
         hash1: B256,
         hash2: B256,
+        /// The two signed messages and the key they verify against (E15).
+        proof: Box<EquivocationProof>,
     },
     /// An epoch transition has occurred. The validator set may have changed.
     EpochTransition {
@@ -304,15 +348,16 @@ pub struct ConsensusEngine {
     /// Insertion order for bounded imported-block eviction. H2 import evidence
     /// survives view changes because a new leader can repropose the same block.
     pub(super) imported_block_fifo: VecDeque<B256>,
-    /// Tracks which block hash each validator voted for (equivocation detection).
-    /// Tracks R1 (Vote) per validator per view for equivocation detection.
-    pub(super) equivocation_tracker: HashMap<u32, B256>,
-    /// Tracks R2 (CommitVote) per validator per view for equivocation detection.
-    pub(super) commit_equivocation_tracker: HashMap<u32, B256>,
-    /// Tracks `(signed_message_commitment, block_hash)` per proposer in the
-    /// current view. The commitment includes validator changes, so reusing a
-    /// block hash with a different reconfiguration payload is still detected.
-    pub(super) proposal_equivocation_tracker: HashMap<u32, (B256, B256)>,
+    /// Tracks R1 (Vote) per validator in the current view: the block hash and
+    /// the signed message, kept as evidence for a later conflicting vote.
+    pub(super) equivocation_tracker: HashMap<u32, (B256, SignedMessage)>,
+    /// Tracks R2 (CommitVote) per validator in the current view, as above.
+    pub(super) commit_equivocation_tracker: HashMap<u32, (B256, SignedMessage)>,
+    /// Tracks `(signed_message_commitment, block_hash, signed message)` per
+    /// proposer in the current view. The commitment includes validator
+    /// changes, so reusing a block hash with a different reconfiguration
+    /// payload is still detected.
+    pub(super) proposal_equivocation_tracker: HashMap<u32, (B256, B256, SignedMessage)>,
     /// Buffer for messages arriving for future views (within FUTURE_VIEW_WINDOW).
     pub(super) future_msg_buffer: Vec<(ViewNumber, ConsensusMessage)>,
     /// Per-view timing for commit latency diagnosis.
@@ -2633,8 +2678,10 @@ mod tests {
                     validator: 1,
                     hash1,
                     hash2,
+                    ..
                 } if *hash1 == first_hash && *hash2 == second_hash
             )));
+            assert_equivocation_proof_verifies(&second_outputs, EquivocationKind::Proposal);
             assert!(
                 !second_outputs.iter().any(|output| matches!(
                     output,
@@ -2695,6 +2742,7 @@ mod tests {
                 validator: 1,
                 hash1,
                 hash2,
+                ..
             } if hash1 != hash2
         )));
         assert!(!outputs.iter().any(|output| matches!(
@@ -3712,6 +3760,26 @@ mod tests {
         assert_eq!(engine.current_phase(), Phase::Voting);
     }
 
+    /// The emitted pair verifies on its own against the carried key (E15).
+    fn assert_equivocation_proof_verifies(outputs: &[EngineOutput], kind: EquivocationKind) {
+        let proof = outputs
+            .iter()
+            .find_map(|output| match output {
+                EngineOutput::EquivocationDetected { proof, .. } => Some(proof),
+                _ => None,
+            })
+            .expect("an equivocation output");
+        assert_eq!(proof.kind, kind);
+        assert_ne!(proof.first.signed, proof.second.signed);
+        let key = n42_primitives::BlsPublicKey::from_bytes(&proof.public_key).expect("key");
+        for side in [&proof.first, &proof.second] {
+            let signature =
+                n42_primitives::BlsSignature::from_bytes(&side.signature).expect("signature");
+            key.verify(&side.signed, &signature)
+                .expect("each side verifies against the validator key");
+        }
+    }
+
     #[test]
     fn test_r1_equivocation_evidence_is_arrival_order_independent() {
         use crate::protocol::quorum::signing_message;
@@ -3752,8 +3820,10 @@ mod tests {
                     validator: 0,
                     hash1,
                     hash2,
+                    ..
                 } if *hash1 == first_hash && *hash2 == second_hash
             )));
+            assert_equivocation_proof_verifies(&outputs, EquivocationKind::Vote);
         }
     }
 
@@ -3812,8 +3882,10 @@ mod tests {
                     validator: 0,
                     hash1,
                     hash2,
+                    ..
                 } if *hash1 == first_hash && *hash2 == second_hash
             )));
+            assert_equivocation_proof_verifies(&outputs, EquivocationKind::CommitVote);
         }
     }
 

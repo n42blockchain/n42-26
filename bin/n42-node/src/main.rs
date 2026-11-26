@@ -2295,6 +2295,12 @@ fn main() {
         );
 
         let consensus_state = Arc::new(SharedConsensusState::new(startup_validator_set.clone()));
+        // E15 / AM28: equivocation evidence survives restarts in the data dir.
+        match consensus_state.open_equivocation_file(&data_dir) {
+            Ok(loaded) => info!(target: "n42::cli", loaded, "equivocation evidence file opened"),
+            Err(e) => warn!(target: "n42::cli", error = %e,
+                "equivocation evidence file unavailable; evidence kept in memory only"),
+        }
         let (admin_tx, admin_rx) = tokio::sync::mpsc::channel(16);
         consensus_state.set_admin_channel(admin_tx);
         // admin_rx will be moved into the on_node_started closure below.

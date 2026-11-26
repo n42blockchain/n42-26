@@ -1621,13 +1621,36 @@ mod tests {
     async fn test_equivocations_with_data() {
         let vs = ValidatorSet::new(&[], 0);
         let state = Arc::new(SharedConsensusState::new(vs));
-        state.record_equivocation(10, 0, B256::repeat_byte(0xAA), B256::repeat_byte(0xBB));
-        state.record_equivocation(11, 1, B256::repeat_byte(0xCC), B256::repeat_byte(0xDD));
+        let side = |byte: u8| n42_consensus::SignedMessage {
+            signed: vec![byte; 4],
+            signature: [byte; 96],
+        };
+        for (view, validator, kind) in [
+            (10, 0, n42_consensus::EquivocationKind::Vote),
+            (11, 1, n42_consensus::EquivocationKind::Proposal),
+        ] {
+            let proof = n42_consensus::EquivocationProof {
+                kind,
+                public_key: [0x11; 48],
+                first: side(1),
+                second: side(2),
+            };
+            state.record_equivocation(EquivocationEvidence::new(
+                view,
+                validator,
+                B256::repeat_byte(0xAA),
+                B256::repeat_byte(0xBB),
+                &proof,
+            ));
+        }
 
         let rpc = N42RpcServer::new(state);
         let result = rpc.equivocations().await.unwrap();
         assert_eq!(result.total, 2);
         assert_eq!(result.evidence[0].view, 10);
         assert_eq!(result.evidence[1].validator_index, 1);
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["evidence"][1]["kind"], "proposal");
+        assert_eq!(json["evidence"][0]["first"]["signed"], "0x01010101");
     }
 }
