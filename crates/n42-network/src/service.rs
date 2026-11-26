@@ -3789,6 +3789,14 @@ impl NetworkService {
         self.pending_gov5_range_requests
             .insert(request_id, (peer, start, count));
         metrics::counter!("n42_gov5_range_client_requests_total").increment(1);
+        tracing::info!(
+            target: "n42::interop::range",
+            %peer,
+            protocol = "/1",
+            start,
+            count,
+            "range request sent"
+        );
     }
 
     fn gov5_range_peer_is_authorized(&self, peer: &PeerId) -> bool {
@@ -4014,6 +4022,7 @@ impl NetworkService {
                         Gov5RangeOutcome::Blocks(Vec::new())
                     }
                 };
+                log_range_outcome(&peer, "/1", start, count, None, &outcome);
                 self.emit_event(NetworkEvent::Gov5RangeResponse {
                     source: peer,
                     start,
@@ -4045,7 +4054,7 @@ impl NetworkService {
                 let unsupported =
                     error.contains("supports none") || error.contains("UnsupportedProtocols");
                 metrics::counter!("n42_gov5_range_client_failures_total").increment(1);
-                tracing::debug!(target: "n42::interop::range", %peer, start, count, %error, "Gov5 range request failed");
+                tracing::info!(target: "n42::interop::range", %peer, protocol = "/1", start, count, %error, unsupported, "range request failed");
                 self.emit_event(NetworkEvent::Gov5RangeResponse {
                     source: peer,
                     start,
@@ -4210,8 +4219,10 @@ impl NetworkService {
                     tracing::debug!(%peer, "unsolicited Gov5 range v2 response");
                     return;
                 };
+                let mut end = None;
                 let outcome = match response {
                     RangeV2Response::Reply(reply) => {
+                        end = reply.end;
                         let digest = self.gov5_fork_digest().unwrap_or_default();
                         match check_range_v2_reply(&request, reply, digest) {
                             RangeV2Verdict::Payloads(blocks) => {
@@ -4248,6 +4259,7 @@ impl NetworkService {
                     }
                     RangeV2Response::Stream { .. } => Gov5RangeOutcome::Blocks(Vec::new()),
                 };
+                log_range_outcome(&peer, "/2", request.start, request.count, end, &outcome);
                 self.emit_event(NetworkEvent::Gov5RangeResponse {
                     source: peer,
                     start: request.start,
@@ -4268,7 +4280,7 @@ impl NetworkService {
                 if matches!(error, OutboundFailure::UnsupportedProtocols) {
                     // Section 5.0: fall back to `/1` and keep asking it there
                     // for an hour; the request is not lost.
-                    tracing::debug!(
+                    tracing::info!(
                         target: "n42::interop::range",
                         %peer,
                         "peer refused bodies_by_range/2; using /1 for an hour"
@@ -4279,13 +4291,14 @@ impl NetworkService {
                     return;
                 }
                 metrics::counter!("n42_gov5_range_client_failures_total").increment(1);
-                tracing::debug!(
+                tracing::info!(
                     target: "n42::interop::range",
                     %peer,
+                    protocol = "/2",
                     start = request.start,
                     count = request.count,
                     %error,
-                    "Gov5 range v2 request failed"
+                    "range request failed"
                 );
                 self.emit_event(NetworkEvent::Gov5RangeResponse {
                     source: peer,
@@ -4413,6 +4426,26 @@ impl NetworkService {
                         unsupported: false,
                     },
                 };
+                match &outcome {
+                    Gov5CommitQcOutcome::Found(payload) => tracing::info!(
+                        target: "n42::interop::range",
+                        %peer,
+                        number = request.number,
+                        hash = %request.hash,
+                        qc_bytes = payload.qc_wire.len(),
+                        headers = payload.headers.len(),
+                        "commit_qc reply"
+                    ),
+                    Gov5CommitQcOutcome::Refused { code, message } => tracing::info!(
+                        target: "n42::interop::range",
+                        %peer,
+                        number = request.number,
+                        code,
+                        %message,
+                        "commit_qc refused"
+                    ),
+                    Gov5CommitQcOutcome::Failed { .. } => {}
+                }
                 self.emit_event(NetworkEvent::Gov5CommitQcResponse {
                     source: peer,
                     request,
@@ -4430,6 +4463,14 @@ impl NetworkService {
                     return;
                 };
                 let unsupported = matches!(error, OutboundFailure::UnsupportedProtocols);
+                tracing::info!(
+                    target: "n42::interop::range",
+                    %peer,
+                    number = request.number,
+                    %error,
+                    unsupported,
+                    "commit_qc request failed"
+                );
                 self.emit_event(NetworkEvent::Gov5CommitQcResponse {
                     source: peer,
                     request,
@@ -5036,6 +5077,14 @@ impl NetworkService {
                 self.pending_gov5_range_v2_requests
                     .insert(request_id, (peer, request));
                 metrics::counter!("n42_gov5_range_v2_client_requests_total").increment(1);
+                tracing::info!(
+                    target: "n42::interop::range",
+                    %peer,
+                    protocol = "/2",
+                    start,
+                    count,
+                    "range request sent"
+                );
             }
             NetworkCommand::RequestGov5Range { peer, start, count } => {
                 self.send_gov5_range_v1(peer, start, count);
@@ -5064,6 +5113,13 @@ impl NetworkService {
                     });
                     return;
                 }
+                tracing::info!(
+                    target: "n42::interop::range",
+                    %peer,
+                    number,
+                    %hash,
+                    "commit_qc request sent"
+                );
                 let request_id = self
                     .swarm
                     .behaviour_mut()
@@ -5240,6 +5296,48 @@ impl NetworkService {
                 self.validator_count = validator_count;
             }
         }
+    }
+}
+
+/// One info line per range reply, so a live run shows what each peer served.
+fn log_range_outcome(
+    peer: &PeerId,
+    protocol: &'static str,
+    start: u64,
+    count: u64,
+    end: Option<crate::sync_v11::RangeEnd>,
+    outcome: &Gov5RangeOutcome,
+) {
+    let (end_next, end_reason) = end.map_or((None, None), |end| (Some(end.next), Some(end.reason)));
+    match outcome {
+        Gov5RangeOutcome::Blocks(blocks) => tracing::info!(
+            target: "n42::interop::range",
+            %peer, protocol, start, count, blocks = blocks.len(), ?end_next, ?end_reason,
+            "range reply"
+        ),
+        Gov5RangeOutcome::Unavailable {
+            canonical_end,
+            retry_after,
+        } => tracing::info!(
+            target: "n42::interop::range",
+            %peer, protocol, start, count, blocks = 0, ?end_reason, canonical_end, ?retry_after,
+            "range reply: nothing served"
+        ),
+        Gov5RangeOutcome::Refused { code, message } => tracing::info!(
+            target: "n42::interop::range",
+            %peer, protocol, start, count, code, %message,
+            "range reply: refused"
+        ),
+        Gov5RangeOutcome::Failed { error, .. } => tracing::info!(
+            target: "n42::interop::range",
+            %peer, protocol, start, count, %error, ?end_reason,
+            "range reply: failed"
+        ),
+        Gov5RangeOutcome::Faulty { reason } => tracing::warn!(
+            target: "n42::interop::range",
+            %peer, protocol, start, count, reason, ?end_next, ?end_reason,
+            "range reply: inconsistent"
+        ),
     }
 }
 

@@ -267,7 +267,8 @@ impl Default for RangeCatchupConfig {
             tail_bytes: 512 << 20,
             max_links: 1 << 16,
             max_window: 1 << 20,
-            stall_timeout: Duration::from_secs(90),
+            // Above the request timeout, so one slow reply is not a stall.
+            stall_timeout: Duration::from_secs(45),
             stall_cooldown: Duration::from_secs(120),
         }
     }
@@ -426,7 +427,11 @@ pub struct RangeCatchup {
     stop_at: Option<u64>,
     last_progress: Option<Instant>,
     progress_head: u64,
-    progress_anchors: u64,
+    /// `stats.blocks_received` at the last progress.
+    progress_received: u64,
+    /// When [`Self::poll`] last ran: the next poll is due a fixed interval
+    /// after it, however often the caller asks for the deadline.
+    last_poll: Option<Instant>,
     cooldown_until: Option<Instant>,
     stopped: Option<Deactivation>,
     avg_block_bytes: usize,
@@ -479,7 +484,8 @@ impl RangeCatchup {
             stop_at: None,
             last_progress: None,
             progress_head: 0,
-            progress_anchors: 0,
+            progress_received: 0,
+            last_poll: None,
             cooldown_until: None,
             stopped: None,
             avg_block_bytes: 0,
@@ -603,8 +609,9 @@ impl RangeCatchup {
         self.head_hash = None;
         self.planned_to = head_number;
         self.last_progress = Some(now);
+        self.last_poll = None;
         self.progress_head = head_number;
-        self.progress_anchors = self.anchored_total;
+        self.progress_received = self.stats.blocks_received;
         self.kick = true;
         true
     }
@@ -652,7 +659,8 @@ impl RangeCatchup {
         }
         let number = self.head_number.checked_add(1)?;
         let block = self.buffer.get(&number)?;
-        if self.anchored.contains_key(&number) {
+        // A loose anchor does not release it in enforce mode.
+        if self.executable(number, &block.hash) {
             return None;
         }
         let usable = |peer: &PeerId, state: &PeerState| {
@@ -705,7 +713,11 @@ impl RangeCatchup {
         if !self.active {
             return None;
         }
-        let mut deadline = now + POLL_INTERVAL;
+        // Anchored to the last poll, not to `now`: the caller recomputes the
+        // deadline after every event, and a deadline of `now + interval`
+        // would never expire under steady traffic (transactions arrive many
+        // times a second), starving the poll, its retries and its stall check.
+        let mut deadline = self.last_poll.map_or(now, |at| at + POLL_INTERVAL);
         for flight in self.in_flight.values() {
             deadline = deadline.min(flight.sent + self.config.request_timeout);
         }
@@ -739,6 +751,7 @@ impl RangeCatchup {
             return (Vec::new(), None);
         }
         self.kick = false;
+        self.last_poll = Some(now);
         self.stop_at = stop_at;
         self.advance_head(head_number, None);
         if let Some(height) = self.quorum_height(status_quorum) {
@@ -763,10 +776,14 @@ impl RangeCatchup {
             }
         }
 
-        // Progress is the head moving or the authenticated chain growing.
-        if self.head_number > self.progress_head || self.anchored_total > self.progress_anchors {
+        // Progress is the head moving or bodies arriving. Anchors do not
+        // count: live commits above the gap keep adding them while the gap
+        // itself does not move.
+        if self.head_number > self.progress_head
+            || self.stats.blocks_received > self.progress_received
+        {
             self.progress_head = self.head_number;
-            self.progress_anchors = self.anchored_total;
+            self.progress_received = self.stats.blocks_received;
             self.last_progress = Some(now);
         }
 
@@ -1140,9 +1157,15 @@ impl RangeCatchup {
                 return report;
             }
             RangeReply::Blocks(blocks) if blocks.is_empty() => {
-                // A clean empty reply: the peer does not hold the range.
-                self.soft_fail(&peer, now, false);
+                // A clean empty reply: the peer does not hold the range yet
+                // (a server serves committed blocks only, so its head trails
+                // the live chain). As `/2`'s CANONICAL_END: a fixed pause, no
+                // escalation, so it is asked again once it has committed more.
                 self.add_work(start, end);
+                if let Some(state) = self.peers.get_mut(&peer) {
+                    state.height = state.height.min(start.saturating_sub(1));
+                    state.backoff_until = Some(now + BACKOFF_BASE);
+                }
                 return report;
             }
             RangeReply::Blocks(blocks) => blocks,
@@ -2027,6 +2050,159 @@ mod tests {
         assert_eq!(client.peers[&short].failures, 0);
         let later = now + BACKOFF_BASE;
         assert_eq!(client.pick_peer(1, 16, later), Some(other));
+    }
+
+    /// What the orchestrator's select loop does with this client, at 10
+    /// unrelated events a second (transaction gossip in the live run): the
+    /// range timer is rebuilt from [`RangeCatchup::next_deadline`] after every
+    /// event and fires only when that deadline passes; a reply drives the
+    /// client at once. One server, whose committed head is `committed(t)`.
+    /// Returns how the client stopped, when, and the head it reached.
+    fn run_select_loop(
+        client: &mut RangeCatchup,
+        blocks: &[RangeBlock],
+        stop_at: u64,
+        server: PeerId,
+        committed: &dyn Fn(Duration) -> u64,
+        on_tick: &mut dyn FnMut(&mut RangeCatchup, Duration),
+    ) -> (Option<Deactivation>, Duration, u64) {
+        let t0 = Instant::now();
+        let (mut head, mut head_hash) = (0u64, GENESIS);
+        let mut calls = 0;
+        let mut deadline = client.next_deadline(t0);
+        let mut elapsed = Duration::ZERO;
+        while elapsed < Duration::from_secs(600) {
+            elapsed += Duration::from_millis(100);
+            let now = t0 + elapsed;
+            on_tick(client, elapsed);
+            if deadline.is_some_and(|due| now >= due) {
+                // drive_range_catchup: poll, then every reply drives again.
+                loop {
+                    let (requests, stopped) = client.poll(now, head, 1, Some(stop_at));
+                    if let Some(reason) = stopped {
+                        return (Some(reason), elapsed, head);
+                    }
+                    let asked = !requests.is_empty();
+                    for request in requests {
+                        assert_eq!(request.peer, server);
+                        let top = committed(elapsed);
+                        let served: Vec<RangeBlock> = blocks
+                            .iter()
+                            .filter(|block| {
+                                block.number >= request.start
+                                    && block.number < request.start + request.count
+                                    && block.number <= top
+                            })
+                            .cloned()
+                            .collect();
+                        let reply = if served.is_empty() {
+                            RangeReply::Unavailable {
+                                canonical_end: true,
+                                retry_after: None,
+                            }
+                        } else {
+                            reply(&served)
+                        };
+                        client.on_reply(
+                            server,
+                            request.start,
+                            reply,
+                            now,
+                            &mut verifier(&mut calls),
+                        );
+                    }
+                    let ready = client.take_ready(head, head_hash, Some(stop_at), 64);
+                    let imported = !ready.is_empty();
+                    for block in ready {
+                        client.imported(block.number, block.hash);
+                        (head, head_hash) = (block.number, block.hash);
+                    }
+                    if !asked && !imported {
+                        break;
+                    }
+                }
+            }
+            deadline = client.next_deadline(now);
+        }
+        (None, elapsed, head)
+    }
+
+    /// The live mixed run of 2026-11-26: v3 restarted with an empty datadir
+    /// at chain head 59 (target 59 > activate_gap). Its one range server
+    /// serves committed blocks only, and its committed head (57) trails the
+    /// live path's staged block (59) by two: 1..=57 arrive at once, 58 is
+    /// "nothing yet" and the server is paused. With nothing in flight the
+    /// next poll was due `now + 1 s`, recomputed after every event, so under
+    /// 10 transactions a second it never came: no retry, no hand-off, no
+    /// stall check, for six minutes. Now the poll is due a second after the
+    /// last one: the client hands the two-block tail to the reverse walk
+    /// within seconds.
+    #[test]
+    fn a_tail_beyond_the_servers_committed_head_is_handed_off_under_steady_traffic() {
+        let server = PeerId::random();
+        let mut client = RangeCatchup::new(RangeCatchupConfig::default(), AnchorMode::Enforce);
+        client.note_peer_status(server, 59);
+        let blocks = chain(1, GENESIS, 59, 1);
+        assert!(client.activate(0, 59, Instant::now()));
+        // The staged block 59 (loose: its proposal) and the engine's commit
+        // QC from the view jump, naming 57.
+        bind(&mut client, &blocks[58], false);
+        client.note_strict_anchor(blocks[56].hash);
+        let (stopped, at, head) =
+            run_select_loop(&mut client, &blocks, 58, server, &|_| 57, &mut |_, _| {});
+        assert_eq!(head, 57, "1..=57 imported");
+        assert_eq!(
+            stopped,
+            Some(Deactivation::CaughtUp),
+            "handed to the reverse walk"
+        );
+        assert!(
+            at <= Duration::from_secs(5),
+            "within seconds, not minutes: {at:?}"
+        );
+    }
+
+    /// The same, with the live path's staged block further up (63): the
+    /// client keeps the tail, asks the server again every couple of seconds
+    /// without escalating, and releases the tail once the server has
+    /// committed it and a later commit QC (a live Decide) anchors it.
+    #[test]
+    fn a_trailing_server_is_asked_again_until_a_later_qc_anchors_the_tail() {
+        let server = PeerId::random();
+        let mut client = RangeCatchup::new(RangeCatchupConfig::default(), AnchorMode::Enforce);
+        client.note_peer_status(server, 64);
+        let blocks = chain(1, GENESIS, 64, 1);
+        assert!(client.activate(0, 64, Instant::now()));
+        bind(&mut client, &blocks[63], false);
+        client.note_strict_anchor(blocks[58].hash);
+        let tail_anchor = blocks[62].hash;
+        let (stopped, at, head) = run_select_loop(
+            &mut client,
+            &blocks,
+            63,
+            server,
+            // Committed head 59 until the next commit, eight seconds later.
+            &|elapsed| {
+                if elapsed < Duration::from_secs(8) {
+                    59
+                } else {
+                    63
+                }
+            },
+            &mut |client, elapsed| {
+                if elapsed == Duration::from_secs(9) {
+                    // A Decide whose block is 63 (later QC).
+                    client.note_strict_anchor(tail_anchor);
+                }
+            },
+        );
+        assert_eq!(
+            head, 63,
+            "the tail is fetched and released ({stopped:?} at {at:?})"
+        );
+        assert_eq!(stopped, Some(Deactivation::CaughtUp));
+        assert!(at <= Duration::from_secs(15), "{at:?}");
+        assert_eq!(client.stats().faults, 0);
     }
 
     /// Sync standard 3.4 step 6: with the next block buffered but not

@@ -100,3 +100,37 @@ CANONICAL_END 还把该对端的高度提示降到 `start-1`，使选对端时�
 ### 仍未做
 - Status 的 `current_height` 仍取 storage head（只是选对端的提示），如需一致可改为 `committed_head`。
 - `/2` 多批预取流水线、Profile-1 follower 的已提交推进依赖其 `BlockCommitted` 输出（未在真实节点上验证）。
+
+## 混合实链停滞（v3 清库重启，2026-11-26 09:13Z）
+
+### 现象
+v3 空库重启，链头约 59，range 追块在 09:13:28 启动（head=0, target=59），1..57 一秒内导入，之后停在 57 约 6 分钟，
+直到 09:19:17 才导入 58（`received=58`），随后反向遍历放出 59..81。期间既无 "range catch-up stopped"，也无停滞超时。
+
+### 根因
+1. **定时器饿死（主因）**：`RangeCatchup::next_deadline(now)` 在无在途请求、无 kick 时返回 `now + 1s`，而编排器 select
+   循环每处理一个事件就重新计算这个 deadline（`orchestrator/mod.rs` run 循环 `range_catchup_timer`）。实链每秒约 10 条
+   交易 gossip，`now + 1s` 永远在下一事件之后，poll 永远不跑。poll 是唯一做重试、`CaughtUp` 判定（head ≥ goal−2 连续三次）
+   和停滞超时的地方，所以三者全部失效。日志佐证：09:19:16.5 交易流停止，0.9 s 后 58 即被取到。
+2. 触发条件：服务器只服务已提交块，其已提交头（57）比本地暂存块（59，反向遍历拿到）低 2；58 请求得到"空"答复后该对端被暂停，
+   客户端里没有别的可用对端（n42-rs 从未被请求，即不在 range 对端表中），于是无在途请求、无 kick，进入上面的饿死状态。
+   若 poll 正常运行，3 次 poll（约 3 s）就会以 CaughtUp 交给反向遍历按 hash 取 58。
+3. 停滞超时还有第二个问题：进展判定计入 `anchored_total`，而 live 提交在缺口之上不断加锚点，即使 poll 运行也永不判停滞。
+4. `tail_anchor_request` 只在 head+1 已缓冲时触发；本例 58 根本没有块体，所以从未发 commit_qc（这不是本例的瓶颈，缺的是块体）。
+
+### 修复
+- `next_deadline` 以上次 poll 为基准（`last_poll + 1s`），不随事件滑动；激活时清零。
+- 进展 = head 前进或收到块体（`stats.blocks_received`），不再计锚点；`stall_timeout` 90 s → 45 s（大于 35 s 请求超时）。
+- `/1` 的干净空答复与 `/2` CANONICAL_END 同样处理：固定 2 s 暂停、高度提示降到 `start−1`，不指数退避。
+- `tail_anchor_request`：已缓冲但只有松散锚点（enforce 下不可执行）时也发 commit_qc。
+- info 日志：`range request sent`（peer、`/1` 或 `/2`、start、count）、`range reply`（块数、END next/reason、
+  nothing served / refused / failed / inconsistent）、`commit_qc request sent` / `commit_qc reply|refused|request failed`。
+
+### 测试
+- `range_catchup::tests::a_tail_beyond_the_servers_committed_head_is_handed_off_under_steady_traffic`：
+  按 select 循环的方式（每 100 ms 一个无关事件、每次重算 deadline、答复立即驱动）跑实链场景：空库 head 0、target 59、
+  唯一服务器已提交头 57、暂存 59。修复后 ≤5 s 以 CaughtUp 交给反向遍历；在原代码上 600 s 模拟时间内不停（已验证复现）。
+- `range_catchup::tests::a_trailing_server_is_asked_again_until_a_later_qc_anchors_the_tail`：暂存块更高（63），服务器已提交头
+  59、8 s 后升到 63，9 s 时一个后续 Decide 锚定 63；修复后尾部被取到并放行、CaughtUp，无计分；原代码同样不停。
+- `orchestrator::tests::a_fresh_node_whose_peers_trail_the_target_by_two_reaches_the_live_head`：编排器端到端，三个服务器都落后
+  2 块，客户端停止后反向遍历按 hash 取缺块，节点到达 live 头（50），每个高度导入一次。

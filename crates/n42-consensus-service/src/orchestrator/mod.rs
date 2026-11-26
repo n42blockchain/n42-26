@@ -11310,6 +11310,88 @@ mod tests {
         assert!(network.range_requests.lock().unwrap().is_empty());
     }
 
+    /// The live mixed run of 2026-11-26 (v3 restarted with an empty datadir,
+    /// chain head 59): the servers serve committed blocks only and their
+    /// committed heads trail the staged top block by two, so a range stops
+    /// two short of it. The client must not hold that tail: it hands it to
+    /// the reverse walk (or fetches it once a peer has committed it), and
+    /// the node reaches the live head, where it can vote again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fresh_node_whose_peers_trail_the_target_by_two_reaches_the_live_head() {
+        let (mut orch, network, mock, peer, chain) =
+            range_catchup_orchestrator(crate::range_catchup::AnchorMode::Enforce).await;
+        let others = [n42_network::PeerId::random(), n42_network::PeerId::random()];
+        for other in others {
+            orch.note_range_peer_status(other, 50);
+        }
+        // The live path holds block 50 (its Decide authenticated it).
+        let (top_hash, top_rlp) = chain[49].clone();
+        orch.remember_h2_v4_block_view(top_hash, 50);
+        orch.handle_h2_v4_gov5_block(peer, top_rlp, None).await;
+        assert!(
+            orch.range_catchup.is_active(),
+            "a 50-block gap starts the range client"
+        );
+        orch.drive_range_catchup().await;
+        let first: Vec<_> = network.range_requests.lock().unwrap().drain(..).collect();
+        assert_eq!(first.len(), 1);
+        let (server, start, count) = first[0];
+        assert_eq!((start, count), (1, 49));
+
+        // The server's committed head is 48: it serves 1..=48 and stops
+        // (END CANONICAL_END). A commit QC the node verified names 48.
+        let rlps = chain[..48].iter().map(|(_, rlp)| rlp.clone()).collect();
+        deliver_range_reply(&mut orch, server, 1, rlps).await;
+        orch.range_catchup.note_strict_anchor(chain[47].0);
+        for _ in 0..4 {
+            orch.drive_range_catchup().await;
+        }
+        assert_eq!(orch.head_block_number, 48);
+
+        // Block 49 is not committed on any server yet: each answers with
+        // nothing (zero blocks, CANONICAL_END), as gov5 and n42-rs do.
+        let mut rounds = 0;
+        while orch.range_catchup.is_active() && rounds < 10 {
+            rounds += 1;
+            let asked: Vec<_> = network.range_requests.lock().unwrap().drain(..).collect();
+            for (peer, start, _) in asked {
+                assert_eq!(start, 49, "only the missing tail is asked for");
+                orch.handle_range_reply(
+                    peer,
+                    start,
+                    n42_network::Gov5RangeOutcome::Unavailable {
+                        canonical_end: true,
+                        retry_after: None,
+                    },
+                )
+                .await;
+            }
+            orch.drive_range_catchup().await;
+        }
+        assert!(
+            !orch.range_catchup.is_active(),
+            "the client does not hold a two-block tail ({rounds} polls)"
+        );
+        // Handed to the reverse walk: block 49 is fetched by hash (its hash
+        // is block 50's parent).
+        assert!(
+            orch.h2_v4_fetch_requested_at.contains_key(&chain[48].0),
+            "the reverse walk asks for the missing parent"
+        );
+        let (parent_hash, parent_rlp) = chain[48].clone();
+        orch.handle_h2_v4_gov5_block(peer, parent_rlp, Some(parent_hash))
+            .await;
+        assert_eq!(orch.head_block_number, 50, "at the live head");
+        assert_eq!(orch.head_block_hash, top_hash);
+        let expected: Vec<B256> = chain.iter().map(|(hash, _)| *hash).collect();
+        assert_eq!(
+            mock.new_payload_hashes(),
+            expected,
+            "each height once, in order"
+        );
+        assert!(orch.h2_v4_catchup_blocks.is_empty());
+    }
+
     /// Profile 1: the V1 header vectors through the real import entry points.
     mod profile1;
 }
