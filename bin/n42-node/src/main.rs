@@ -113,6 +113,7 @@ where
 {
     let best_provider = provider.clone();
     let hash_provider = provider.clone();
+    let header_provider = provider.clone();
     n42_network::Gov5CanonicalBlockReader::new_ranged(
         move || {
             best_provider
@@ -156,6 +157,36 @@ where
             Ok(rlps)
         },
     )
+    // Headers only (bodies_by_range/2 HEADERS_ONLY, commit_qc/1): the exact
+    // gov5/Profile-1 encoding, remembered by hash or recovered from reth's.
+    .with_header_reader(move |numbers| {
+        let view = header_provider
+            .consistent_provider()
+            .map_err(|error| error.to_string())?;
+        let mut headers = Vec::with_capacity(numbers.size_hint().0);
+        for number in numbers {
+            let Some(header) = view
+                .header_by_number(number)
+                .map_err(|error| error.to_string())?
+            else {
+                break;
+            };
+            let hash = view
+                .block_hash(number)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("canonical hash is missing for header {number}"))?;
+            let raw = match n42_consensus::gov5_native_header_rlp(&hash)
+                .filter(|raw| alloy_primitives::keccak256(raw) == hash)
+            {
+                Some(raw) => raw.to_vec(),
+                None => n42_consensus::Gov5NativeHeader::recover(&header, hash)
+                    .ok_or_else(|| format!("cannot recover persisted native header {hash}"))?
+                    .encode(),
+            };
+            headers.push(raw);
+        }
+        Ok(headers)
+    })
     .with_hash_reader(move |hash| {
         let view = hash_provider
             .consistent_provider()
@@ -180,6 +211,40 @@ where
             .map(Some)
             .map_err(|e| e.to_string())
     })
+}
+
+/// The serving reader of a consensus participant: ranges and commit_qc stop
+/// at the committed tip, not at reth's head. A leader's build forkchoice
+/// update makes its locked (prepare-certified, uncommitted) block canonical,
+/// and an ahead build may extend it further, so `best_block_number` can run
+/// ahead of what is committed. The tip starts at the persisted committed
+/// block (`committed`, else genesis) and moves with each commit the
+/// orchestrator reports.
+fn gov5_committed_block_reader<N>(
+    provider: reth_provider::providers::BlockchainProvider<N>,
+    committed: Option<B256>,
+) -> eyre::Result<n42_network::Gov5CanonicalBlockReader>
+where
+    N: reth_provider::providers::ProviderNodeTypes<Primitives = n42_tx_types::N42Primitives>,
+{
+    let start = match committed {
+        Some(hash) => hash,
+        None => provider
+            .block_hash(0)?
+            .ok_or_else(|| eyre::eyre!("genesis hash is missing"))?,
+    };
+    let number_provider = provider.clone();
+    let reader = gov5_canonical_block_reader(provider).with_committed_resolver(move |hash| {
+        let view = number_provider
+            .consistent_provider()
+            .map_err(|e| e.to_string())?;
+        let Some(number) = view.block_number(hash).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        Ok((view.block_hash(number).map_err(|e| e.to_string())? == Some(hash)).then_some(number))
+    });
+    reader.note_committed(start);
+    Ok(reader)
 }
 
 fn env_bool(name: &str) -> bool {
@@ -3250,9 +3315,13 @@ fn main() {
                     }
                         .map_err(|e| eyre::eyre!("failed to create consensus network service: {e}"))?;
                 if h2_v4_participant {
-                    net_service.set_gov5_canonical_block_reader(gov5_canonical_block_reader(
+                    net_service.set_gov5_canonical_block_reader(gov5_committed_block_reader(
                         full_node.provider.clone(),
-                    ));
+                        snapshot
+                            .as_ref()
+                            .map(|snapshot| snapshot.last_committed_qc.block_hash)
+                            .filter(|hash| !hash.is_zero()),
+                    )?);
                 }
                 if profile1_unbound_validator
                     || (follower_mode

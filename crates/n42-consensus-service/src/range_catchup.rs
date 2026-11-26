@@ -71,6 +71,8 @@ const UNSUPPORTED_BACKOFF: Duration = Duration::from_secs(3600);
 const MAX_QC_CACHE: usize = 4096;
 const MAX_ANCHORS: usize = 1 << 16;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Spacing of `commit_qc/1` requests for an unanchored tail.
+const TAIL_ANCHOR_INTERVAL: Duration = Duration::from_secs(5);
 
 /// `N42_SYNC_ANCHOR`: off | observe | enforce.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,6 +176,18 @@ pub enum RangeReply {
     Blocks(Vec<Result<RangeBlock, String>>),
     Refused,
     Failed { unsupported: bool },
+    /// A reply the network layer proved inconsistent (a `bodies_by_range/2`
+    /// END that contradicts its chunks): a provable fault, nothing kept.
+    Fault(&'static str),
+    /// A `/2` peer legitimately served nothing (zero blocks with END reason
+    /// 3-6, or RATE_LIMITED). No score and no escalating back-off (sections
+    /// 3.5, 6.3).
+    Unavailable {
+        /// The peer's committed head lies below the requested start.
+        canonical_end: bool,
+        /// The server asked to wait this long (RATE_LIMITED).
+        retry_after: Option<Duration>,
+    },
 }
 
 /// A request the caller must send.
@@ -418,6 +432,10 @@ pub struct RangeCatchup {
     avg_block_bytes: usize,
     /// Highest height handed to the importer by [`Self::take_ready`].
     released_to: u64,
+    /// When the last tail-anchor `commit_qc/1` request was issued.
+    last_tail_anchor_request: Option<Instant>,
+    /// Peers that do not serve `commit_qc/1` (asked once, refused locally).
+    no_commit_qc: HashSet<PeerId>,
     stats: RangeCatchupStats,
 }
 
@@ -466,6 +484,8 @@ impl RangeCatchup {
             stopped: None,
             avg_block_bytes: 0,
             released_to: 0,
+            last_tail_anchor_request: None,
+            no_commit_qc: HashSet::new(),
             stats: RangeCatchupStats::default(),
         }
     }
@@ -615,6 +635,60 @@ impl RangeCatchup {
         if self.loose.contains(&hash) {
             self.mark(hash, false);
         }
+    }
+
+    /// The next `commit_qc/1` request that would release an unanchored tail
+    /// (sync standard 3.4 step 6): `head + 1` is buffered but not anchored, so
+    /// the importer is waiting for an anchor. Asks the peer that served it
+    /// (it holds the chain above) for a QC reaching it, at most every
+    /// [`TAIL_ANCHOR_INTERVAL`].
+    pub fn tail_anchor_request(&mut self, now: Instant) -> Option<(PeerId, u64, B256)> {
+        if !self.active
+            || self
+                .last_tail_anchor_request
+                .is_some_and(|at| now.saturating_duration_since(at) < TAIL_ANCHOR_INTERVAL)
+        {
+            return None;
+        }
+        let number = self.head_number.checked_add(1)?;
+        let block = self.buffer.get(&number)?;
+        if self.anchored.contains_key(&number) {
+            return None;
+        }
+        let usable = |peer: &PeerId, state: &PeerState| {
+            state.available(now) && !self.no_commit_qc.contains(peer)
+        };
+        let peer = Some(block.source)
+            .filter(|source| {
+                self.peers
+                    .get(source)
+                    .is_some_and(|state| usable(source, state))
+            })
+            .or_else(|| {
+                self.peers
+                    .iter()
+                    .filter(|(peer, state)| usable(peer, state) && state.height >= number)
+                    .map(|(peer, _)| *peer)
+                    .min()
+            })?;
+        self.last_tail_anchor_request = Some(now);
+        Some((peer, number, block.hash))
+    }
+
+    /// `peer` does not speak `commit_qc/1`: no tail-anchor request goes to it
+    /// again in this run.
+    pub fn note_commit_qc_unsupported(&mut self, peer: PeerId) {
+        self.no_commit_qc.insert(peer);
+    }
+
+    /// A `commit_qc/1` reply checked by [`verify_commit_qc_reply`]: its
+    /// header links join the fetched chain and its QC is a strict anchor.
+    pub fn note_commit_qc_anchor(&mut self, anchor: &n42_network::CommitQcAnchor) {
+        for pair in anchor.chain.windows(2) {
+            let ((number, hash), (_, parent)) = (pair[0], pair[1]);
+            self.record_link(hash, parent, number);
+        }
+        self.note_strict_anchor(anchor.qc.block_hash);
     }
 
     /// The caller executed a released block (with or without moving its
@@ -1039,6 +1113,30 @@ impl RangeCatchup {
             RangeReply::Failed { unsupported } => {
                 self.soft_fail(&peer, now, unsupported);
                 self.add_work(start, end);
+                return report;
+            }
+            RangeReply::Fault(reason) => {
+                report.fault = Some(reason);
+                report.peer_excluded = self.fault(&peer, now);
+                self.add_work(start, end);
+                return report;
+            }
+            RangeReply::Unavailable {
+                canonical_end,
+                retry_after,
+            } => {
+                self.add_work(start, end);
+                if let Some(state) = self.peers.get_mut(&peer) {
+                    if canonical_end {
+                        // It holds nothing from `start`: rank it below peers
+                        // that may (until its next Status).
+                        state.height = state.height.min(start.saturating_sub(1));
+                    }
+                    // A fixed pause (the server's, or the base one) keeps a
+                    // lone peer from being asked again at once; failures do
+                    // not grow, so it never escalates.
+                    state.backoff_until = Some(now + retry_after.unwrap_or(BACKOFF_BASE));
+                }
                 return report;
             }
             RangeReply::Blocks(blocks) if blocks.is_empty() => {
@@ -1540,6 +1638,35 @@ fn qc_key(qc: &H2QuorumCertificate) -> B256 {
     keccak256(bytes)
 }
 
+/// Why a `commit_qc/1` reply is not an anchor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommitQcRejection {
+    /// The reply is inconsistent (undecodable QC, a header chain that does not
+    /// reach the request) or its QC fails against a known set: a provable fault.
+    Fault(&'static str),
+    /// A well-formed reply whose QC is not an anchor here: a prepare-domain
+    /// quorum or an unknown epoch (fail closed, no fault).
+    NotAnchor(QcCheck),
+}
+
+/// The `commit_qc/1` client check (sync standard section 5.2): the header
+/// chain from the QC's block down to the requested `(number, hash)`, then the
+/// QC itself under `verify` (section 3.3: commit domain, the set of the QC's
+/// own epoch, no fallback).
+pub fn verify_commit_qc_reply(
+    request: &n42_network::CommitQcRequest,
+    payload: &n42_network::CommitQcPayload,
+    verify: impl FnOnce(&H2QuorumCertificate) -> QcCheck,
+) -> Result<n42_network::CommitQcAnchor, CommitQcRejection> {
+    let anchor =
+        n42_network::check_commit_qc_reply(request, payload).map_err(CommitQcRejection::Fault)?;
+    match verify(&anchor.qc) {
+        QcCheck::Verified => Ok(anchor),
+        QcCheck::Invalid => Err(CommitQcRejection::Fault("QC fails verification")),
+        check => Err(CommitQcRejection::NotAnchor(check)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1823,6 +1950,199 @@ mod tests {
                 assert_eq!(report.accepted, 3, "observe keeps the linked prefix");
             }
         }
+    }
+
+    #[test]
+    fn an_inconsistent_v2_reply_is_scored_and_asked_for_again() {
+        let peer = PeerId::random();
+        let (mut client, now) = active(AnchorMode::Enforce, &[peer], 40);
+        expect(&mut client, peer, 1, 16, now);
+        let mut calls = 0;
+        let report = client.on_reply(
+            peer,
+            1,
+            RangeReply::Fault("END next does not match the chunks"),
+            now,
+            &mut verifier(&mut calls),
+        );
+        assert_eq!(report.fault, Some("END next does not match the chunks"));
+        assert_eq!(report.accepted, 0);
+        assert_eq!(client.stats().faults, 1);
+        assert_eq!(
+            client.work.get(&1),
+            Some(&17),
+            "the range is asked for again"
+        );
+    }
+
+    /// A `/2` peer that legitimately served nothing (END reason 3-6, or
+    /// RATE_LIMITED) is neither scored nor backed off exponentially:
+    /// CANONICAL_END ranks it below peers that may hold the range, and
+    /// RATE_LIMITED waits exactly the server's `retry_after_ms`.
+    #[test]
+    fn an_empty_v2_reply_is_neither_scored_nor_escalated() {
+        let (short, other) = (PeerId::random(), PeerId::random());
+        let (mut client, now) = active(AnchorMode::Enforce, &[short, other], 40);
+        let mut calls = 0;
+        for _ in 0..4 {
+            expect(&mut client, short, 1, 16, now);
+            let report = client.on_reply(
+                short,
+                1,
+                RangeReply::Unavailable {
+                    canonical_end: false,
+                    retry_after: Some(Duration::from_millis(1500)),
+                },
+                now,
+                &mut verifier(&mut calls),
+            );
+            assert_eq!(report.fault, None);
+            assert_eq!(client.work.get(&1), Some(&17), "asked for again");
+            client.take_work(1, 17);
+        }
+        let state = &client.peers[&short];
+        assert_eq!(state.failures, 0, "no escalation");
+        assert_eq!(
+            state.backoff_until,
+            Some(now + Duration::from_millis(1500)),
+            "the server's retry_after_ms, exactly"
+        );
+        assert_eq!(client.stats().faults, 0);
+        assert_eq!(client.stats().soft_failures, 0);
+
+        // CANONICAL_END: its head lies below the range; another peer is
+        // picked as soon as the short one's pause is over.
+        expect(&mut client, short, 1, 16, now);
+        client.on_reply(
+            short,
+            1,
+            RangeReply::Unavailable {
+                canonical_end: true,
+                retry_after: None,
+            },
+            now,
+            &mut verifier(&mut calls),
+        );
+        assert_eq!(client.peers[&short].height, 0);
+        assert_eq!(client.peers[&short].failures, 0);
+        let later = now + BACKOFF_BASE;
+        assert_eq!(client.pick_peer(1, 16, later), Some(other));
+    }
+
+    /// Sync standard 3.4 step 6: with the next block buffered but not
+    /// anchored, a `commit_qc/1` request goes to the peer that served it
+    /// (unless it does not speak commit_qc), at most every few seconds.
+    #[test]
+    fn an_unanchored_tail_asks_for_a_commit_qc() {
+        let (source, other) = (PeerId::random(), PeerId::random());
+        let (mut client, now) = active(AnchorMode::Enforce, &[source, other], 40);
+        assert_eq!(client.tail_anchor_request(now), None, "nothing buffered");
+        let blocks = chain(1, GENESIS, 16, 1);
+        expect(&mut client, source, 1, 16, now);
+        let mut calls = 0;
+        client.on_reply(source, 1, reply(&blocks), now, &mut verifier(&mut calls));
+        assert_eq!(
+            client.tail_anchor_request(now),
+            Some((source, 1, blocks[0].hash))
+        );
+        assert_eq!(client.tail_anchor_request(now), None, "spaced");
+        client.note_commit_qc_unsupported(source);
+        let later = now + TAIL_ANCHOR_INTERVAL;
+        assert_eq!(
+            client.tail_anchor_request(later),
+            Some((other, 1, blocks[0].hash))
+        );
+        // Once anchored, nothing more is asked.
+        bind(&mut client, &blocks[15], true);
+        assert_eq!(
+            client.tail_anchor_request(later + TAIL_ANCHOR_INTERVAL),
+            None
+        );
+    }
+
+    /// gov5's `commit_qc/1` golden vectors (sync standard 5.2), checked as a
+    /// client would: the header chain, then the QC under the H2-v4 commit
+    /// domain against the fixture chain's validators. gov5 derives them as
+    /// `sha256("n42-profile1-test-validator-<i>")` with the first byte cleared.
+    #[test]
+    fn commit_qc_vectors_verify_against_the_fixture_validators() {
+        use crate::h2_finality::{H2V4AnchorVerdict, verify_h2_v4_sync_anchor};
+        use alloy_primitives::Address;
+        use n42_chainspec::ValidatorInfo;
+        use n42_consensus::ValidatorSet;
+        use n42_network::h2_v4::H2V4ChainIdentity;
+        use n42_primitives::BlsSecretKey;
+        use sha2::{Digest, Sha256};
+
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../n42-network/tests/fixtures/sync-v11/commit_qc_1.json"
+        ))
+        .unwrap();
+        let bytes = |value: &serde_json::Value| {
+            hex::decode(value.as_str().unwrap().trim_start_matches("0x")).unwrap()
+        };
+        let identity = H2V4ChainIdentity {
+            chain_id: vectors["chain_id"].as_u64().unwrap(),
+            genesis_hash: B256::from_slice(&bytes(&vectors["genesis_hash"])),
+        };
+        let validators: Vec<ValidatorInfo> = (0..4)
+            .map(|index| {
+                let mut seed: [u8; 32] =
+                    Sha256::digest(format!("n42-profile1-test-validator-{index}")).into();
+                seed[0] = 0;
+                ValidatorInfo {
+                    address: Address::with_last_byte(index as u8 + 1),
+                    bls_public_key: BlsSecretKey::from_bytes(&seed).unwrap().public_key(),
+                    p2p_peer_id: None,
+                }
+            })
+            .collect();
+        let set = ValidatorSet::new(&validators, 1);
+        let check = |qc: &H2QuorumCertificate| match verify_h2_v4_sync_anchor(qc, identity, &set) {
+            H2V4AnchorVerdict::Verified => QcCheck::Verified,
+            H2V4AnchorVerdict::PrepareDomain => QcCheck::PrepareDomain,
+            H2V4AnchorVerdict::Invalid => QcCheck::Invalid,
+        };
+        let mut verified = 0;
+        for case in vectors["cases"].as_array().unwrap() {
+            let chunk = &case["response_chunks"][0];
+            if chunk["code"] != "0x00" {
+                continue;
+            }
+            let request = n42_network::CommitQcRequest {
+                number: case["request_fields"]["number"].as_u64().unwrap(),
+                hash: B256::from_slice(&bytes(&case["request_fields"]["hash"])),
+            };
+            let payload = n42_network::CommitQcPayload::decode(&bytes(&chunk["payload"])).unwrap();
+            let anchor = verify_commit_qc_reply(&request, &payload, check).unwrap();
+            assert_eq!(anchor.qc_block.map(|(number, _)| number), Some(9));
+            verified += 1;
+
+            // A signature by other keys is a provable fault, an unknown epoch
+            // is not.
+            let mut forged = payload.clone();
+            let mut qc = decode_h2_qc(&forged.qc_wire).unwrap();
+            qc.aggregate_signature = BlsSecretKey::key_gen(&[7; 32])
+                .unwrap()
+                .sign_h2_v4(b"other")
+                .to_bytes()
+                .to_vec();
+            forged.qc_wire = n42_network::h2_wire::encode_h2_qc(&qc).unwrap();
+            assert_eq!(
+                verify_commit_qc_reply(&request, &forged, check),
+                Err(CommitQcRejection::Fault("QC fails verification"))
+            );
+            assert_eq!(
+                verify_commit_qc_reply(&request, &payload, |_| QcCheck::UnknownEpoch),
+                Err(CommitQcRejection::NotAnchor(QcCheck::UnknownEpoch))
+            );
+
+            // The anchor joins the client's chain as a strict anchor.
+            let mut client = RangeCatchup::new(config(), AnchorMode::Enforce);
+            client.note_commit_qc_anchor(&anchor);
+            assert!(client.strict.contains(&anchor.qc.block_hash));
+        }
+        assert_eq!(verified, 3);
     }
 
     #[test]

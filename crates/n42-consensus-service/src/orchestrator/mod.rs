@@ -5504,6 +5504,13 @@ impl ConsensusService {
             } => {
                 self.handle_range_reply(source, start, outcome).await;
             }
+            NetworkEvent::Gov5CommitQcResponse {
+                source,
+                request,
+                outcome,
+            } => {
+                self.handle_commit_qc_reply(source, request, outcome);
+            }
             _ => {
                 // Verification receipts are handled by dedicated subsystems.
             }

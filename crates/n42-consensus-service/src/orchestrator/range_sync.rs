@@ -28,13 +28,16 @@
 
 use super::ConsensusService;
 use crate::h2_finality::{H2V4AnchorVerdict, verify_h2_v4_sync_anchor};
-use crate::range_catchup::{AnchorMode, Deactivation, QcCheck, RangeBlock, RangeReply, extra_qc};
+use crate::range_catchup::{
+    AnchorMode, CommitQcRejection, Deactivation, QcCheck, RangeBlock, RangeReply, extra_qc,
+    verify_commit_qc_reply,
+};
 use alloy_primitives::B256;
 use metrics::{counter, gauge};
 use n42_consensus::{ConsensusEngine, ValidatorSet};
 use n42_network::h2_v4::H2V4ChainIdentity;
 use n42_network::h2_wire::H2QuorumCertificate;
-use n42_network::{Gov5RangeOutcome, PeerId};
+use n42_network::{CommitQcRequest, Gov5CommitQcOutcome, Gov5RangeOutcome, PeerId};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -257,8 +260,72 @@ impl ConsensusService {
                 debug!(target: "n42::interop::range", %source, start, %error, unsupported, "range request failed");
                 RangeReply::Failed { unsupported }
             }
+            Gov5RangeOutcome::Faulty { reason } => RangeReply::Fault(reason),
+            Gov5RangeOutcome::Unavailable {
+                canonical_end,
+                retry_after,
+            } => {
+                debug!(target: "n42::interop::range", %source, start, canonical_end, ?retry_after, "range peer served nothing");
+                RangeReply::Unavailable {
+                    canonical_end,
+                    retry_after,
+                }
+            }
         };
         self.on_range_reply_decoded(source, start, reply).await;
+    }
+
+    /// A `commit_qc/1` answer (sync standard 5.2): checked down to the
+    /// requested height and verified strictly; a verified anchor feeds the
+    /// range client while it runs.
+    pub(super) fn handle_commit_qc_reply(
+        &mut self,
+        source: PeerId,
+        request: CommitQcRequest,
+        outcome: Gov5CommitQcOutcome,
+    ) {
+        let payload = match outcome {
+            Gov5CommitQcOutcome::Found(payload) => payload,
+            Gov5CommitQcOutcome::Refused { code, message } => {
+                debug!(target: "n42::interop::range", %source, number = request.number, code, %message, "commit_qc refused");
+                return;
+            }
+            Gov5CommitQcOutcome::Failed { error, unsupported } => {
+                debug!(target: "n42::interop::range", %source, number = request.number, %error, unsupported, "commit_qc failed");
+                if unsupported {
+                    self.range_catchup.note_commit_qc_unsupported(source);
+                }
+                return;
+            }
+        };
+        let engine = &self.engine;
+        let schedule = self.epoch_schedule.as_ref();
+        let identity = self.h2_v4_identity;
+        match verify_commit_qc_reply(&request, &payload, |qc| {
+            range_qc_check(engine, schedule, identity, qc)
+        }) {
+            Ok(anchor) => {
+                counter!("n42_commit_qc_anchors_verified_total").increment(1);
+                info!(
+                    target: "n42::interop::range",
+                    %source,
+                    qc_view = anchor.qc.view,
+                    qc_block = %anchor.qc.block_hash,
+                    headers = anchor.chain.len(),
+                    "commit_qc anchor verified"
+                );
+                if self.range_catchup.is_active() {
+                    self.range_catchup.note_commit_qc_anchor(&anchor);
+                }
+            }
+            Err(CommitQcRejection::Fault(reason)) => {
+                counter!("n42_commit_qc_faults_total", "reason" => reason).increment(1);
+                warn!(target: "n42::interop::range", %source, number = request.number, reason, "commit_qc reply failed verification");
+            }
+            Err(CommitQcRejection::NotAnchor(check)) => {
+                debug!(target: "n42::interop::range", %source, number = request.number, ?check, "commit_qc reply is not an anchor here");
+            }
+        }
     }
 
     pub(super) async fn on_range_reply_decoded(
@@ -329,6 +396,13 @@ impl ConsensusService {
             self.on_range_catchup_stopped(reason).await;
             return;
         }
+        // Sync standard 3.4 step 6: the next block is buffered but nothing
+        // anchors it yet; ask a peer for a CommitQC reaching it.
+        if let Some((peer, number, hash)) = self.range_catchup.tail_anchor_request(now)
+            && let Err(error) = self.network.request_gov5_commit_qc(peer, number, hash)
+        {
+            debug!(target: "n42::interop::range", %peer, number, %error, "could not queue commit_qc request");
+        }
 
         let ready = self.range_catchup.take_ready(
             self.head_block_number,
@@ -385,6 +459,11 @@ impl ConsensusService {
                 return;
             }
             self.range_catchup.imported(block.number, block.hash);
+            // Below a strict (commit) anchor: committed, so `/1`, `/2` and
+            // commit_qc may serve it once it is canonical.
+            if !block.loose_only && self.h2_v4_identity.is_some() {
+                self.network.note_committed_block(block.hash);
+            }
             counter!("n42_range_catchup_imported_total").increment(1);
             if block.loose_only {
                 counter!("n42_range_catchup_loose_only_total").increment(1);

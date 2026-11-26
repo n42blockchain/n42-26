@@ -17,6 +17,7 @@ pub mod reconnection;
 pub mod service;
 pub mod snappy_pool;
 pub mod state_sync;
+pub mod sync_v11;
 pub mod transport;
 pub mod tx_forward;
 
@@ -50,7 +51,14 @@ pub use mobile::{
     MSG_TYPE_CACHE_SYNC, MSG_TYPE_CACHE_SYNC_ZSTD, ShardedStarHub, ShardedStarHubConfig,
     ShardedStarHubHandle, StarHub, StarHubConfig, StarHubHandle,
 };
-pub use service::{Gov5RangeOutcome, NetworkCommand, NetworkEvent, NetworkHandle, NetworkService};
+pub use service::{
+    Gov5CommitQcOutcome, Gov5RangeOutcome, NetworkCommand, NetworkEvent, NetworkHandle,
+    NetworkService,
+};
+pub use sync_v11::{
+    CommitQcAnchor, CommitQcPayload, CommitQcRequest, GOV5_BODIES_BY_RANGE_V2_PROTOCOL,
+    GOV5_COMMIT_QC_PROTOCOL, check_commit_qc_reply,
+};
 pub use state_sync::{
     BlockSyncRequest, BlockSyncResponse, MAX_BLOCKS_PER_SYNC_REQUEST, MAX_SYNC_MESSAGE_SIZE,
     SyncBlock, SyncPayload,
