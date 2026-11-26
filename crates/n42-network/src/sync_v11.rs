@@ -933,6 +933,8 @@ impl CommitQcPayload {
 pub struct CommitQcSource {
     pub reader: Gov5CanonicalBlockReader,
     pub persisted_qc: Option<Vec<u8>>,
+    /// The requesting peer, for the serve log line (none in tests).
+    pub requester: Option<libp2p::PeerId>,
 }
 
 impl fmt::Debug for CommitQcSource {
@@ -954,7 +956,7 @@ pub enum CommitQcResponse {
     /// Server side: answered from `source` on a blocking thread.
     Lookup {
         request: CommitQcRequest,
-        source: CommitQcSource,
+        source: Box<CommitQcSource>,
     },
 }
 
@@ -1293,7 +1295,10 @@ impl request_response::Codec for Gov5CommitQcCodec {
     {
         let response = match response {
             CommitQcResponse::Lookup { request, source } => {
-                run_blocking(move || serve_commit_qc(&source, request)).await?
+                let requester = source.requester;
+                let served = run_blocking(move || serve_commit_qc(&source, request)).await?;
+                log_commit_qc_served(requester, &request, &served);
+                served
             }
             response => response,
         };
@@ -1312,6 +1317,36 @@ impl request_response::Codec for Gov5CommitQcCodec {
             CommitQcResponse::Lookup { .. } => unreachable!("resolved above"),
         }
         io.close().await
+    }
+}
+
+/// One info line per served `commit_qc/1` request, as for range serving.
+fn log_commit_qc_served(
+    peer: Option<libp2p::PeerId>,
+    request: &CommitQcRequest,
+    response: &CommitQcResponse,
+) {
+    let peer = peer.map(|peer| peer.to_string()).unwrap_or_default();
+    match response {
+        CommitQcResponse::Found(payload) => tracing::info!(
+            target: "n42::interop::range",
+            %peer,
+            number = request.number,
+            hash = %request.hash,
+            qc_view = decode_h2_qc(&payload.qc_wire).ok().map(|qc| qc.view),
+            headers = payload.headers.len(),
+            "serving commit_qc/1"
+        ),
+        CommitQcResponse::Error { code, message } => tracing::info!(
+            target: "n42::interop::range",
+            %peer,
+            number = request.number,
+            hash = %request.hash,
+            code,
+            %message,
+            "commit_qc/1 refused"
+        ),
+        CommitQcResponse::Lookup { .. } => {}
     }
 }
 

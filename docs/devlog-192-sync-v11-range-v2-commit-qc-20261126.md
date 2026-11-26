@@ -134,3 +134,81 @@ v3 空库重启，链头约 59，range 追块在 09:13:28 启动（head=0, targe
   59、8 s 后升到 63，9 s 时一个后续 Decide 锚定 63；修复后尾部被取到并放行、CaughtUp，无计分；原代码同样不停。
 - `orchestrator::tests::a_fresh_node_whose_peers_trail_the_target_by_two_reaches_the_live_head`：编排器端到端，三个服务器都落后
   2 块，客户端停止后反向遍历按 hash 取缺块，节点到达 live 头（50），每个高度导入一次。
+
+## 闸门 4b / 4b-S 之后的两项跟进（分支 feat/profile1-sync-v11-followups，基于 e3d22dd）
+
+### 1. commit_qc/1 服务端日志
+
+- `/1`「serving Gov5 canonical block range」和 `/2`「serving bodies_by_range/2」由 debug 提到 info（每个入站请求一行；
+  追块期间约每秒一行，可以接受）。
+- commit_qc/1 每个入站请求一行，target `n42::interop::range`：
+  - 在 handler 里拒绝（unauthorized / rate_limit / unavailable）：`reject_gov5_commit_qc` 现在多带 `(peer, &request)` 参数，
+    打印「commit_qc/1 refused」，字段为 peer、number、hash、code、reason。
+  - 查询结果要在 codec 里由 `serve_commit_qc` 在阻塞线程上惰性求出，codec 拿不到 peer。因此 `CommitQcSource` 增加
+    `requester: Option<PeerId>`，`Gov5CommitQcCodec::write_response` 求出结果后调用 `log_commit_qc_served`：
+    - Found：「serving commit_qc/1」，字段为 peer、number、hash、qc_view（解码 qc_wire）、headers；
+    - Error：「commit_qc/1 refused」，字段为 code、message，例如 0x03 number is not committed / unknown hash。
+  - `CommitQcResponse::Lookup.source` 改为 `Box<CommitQcSource>`，否则 clippy 报 large_enum_variant。
+
+### 2. 追块后前几个 view 只走导入门控投票
+
+结论：不是追块路径少播种了状态，而是预检查与本 view 的 Decide 在赛跑，预检查输了。追块后的前几个 view
+并没有特殊之处。
+
+预检查（`DeferredChecker::check_inner`）需要四样东西，追块放行的块都具备：
+
+1. 提案头已登记（`remembered_profile1_header`）：提案处理时登记，与追块无关。
+2. 父块的 executed fields：每次 reth 导入都由 QMDB state-root job 写入（`qmdb_state_root.rs` 的
+   `remember_executed_fields`），range / 暂存放行的块同样经过 new_payload。何况块 222 本身的导入就要求父块 221 的
+   fields 存在，否则会被拒绝，而它被接受了。
+3. 父块的后状态：`state_by_block_hash`，失败再回退到 `executed_state_by_block_hash`。
+4. 发送者恢复与 nonce/余额检查。
+
+`on_block_checked` 只在 `pending_proposal` 仍是当前 view 时才发票。Decide 一到，view 就前进，之后到达的 Checked
+被静默忽略，不打任何日志。所以日志里「没有 checked vote 行」只说明预检查晚于 Decide，并不说明状态缺失。
+
+#### 统计（node.log，清库重启之后）
+
+| 闸门 | follower view 数 | 有预检查票的 view | Decide 中位数（距提案） | 预检查票中位数（距提案） |
+|---|---|---|---|---|
+| 4b | 122 | 47 | 10.35 ms | 8.3 ms |
+| 4b-S | 67 | 22 | 10.4 ms | 9.0 ms |
+
+- 也就是约 60% 的 view 稳态下也没有预检查票。
+- 4b 在 228 之后也有连续 3–4 个 view 缺票（244/245/246/248）。
+- 4b 的 224–226 Decide 分别在 10.3、8.1、10.2 ms 到达。块数据在提案后 2–4 ms 才到，检查在解码后才开始，并与
+  new_payload 争抢 CPU；224 有 320 笔交易，比后面多。
+- 4b-S 的 217 预检查在 7.2 ms 完成，Decide 在 12.1 ms 到达，赢了。
+
+其余三个验证者在约 3 ms 内投票，2f+1 不需要本节点。所以缺票不影响活性，也不是正确性问题。
+
+#### 本次改动：只加观测，不改行为
+
+在 `execution_bridge.rs` 的预检查任务里：
+
+- 新增 info 日志「deferred check finished」（target `n42::profile1`），字段为 hash、view、block_number、
+  result（checked/retry/refused/unsupported）、reason、elapsed_ms、since_block_data_ms；
+- 新增直方图 `n42_deferred_check_ms`。
+
+有了这些，就能拿检查完成时间和「received Decide」对比，区分输掉赛跑与 Retry（Retry 原来是 debug 级别，被过滤）。
+
+#### 未做的修复（建议）
+
+要让预检查更常赢，需要缩短检查本身的延迟（约 5–8 ms 的 spawn_blocking 加发送者恢复），或者更早开始检查，例如
+复用 eager import 已经恢复出的发送者，或给预检查单独开一个线程池。这属于性能优化，与追块无关，本次不做。
+
+### 测试
+
+- clippy `-D warnings`（n42-network / n42-consensus-service / n42-node，all-targets）通过。
+- 测试全部通过：
+
+  | 测试目标 | 通过 | 忽略 |
+  |---|---|---|
+  | consensus-service lib | 365 | 5 |
+  | profile1_v6 | 19 | 0 |
+  | network lib | 264 | 1 |
+  | n42-node lib | 314 | 12 |
+  | n42-node 集成测试 | 全部 | — |
+
+- 日志行没有加专门的单元测试；commit_qc 的 codec 路径由现有 `commit_qc_server_reproduces_every_vector` 覆盖，
+  `requester: None`。
