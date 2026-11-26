@@ -2,27 +2,64 @@ use alloy_primitives::B256;
 use n42_primitives::consensus::{CommitVote, ConsensusMessage, PrepareQC, Vote};
 use std::collections::HashMap;
 
-use super::state_machine::{ConsensusEngine, EngineOutput};
+use super::state_machine::{
+    ConsensusEngine, EngineOutput, EquivocationKind, EquivocationProof, SignedMessage,
+};
 use crate::error::{ConsensusError, ConsensusResult};
 
-/// Checks an equivocation tracker for a validator voting for two different blocks.
-/// Returns `Some((hash1, hash2))` if equivocation detected, `None` otherwise.
+/// A conflict found by [`check_equivocation`]: both block hashes and both
+/// signed messages, first-seen first.
+pub(super) type Conflict = (B256, B256, SignedMessage, SignedMessage);
+
+/// Checks an equivocation tracker for a validator voting for two different
+/// blocks. The first message a validator signs in the view is kept as
+/// evidence; a later one for a different block returns the conflict.
 pub(super) fn check_equivocation(
-    tracker: &mut HashMap<u32, B256>,
+    tracker: &mut HashMap<u32, (B256, SignedMessage)>,
     voter: u32,
     block_hash: B256,
-) -> Option<(B256, B256)> {
-    if let Some(&prev) = tracker.get(&voter) {
-        if prev != block_hash {
-            return Some((prev, block_hash));
+    signed: SignedMessage,
+) -> Option<Conflict> {
+    match tracker.get(&voter) {
+        Some((prev, first)) if *prev != block_hash => {
+            Some((*prev, block_hash, first.clone(), signed))
         }
-    } else {
-        tracker.insert(voter, block_hash);
+        Some(_) => None,
+        None => {
+            tracker.insert(voter, (block_hash, signed));
+            None
+        }
     }
-    None
 }
 
 impl ConsensusEngine {
+    /// Emits [`EngineOutput::EquivocationDetected`] with the signed pair and
+    /// the validator's key from the view's set.
+    pub(super) fn emit_equivocation(
+        &mut self,
+        kind: EquivocationKind,
+        view: u64,
+        validator: u32,
+        (hash1, hash2, first, second): Conflict,
+    ) -> ConsensusResult<()> {
+        let public_key = self
+            .validator_set_for_view(view)
+            .get_public_key(validator)?
+            .to_bytes();
+        self.emit(EngineOutput::EquivocationDetected {
+            view,
+            validator,
+            hash1,
+            hash2,
+            proof: Box::new(EquivocationProof {
+                kind,
+                public_key,
+                first,
+                second,
+            }),
+        })
+    }
+
     /// Processes a Round 1 (Prepare) vote from a validator.
     pub(super) fn process_vote(&mut self, vote: Vote) -> ConsensusResult<()> {
         self.process_vote_inner(vote, false)
@@ -53,10 +90,10 @@ impl ConsensusEngine {
             return Ok(());
         }
 
+        let msg = self.signing_profile.vote_message(view, vote.block_hash);
         if !signature_verified {
             let view_set = self.validator_set_for_view(view);
             let pk = view_set.get_public_key(vote.voter)?;
-            let msg = self.signing_profile.vote_message(view, vote.block_hash);
             if !self
                 .signing_profile
                 .verify_single(pk, &msg, &vote.signature)
@@ -70,17 +107,19 @@ impl ConsensusEngine {
 
         // Equivocation check is gated on a verified signature so that an unauthenticated
         // peer cannot poison the tracker against a real voter.
-        if let Some((h1, h2)) =
-            check_equivocation(&mut self.equivocation_tracker, vote.voter, vote.block_hash)
-        {
+        let signed = SignedMessage {
+            signed: msg,
+            signature: vote.signature.to_bytes(),
+        };
+        if let Some(conflict) = check_equivocation(
+            &mut self.equivocation_tracker,
+            vote.voter,
+            vote.block_hash,
+            signed,
+        ) {
             tracing::warn!(target: "n42::cl::voting", view, validator = vote.voter,
-                hash1 = %h1, hash2 = %h2, "vote equivocation detected");
-            self.emit(EngineOutput::EquivocationDetected {
-                view,
-                validator: vote.voter,
-                hash1: h1,
-                hash2: h2,
-            })?;
+                hash1 = %conflict.0, hash2 = %conflict.1, "vote equivocation detected");
+            self.emit_equivocation(EquivocationKind::Vote, view, vote.voter, conflict)?;
             return Ok(());
         }
 
@@ -233,13 +272,13 @@ impl ConsensusEngine {
             return Ok(());
         }
 
+        let changes_hash = self.cached_changes_hash(&cv.block_hash);
+        let msg = self
+            .signing_profile
+            .commit_message(view, cv.block_hash, changes_hash);
         if !signature_verified {
             let view_set = self.validator_set_for_view(view);
             let pk = view_set.get_public_key(cv.voter)?;
-            let changes_hash = self.cached_changes_hash(&cv.block_hash);
-            let msg = self
-                .signing_profile
-                .commit_message(view, cv.block_hash, changes_hash);
             if !self.signing_profile.verify_single(pk, &msg, &cv.signature) {
                 return Err(ConsensusError::InvalidSignature {
                     view,
@@ -250,19 +289,19 @@ impl ConsensusEngine {
 
         // R2 equivocation check — gated on verified signature, leader-only by design
         // (CommitVotes are sent directly to the leader, not broadcast).
-        if let Some((h1, h2)) = check_equivocation(
+        let signed = SignedMessage {
+            signed: msg,
+            signature: cv.signature.to_bytes(),
+        };
+        if let Some(conflict) = check_equivocation(
             &mut self.commit_equivocation_tracker,
             cv.voter,
             cv.block_hash,
+            signed,
         ) {
             tracing::warn!(target: "n42::cl::voting", view, validator = cv.voter,
-                hash1 = %h1, hash2 = %h2, "commit-vote equivocation detected");
-            self.emit(EngineOutput::EquivocationDetected {
-                view,
-                validator: cv.voter,
-                hash1: h1,
-                hash2: h2,
-            })?;
+                hash1 = %conflict.0, hash2 = %conflict.1, "commit-vote equivocation detected");
+            self.emit_equivocation(EquivocationKind::CommitVote, view, cv.voter, conflict)?;
             return Ok(());
         }
 

@@ -1017,3 +1017,67 @@ AM19 与检查早于提案；被拒块无 Round 1；非 Profile 1 无效果）�
 - 交易在 topic 上不按 leader 定向，O(n) 扇出由 gossipsub 承担；高 TPS 下（>数千 tx/s）的 topic 带宽与池导入开销未测。
 - 入站交易不再经 `recently_imported` 以外的去重；大量重复批（gov5 再广播）靠 `pool.contains` 早退。
 - 15.6 节“交易不转发给其他客户端的 leader”一项由本节解决。
+
+## 17. AM28：作恶证据带签名原文并落盘（E15）（2026-11-26 追加）
+
+### 17.1 背景
+
+rc4 E15 要求“验证、持久化签名对、经 `n42_equivocations` RPC 与指标公开”。AM28 规定 RPC 形状：
+`{total, evidence:[{view, validatorIndex, hash1, hash2, detectedAt, kind, publicKey, first, second}]}`，
+`first`/`second` 各为 `{signed, signature}`（hex），并持久化到 `equivocations.jsonl`。
+n42-26 此前只返回前五个字段，证据仅存内存（500 条环形队列），重启即丢。收尾报告（HANDOFF 2026-11-26 01:00）
+将其列为下一个 PR。
+
+### 17.2 设计决策
+
+- **证据在引擎内留存原文**：三个 tracker（R1 Vote、R2 CommitVote、Proposal）从只存哈希改为同时存第一条
+  消息的签名字节和 96 字节签名。冲突时 `EngineOutput::EquivocationDetected` 新增 `proof: Box<EquivocationProof>`
+  （`kind`、48 字节公钥、`first`、`second`）。Box 避免把枚举整体撑大。
+  - 替代方案：只在编排层根据哈希重建消息。被否：commit 消息依赖 `changes_hash`，proposal 消息依赖
+    validator changes，编排层拿不到第一条消息的签名，无法重建。
+- **签名字节就是签名域消息**：`signed` 是 `signing_profile` 生成、被 BLS 校验过的那段字节
+  （vote/commit/proposal message），与 n42-rs `SignedValue.message` 同义，证据可脱离节点独立验证。
+- **批量验签路径同样留证**：`signature_verified = true`（随机化批验）时以前不构造消息；现在消息总是先构造，
+  签名校验仍只在未批验时做。
+- **一条记录对应一次作恶**：按 (kind, view, validator) 去重，与 n42-rs 一致；同一 view 内 vote 与 commitVote
+  分开记。
+- **落盘**：`<N42_DATA_DIR>/equivocations.jsonl`，每条一行，追加后 `sync_data`，首次创建时 sync 目录。
+  启动时加载历史，记录在 RPC 中继续可见、重启后不会重复写。崩溃留下的半行跳过并补换行，
+  保证下一条另起一行。写失败只记 error，记录仍在内存中返回。
+  - 写盘发生在共识循环里，阻塞几毫秒；作恶极少见，可接受。
+- **kind 取值**：`vote` / `commit_vote` / `proposal`（snake_case，AM28 原文与 gov5 的写法）。
+  PR 初版写成 `commitVote`（照搬了 n42-rs 当时的 camelCase），n42-rs 指出后两边都改为 `commit_vote`；
+  读取时仍接受 `commitVote`。
+
+### 17.3 实施细节
+
+| 位置 | 改动 |
+|---|---|
+| `n42-consensus/src/protocol/state_machine.rs` | 新增 `EquivocationKind`、`SignedMessage`、`EquivocationProof`；`EquivocationDetected` 加 `proof`；tracker 类型加签名消息 |
+| `protocol/voting.rs` | `check_equivocation` 带签名消息返回冲突对；`emit_equivocation` 从当 view 验证者集合取公钥 |
+| `protocol/proposal.rs` | proposal tracker 存 `(commitment, block_hash, SignedMessage)` |
+| `n42-consensus-service/src/consensus_state.rs` | `EquivocationEvidence` 改 AM28 形状（`EvidenceKind`、`SignedValue`）；`open_equivocation_file`、`record_equivocation(evidence) -> bool` |
+| `orchestrator/consensus_loop.rs` | 构造证据并记录，日志带 kind |
+| `bin/n42-node/src/main.rs` | 建 `SharedConsensusState` 后打开 `data_dir/equivocations.jsonl` |
+
+测试：
+- 引擎：R1、R2、proposal 三个已有作恶测试新增断言 `assert_equivocation_proof_verifies`：kind 正确、两边字节不同、
+  两边签名都能用证据里的公钥验过。
+- 共享状态：AM28 JSON 字段集合、`first` 恰为 `{signed, signature}`、公钥 48 字节 / 签名 96 字节 hex；
+  一次作恶一条；重启加载、半行跳过、重启后不重复写、半行后续写可读；内存上限 500。
+- RPC：`kind` 和 `first.signed` 的 JSON 输出；`commitVote` 旧写法仍可读取。
+
+`cargo clippy -p n42-consensus -p n42-consensus-service -p n42-node -p n42-node-bin --all-targets -- -D warnings`
+通过；三个 crate 的测试全部通过。
+
+### 17.4 遇到的问题
+
+- `cargo fmt --check` 在 main 上本来就不干净（多处未改动文件），只修正本次新增代码的格式。
+- 用 rustfmt 检查单个文件会带上子模块，计数不可比，改为按 `cargo fmt --check` 的 diff 位置筛本次改动的行。
+
+### 17.5 状态与后续
+
+- [x] 引擎留存签名原文并输出证据对
+- [x] AM28 RPC 形状、`equivocations.jsonl` 落盘与重启加载
+- [x] 单元测试（证据可独立验证）
+- [ ] 混合轮次中的跨客户端验证：需要一个故意双签的节点，目前三方都没有作恶注入工具，暂以单元测试为准。

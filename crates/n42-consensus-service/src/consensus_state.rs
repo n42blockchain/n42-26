@@ -1,10 +1,12 @@
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, Bytes};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use n42_chainspec::ValidatorInfo;
-use n42_consensus::ValidatorSet;
+use n42_consensus::{EquivocationKind, EquivocationProof, SignedMessage, ValidatorSet};
 use n42_primitives::QuorumCertificate;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, oneshot};
@@ -108,12 +110,14 @@ pub struct AttestationRecord {
     pub timestamp: u64,
 }
 
-/// Locally authenticated evidence of equivocation by a validator.
+/// Locally authenticated evidence of equivocation by a validator, in the
+/// AM28 shape served by `n42_equivocations` and kept in
+/// `<N42_DATA_DIR>/equivocations.jsonl` (E15).
 ///
 /// For R1/R2 votes, `hash1`/`hash2` are block hashes. For a same-block
 /// double-proposal that changes another signed field, they are commitments to
 /// the two distinct proposal signing messages.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EquivocationEvidence {
     pub view: u64,
@@ -121,7 +125,83 @@ pub struct EquivocationEvidence {
     pub hash1: B256,
     pub hash2: B256,
     pub detected_at: u64,
+    pub kind: EvidenceKind,
+    /// The validator's BLS public key (48 bytes).
+    pub public_key: Bytes,
+    /// The message seen first.
+    pub first: SignedValue,
+    /// The conflicting message.
+    pub second: SignedValue,
 }
+
+/// What was signed twice: `vote`, `commit_vote` or `proposal` (AM28).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    Vote,
+    /// `commitVote`, the spelling n42-rs briefly emitted, still loads.
+    #[serde(alias = "commitVote")]
+    CommitVote,
+    Proposal,
+}
+
+impl From<EquivocationKind> for EvidenceKind {
+    fn from(kind: EquivocationKind) -> Self {
+        match kind {
+            EquivocationKind::Vote => Self::Vote,
+            EquivocationKind::CommitVote => Self::CommitVote,
+            EquivocationKind::Proposal => Self::Proposal,
+        }
+    }
+}
+
+/// One side of an equivocating pair: the exact signed bytes and the BLS
+/// signature (96 bytes), both hex in JSON.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedValue {
+    pub signed: Bytes,
+    pub signature: Bytes,
+}
+
+impl From<&SignedMessage> for SignedValue {
+    fn from(message: &SignedMessage) -> Self {
+        Self {
+            signed: Bytes::copy_from_slice(&message.signed),
+            signature: Bytes::copy_from_slice(&message.signature),
+        }
+    }
+}
+
+impl EquivocationEvidence {
+    /// The evidence for `proof`, detected now.
+    pub fn new(
+        view: u64,
+        validator_index: u32,
+        hash1: B256,
+        hash2: B256,
+        proof: &EquivocationProof,
+    ) -> Self {
+        Self {
+            view,
+            validator_index,
+            hash1,
+            hash2,
+            detected_at: unix_now_secs(),
+            kind: proof.kind.into(),
+            public_key: Bytes::copy_from_slice(&proof.public_key),
+            first: (&proof.first).into(),
+            second: (&proof.second).into(),
+        }
+    }
+
+    /// One record per offence: (kind, view, validator).
+    fn key(&self) -> (EvidenceKind, u64, u32) {
+        (self.kind, self.view, self.validator_index)
+    }
+}
+
+/// The evidence file's name inside the consensus data dir.
+pub const EQUIVOCATIONS_FILE: &str = "equivocations.jsonl";
 
 const MAX_ATTESTATION_HISTORY: usize = 1000;
 const MAX_EQUIVOCATION_LOG: usize = 500;
@@ -138,6 +218,34 @@ pub fn configured_min_mobile_verifiers() -> u32 {
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(MIN_MOBILE_VERIFIERS)
+}
+
+/// Appends `evidence` as one JSON line and syncs it to disk.
+fn append_synced(path: &Path, evidence: &EquivocationEvidence) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(evidence).map_err(std::io::Error::other)?;
+    line.push(b'\n');
+    let created = !path.exists();
+    if created && let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(&line)?;
+    file.sync_data()?;
+    if created && let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Keeps the in-memory log at [`MAX_EQUIVOCATION_LOG`] records, oldest out.
+fn push_bounded(log: &mut VecDeque<EquivocationEvidence>, evidence: EquivocationEvidence) {
+    if log.len() >= MAX_EQUIVOCATION_LOG {
+        log.pop_front();
+    }
+    log.push_back(evidence);
 }
 
 fn unix_now_secs() -> u64 {
@@ -188,6 +296,9 @@ pub struct SharedConsensusState {
     pub block_committed_tx: broadcast::Sender<VerificationTask>,
     attestation_history: Mutex<VecDeque<AttestationRecord>>,
     equivocation_log: Mutex<VecDeque<EquivocationEvidence>>,
+    /// `<data dir>/equivocations.jsonl` once [`Self::open_equivocation_file`]
+    /// ran; `None` keeps evidence in memory only.
+    equivocation_file: Mutex<Option<PathBuf>>,
     /// BLS pubkeys of verifiers that have completed a QUIC handshake with StarHub.
     /// Only keys in this set are accepted by `submit_attestation` (RPC path).
     authorized_verifiers: Mutex<HashSet<[u8; 48]>>,
@@ -231,6 +342,7 @@ impl SharedConsensusState {
             block_committed_tx,
             attestation_history: Mutex::new(VecDeque::new()),
             equivocation_log: Mutex::new(VecDeque::new()),
+            equivocation_file: Mutex::new(None),
             authorized_verifiers: Mutex::new(HashSet::new()),
             jmt_root: ArcSwap::from_pointee(None),
             twig_root: ArcSwap::from_pointee(None),
@@ -324,30 +436,84 @@ impl SharedConsensusState {
         )
     }
 
-    pub fn record_equivocation(&self, view: u64, validator_index: u32, hash1: B256, hash2: B256) {
-        let evidence = EquivocationEvidence {
-            view,
-            validator_index,
-            hash1,
-            hash2,
-            detected_at: unix_now_secs(),
-        };
-        let mut log = self.equivocation_log.lock().unwrap_or_else(|e| {
-            tracing::error!("equivocation_log mutex poisoned: {e}");
-            e.into_inner()
-        });
-        if log.len() >= MAX_EQUIVOCATION_LOG {
-            log.pop_front();
+    /// Persists equivocation evidence in `<data_dir>/equivocations.jsonl` and
+    /// loads what earlier runs recorded. A line that does not parse (a write
+    /// cut short by a crash) is skipped with a warning. Returns the number of
+    /// records loaded.
+    pub fn open_equivocation_file(&self, data_dir: &Path) -> std::io::Result<usize> {
+        let path = data_dir.join(EQUIVOCATIONS_FILE);
+        let mut loaded = Vec::new();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                // Terminate a torn last line so the next record starts on its own.
+                if !text.is_empty() && !text.ends_with('\n') {
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)?
+                        .write_all(b"\n")?;
+                }
+                for (number, line) in text.lines().enumerate() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<EquivocationEvidence>(line) {
+                        Ok(evidence) => loaded.push(evidence),
+                        Err(e) => warn!(path = %path.display(), line = number + 1, error = %e,
+                            "unreadable equivocation record skipped"),
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
-        log.push_back(evidence);
+        let count = loaded.len();
+        let mut log = self.lock_equivocation_log();
+        for evidence in loaded {
+            push_bounded(&mut log, evidence);
+        }
+        drop(log);
+        *self
+            .equivocation_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(path);
+        Ok(count)
+    }
+
+    /// Records verified equivocation evidence. One record per (kind, view,
+    /// validator): a repeat of a recorded offence returns `false` and is not
+    /// written again. With a file open, the record is appended and synced
+    /// before it is listed; equivocations are rare, so the blocking write in
+    /// the consensus loop is acceptable. A failed write is logged and the
+    /// record is still served from memory.
+    pub fn record_equivocation(&self, evidence: EquivocationEvidence) -> bool {
+        let mut log = self.lock_equivocation_log();
+        if log.iter().any(|known| known.key() == evidence.key()) {
+            return false;
+        }
+        let path = self
+            .equivocation_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(path) = path
+            && let Err(e) = append_synced(&path, &evidence)
+        {
+            tracing::error!(path = %path.display(), error = %e,
+                "failed to persist equivocation evidence");
+        }
+        push_bounded(&mut log, evidence);
+        true
     }
 
     pub fn get_equivocations(&self) -> Vec<EquivocationEvidence> {
-        let log = self.equivocation_log.lock().unwrap_or_else(|e| {
+        self.lock_equivocation_log().iter().cloned().collect()
+    }
+
+    fn lock_equivocation_log(&self) -> std::sync::MutexGuard<'_, VecDeque<EquivocationEvidence>> {
+        self.equivocation_log.lock().unwrap_or_else(|e| {
             tracing::error!("equivocation_log mutex poisoned: {e}");
             e.into_inner()
-        });
-        log.iter().cloned().collect()
+        })
     }
 
     /// Marks a verifier pubkey as authorized (called when a QUIC handshake completes).
@@ -612,26 +778,126 @@ mod tests {
         assert_eq!(latest, Some(2));
     }
 
+    fn evidence(kind: EquivocationKind, view: u64, validator: u32) -> EquivocationEvidence {
+        let proof = EquivocationProof {
+            kind,
+            public_key: [0x11; 48],
+            first: SignedMessage {
+                signed: vec![1, 2, 3],
+                signature: [0x22; 96],
+            },
+            second: SignedMessage {
+                signed: vec![4, 5, 6],
+                signature: [0x33; 96],
+            },
+        };
+        EquivocationEvidence::new(
+            view,
+            validator,
+            B256::repeat_byte(0xAA),
+            B256::repeat_byte(0xBB),
+            &proof,
+        )
+    }
+
     #[test]
     fn test_record_equivocation() {
         let state = make_state();
-        let h1 = B256::repeat_byte(0xAA);
-        let h2 = B256::repeat_byte(0xBB);
-        state.record_equivocation(5, 2, h1, h2);
+        assert!(state.record_equivocation(evidence(EquivocationKind::Vote, 5, 2)));
 
         let evs = state.get_equivocations();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].view, 5);
         assert_eq!(evs[0].validator_index, 2);
-        assert_eq!(evs[0].hash1, h1);
-        assert_eq!(evs[0].hash2, h2);
+        assert_eq!(evs[0].hash1, B256::repeat_byte(0xAA));
+        assert_eq!(evs[0].hash2, B256::repeat_byte(0xBB));
+        assert_eq!(evs[0].first.signed.as_ref(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_equivocation_one_record_per_offence() {
+        let state = make_state();
+        assert!(state.record_equivocation(evidence(EquivocationKind::Vote, 5, 2)));
+        assert!(!state.record_equivocation(evidence(EquivocationKind::Vote, 5, 2)));
+        assert!(state.record_equivocation(evidence(EquivocationKind::CommitVote, 5, 2)));
+        assert!(state.record_equivocation(evidence(EquivocationKind::Vote, 6, 2)));
+        assert_eq!(state.get_equivocations().len(), 3);
+    }
+
+    #[test]
+    fn test_equivocation_am28_json_shape() {
+        let json = serde_json::to_value(evidence(EquivocationKind::CommitVote, 9, 3)).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "detectedAt",
+                "first",
+                "hash1",
+                "hash2",
+                "kind",
+                "publicKey",
+                "second",
+                "validatorIndex",
+                "view"
+            ]
+        );
+        assert_eq!(json["kind"], "commit_vote");
+        let legacy: EvidenceKind = serde_json::from_str("\"commitVote\"").unwrap();
+        assert_eq!(legacy, EvidenceKind::CommitVote);
+        assert_eq!(json["publicKey"].as_str().unwrap().len(), 2 + 96);
+        let mut side: Vec<&str> = json["first"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        side.sort_unstable();
+        assert_eq!(side, ["signature", "signed"]);
+        assert_eq!(json["first"]["signed"], "0x010203");
+        assert_eq!(json["second"]["signature"].as_str().unwrap().len(), 2 + 192);
+    }
+
+    #[test]
+    fn test_equivocation_evidence_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_state();
+        assert_eq!(state.open_equivocation_file(dir.path()).unwrap(), 0);
+        assert!(state.record_equivocation(evidence(EquivocationKind::Vote, 5, 2)));
+        assert!(state.record_equivocation(evidence(EquivocationKind::Proposal, 7, 1)));
+        assert!(!state.record_equivocation(evidence(EquivocationKind::Vote, 5, 2)));
+
+        // A torn last line from a crash is skipped.
+        let path = dir.path().join(EQUIVOCATIONS_FILE);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"{\"view\":").unwrap();
+
+        let restarted = make_state();
+        assert_eq!(restarted.open_equivocation_file(dir.path()).unwrap(), 2);
+        assert_eq!(restarted.get_equivocations(), state.get_equivocations());
+        assert!(
+            !restarted.record_equivocation(evidence(EquivocationKind::Proposal, 7, 1)),
+            "an offence recorded before the restart is not written again"
+        );
+        // A record written after the torn line is readable on the next start.
+        assert!(restarted.record_equivocation(evidence(EquivocationKind::CommitVote, 8, 0)));
+        assert_eq!(make_state().open_equivocation_file(dir.path()).unwrap(), 3);
     }
 
     #[test]
     fn test_equivocation_log_bounded() {
         let state = make_state();
         for i in 0..510u64 {
-            state.record_equivocation(i, 0, B256::repeat_byte(0xAA), B256::repeat_byte(0xBB));
+            state.record_equivocation(evidence(EquivocationKind::Vote, i, 0));
         }
         let evs = state.get_equivocations();
         assert_eq!(evs.len(), 500);

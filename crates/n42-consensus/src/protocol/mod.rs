@@ -11,4 +11,7 @@ mod voting;
 pub use pacemaker::Pacemaker;
 pub use quorum::{TimeoutCollector, VoteCollector};
 pub use round::{Phase, RoundState};
-pub use state_machine::{ConsensusEngine, ConsensusEvent, EngineOutput, ViewTiming};
+pub use state_machine::{
+    ConsensusEngine, ConsensusEvent, EngineOutput, EquivocationKind, EquivocationProof,
+    SignedMessage, ViewTiming,
+};
