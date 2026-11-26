@@ -11,7 +11,7 @@ mod follower_import;
 mod import_gate;
 mod own_block;
 mod reth_engine;
-pub use deferred::DeferredChecker;
+pub use deferred::{DeferredCheckTimings, DeferredChecker};
 pub(crate) use deferred::{intrinsic_rules, plan_tx, sender_state};
 pub use delegated::DelegatedExecutionLayer;
 pub use follower_import::FollowerImport;

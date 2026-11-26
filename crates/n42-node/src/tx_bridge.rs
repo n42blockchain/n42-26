@@ -8,6 +8,23 @@ use std::collections::{HashSet, VecDeque};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+/// A network transaction with its sender. A secp256k1 sender goes through
+/// reth's shared cache when there is one (the same check as
+/// `try_into_recovered`: the cache holds only senders recovered from the
+/// transaction with that hash, and a failure is not cached).
+fn recover_network_transaction(
+    cache: Option<&reth_evm::SenderRecoveryCache>,
+    tx: N42TxEnvelope,
+) -> Option<reth_primitives_traits::Recovered<N42TxEnvelope>> {
+    match (cache, &tx) {
+        (Some(cache), N42TxEnvelope::Eth(_)) => cache
+            .recover(&tx)
+            .ok()
+            .map(|sender| reth_primitives_traits::Recovered::new_unchecked(tx, sender)),
+        _ => tx.try_into_recovered().ok(),
+    }
+}
+
 /// Maximum number of recently-seen transaction hashes to track for dedup.
 const RECENT_TX_CAPACITY: usize = 10_000;
 
@@ -28,6 +45,10 @@ pub struct TxPoolBridge<Pool> {
     broadcast_tx: mpsc::Sender<Vec<u8>>,
     recently_imported_order: VecDeque<B256>,
     recently_imported_set: HashSet<B256>,
+    /// reth's shared secp256k1 sender cache: a sender recovered here is
+    /// reused by the deferred proposal check and the engine's payload
+    /// conversion of the block that carries the transaction.
+    sender_cache: Option<reth_evm::SenderRecoveryCache>,
 }
 
 impl<Pool> TxPoolBridge<Pool>
@@ -45,7 +66,17 @@ where
             broadcast_tx,
             recently_imported_order: VecDeque::with_capacity(RECENT_TX_CAPACITY),
             recently_imported_set: HashSet::with_capacity(RECENT_TX_CAPACITY),
+            sender_cache: None,
         }
+    }
+
+    /// Recovers network transactions' senders through reth's shared cache.
+    pub fn with_sender_recovery_cache(
+        mut self,
+        cache: Option<reth_evm::SenderRecoveryCache>,
+    ) -> Self {
+        self.sender_cache = cache;
+        self
     }
 
     pub async fn run(mut self) {
@@ -120,9 +151,9 @@ where
                 continue;
             }
 
-            let recovered = match tx.try_into_recovered() {
-                Ok(r) => r,
-                Err(_) => {
+            let recovered = match recover_network_transaction(self.sender_cache.as_ref(), tx) {
+                Some(r) => r,
+                None => {
                     debug!(%tx_hash, "failed to recover sender from network transaction");
                     continue;
                 }
@@ -187,6 +218,49 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ingress files a gossiped secp256k1 sender in reth's shared cache
+    /// (for the deferred check and the import), with the same outcome as
+    /// `try_into_recovered`; a signature that does not recover is refused
+    /// and not filed.
+    #[test]
+    fn network_transactions_file_their_senders() {
+        use alloy_consensus::{TxEip1559, transaction::TxHashRef as _};
+        use alloy_eips::eip2718::{Decodable2718 as _, Encodable2718 as _};
+        use reth_ethereum_primitives::{Transaction, TransactionSigned};
+        let key = secp256k1::Keypair::from_secret_key(
+            &secp256k1::SecretKey::from_secret_bytes([0x11; 32]).unwrap(),
+        );
+        let signed: TransactionSigned = reth_testing_utils::generators::sign_tx_with_key_pair(
+            key,
+            Transaction::Eip1559(TxEip1559 {
+                chain_id: 1144,
+                gas_limit: 21_000,
+                max_fee_per_gas: 2,
+                ..Default::default()
+            }),
+        );
+        let tx: N42TxEnvelope = signed.into();
+        let cache = reth_evm::SenderRecoveryCache::new(16);
+        let expected = tx.clone().try_into_recovered().expect("recovers");
+        let recovered = recover_network_transaction(Some(&cache), tx.clone()).expect("recovers");
+        assert_eq!(recovered.signer(), expected.signer());
+        assert_eq!(cache.get(tx.tx_hash()), Some(expected.signer()));
+        assert_eq!(
+            recover_network_transaction(None, tx.clone())
+                .expect("recovers")
+                .signer(),
+            expected.signer()
+        );
+
+        let mut raw = tx.encoded_2718();
+        let len = raw.len();
+        raw[len - 32..].fill(0xff);
+        let bad = N42TxEnvelope::decode_2718_exact(&raw).expect("decodes");
+        assert!(bad.clone().try_into_recovered().is_err());
+        assert!(recover_network_transaction(Some(&cache), bad.clone()).is_none());
+        assert_eq!(cache.get(bad.tx_hash()), None);
+    }
 
     /// Standalone dedup tracker mirroring TxPoolBridge internals for unit testing.
     struct DedupTracker {
