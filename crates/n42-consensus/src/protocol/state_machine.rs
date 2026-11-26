@@ -209,7 +209,7 @@ impl EquivocationKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Vote => "vote",
-            Self::CommitVote => "commitVote",
+            Self::CommitVote => "commit_vote",
             Self::Proposal => "proposal",
         }
     }

@@ -1045,7 +1045,9 @@ n42-26 此前只返回前五个字段，证据仅存内存（500 条环形队列
   启动时加载历史，记录在 RPC 中继续可见、重启后不会重复写。崩溃留下的半行跳过并补换行，
   保证下一条另起一行。写失败只记 error，记录仍在内存中返回。
   - 写盘发生在共识循环里，阻塞几毫秒；作恶极少见，可接受。
-- **kind 取值**：`vote` / `commitVote` / `proposal`，与 n42-rs `EquivocationKind` 的 camelCase 一致。
+- **kind 取值**：`vote` / `commit_vote` / `proposal`（snake_case，AM28 原文与 gov5 的写法）。
+  PR 初版写成 `commitVote`（照搬了 n42-rs 当时的 camelCase），n42-rs 指出后两边都改为 `commit_vote`；
+  读取时仍接受 `commitVote`。
 
 ### 17.3 实施细节
 
@@ -1063,7 +1065,7 @@ n42-26 此前只返回前五个字段，证据仅存内存（500 条环形队列
   两边签名都能用证据里的公钥验过。
 - 共享状态：AM28 JSON 字段集合、`first` 恰为 `{signed, signature}`、公钥 48 字节 / 签名 96 字节 hex；
   一次作恶一条；重启加载、半行跳过、重启后不重复写、半行后续写可读；内存上限 500。
-- RPC：`kind` 和 `first.signed` 的 JSON 输出。
+- RPC：`kind` 和 `first.signed` 的 JSON 输出；`commitVote` 旧写法仍可读取。
 
 `cargo clippy -p n42-consensus -p n42-consensus-service -p n42-node -p n42-node-bin --all-targets -- -D warnings`
 通过；三个 crate 的测试全部通过。

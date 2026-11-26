@@ -134,11 +134,13 @@ pub struct EquivocationEvidence {
     pub second: SignedValue,
 }
 
-/// What was signed twice: `vote`, `commitVote` or `proposal`.
+/// What was signed twice: `vote`, `commit_vote` or `proposal` (AM28).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub enum EvidenceKind {
     Vote,
+    /// `commitVote`, the spelling n42-rs briefly emitted, still loads.
+    #[serde(alias = "commitVote")]
     CommitVote,
     Proposal,
 }
@@ -846,7 +848,9 @@ mod tests {
                 "view"
             ]
         );
-        assert_eq!(json["kind"], "commitVote");
+        assert_eq!(json["kind"], "commit_vote");
+        let legacy: EvidenceKind = serde_json::from_str("\"commitVote\"").unwrap();
+        assert_eq!(legacy, EvidenceKind::CommitVote);
         assert_eq!(json["publicKey"].as_str().unwrap().len(), 2 + 96);
         let mut side: Vec<&str> = json["first"]
             .as_object()
