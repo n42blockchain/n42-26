@@ -3965,7 +3965,7 @@ impl NetworkService {
                     metrics::counter!("n42_gov5_range_requests_accepted_total").increment(1);
                     metrics::counter!("n42_gov5_range_blocks_requested_total")
                         .increment(request.count);
-                    tracing::debug!(
+                    tracing::info!(
                         target: "n42::interop::range",
                         %peer,
                         ?request_id,
@@ -4194,7 +4194,7 @@ impl NetworkService {
                 } else {
                     self.pending_gov5_range_v2s.insert(request_id, peer);
                     metrics::counter!("n42_gov5_range_v2_requests_accepted_total").increment(1);
-                    tracing::debug!(
+                    tracing::info!(
                         target: "n42::interop::range",
                         %peer,
                         ?request_id,
@@ -4319,12 +4319,22 @@ impl NetworkService {
     fn reject_gov5_commit_qc(
         &mut self,
         channel: libp2p::request_response::ResponseChannel<CommitQcResponse>,
+        (peer, request): (PeerId, &CommitQcRequest),
         reason: &'static str,
         code: u8,
         message: String,
     ) {
         metrics::counter!("n42_gov5_commit_qc_requests_rejected_total", "reason" => reason)
             .increment(1);
+        tracing::info!(
+            target: "n42::interop::range",
+            %peer,
+            number = request.number,
+            hash = %request.hash,
+            code,
+            reason,
+            "commit_qc/1 refused"
+        );
         let _ = self
             .swarm
             .behaviour_mut()
@@ -4353,6 +4363,7 @@ impl NetworkService {
                 if !self.gov5_chain_authenticated_peers.contains(&peer) {
                     self.reject_gov5_commit_qc(
                         channel,
+                        (peer, &request),
                         "unauthorized",
                         result_code::INVALID_REQUEST,
                         "peer has not completed a matching status exchange".to_owned(),
@@ -4369,6 +4380,7 @@ impl NetworkService {
                 {
                     self.reject_gov5_commit_qc(
                         channel,
+                        (peer, &request),
                         "rate_limit",
                         result_code::RATE_LIMITED,
                         GOV5_RETRY_AFTER_MS.to_owned(),
@@ -4379,6 +4391,7 @@ impl NetworkService {
                 let Some(reader) = self.gov5_canonical_blocks.clone() else {
                     self.reject_gov5_commit_qc(
                         channel,
+                        (peer, &request),
                         "unavailable",
                         result_code::SERVER_ERROR,
                         "canonical block provider is unavailable".to_owned(),
@@ -4387,10 +4400,11 @@ impl NetworkService {
                 };
                 let response = CommitQcResponse::Lookup {
                     request,
-                    source: CommitQcSource {
+                    source: Box::new(CommitQcSource {
                         reader,
                         persisted_qc: self.gov5_committed_qc.clone(),
-                    },
+                        requester: Some(peer),
+                    }),
                 };
                 if self
                     .swarm

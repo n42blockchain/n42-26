@@ -1067,7 +1067,8 @@ impl ConsensusService {
                 .then(|| self.deferred_check_tx.clone());
             tokio::spawn(async move {
                 let _in_flight = in_flight;
-                let decompress_start = std::time::Instant::now();
+                let block_data_at = std::time::Instant::now();
+                let decompress_start = block_data_at;
                 let payload_wire = match super::decompress_payload(&payload_compressed) {
                     Ok(d) => d,
                     Err(_) => {
@@ -1147,7 +1148,29 @@ impl ConsensusService {
                     let checker = eh.clone();
                     let payload = execution_data.clone();
                     tokio::spawn(async move {
+                        let check_started = std::time::Instant::now();
                         let outcome = checker.deferred_check(&payload).await;
+                        let elapsed_ms = check_started.elapsed().as_secs_f64() * 1000.0;
+                        metrics::histogram!("n42_deferred_check_ms").record(elapsed_ms);
+                        // A pass only releases the vote if it lands before the
+                        // view's Decide; this line dates it against that.
+                        let (result, reason) = match &outcome {
+                            crate::deferred_check::DeferredCheck::Checked => ("checked", None),
+                            crate::deferred_check::DeferredCheck::Retry(reason) => ("retry", Some(reason.as_str())),
+                            crate::deferred_check::DeferredCheck::Refused(reason) => ("refused", Some(reason.as_str())),
+                            crate::deferred_check::DeferredCheck::Unsupported => ("unsupported", None),
+                        };
+                        info!(
+                            target: "n42::profile1",
+                            %hash,
+                            view,
+                            block_number,
+                            result,
+                            reason,
+                            elapsed_ms = format_args!("{elapsed_ms:.1}"),
+                            since_block_data_ms = block_data_at.elapsed().as_millis() as u64,
+                            "deferred check finished"
+                        );
                         let _ = checked_tx.send((hash, parent_hash, outcome)).await;
                     });
                 }

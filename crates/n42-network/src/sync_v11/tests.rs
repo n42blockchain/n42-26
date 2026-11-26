@@ -445,6 +445,7 @@ fn served_head_follows_the_committed_tip_not_the_storage_head() {
     let source = CommitQcSource {
         reader: reader.clone(),
         persisted_qc: None,
+        requester: None,
     };
     assert!(matches!(
         serve_commit_qc(
@@ -687,6 +688,7 @@ fn commit_qc_server_reproduces_every_vector() {
     let source = CommitQcSource {
         reader: vector_reader(),
         persisted_qc: None,
+        requester: None,
     };
     let mut names = Vec::new();
     for case in vectors["cases"].as_array().unwrap() {
@@ -696,7 +698,7 @@ fn commit_qc_server_reproduces_every_vector() {
         // The same through the codec, resolved lazily as the swarm does.
         let wire = write_commit_qc_response(CommitQcResponse::Lookup {
             request,
-            source: source.clone(),
+            source: Box::new(source.clone()),
         });
         assert_commit_qc_matches(case, &read_commit_qc_response(&wire));
         names.push(case["name"].as_str().unwrap().to_owned());
@@ -791,6 +793,7 @@ fn commit_qc_server_prefers_the_lowest_qc_and_reads_the_persisted_one() {
     let source = CommitQcSource {
         reader: vector_reader(),
         persisted_qc: None,
+        requester: None,
     };
     let headers = vector_reader().header_rlps_by_range(6..=10).unwrap();
     let hashes: Vec<B256> = headers.iter().map(keccak256).collect();
@@ -828,6 +831,7 @@ fn commit_qc_server_prefers_the_lowest_qc_and_reads_the_persisted_one() {
     persisted.block_hash = hashes[4];
     let with_persisted = CommitQcSource {
         persisted_qc: Some(encode_h2_qc(&persisted).unwrap()),
+        requester: None,
         ..source
     };
     let CommitQcResponse::Found(reached) = serve_commit_qc(&with_persisted, head_request) else {
