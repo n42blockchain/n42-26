@@ -334,6 +334,20 @@ fn layout_refusals_of_v1_are_decode_errors() {
 }
 
 #[test]
+fn a_profile1_genesis_with_alt_sig_tx_or_frame_blocks_is_refused() {
+    let (spec, _, _) = profile1_chain_spec(&genesis_8s()).unwrap();
+    for key in ["altSigTx", "frameBlocks"] {
+        let mut genesis = spec.genesis.clone();
+        genesis.config.extra_fields.insert(key.to_owned(), serde_json::json!(true));
+        let error = profile1::resolve_genesis_profile(&genesis).unwrap_err();
+        assert!(error.to_string().contains(key), "{key}: {error}");
+        // An explicit false is the default and stays valid.
+        genesis.config.extra_fields.insert(key.to_owned(), serde_json::json!(false));
+        assert!(profile1::resolve_genesis_profile(&genesis).unwrap().is_some(), "{key}=false");
+    }
+}
+
+#[test]
 fn a_profile1_config_from_genesis_requires_the_profile_field() {
     let (spec, _, _) = profile1_chain_spec(&genesis_8s()).unwrap();
     let mut genesis = spec.genesis.clone();

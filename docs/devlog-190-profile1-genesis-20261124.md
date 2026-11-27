@@ -1201,3 +1201,166 @@ n{4,7,100}-T8-k3、AM32 边界钳制及其 -p1 / -next-dead 变体）。n42-rs m
 - [x] AM33 实现、gov5 向量全部通过（pacemaker 级与引擎级）、devlog。
 - [ ] 混合 5d 式重跑：6 个连续缺席 leader，base 24 s 下断档 ≤ 216 s（加出块间隔）。
 - 未处理（沿用现状）：从快照恢复且 c > 0 的节点，首个 view 的计时器仍是 base（`Pacemaker::new` 的初始 deadline），直到第一次 `arm_view_timer`。
+
+## 19. 混合生产标准 v1.2 补齐（计划 F1：V2、V7、V9、AM34 第 3-5 项）（2026-11-27 追加）
+
+分支 `feat/profile1-v12-f1`（基于 origin/main b64f650）。向量均从 gov5 main 08ecf671 `internal/testdata/profile1/vectors/` 逐字节复制
+（与 qs-scratch 副本一致），按 AM33 的做法放 `testdata/profile1/gov5/<V>/`，测试先校验 SHA-256。gov5 没有单独的 AM34 向量目录。
+
+| 向量 | 文件 | SHA-256 | 位置 |
+| --- | --- | --- | --- |
+| V2 | `roots.json` | `deff5a4736778ef0b70aedc30f747d7ccd89422479393d37cba04fc541cdef18` | `crates/n42-node/testdata/profile1/gov5/V2/` |
+| V7 | `leader_schedule.json` | `a08180b1fc9625c0b6cd6128b775e40dcdf04a900b9ba3bf45aa9210340fd445` | `crates/n42-consensus/testdata/profile1/gov5/V7/` |
+| V9 | `gossipsub_parameters.json` | `b315f30b8b9682486ab750f7aa7ab3bbaa84bd62f8941c74492208479fad8716` | `crates/n42-network/testdata/profile1/gov5/V9/` |
+
+### 19.1 V7 leader 调度（无 2^64-1 行）— 已满足，补测试（4ea2dff）
+
+- `crates/n42-consensus/tests/profile1_v7.rs`（6 个）：profiles、leader 表、tenure 窗口、epoch、51 行 `view_after_tc`、11 条序列，
+  全部与 gov5 一致，调度代码未改。
+
+### 19.2 AM34 第 3 项：view 2^64-1 的 QC/TC 无效（425bbe6）— 实际缺口
+
+- 修复前：`view_after_tc(MAX)` 用 `wrapping_add` 回绕到 view 0；签名正确的 view = MAX 的 QC/TC 会被接受。
+- 设计：拒绝点放在所有入口的公共底层，而不是逐个调用点：
+  - `validator/selection.rs`：`MAX_CERTIFIED_VIEW`、`certifiable_view()`；`view_after_tc` 只对 MAX 以下有定义，MAX 饱和不回绕。
+  - `protocol/quorum.rs`：`collect_signer_keys` 拒绝 MAX（覆盖 verify_qc、commit、any-domain、TC），构建 QC/TC 同样拒绝。
+  - 引擎：`on_block_ready` / `send_vote` / `on_timeout` 在 MAX 不提议、不签名；proposal、timeout、future timeout、NewView 携带的 TC 均拒绝；
+    `current_view + FUTURE_VIEW_WINDOW` 与编排层 build-ahead 的加法改 `saturating_add`。
+  - `n42-consensus-service/src/h2_finality.rs`：Decide、sync anchor、shadow 校验与 NewView 分支新增 `LastView` 错误。
+  - `n42-network/src/sync_v11.rs`：`check_commit_qc_reply` 拒绝 view = MAX 的 commit_qc。
+- 测试：选择层、quorum（Native 与 H2V4，MAX 与 MAX-1）、引擎、h2_finality、sync_v11 各一个。
+
+### 19.3 V2 收据根含 EIP-7708 转账日志（AM34 第 5 项）— 已满足，补测试（131f229）
+
+- n42-26 经 evm2 Amsterdam（`amsterdamTime`）已产出来自 `0xff…fe` 的 7708 日志，无需开关；`fast_transfer` 路径（默认关闭）同样产出。
+- `n42-consensus` 新增 `gov5_native_receipt_rlp`（收据根共用编码）；`crates/n42-node/tests/profile1_vectors.rs` 新增 4 个 V2 测试：
+  收据与收据根、转账日志属于收据根、withdrawals 根、committee evidence，全部等于 gov5。
+
+### 19.4 V9 GossipSub 参数与 AM34 第 4-5 项：只订阅 G2 主题（85111b1）
+
+修复前（Profile 1 节点）：
+
+| 项 | n42-26 原值 | V9 / gov5 |
+| --- | --- | --- |
+| heartbeat / 初始延迟 | 1 s / 5 s | 700 ms / 100 ms |
+| history length | 5 | 6 |
+| seen TTL | 60 s | 30 s |
+| IDONTWANT 阈值 | 1000 | 1024 |
+| mesh D/Dlo/Dhi | 按网络规模缩放（环境变量可调） | 8 / 6 / 12 |
+| 校验模式 | Permissive | Anonymous（StrictNoSign + 无 author） |
+| max transmit size | 16 MiB | 78 293 706（32 + n + n/6，n = 64 MiB） |
+| gov5 块 gossip 解码上限 | 1 MiB | maxBlockBytes = 64 MiB |
+| 订阅主题 | G2 之外还订阅 `/n42/{consensus,blocks,verification,mempool,blobs}/1` | 只 G2 |
+
+设计与实现：
+
+- 新模块 `n42-network/src/gossipsub/profile1.rs`：V9 常量、`gossipsub_config(genesis, max_block_bytes)`、`max_gossip_wire_size`、`g2_topics`。
+  线上契约（主题串、G3 消息 id、大小上限）必须相等；mesh/history 等属于本地路由行为，但同样取 gov5 值，使 Rust 成员 graft/prune 行为与 Go 一致。
+  peer scoring 按 AM34 属本地选择，保留原有参数。
+- `TransportConfig::profile1_max_block_bytes`：设置时 swarm 用 profile-1 配置；非 gov5 传输（无匿名信封）直接报错。
+- `NetworkService::new_profile1_participant` / `new_profile1_observer`：只订阅 G2（gov5 block、hotstuff_consensus、H2-v4，participant 另加
+  `transaction_v2`）；`gossipsub_publish` 丢弃 G2 之外的发布（计数 `n42_profile1_non_g2_publish_dropped_total`）；gov5 块 gossip 的解码上限与
+  原始上限改为 maxBlockBytes 及其 snappy 上界（`validate_message_with_gov5_block_cap`）。
+- `bin/n42-node/src/main.rs`：验证者与观察者两条路径按 `profile1_config().max_block_bytes` 选择上述构造。
+- 请求-响应协议（sync v1.1 range/commit_qc、block-by-hash、bodies-by-range、status、direct H2、block_direct）不受影响；
+  n42-26 之间的原生块数据仍经 block_direct 推送，gov5 `block` 主题携带完整块，原生 `/n42/blocks/1` gossip 后备在 Profile 1 上被丢弃不损失路径。
+- G2 中的 `mobileverify_{packet,registration}` 暂不加入：n42-26 尚无 mobileverify 服务（I1），加入一个无法校验的主题只会成为转发方。
+  cohort 主题（`mobileverify_cohort_{index,reveal,cert}`）永不订阅。
+
+测试：
+
+- `crates/n42-network/tests/profile1_v9.rs`（4 个，先校验 SHA-256）：11 个主题串、inG2 列表与本节点订阅集合的关系（不含 cohort）、
+  4 条消息 id、router 选项（大小上限、Anonymous、seen TTL）、`gossipSubParams` 逐字段比较；rust-libp2p 无对应项的字段
+  （ConnectionTimeout、Connectors、MaxPendingConnections、DirectConnectInitialDelay、SlowHeartbeatWarning、IDontWantMessageTTL、
+  MaxIDontWantLength、MaxIDontWantMessages）列入 `NO_COUNTERPART`，向量新增字段未归类即失败（与 n42-rs 测试相同做法）。
+- `service::tests`（4 个）：participant 与 observer 只订阅 G2；G2 之外的发布被丢弃、非 Profile-1 服务仍订阅原生主题；profile-1 swarm 需要 gov5 传输。
+
+### 19.5 问题与解决
+
+- rustfmt 会顺带重排 `main.rs` 中原本未格式化的代码；回退后只重放本次改动。
+- `new_with_options` 增加参数后触发 clippy `too_many_arguments`，按现有写法加 allow。
+
+### 19.6 状态与后续
+
+- [x] V7、V2 已满足（补向量测试）；AM34 第 3 项修复；V9 与 AM34 第 4-5 项实现。
+- [x] clippy `-p n42-network -p n42-consensus -p n42-consensus-service -p n42-node -p n42-node-bin --all-targets -D warnings` 通过；
+  `cargo test -p n42-consensus -p n42-consensus-service -p n42-network -p n42-node -p n42-execution`：1565 通过、0 失败、29 忽略（既有 #[ignore] 基准）。
+- [ ] 混合集群实跑确认：700 ms heartbeat 与 G2-only 下 n42-26 与 gov5 成员的 mesh 形成、64 MiB 块 gossip。
+- [ ] mobileverify G2 主题（I1）落地后加入订阅集合。
+- 待与 gov5/rs 确认：gov5 是否在 validate 之后才转发（rust-libp2p Anonymous 模式下本节点仍是立即转发，未启用 `validate_messages()`）。
+
+### 19.7 追加：先校验后转发（AM36，n42-rs 提议稿 18fa2d68b）（2026-11-27）
+
+背景：F1 报告指出 n42-26 收到即转发。rs 据此提议 AM36（Profile 1 全部 G2 主题）：
+1. 消息解码为主题对应类型且字段在范围内（含 AM34 第 3 项的 view 上限）才转发，否则 Reject；
+2. 转发前验 BLS 可选；
+3. 已离开 view 的消息或重复消息 Ignore；
+4. mobileverify 主题在服务上线后按同一规则解码。
+
+实现（仅 Profile 1；其他路线不变，仍是 Permissive、无 `validate_messages`）：
+
+- `gossipsub::profile1::gossipsub_config` 打开 `validate_messages()`；V9 测试断言之。
+- `NetworkService::handle_gossipsub_message` 拆成两步：`classify_gossipsub_message` 返回 `(MessageAcceptance, Option<NetworkEvent>)`，
+  原先每个 `return;` 都改成带判定的返回；外层在 Profile 1 上对每条消息恰好调用一次 `report_message_validation_result`，
+  且只有 Accept 才把事件交给节点。不存在不上报的路径（router 在 `validate_messages` 下会一直持有未上报消息直到 mcache 轮换）。
+- 判定（全部无状态或只读本地 committed view，不验签、不执行）：
+
+| 主题 | Accept | Reject | Ignore |
+| --- | --- | --- | --- |
+| gov5 `block` | snappy 解压长度一致、≤ maxBlockBytes、整块按 Profile-1 24 元素布局 RLP 解码成功 | 其余 | — |
+| `hotstuff_consensus` | 解码成功且所有 view（消息本身与内含 QC/TC/highQC/highTC）≠ 2^64-1 | 解码失败或 view 越界 | view < 本地最新 CommitQC 的 view |
+| H2-v4 | 同上，另需信封链身份一致 | 同上 | 同上 |
+| `transaction_v2` | 批次解码且每条都是本链已知交易 | 批次解码失败或任一条不可解码 | 空批次 |
+
+- 新增 `GossipValidationStats`（received/accepted/rejected/ignored/unreported），`NetworkService::gossip_validation_stats()` 取得；
+  指标 `n42_profile1_gossip_validation_total{verdict}`、`n42_profile1_h2_out_of_range_total`、`n42_profile1_h2_stale_total`。
+- 陈旧判定的 view 下限来自 `NetworkCommand::NoteCommittedQc`（consensus_loop 每次提交时发送），取最大值；
+  只忽略严格低于已提交 view 的 H2 消息，已提交 view 本身及未来 view 照常转发。
+- BLS 仍在 Accept 之后由共识处理器验证（AM36 第 2 条允许），因此不存在重复验签。
+
+测试：
+
+- `service::tests::profile1_validates_before_forwarding`：真实三节点线形拓扑（发布者 → Profile-1 服务 → 观察者，两端不直连），
+  4 个 G2 主题各发一条合法消息与一条畸形消息，另加 view = 2^64-1 的 gov5 H2 与 H2-v4 消息、含不可解码条目的交易批次、
+  低于已提交 view 的 H2 消息。断言：Accept 4、Reject 7、Ignore 1、unreported 0；观察者只收到 4 条合法消息。
+  变异检查：去掉 `validate_messages()` 后观察者收到全部 12 条，测试失败。
+- `tests/profile1_v9.rs`：配置断言 `validate_messages()`。
+
+对 AM36 文本的意见（转 rs）见 F1 追加报告。
+
+状态：
+- [x] 实现、测试；clippy（n42-network、n42-consensus-service、n42-node、n42-node-bin，-D warnings）通过；n42-network + n42-consensus-service + n42-node 测试 1017 通过、0 失败、20 忽略。
+- [ ] 混合集群实跑：确认 gov5 不在 HotStuff/H2-v4 主题上注册校验器时，n42-26 的 Reject 不会误罚 gov5 成员（gov5 不会发送畸形消息，应无影响）。
+
+### 19.8 追加：对齐 AM36 第 5-9 项（n42-rs 741d71ed7）（2026-11-27）
+
+rs 根据本节 19.7 的意见把 AM36 补成第 5-9 项。与 PR #58 的差异及处理：
+
+- 第 5 项（无状态字段检查）新增两条，失败即 Reject：proposal 的 justify QC view 必须小于 proposal view；Decide 的 commit QC view 必须等于 Decide view
+  （`gossipsub::profile1::h2_fields_in_range`）。签名者编号与委员会规模、头部 view/slot、BLS 仍在处理器，不在转发前检查。
+- 第 8 项（`transaction_v2`）：新增 `tx_batch_verdict`。任一条字节不能解码为交易（空条目、非法 legacy 前缀、已知类型但字节损坏）→ Reject；
+  全部可解码但有类型不在 Profile-1 集合（`check_profile1_tx_type`：0x00/0x01/0x02/0x04；Profile 1 无 `altSigTx`，0x50 不在内）→ Ignore，
+  不转发、不交给交易池、不惩罚。本客户端没有解码器的类型字节（如 0x05）按"集合外类型"处理为 Ignore，不按"不可解码"Reject，
+  以符合第 8 项"多认识一种类型的客户端不受罚"的本意。空批次 Ignore。
+- 第 3 项新增说明：Ignore 会同时阻止本地交付，因此过期 H2 消息要先交给迟到消息存储。原实现过期消息直接丢弃；现在过期的 gov5 H2 / H2-v4 消息
+  上报 Ignore（不转发、不惩罚），但仍以事件交给共识处理器（AM28/§17.6 的迟到消息与作恶证据路径照常工作）。外层改为：判定不是 Reject 且有事件就交付。
+- 已一致、无需改动：第 6 项过期 = 严格低于最新 CommitQC 的 view，已提交 view 本身不过期；未来 view 无上限 Accept；第 7 项 block 与
+  `transaction_v2` 没有过期规则，合法即 Accept，重复由 message id 去重。
+
+测试：
+
+- `gossipsub::profile1::tests`（3 个）：proposal / Decide 的 view 关系；过期边界（49 过期、50 不过期、远期不过期）；交易批次判定的 Accept / Reject / Ignore 各情形。
+- `service::tests::profile1_validates_before_forwarding` 扩展为 21 条消息：
+  - Accept 7（含已提交 view 50、未来 view 1 000 000 / 1 000 001）；
+  - Reject 10（新增 commit QC view 不符的 Decide ×2、justify QC view 不小于 view 的 proposal、类型内容损坏的交易条目）；
+  - Ignore 4（过期 gov5 H2 与 H2-v4、blob 交易批次、含 0x05 类型条目的批次）。
+  - 断言 unreported = 0；观察者只收到 7 条 Accept；节点收到的 H2 view 为 {10, 20, 50, 100, 101, 1 000 000, 1 000 001}（两条过期消息仍交付）；交易批次只交付 1 个。
+
+状态：clippy（n42-network、n42-consensus-service、n42-node、n42-node-bin，-D warnings）通过；n42-network + n42-consensus-service + n42-node 测试 1020 通过、0 失败、20 忽略。
+
+### 19.9 Start-up refusal of altSigTx / frameBlocks on a Profile-1 genesis (2026-11-27)
+
+- **Decision**: A11/C4 (decision O3) keeps 0x50 out of Profile 1 everywhere, and A12 keeps frame blocks out. The standard also requires that a Profile-1 genesis enabling `altSigTx` be refused at start-up. n42-26 already refused 0x50 in the pool, in blocks and in execution (`check_profile1_tx_type`), but it started on such a genesis.
+- **Change**: `Profile1Config::from_genesis` now rejects `altSigTx: true` and `frameBlocks: true`. An explicit `false` stays valid. `resolve_genesis_profile` propagates the error, and `install_genesis_profile` then refuses to start.
+- **Test**: `a_profile1_genesis_with_alt_sig_tx_or_frame_blocks_is_refused` in crates/n42-chainspec/tests/profile1_vectors.rs.
+- **Note**: rs first suggested that 0x50 is valid when the genesis has altSigTx, then corrected it. fleet7 is an all-Rust bench chain outside Profile 1. AM36 item 8 uses the fixed set {0x00, 0x01, 0x02, 0x04}.

@@ -1,5 +1,6 @@
 pub mod block_direct;
 pub mod codec;
+pub mod mem_stats;
 pub mod compact_receipts;
 pub mod consensus_direct;
 pub mod dissemination;
@@ -53,7 +54,7 @@ pub use mobile::{
 };
 pub use service::{
     Gov5CommitQcOutcome, Gov5RangeOutcome, NetworkCommand, NetworkEvent, NetworkHandle,
-    NetworkService,
+    GossipValidationStats, NetworkService,
 };
 pub use sync_v11::{
     CommitQcAnchor, CommitQcPayload, CommitQcRequest, GOV5_BODIES_BY_RANGE_V2_PROTOCOL,

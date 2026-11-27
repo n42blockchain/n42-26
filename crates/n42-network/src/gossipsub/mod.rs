@@ -1,4 +1,5 @@
 pub mod handlers;
+pub mod profile1;
 pub mod topics;
 
 pub use handlers::{

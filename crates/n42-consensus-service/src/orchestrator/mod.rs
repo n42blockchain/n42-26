@@ -640,7 +640,7 @@ pub(super) fn ahead_step(
     output_enabled: bool,
     child_covered: bool,
 ) -> AheadStep {
-    if ready.context.view >= current_view + depth.max(1) {
+    if ready.context.view >= current_view.saturating_add(depth.max(1)) {
         // `depth` blocks ahead at most: wait for a later view.
         return AheadStep::Hold;
     }
@@ -648,7 +648,7 @@ pub(super) fn ahead_step(
         return AheadStep::Skip;
     }
     let child = PayloadBuildContext {
-        view: ready.context.view + 1,
+        view: ready.context.view.saturating_add(1),
         parent_hash: ready.block_hash,
     };
     match ready.kind {
@@ -1165,6 +1165,19 @@ pub struct CommittedBlock {
 }
 
 impl CommittedBlock {
+    /// Bytes of block data this entry keeps alive: its payload, its envelope
+    /// (shared with the short pending caches while the block is fresh) and
+    /// any raw execution lineage.
+    fn retained_bytes(&self) -> usize {
+        self.payload.len()
+            + self.block_data.as_ref().map_or(0, |data| data.len())
+            + self
+                .execution_lineage
+                .iter()
+                .map(|payload| payload.block_data.len())
+                .sum::<usize>()
+    }
+
     fn retained_payload(&self) -> Vec<u8> {
         if !self.payload.is_empty() {
             return self.payload.clone();
@@ -3082,9 +3095,9 @@ impl ConsensusService {
                     ahead::tip_capacity(depth, execution_bridge::finalize_on_tip_chain()),
                 );
         }
-        let leads_next = self.engine.is_leader_for_view(ready.context.view + 1);
+        let leads_next = self.engine.is_leader_for_view(ready.context.view.saturating_add(1));
         let child = PayloadBuildContext {
-            view: ready.context.view + 1,
+            view: ready.context.view.saturating_add(1),
             parent_hash: ready.block_hash,
         };
         let on_output = self.ahead.output_build(child).is_some();
@@ -7450,6 +7463,42 @@ mod tests {
                 .pending_block_data
                 .contains_key(&B256::repeat_byte(0x01))
         );
+    }
+
+    #[test]
+    fn committed_block_ring_is_bounded_by_bytes_after_the_newest_blocks() {
+        let entry = |view: u64, bytes: usize| CommittedBlock {
+            view,
+            block_hash: B256::from(U256::from(view)),
+            commit_qc: QuorumCertificate::genesis(),
+            payload: Vec::new(),
+            payload_len: 0,
+            block_data: Some(Arc::new(vec![0u8; bytes])),
+            validator_changes: None,
+            execution_lineage: Vec::new(),
+        };
+        let mut ring = VecDeque::new();
+        for view in 0..200 {
+            ring.push_back(entry(view, 1_000));
+            state_mgmt::trim_committed_blocks(&mut ring, 10_000, 100_000);
+        }
+        // 100 entries of 1,000 bytes fit the budget; the oldest left first.
+        assert_eq!(ring.len(), 100);
+        assert_eq!(ring.front().map(|block| block.view), Some(100));
+        assert_eq!(ring.back().map(|block| block.view), Some(199));
+
+        // Blocks larger than the whole budget still keep the newest 64.
+        for view in 200..300 {
+            ring.push_back(entry(view, 1_000_000));
+            state_mgmt::trim_committed_blocks(&mut ring, 10_000, 100_000);
+        }
+        assert_eq!(ring.len(), 64);
+        assert_eq!(ring.back().map(|block| block.view), Some(299));
+
+        // The entry cap still applies to small blocks.
+        let retained = state_mgmt::trim_committed_blocks(&mut ring, 10, usize::MAX);
+        assert_eq!(ring.len(), 10);
+        assert_eq!(retained, 10 * 1_000_000);
     }
 
     #[test]
