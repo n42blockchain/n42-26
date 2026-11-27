@@ -175,7 +175,7 @@ impl AuthenticatedConsensusMessage {
 /// consumed, so the engine must only skip individual verification while that
 /// domain is still canonical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthenticatedVoteProof {
+pub(super) enum AuthenticatedVoteProof {
     Vote {
         signer: u32,
     },
@@ -194,7 +194,7 @@ impl AuthenticatedVoteProof {
 }
 
 /// What a validator signed twice in one view (E15).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EquivocationKind {
     /// Two Round-1 votes.
     Vote,
@@ -358,6 +358,9 @@ pub struct ConsensusEngine {
     /// changes, so reusing a block hash with a different reconfiguration
     /// payload is still detected.
     pub(super) proposal_equivocation_tracker: HashMap<u32, (B256, B256, SignedMessage)>,
+    /// The three trackers of the last few closed views and the late messages
+    /// of those views, for conflicts that cross the view boundary.
+    pub(super) late_evidence: super::late_evidence::LateEvidence,
     /// Buffer for messages arriving for future views (within FUTURE_VIEW_WINDOW).
     pub(super) future_msg_buffer: Vec<(ViewNumber, ConsensusMessage)>,
     /// Per-view timing for commit latency diagnosis.
@@ -471,6 +474,7 @@ impl ConsensusEngine {
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
+            late_evidence: Default::default(),
             future_msg_buffer: Vec::new(),
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
@@ -584,6 +588,7 @@ impl ConsensusEngine {
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
+            late_evidence: Default::default(),
             future_msg_buffer: Vec::new(),
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
@@ -1158,6 +1163,8 @@ impl ConsensusEngine {
                 ConsensusMessage::Decide(_) | ConsensusMessage::NewView(_)
             )
         {
+            // Evidence only: a late message never reaches a collector.
+            self.note_late_message(&msg, authenticated_proof)?;
             if let ConsensusMessage::Proposal(ref proposal) = msg
                 && self.recover_late_committed_proposal(proposal)?
             {
@@ -1334,6 +1341,7 @@ impl ConsensusEngine {
         if new_view <= self.round_state.current_view() {
             return Ok(());
         }
+        let closing_view = self.round_state.current_view();
 
         // Save current PrepareQC for piggybacking into the next Proposal (chained mode).
         self.previous_prepare_qc = self.prepare_qc.take();
@@ -1429,9 +1437,14 @@ impl ConsensusEngine {
             self.imported_blocks.clear();
             self.imported_block_fifo.clear();
         }
-        self.equivocation_tracker.clear();
-        self.commit_equivocation_tracker.clear();
-        self.proposal_equivocation_tracker.clear();
+        // The closing view's trackers stay checkable for a few views: a
+        // commit vote that arrives after the CommitQC is otherwise never
+        // compared with the one already counted.
+        let votes = std::mem::take(&mut self.equivocation_tracker);
+        let commit_votes = std::mem::take(&mut self.commit_equivocation_tracker);
+        let proposals = std::mem::take(&mut self.proposal_equivocation_tracker);
+        self.late_evidence
+            .close_view(closing_view, new_view, votes, commit_votes, proposals);
 
         // Defense-in-depth: re-derive my_index from the current set on every view
         // advance. The epoch-boundary branch above only fires for live consensus
@@ -3825,6 +3838,278 @@ mod tests {
             )));
             assert_equivocation_proof_verifies(&outputs, EquivocationKind::Vote);
         }
+    }
+
+    fn drain_outputs(rx: &mut mpsc::Receiver<EngineOutput>) -> Vec<EngineOutput> {
+        let mut outputs = Vec::new();
+        while let Ok(output) = rx.try_recv() {
+            outputs.push(output);
+        }
+        outputs
+    }
+
+    fn equivocations(outputs: &[EngineOutput]) -> Vec<(u64, u32, B256, B256, EquivocationKind)> {
+        outputs
+            .iter()
+            .filter_map(|output| match output {
+                EngineOutput::EquivocationDetected {
+                    view,
+                    validator,
+                    hash1,
+                    hash2,
+                    proof,
+                } => Some((*view, *validator, *hash1, *hash2, proof.kind)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Leader 1 of a four-validator set commits view 1 with votes of 0 and 2
+    /// and moves to view 2; returns the engine past its CommitQC.
+    fn leader_past_commit_qc(
+        block_hash: B256,
+    ) -> (
+        ConsensusEngine,
+        Vec<BlsSecretKey>,
+        mpsc::Receiver<EngineOutput>,
+    ) {
+        use crate::protocol::quorum::{commit_signing_message, signing_message};
+        let (mut engine, sks, _, mut rx) = make_engine(4, 1);
+        engine
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
+            .expect("leader initializes its collectors");
+        for voter in [0u32, 2] {
+            let vote = Vote {
+                view: 1,
+                block_hash,
+                voter,
+                signature: sks[voter as usize].sign(&signing_message(1, &block_hash)),
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+                .expect("R1 vote");
+        }
+        for voter in [0u32, 2] {
+            let commit_vote = CommitVote {
+                view: 1,
+                block_hash,
+                voter,
+                signature: sks[voter as usize].sign(&commit_signing_message(
+                    1,
+                    &block_hash,
+                    &B256::ZERO,
+                )),
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(
+                    commit_vote,
+                )))
+                .expect("commit vote");
+        }
+        assert_eq!(engine.current_view(), 2, "the CommitQC moved the leader on");
+        assert!(engine.commit_equivocation_tracker.is_empty());
+        drain_outputs(&mut rx);
+        (engine, sks, rx)
+    }
+
+    fn late_commit_vote(sk: &BlsSecretKey, voter: u32, block_hash: B256) -> ConsensusEvent {
+        use crate::protocol::quorum::commit_signing_message;
+        ConsensusEvent::Message(ConsensusMessage::CommitVote(CommitVote {
+            view: 1,
+            block_hash,
+            voter,
+            signature: sk.sign(&commit_signing_message(1, &block_hash, &B256::ZERO)),
+        }))
+    }
+
+    fn late_vote(sk: &BlsSecretKey, voter: u32, block_hash: B256) -> ConsensusEvent {
+        use crate::protocol::quorum::signing_message;
+        ConsensusEvent::Message(ConsensusMessage::Vote(Vote {
+            view: 1,
+            block_hash,
+            voter,
+            signature: sk.sign(&signing_message(1, &block_hash)),
+        }))
+    }
+
+    #[test]
+    fn a_conflicting_commit_vote_after_the_commit_qc_is_evidence() {
+        let block = B256::repeat_byte(0xC1);
+        let twin = B256::repeat_byte(0xD2);
+        let (mut engine, sks, mut rx) = leader_past_commit_qc(block);
+
+        // Voter 0's counted commit vote is the first of the pair.
+        engine
+            .process_event(late_commit_vote(&sks[0], 0, twin))
+            .unwrap();
+        let outputs = drain_outputs(&mut rx);
+        assert_eq!(
+            equivocations(&outputs),
+            vec![(1, 0, block, twin, EquivocationKind::CommitVote)]
+        );
+        assert_equivocation_proof_verifies(&outputs, EquivocationKind::CommitVote);
+
+        // Voter 3 was outside the quorum: both of its commit votes are late,
+        // in either order.
+        engine
+            .process_event(late_commit_vote(&sks[3], 3, twin))
+            .unwrap();
+        assert!(
+            drain_outputs(&mut rx).is_empty(),
+            "one late vote is no evidence"
+        );
+        engine
+            .process_event(late_commit_vote(&sks[3], 3, block))
+            .unwrap();
+        let outputs = drain_outputs(&mut rx);
+        assert_eq!(
+            equivocations(&outputs),
+            vec![(1, 3, twin, block, EquivocationKind::CommitVote)]
+        );
+        assert_equivocation_proof_verifies(&outputs, EquivocationKind::CommitVote);
+        assert_eq!(
+            engine.current_view(),
+            2,
+            "late messages never move the view"
+        );
+    }
+
+    #[test]
+    fn a_conflicting_r1_vote_after_the_view_closed_is_evidence() {
+        let block = B256::repeat_byte(0xA1);
+        let twin = B256::repeat_byte(0xB2);
+        let (mut engine, sks, mut rx) = leader_past_commit_qc(block);
+
+        engine.process_event(late_vote(&sks[2], 2, twin)).unwrap();
+        let outputs = drain_outputs(&mut rx);
+        assert_eq!(
+            equivocations(&outputs),
+            vec![(1, 2, block, twin, EquivocationKind::Vote)]
+        );
+        assert_equivocation_proof_verifies(&outputs, EquivocationKind::Vote);
+    }
+
+    #[test]
+    fn honest_late_messages_produce_nothing() {
+        let block = B256::repeat_byte(0xE1);
+        let (mut engine, sks, mut rx) = leader_past_commit_qc(block);
+
+        // Repeats of counted votes, and a late voter's matching pair.
+        engine.process_event(late_vote(&sks[0], 0, block)).unwrap();
+        engine
+            .process_event(late_commit_vote(&sks[2], 2, block))
+            .unwrap();
+        engine.process_event(late_vote(&sks[3], 3, block)).unwrap();
+        engine
+            .process_event(late_commit_vote(&sks[3], 3, block))
+            .unwrap();
+        engine
+            .process_event(late_commit_vote(&sks[3], 3, block))
+            .unwrap();
+        assert!(drain_outputs(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_forged_late_message_is_never_evidence() {
+        let block = B256::repeat_byte(0xF1);
+        let twin = B256::repeat_byte(0xF2);
+        let (mut engine, sks, mut rx) = leader_past_commit_qc(block);
+
+        // A commit vote for voter 3 signed by another key arrives first and is
+        // kept unverified; voter 3's real vote does not convict it.
+        engine
+            .process_event(late_commit_vote(&sks[0], 3, twin))
+            .unwrap();
+        engine
+            .process_event(late_commit_vote(&sks[3], 3, block))
+            .unwrap();
+        assert!(drain_outputs(&mut rx).is_empty());
+        // A forged second against a verified first is not evidence either.
+        engine
+            .process_event(late_commit_vote(&sks[0], 2, twin))
+            .unwrap();
+        assert!(drain_outputs(&mut rx).is_empty());
+        // The real one took the forged one's place: a real conflict still is.
+        engine
+            .process_event(late_commit_vote(&sks[3], 3, twin))
+            .unwrap();
+        assert_eq!(
+            equivocations(&drain_outputs(&mut rx)),
+            vec![(1, 3, block, twin, EquivocationKind::CommitVote)]
+        );
+    }
+
+    #[test]
+    fn late_messages_outside_the_window_are_ignored_and_dropped() {
+        let block = B256::repeat_byte(0x71);
+        let twin = B256::repeat_byte(0x72);
+        let (mut engine, sks, mut rx) = leader_past_commit_qc(block);
+        engine
+            .process_event(late_commit_vote(&sks[3], 3, twin))
+            .unwrap();
+        assert_ne!(engine.late_evidence.retained(), (0, 0));
+
+        engine
+            .advance_to_view(1 + super::super::late_evidence::LATE_EVIDENCE_VIEWS + 1)
+            .unwrap();
+        assert_eq!(
+            engine.late_evidence.retained(),
+            (0, 0),
+            "view 1 left the window"
+        );
+        drain_outputs(&mut rx);
+        engine
+            .process_event(late_commit_vote(&sks[0], 0, twin))
+            .unwrap();
+        engine
+            .process_event(late_commit_vote(&sks[3], 3, block))
+            .unwrap();
+        engine.process_event(late_vote(&sks[2], 2, twin)).unwrap();
+        assert!(equivocations(&drain_outputs(&mut rx)).is_empty());
+        assert_eq!(engine.late_evidence.retained(), (0, 0));
+    }
+
+    #[test]
+    fn a_conflicting_proposal_after_the_view_closed_is_evidence() {
+        use crate::protocol::quorum::proposal_signing_message;
+        let block = B256::repeat_byte(0x81);
+        let twin = B256::repeat_byte(0x82);
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        let proposal = |hash: B256| n42_primitives::consensus::Proposal {
+            view: 1,
+            block_hash: hash,
+            justify_qc: QuorumCertificate::genesis(),
+            proposer: 1,
+            signature: sks[1].sign(&proposal_signing_message(1, &hash, &None)),
+            prepare_qc: None,
+            tx_root_hash: None,
+            validator_changes: None,
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal(block),
+            )))
+            .expect("proposal");
+        engine.advance_to_view(2).unwrap();
+        drain_outputs(&mut rx);
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal(block),
+            )))
+            .unwrap();
+        assert!(equivocations(&drain_outputs(&mut rx)).is_empty());
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal(twin),
+            )))
+            .unwrap();
+        let outputs = drain_outputs(&mut rx);
+        assert_eq!(
+            equivocations(&outputs),
+            vec![(1, 1, block, twin, EquivocationKind::Proposal)]
+        );
+        assert_equivocation_proof_verifies(&outputs, EquivocationKind::Proposal);
     }
 
     #[test]
