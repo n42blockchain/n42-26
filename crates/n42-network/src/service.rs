@@ -2667,6 +2667,9 @@ impl NetworkService {
     ) {
         metrics::counter!("n42_gossipsub_messages_received").increment(1);
         tracing::info!(target: "n42::net", %source, topic = %message.topic, bytes = message.data.len(), "gossipsub message received");
+        // The topic hash string is bounded by the subscribed set (G2 only on
+        // Profile 1), so it is safe as a metric label.
+        let topic = message.topic.to_string();
         let (verdict, event) = self.classify_gossipsub_message(source, message);
         if self.profile1.is_none() {
             // Other lines: the router forwarded the message already
@@ -2685,7 +2688,17 @@ impl NetworkService {
             gossipsub::MessageAcceptance::Reject => "reject",
             gossipsub::MessageAcceptance::Ignore => "ignore",
         };
-        metrics::counter!("n42_profile1_gossip_validation_total", "verdict" => label).increment(1);
+        metrics::counter!(
+            "n42_profile1_gossip_validation_total",
+            "verdict" => label,
+            "topic" => topic.clone()
+        )
+        .increment(1);
+        if verdict != gossipsub::MessageAcceptance::Accept {
+            // Rejects penalise the source peer's gossipsub score; both are
+            // logged so a round can count them per topic and per peer.
+            tracing::info!(target: "n42::net", %source, %topic, verdict = label, "AM36 gossip verdict");
+        }
         self.swarm
             .behaviour_mut()
             .gossipsub
