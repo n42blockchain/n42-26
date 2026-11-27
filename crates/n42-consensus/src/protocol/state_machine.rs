@@ -1045,6 +1045,32 @@ impl ConsensusEngine {
         &self.durable_locked_qc
     }
 
+    /// AM35: after a commit, raise the durable lock to the CommitQC when it is
+    /// higher. A node that imports slowly may hold its R2 votes for several
+    /// views while the others commit; without this its durable lock stays
+    /// behind `last_committed_qc` and every snapshot is refused
+    /// (`last_committed_qc.view > locked_qc.view`).
+    ///
+    /// The CommitQC is a safe durable lock even when this node never
+    /// journalled the block: it carries 2f+1 R2 votes, and every R2 voter
+    /// made the block durable before signing, so after a whole-set power loss
+    /// at least 2f+1 members can re-import and serve it. `Round::commit`
+    /// already treats the CommitQC as the in-memory lock.
+    pub(super) fn advance_durable_lock_on_commit(&mut self, commit_qc: &QuorumCertificate) {
+        if commit_qc.view <= self.durable_locked_qc.view {
+            return;
+        }
+        match self.vote_log.record_lock(commit_qc) {
+            Ok(()) => self.durable_locked_qc = commit_qc.clone(),
+            Err(error) => tracing::warn!(
+                target: "n42::am35",
+                view = commit_qc.view,
+                %error,
+                "could not persist the CommitQC as the durable lock"
+            ),
+        }
+    }
+
     /// AM35: the R2 prologue shared by the follower commit vote and the
     /// leader self-vote: make the voted block (and the locked block, should
     /// it differ) durable, then the lock, then the R2 vote-log record. Returns
@@ -3741,6 +3767,47 @@ mod tests {
 
         assert_eq!(*log.0.lock().unwrap(), ["vote:1", "block:1", "lock:1", "commit:1"]);
         assert!(output_rx.try_recv().is_ok());
+    }
+
+    /// A follower that never sent R2 (its import was too slow) still commits
+    /// on the Decide; its durable lock must follow the CommitQC, or every
+    /// snapshot is refused for `last_committed_qc.view > locked_qc.view`.
+    #[test]
+    fn test_decide_without_own_commit_vote_advances_durable_lock() {
+        let (_fresh_engine, sks, vs, _fresh_rx) = make_engine(4, 0);
+        let (output_tx, _output_rx) = mpsc::channel(32);
+        let log = Arc::new(RecordingVoteLog::default());
+        let mut engine = ConsensusEngine::with_recovered_state_and_vote_log(
+            3,
+            sks[3].clone(),
+            EpochManager::new(vs.clone()),
+            60_000,
+            120_000,
+            output_tx,
+            1,
+            QuorumCertificate::genesis(),
+            QuorumCertificate::genesis(),
+            0,
+            0,
+            0,
+            log.clone(),
+        );
+        let block_hash = B256::repeat_byte(0xDA);
+        let commit_qc = build_test_commit_qc(1, block_hash, &sks, &vs, &[0, 1, 2]);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                view: 1,
+                block_hash,
+                commit_qc,
+                validator_changes_hash: B256::ZERO,
+            })))
+            .unwrap();
+
+        assert_eq!(engine.last_committed_qc().view, 1);
+        assert_eq!(engine.durable_locked_qc().view, 1);
+        assert_eq!(engine.durable_locked_qc().block_hash, block_hash);
+        // Persisted as the durable lock; no R2 was recorded for this node.
+        assert_eq!(*log.0.lock().unwrap(), ["lock:1"]);
     }
 
     #[test]

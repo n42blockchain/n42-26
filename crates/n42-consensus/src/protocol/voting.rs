@@ -397,6 +397,7 @@ impl ConsensusEngine {
             "block committed!");
 
         self.round_state.commit(commit_qc.clone());
+        self.advance_durable_lock_on_commit(&commit_qc);
 
         // The Decide must carry the hash the commit votes signed. Changes queued
         // after the proposal stay pending for a later block; staging them here

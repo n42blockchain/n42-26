@@ -315,3 +315,11 @@ See the AM35 report for the exact commands. In summary:
 - After each restart, every node must log `AM35: block journal replayed` with `locked_replayed=true`
   (when the lock was above the EL head). The chain must commit a higher block within 60 s, and the nodes
   must agree on the committed hashes.
+
+## E9 finding: durable lock behind the CommitQC on a slow node (2026-11-27)
+
+- **Symptom**: in the E9 mixed gate, n42-26 v3 logged `failed to save consensus state ... refusing to persist invalid snapshot: last_committed_qc.view (17) > locked_qc.view (15)`, 21 times in the first 3 minutes. v3 imported more slowly than the other clients, so in several views its R2 vote was still waiting for the import when the other three formed the CommitQC. v3 committed on the Decide without sending R2, `record_lock` never ran, and `durable_locked_qc` stayed behind `last_committed_qc`. The snapshot invariant (committed ≤ locked) then refused every save, so the snapshot on disk stayed stale. The local whole-set e2e did not catch this because all 4 nodes there were n42-26 and every node voted in every view.
+- **Fix**: `advance_durable_lock_on_commit` runs after both commit paths (leader CommitQC and follower Decide). When the CommitQC view is above the durable lock, it persists the CommitQC with `record_lock` and adopts it.
+- **Why the CommitQC is a safe durable lock without our own journal entry**: it carries 2f+1 R2 votes, and every R2 voter made the block durable (EL or journal) before signing. After a whole-set power loss, at least 2f+1 members therefore re-import the block and can serve it. `Round::commit` already uses the CommitQC as the in-memory lock.
+- **Alternative rejected**: journalling the block on commit. It needs the block data, which a slow node may not have yet at Decide time, and it adds nothing to the 2f+1 copies above.
+- **Test**: `test_decide_without_own_commit_vote_advances_durable_lock`. Results: n42-consensus lib 297, integration 67, n42-consensus-service 400 and n42-node 354 tests pass; clippy is clean.
