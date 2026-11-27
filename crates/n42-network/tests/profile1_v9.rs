@@ -188,6 +188,8 @@ fn v9_router_options_match_gov5() {
         cfg.validation_mode(),
         libp2p::gossipsub::ValidationMode::Anonymous
     ));
+    // AM36: the router forwards only what the node validated.
+    assert!(cfg.validate_messages());
     assert_eq!(cfg.duplicate_cache_time(), ms(&router["seenMessagesTTLMs"]));
     assert_eq!(
         profile1::SEEN_MESSAGES_TTL,

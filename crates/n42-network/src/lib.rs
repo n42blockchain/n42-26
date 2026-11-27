@@ -53,7 +53,7 @@ pub use mobile::{
 };
 pub use service::{
     Gov5CommitQcOutcome, Gov5RangeOutcome, NetworkCommand, NetworkEvent, NetworkHandle,
-    NetworkService,
+    GossipValidationStats, NetworkService,
 };
 pub use sync_v11::{
     CommitQcAnchor, CommitQcPayload, CommitQcRequest, GOV5_BODIES_BY_RANGE_V2_PROTOCOL,

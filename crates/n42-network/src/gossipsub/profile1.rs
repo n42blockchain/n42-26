@@ -115,6 +115,9 @@ pub fn gossipsub_config(
         .iwant_followup_time(IWANT_FOLLOWUP_TIME)
         .max_transmit_size(max_gossip_wire_size(max_block_bytes))
         .validation_mode(gossipsub::ValidationMode::Anonymous)
+        // AM36: forward only what the node reported Accept for
+        // (`NetworkService::handle_gossipsub_message` reports every message).
+        .validate_messages()
         .message_id_fn(message_id_fn(genesis_hash))
         .build()
 }
@@ -144,4 +147,77 @@ pub fn g2_topics(genesis_hash: B256, takes_transactions: bool) -> Vec<IdentTopic
 /// `max_block_bytes` (B15).
 pub const fn gov5_block_fits(max_block_bytes: usize, decoded_bytes: usize) -> bool {
     decoded_bytes <= max_block_bytes
+}
+
+/// What a profile-1 member does with a gossip message before forwarding it
+/// (AM36): [`gossipsub::MessageAcceptance::Accept`] forwards it,
+/// `Reject` drops and penalises the sender, `Ignore` drops without penalty.
+pub type Verdict = gossipsub::MessageAcceptance;
+
+/// AM36 rule 1 for an H2 message (gov5 `hotstuff_consensus` and H2-v4): every
+/// view it carries -- its own and those of the certificates inside it -- is a
+/// view a certificate may exist for (AM34 item 3: not 2^64-1).
+///
+/// Stateless: it needs no committee, no current view and no signature check.
+/// Signer bitmaps and BLS signatures are checked by the consensus handler
+/// after Accept (AM36 rule 2 leaves them optional before forwarding).
+pub fn h2_fields_in_range(message: &crate::h2_wire::H2Message) -> Result<(), &'static str> {
+    use crate::h2_wire::{H2Message, H2QuorumCertificate, H2TimeoutCertificate};
+
+    fn qc(qc: &H2QuorumCertificate) -> bool {
+        n42_consensus::certifiable_view(qc.view)
+    }
+    fn tc(tc: &H2TimeoutCertificate) -> bool {
+        n42_consensus::certifiable_view(tc.view) && qc(&tc.high_qc)
+    }
+    let in_range = match message {
+        H2Message::Proposal(p) => {
+            n42_consensus::certifiable_view(p.view)
+                && qc(&p.justify_qc)
+                && p.prepare_qc.as_ref().is_none_or(qc)
+        }
+        H2Message::Vote(v) | H2Message::CommitVote(v) => {
+            n42_consensus::certifiable_view(v.view) && v.high_tc.as_ref().is_none_or(tc)
+        }
+        H2Message::PrepareQc(p) => n42_consensus::certifiable_view(p.view) && qc(&p.qc),
+        H2Message::Timeout(t) => {
+            n42_consensus::certifiable_view(t.view)
+                && qc(&t.high_qc)
+                && t.high_tc.as_ref().is_none_or(tc)
+        }
+        H2Message::NewView(n) => {
+            n42_consensus::certifiable_view(n.view) && tc(&n.timeout_certificate)
+        }
+        H2Message::Decide(d) => n42_consensus::certifiable_view(d.view) && qc(&d.commit_qc),
+    };
+    if in_range {
+        Ok(())
+    } else {
+        Err("a view of 2^64-1 (AM34 item 3)")
+    }
+}
+
+/// The view an H2 message belongs to, for AM36 rule 3 (stale messages).
+pub const fn h2_message_view(message: &crate::h2_wire::H2Message) -> u64 {
+    use crate::h2_wire::H2Message;
+    match message {
+        H2Message::Proposal(p) => p.view,
+        H2Message::Vote(v) | H2Message::CommitVote(v) => v.view,
+        H2Message::PrepareQc(p) => p.view,
+        H2Message::Timeout(t) => t.view,
+        H2Message::NewView(n) => n.view,
+        H2Message::Decide(d) => d.view,
+    }
+}
+
+/// AM36 rule 3: a well-formed H2 message is stale when its view is below the
+/// view of the newest CommitQC this member holds; the member has left every
+/// such view. Messages for the committed view itself and later (including
+/// future views) are forwarded: a peer one view behind still needs the
+/// Decide and votes of the committed view.
+pub const fn h2_message_is_stale(view: u64, committed_view: Option<u64>) -> bool {
+    match committed_view {
+        Some(committed) => view < committed,
+        None => false,
+    }
 }

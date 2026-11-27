@@ -1288,3 +1288,46 @@ n{4,7,100}-T8-k3、AM32 边界钳制及其 -p1 / -next-dead 变体）。n42-rs m
 - [ ] 混合集群实跑确认：700 ms heartbeat 与 G2-only 下 n42-26 与 gov5 成员的 mesh 形成、64 MiB 块 gossip。
 - [ ] mobileverify G2 主题（I1）落地后加入订阅集合。
 - 待与 gov5/rs 确认：gov5 是否在 validate 之后才转发（rust-libp2p Anonymous 模式下本节点仍是立即转发，未启用 `validate_messages()`）。
+
+### 19.7 追加：先校验后转发（AM36，n42-rs 提议稿 18fa2d68b）（2026-11-27）
+
+背景：F1 报告指出 n42-26 收到即转发。rs 据此提议 AM36（Profile 1 全部 G2 主题）：
+1. 消息解码为主题对应类型且字段在范围内（含 AM34 第 3 项的 view 上限）才转发，否则 Reject；
+2. 转发前验 BLS 可选；
+3. 已离开 view 的消息或重复消息 Ignore；
+4. mobileverify 主题在服务上线后按同一规则解码。
+
+实现（仅 Profile 1；其他路线不变，仍是 Permissive、无 `validate_messages`）：
+
+- `gossipsub::profile1::gossipsub_config` 打开 `validate_messages()`；V9 测试断言之。
+- `NetworkService::handle_gossipsub_message` 拆成两步：`classify_gossipsub_message` 返回 `(MessageAcceptance, Option<NetworkEvent>)`，
+  原先每个 `return;` 都改成带判定的返回；外层在 Profile 1 上对每条消息恰好调用一次 `report_message_validation_result`，
+  且只有 Accept 才把事件交给节点。不存在不上报的路径（router 在 `validate_messages` 下会一直持有未上报消息直到 mcache 轮换）。
+- 判定（全部无状态或只读本地 committed view，不验签、不执行）：
+
+| 主题 | Accept | Reject | Ignore |
+| --- | --- | --- | --- |
+| gov5 `block` | snappy 解压长度一致、≤ maxBlockBytes、整块按 Profile-1 24 元素布局 RLP 解码成功 | 其余 | — |
+| `hotstuff_consensus` | 解码成功且所有 view（消息本身与内含 QC/TC/highQC/highTC）≠ 2^64-1 | 解码失败或 view 越界 | view < 本地最新 CommitQC 的 view |
+| H2-v4 | 同上，另需信封链身份一致 | 同上 | 同上 |
+| `transaction_v2` | 批次解码且每条都是本链已知交易 | 批次解码失败或任一条不可解码 | 空批次 |
+
+- 新增 `GossipValidationStats`（received/accepted/rejected/ignored/unreported），`NetworkService::gossip_validation_stats()` 取得；
+  指标 `n42_profile1_gossip_validation_total{verdict}`、`n42_profile1_h2_out_of_range_total`、`n42_profile1_h2_stale_total`。
+- 陈旧判定的 view 下限来自 `NetworkCommand::NoteCommittedQc`（consensus_loop 每次提交时发送），取最大值；
+  只忽略严格低于已提交 view 的 H2 消息，已提交 view 本身及未来 view 照常转发。
+- BLS 仍在 Accept 之后由共识处理器验证（AM36 第 2 条允许），因此不存在重复验签。
+
+测试：
+
+- `service::tests::profile1_validates_before_forwarding`：真实三节点线形拓扑（发布者 → Profile-1 服务 → 观察者，两端不直连），
+  4 个 G2 主题各发一条合法消息与一条畸形消息，另加 view = 2^64-1 的 gov5 H2 与 H2-v4 消息、含不可解码条目的交易批次、
+  低于已提交 view 的 H2 消息。断言：Accept 4、Reject 7、Ignore 1、unreported 0；观察者只收到 4 条合法消息。
+  变异检查：去掉 `validate_messages()` 后观察者收到全部 12 条，测试失败。
+- `tests/profile1_v9.rs`：配置断言 `validate_messages()`。
+
+对 AM36 文本的意见（转 rs）见 F1 追加报告。
+
+状态：
+- [x] 实现、测试；clippy（n42-network、n42-consensus-service、n42-node、n42-node-bin，-D warnings）通过；n42-network + n42-consensus-service + n42-node 测试 1017 通过、0 失败、20 忽略。
+- [ ] 混合集群实跑：确认 gov5 不在 HotStuff/H2-v4 主题上注册校验器时，n42-26 的 Reject 不会误罚 gov5 成员（gov5 不会发送畸形消息，应无影响）。
