@@ -320,6 +320,10 @@ impl ConfigureEngineEvm<ExecutionData> for N42EvmConfig {
             metrics::counter!("n42_alt_sig_payload_sender_total", "cache" => outcome)
                 .absolute(count.load(Ordering::Relaxed));
         }
+        for (outcome, count) in [("hit", &ETH_SENDER_HIT), ("miss", &ETH_SENDER_MISS)] {
+            metrics::counter!("n42_secp256k1_payload_sender_total", "cache" => outcome)
+                .absolute(count.load(Ordering::Relaxed));
+        }
         let txs = payload.payload.transactions().clone();
         let convert = self.payload_transaction_converter();
         Ok((txs, convert))
@@ -362,7 +366,7 @@ impl N42EvmConfig {
             raw.par_iter().map(|tx| recover_payload_transaction(cache, tx)).collect();
         let (mut transactions, mut senders) =
             (Vec::with_capacity(raw.len()), Vec::with_capacity(raw.len()));
-        let mut sources = [0u64; 3];
+        let mut sources = [0u64; 5];
         for recovered in recovered {
             let (tx, source) = recovered?;
             if let Some(source) = source {
@@ -372,8 +376,15 @@ impl N42EvmConfig {
             transactions.push(tx);
             senders.push(sender);
         }
-        for (source, count) in
-            [SenderSource::Hit, SenderSource::Frame, SenderSource::Miss].into_iter().zip(sources)
+        for (source, count) in [
+            SenderSource::Hit,
+            SenderSource::Frame,
+            SenderSource::Miss,
+            SenderSource::EthHit,
+            SenderSource::EthMiss,
+        ]
+        .into_iter()
+        .zip(sources)
         {
             if count > 0 {
                 source.counter().fetch_add(count, Ordering::Relaxed);
@@ -383,15 +394,19 @@ impl N42EvmConfig {
     }
 }
 
-/// Where a 0x50 transaction's sender came from.
+/// Where a payload transaction's sender came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SenderSource {
-    /// The admission cache.
+    /// 0x50: the admission cache.
     Hit = 0,
-    /// A frame this node holds.
+    /// 0x50: a frame this node holds.
     Frame = 1,
-    /// Verified here.
+    /// 0x50: verified here.
     Miss = 2,
+    /// secp256k1: reth's shared sender cache.
+    EthHit = 3,
+    /// secp256k1: recovered here.
+    EthMiss = 4,
 }
 
 impl SenderSource {
@@ -400,6 +415,8 @@ impl SenderSource {
             Self::Hit => &SENDER_HIT,
             Self::Frame => &SENDER_FRAME,
             Self::Miss => &SENDER_MISS,
+            Self::EthHit => &ETH_SENDER_HIT,
+            Self::EthMiss => &ETH_SENDER_MISS,
         }
     }
 }
@@ -435,13 +452,19 @@ fn recover_payload_transaction(
                 }
             }
         }
-        N42TxEnvelope::Eth(_) => (
-            match sender_recovery_cache {
-                Some(cache) => cache.recover(&tx),
-                None => tx.try_recover(),
-            },
-            None,
-        ),
+        N42TxEnvelope::Eth(_) => match sender_recovery_cache {
+            Some(cache) => {
+                // The closure runs only on a miss.
+                let mut recovered = false;
+                let signer = cache.recover_with(&tx, |tx| {
+                    recovered = true;
+                    tx.try_recover()
+                });
+                let source = if recovered { SenderSource::EthMiss } else { SenderSource::EthHit };
+                (signer, Some(source))
+            }
+            None => (tx.try_recover(), Some(SenderSource::EthMiss)),
+        },
     };
     let signer = signer.map_err(AnyError::new)?;
     Ok((tx.with_signer(signer), source))
@@ -451,6 +474,40 @@ fn recover_payload_transaction(
 static SENDER_HIT: AtomicU64 = AtomicU64::new(0);
 static SENDER_FRAME: AtomicU64 = AtomicU64::new(0);
 static SENDER_MISS: AtomicU64 = AtomicU64::new(0);
+/// Where the senders of secp256k1 payload transactions came from, since start.
+static ETH_SENDER_HIT: AtomicU64 = AtomicU64::new(0);
+static ETH_SENDER_MISS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide counts of where payload conversion (the engine's, and the
+/// follower import's) found transaction senders, since start.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadSenderCounts {
+    /// Found in a cache (secp256k1 shared cache, 0x50 admission cache or a
+    /// held frame).
+    pub hits: u64,
+    /// Verified during the conversion.
+    pub misses: u64,
+}
+
+impl PayloadSenderCounts {
+    /// The counts now.
+    pub fn now() -> Self {
+        Self {
+            hits: ETH_SENDER_HIT.load(Ordering::Relaxed)
+                + SENDER_HIT.load(Ordering::Relaxed)
+                + SENDER_FRAME.load(Ordering::Relaxed),
+            misses: ETH_SENDER_MISS.load(Ordering::Relaxed) + SENDER_MISS.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The counts since `earlier`.
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            hits: self.hits.saturating_sub(earlier.hits),
+            misses: self.misses.saturating_sub(earlier.misses),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
