@@ -60,5 +60,5 @@ pub use validator::{
     ResolvedLeaderSchedule, ValidatorSet, install_leader_schedule, leader_index, leader_schedule,
     leader_tenure, view_after_tc,
 };
-pub use vote_log::{NoopVoteLog, VoteLogWriter};
+pub use vote_log::{BlockDurability, NoopVoteLog, VoteLogWriter};
 pub use vote_rules::VoteRules;

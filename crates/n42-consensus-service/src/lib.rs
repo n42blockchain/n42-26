@@ -9,6 +9,7 @@
 //! execution-domain type deps. See `docs/task-caplin-stage6-clean-extraction.md`.
 
 pub mod blob_port;
+pub mod block_journal;
 pub mod bootstrap;
 pub mod consensus_state;
 pub mod deferred_check;

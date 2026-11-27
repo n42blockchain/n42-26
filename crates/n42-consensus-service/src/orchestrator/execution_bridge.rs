@@ -1478,6 +1478,20 @@ impl ConsensusService {
         }
         let execution_parent_hash = execution_data.parent_hash();
         let payload_timestamp = execution_data.payload.timestamp();
+        // AM35: a synced block may be an unpersisted ancestor of the next
+        // block this node commit-votes; keep it where the journal finds it.
+        crate::block_journal::note_block_lineage(
+            broadcast.block_hash,
+            execution_parent_hash,
+            execution_data.block_number(),
+        );
+        if let Some(journal) = self.block_journal.as_ref()
+            && !journal.holds(&broadcast.block_hash)
+            && let Ok(data) = bincode::serialize(&broadcast)
+        {
+            journal.stage_data(broadcast.block_hash, broadcast.view, Arc::new(data));
+            self.retry_held_commit_vote();
+        }
         if self
             .bad_blocks
             .should_skip(broadcast.block_hash, "sync_import_pre_submit")
@@ -2323,6 +2337,9 @@ async fn handle_built_payload(
     } else {
         None
     };
+    // AM35: the leader's own block reaches the journal through its payload
+    // feedback; record its lineage so the R2 self-vote does not decode it.
+    crate::block_journal::note_block_lineage(hash, execution_data.parent_hash(), block_number);
     // 1. Broadcast block data + blob sidecars to followers. Native peers start
     //    validating now; the Gov5 copy below costs ~130 ms per full block and
     //    used to run first.

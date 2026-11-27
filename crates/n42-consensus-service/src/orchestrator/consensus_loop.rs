@@ -1876,6 +1876,13 @@ impl ConsensusService {
         // validity advances so a crash/restart never observes a newer Reth head
         // paired with a stale execution guard.
         self.save_consensus_state();
+        // AM35: journal entries the execution layer has persisted since are
+        // dropped here, off the vote path.
+        if let Some(journal) = self.block_journal.as_ref()
+            && let Err(error) = journal.maybe_compact()
+        {
+            warn!(target: "n42::cl::block_journal", %error, "block journal compaction failed");
+        }
         // Execution is now confirmed for this block: flush its staged sidecar
         // state-tree diff (no-op when nothing is staged - e.g. catch-up blocks
         // whose broadcast never reached us; the sidecar catch-up path owns those).
@@ -1972,7 +1979,7 @@ impl ConsensusService {
         }
     }
 
-    fn record_eager_import_completion(
+    pub(super) fn record_eager_import_completion(
         &mut self,
         hash: B256,
         block_ts: u64,
@@ -1981,6 +1988,7 @@ impl ConsensusService {
         has_staking_target: bool,
         state_diff: Option<n42_execution::state_diff::StateDiff>,
     ) {
+        crate::block_journal::note_block_lineage(hash, parent_hash, block_number);
         if self.h2_v4_identity.is_some() && block_number > self.head_block_number {
             // Gossip does not echo a leader's own body. Retain the height from
             // successful new_payload so its later Valid FCU advances both the
@@ -2003,7 +2011,7 @@ impl ConsensusService {
         self.record_eager_execution_validated(hash);
     }
 
-    async fn finish_eager_import_completion(
+    pub(super) async fn finish_eager_import_completion(
         &mut self,
         hash: B256,
         parent_hash: B256,

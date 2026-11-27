@@ -2,6 +2,7 @@ mod ahead;
 pub(crate) mod bad_block_cache;
 mod consensus_loop;
 mod execution_bridge;
+mod journal_replay;
 pub mod frame_ref;
 pub use execution_bridge::{compact_block_enabled, shared_execution_enabled};
 mod range_sync;
@@ -319,6 +320,39 @@ pub(super) fn encode_execution_payload(
         header_bytes: header.len(),
         transaction_bytes,
     })
+}
+
+/// AM35 block journal: the execution parent and number of the block that
+/// serialized block data `data` carries, if it is the block `hash`.
+pub(crate) fn block_data_lineage(hash: B256, data: &[u8]) -> Option<(B256, u64)> {
+    let broadcast = bincode::deserialize::<BlockDataBroadcast>(data).ok()?;
+    if broadcast.block_hash != hash {
+        return None;
+    }
+    ConsensusService::execution_parent_and_number(data)
+}
+
+/// AM35 block journal: block data (bincode `BlockDataBroadcast`, payload in
+/// the uncompressed binary wire image) for a block held only as an execution
+/// payload, such as a catch-up import.
+pub(crate) fn block_data_from_execution(
+    hash: B256,
+    view: u64,
+    timestamp: u64,
+    execution: &ExecutionData,
+) -> std::io::Result<Vec<u8>> {
+    let mut execution = execution.clone();
+    let encoded = encode_execution_payload(&mut execution)?;
+    bincode::serialize(&BlockDataBroadcast {
+        block_hash: hash,
+        view,
+        payload_json: encoded.bytes,
+        timestamp,
+        execution_output: None,
+        leader_ready_unix_ms: 0,
+        native_header_rlp: n42_consensus::gov5_native_header_rlp(&hash).map(|raw| raw.to_vec()),
+    })
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))
 }
 
 pub(super) fn execution_payload_wire_format(payload: &[u8]) -> &'static str {
@@ -1498,6 +1532,10 @@ pub struct ConsensusService {
     /// ([`Self::drop_rejected_block_data`]) before it lets the entry stand in
     /// for the block.
     rejected_block_data: Arc<std::sync::Mutex<HashSet<B256>>>,
+    /// AM35 block journal (shared with the vote log): block data is staged
+    /// here as it arrives, made durable before an R2 vote, and replayed into
+    /// the execution layer on restart.
+    block_journal: Option<Arc<crate::block_journal::BlockJournal>>,
     /// Fast propose mode: skip slot boundary alignment, build immediately after
     /// ViewChanged/BlockCommitted. Consensus voting naturally paces block production.
     /// Enabled by `N42_FAST_PROPOSE=1`. Default: false (grid-aligned slots).
@@ -2176,6 +2214,13 @@ impl ConsensusService {
                 return false;
             }
         };
+        // AM35: a catch-up block may be an unpersisted ancestor of the next
+        // block this node commit-votes; keep it where the journal finds it.
+        crate::block_journal::note_block_lineage(block_hash, block.header.parent_hash, block_number);
+        if let Some(journal) = self.block_journal.as_ref() {
+            journal.stage_execution(block_hash, view, block_timestamp, &execution_data);
+            self.retry_held_commit_vote();
+        }
 
         match el
             .new_payload_for(ExecutionPath::HISTORICAL_SEQUENTIAL, execution_data)
@@ -2555,6 +2600,11 @@ impl ConsensusService {
             return;
         }
         counter!("n42_block_data_rejected_dropped_total").increment(rejected.len() as u64);
+        if let Some(journal) = self.block_journal.as_ref() {
+            for hash in &rejected {
+                journal.unstage(hash);
+            }
+        }
         self.pending_block_data
             .retain(|hash, _| !rejected.contains(hash));
         self.recent_block_data
@@ -2614,6 +2664,7 @@ impl ConsensusService {
             "site" => "recent_cache"
         )
         .increment(data.len() as u64);
+        self.stage_journal_block_data(hash, view, &data);
         self.recent_block_data.push_back(RecentBlockData {
             view,
             block_hash: hash,
@@ -3570,6 +3621,7 @@ impl ConsensusService {
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             eager_imports_in_flight: Arc::default(),
             rejected_block_data: Arc::default(),
+            block_journal: None,
             fast_propose: std::env::var("N42_FAST_PROPOSE")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
@@ -3850,6 +3902,7 @@ impl ConsensusService {
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             eager_imports_in_flight: Arc::default(),
             rejected_block_data: Arc::default(),
+            block_journal: None,
             fast_propose,
             async_finalize_fcu,
             defer_state_root: false,
@@ -3911,6 +3964,35 @@ impl ConsensusService {
 
     /// E12: halts import, voting and producing on proof that the committed
     /// chain and this node's execution disagree (see [`crate::halt`]).
+    /// AM35: stages block data in `journal` (the one the vote log makes R2
+    /// blocks durable in) and replays it into the execution layer on start.
+    pub fn with_block_journal(mut self, journal: Arc<crate::block_journal::BlockJournal>) -> Self {
+        self.block_journal = Some(journal);
+        self
+    }
+
+    /// AM35: hands `data` of `hash` to the block journal, and retries an R2
+    /// vote the engine holds because that data was missing.
+    fn stage_journal_block_data(&mut self, hash: B256, view: u64, data: &SharedBlockData) {
+        let Some(journal) = self.block_journal.as_ref() else {
+            return;
+        };
+        journal.stage_data(hash, view, Arc::clone(data));
+        self.retry_held_commit_vote();
+    }
+
+    /// AM35: newly staged block data (the held block's own, or a missing
+    /// ancestor's) may let a held R2 vote go now.
+    pub(super) fn retry_held_commit_vote(&mut self) {
+        if let Some(hash) = self.engine.held_commit_vote_block()
+            && let Err(error) = self
+                .engine
+                .process_event(n42_consensus::ConsensusEvent::BlockDataStaged(hash))
+        {
+            error!(target: "n42::cl::block_journal", %hash, %error, "failed to retry the held commit vote");
+        }
+    }
+
     pub fn with_halt(mut self, halt: Arc<crate::halt::Halt>) -> Self {
         self.halt = Some(halt);
         self
@@ -4263,6 +4345,13 @@ impl ConsensusService {
             head = %self.head_block_hash,
             "N42 consensus layer initialized"
         );
+
+        // AM35: hand journalled blocks the execution layer lost back to it
+        // before this node builds, votes or serves (the leader's first build
+        // is scheduled just below).
+        if !self.halted() {
+            self.replay_block_journal().await;
+        }
 
         if !self.halted() {
             self.initialize_startup_schedule().await;
@@ -11394,4 +11483,7 @@ mod tests {
 
     /// Profile 1: the V1 header vectors through the real import entry points.
     mod profile1;
+
+    /// AM35: the block journal through the vote path and restart replay.
+    mod am35_block_journal;
 }
