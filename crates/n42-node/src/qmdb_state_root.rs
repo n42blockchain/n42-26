@@ -473,6 +473,25 @@ impl QmdbReadViewCache {
     }
 }
 
+/// See [`Gov5QmdbStateRootStore::memory_stats`]. The live tree costs about
+/// 200 resident bytes per entry (`tests/memory_footprint.rs`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QmdbMemoryStats {
+    /// Live state entries in the leaf tree.
+    pub live_entries: usize,
+    /// Blocks indexed since the base, each ~200 bytes once its operations
+    /// moved to the WAL.
+    pub blocks: usize,
+    /// Operations still resident (bounded by the resident budget).
+    pub operations_bytes: usize,
+    pub undo_records: usize,
+    /// Undo heap (bounded by the retained-undo budget).
+    pub undo_bytes: usize,
+    pub read_views: usize,
+    /// Logical bytes of the read views; shared nodes are counted per view.
+    pub read_view_bytes: usize,
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Gov5QmdbStateRootError {
     #[error("QMDB holds no prepared candidate for the requested execution")]
@@ -986,6 +1005,28 @@ impl Gov5QmdbStateRootStore {
             state.tree.next_slot(),
             state.tree.twig_count(),
         ))
+    }
+
+    /// Sizes of the store's in-memory parts for the `N42_MEM` line, or
+    /// `None` while a commit holds the state. Unlike [`Self::tree_stats`] it
+    /// never discards a prepared candidate.
+    pub fn memory_stats(&self) -> Option<QmdbMemoryStats> {
+        let (read_views, read_view_bytes) = self
+            .read_views
+            .try_read()
+            .ok()
+            .and_then(|cache| cache.as_ref().map(|c| (c.views.len(), c.logical_bytes)))
+            .unwrap_or_default();
+        let state = self.state.try_lock().ok()?;
+        Some(QmdbMemoryStats {
+            live_entries: state.tree.len(),
+            blocks: state.blocks.len(),
+            operations_bytes: state.operations_bytes,
+            undo_records: state.applied.len(),
+            undo_bytes: state.undo_heap_bytes,
+            read_views,
+            read_view_bytes,
+        })
     }
 
     /// A retained block as archive readers see it: durable, or absent.

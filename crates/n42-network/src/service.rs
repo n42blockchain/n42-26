@@ -97,9 +97,10 @@ const GOV5_BLOCK_REQUEST_STALE_AFTER: Duration = Duration::from_millis(1500);
 const MAX_SERVED_GOV5_BLOCKS: usize = 1024;
 /// Bytes of block bodies the serve cache holds. A body is retained with only
 /// its header read and may be 64 MiB, so the entry count alone lets peers pin
-/// 64 GiB; this holds sixteen blocks of the largest size and every block of
-/// an ordinary one.
-const MAX_SERVED_GOV5_BLOCK_BYTES: usize = 1024 * 1024 * 1024;
+/// 64 GiB. The cache only bridges a proposal that arrives before its block:
+/// a canonical block it no longer holds is answered from storage. This holds
+/// four blocks of the largest size and about 1,000 of 1,200 transfers.
+const MAX_SERVED_GOV5_BLOCK_BYTES: usize = 256 * 1024 * 1024;
 const GOV5_RANGE_BLOCKS_PER_SECOND: f64 = 1024.0;
 const GOV5_RANGE_BLOCKS_BURST: f64 = 4096.0;
 const MAX_PENDING_GOV5_RANGES: usize = 8;
@@ -232,6 +233,10 @@ fn evict_served_gov5_blocks_over(
             held -= dropped.rlp.len();
         }
     }
+    crate::mem_stats::SERVED_GOV5_BLOCKS
+        .store(blocks.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    crate::mem_stats::SERVED_GOV5_BLOCK_BYTES
+        .store(held as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The body to answer a block-by-hash request with, or empty. An unchecked

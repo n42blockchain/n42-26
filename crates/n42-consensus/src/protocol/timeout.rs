@@ -221,6 +221,7 @@ impl ConsensusEngine {
         if !self.signing_profile.is_gov5() {
             self.imported_blocks.clear();
             self.imported_block_fifo.clear();
+            self.imported_parents.clear();
         }
 
         // Preserve any timeouts already collected from validators who timed out before us.
