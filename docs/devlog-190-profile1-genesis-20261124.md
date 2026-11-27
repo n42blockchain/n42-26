@@ -1131,3 +1131,73 @@ n42-26 此前只返回前五个字段，证据仅存内存（500 条环形队列
 **状态**：
 - [x] 修复与测试；clippy -D warnings 通过；n42-consensus、n42-consensus-service 全部测试通过。
 - [ ] 与 n42-rs 注入器（`N42_TEST_EQUIVOCATE=commit_vote:every-1`）做混合轮次验证：n42-26 作为 leader 时，应在 `n42_equivocations` 中记录对方的 commit_vote 双签对。
+
+## 18. AM33：连续缺席 leader 的超时退避（v1.2）（2026-11-26 追加）
+
+### 18.1 背景与标准文本
+
+gate 5d（n = 100，base 24 s / max 96 s）中 6 个连续缺席 leader（view 57..62）造成一次 464 s 断档：旧规则每个 TC 都翻倍
+（24/48/96/96/96/96 s）。gov5、n42-rs、n42-26 于 2026-11-26 21:10 EST 商定 AM33（n42-rs `docs/AM33_DRAFT_CONSECUTIVE_ABSENT_LEADERS.md`
+"Agreed" 节；gov5 向量 `vectors/AM33/README.md`）：
+
+    timeout(c) = min(base_eff * 2^floor(c / g), max),   g = min(f + 1, 3),   f = floor((n - 1) / 3)
+
+- `c` 每次本地 view 超时加 1；在 commit QC（Decide）与基于 QC 的 view 跳转时清零；TC 从不清零（含 SyncInfo 中携带的 TC，gov5 已去掉该清零）。
+- 一个 view 的计时器为进入该 view 时的 `timeout(c)`。
+- `base_eff` 为本地自适应基准 `max(base, 2 * p95 commit latency)`，上限 max；分组只除指数。
+- n 为引擎启动 view 计时器时持有的验证者集大小。
+
+向量：gov5 `internal/testdata/profile1/vectors/AM33/timeout_backoff.json`（gov5 a64a7947，SHA-256 `dd23ae8d…b222`），
+逐字节复制到 `crates/n42-consensus/testdata/profile1/gov5/AM33/`（含 README）。内容：groups（n = 1..7, 10, 100, 512）、
+timeouts（n = 4/7/100，24 s/96 s 与 6 s/30 s，c = 0..12，含旧规则列）、29 条 runs（gate-5d、n{4,7,100}-T1-k{1..6}、n100-T1-k33、
+n{4,7,100}-T8-k3、AM32 边界钳制及其 -p1 / -next-dead 变体）。n42-rs main d8a5e54d2 已通过同一向量。
+
+### 18.2 设计决策
+
+- **计数方式不变**：n42-26 原本就是"本地超时 +1、commit 与 QC 跳转清零、TC 不清零"，与商定规则一致。n42-26 没有 SyncInfo；
+  对应的"携带 TC"路径是 NewView（TC 内嵌），它只推进 view，不动 `c`。他人 TC 让本节点离开 view 而本地计时器未触发时，`c` 不变
+  （只计本地超时）。f+1 弱同步路径（`collect_future_timeout`）推进后会调用 `on_timeout`，属于本地超时，照常 +1。
+- **只改指数**：`Pacemaker::timeout_duration` 指数改为 `floor(c / g)`；自适应基准不动（与 gov5/n42-rs 相同：分组只作用于指数）。
+- **仅 Profile 1 生效**：AM33 是混合生产标准 v1.2 对 SYNC §10.2 的修订，三方针对 Profile 1 商定。原生 0x50 路线与 ETH 路线不属于该标准，
+  按 CLAUDE.md "保留各自协议配置与验收口径"，这些链不设委员会规模（n = 0 → g = 1），行为与之前完全一致。开关沿用 `VoteRules::profile1`。
+  （n42-rs 是无条件启用；其仓库只有 H2 主线，不涉及此取舍。）
+- **API 对齐 n42-rs/gov5**：`Pacemaker::backoff_group_size(n)`（gov5 `BackoffGroupSize`）、`set_committee_size`（gov5 `SetCommitteeSize`）、
+  `with_committee_size`、`backoff_group()`，便于三方对照。
+
+### 18.3 实施细节
+
+- `protocol/pacemaker.rs`：新增 `committee_size` 字段（0 = 无，g = 1）与上述方法；新增 `armed_timeout()`（上次 `reset_for_view` 设定的时长，
+  确定性，测试用），`reset_for_view` 日志带 `backoff_group`。
+- `protocol/state_machine.rs`：
+  - `sync_backoff_group()`：Profile 1 取当前持有的验证者集大小，其他路线取 0；在两个构造函数末尾与 `set_vote_rules` 中调用。
+  - `arm_view_timer(view)`：先 `sync_backoff_group()` 再 `reset_for_view(view, c)`。`advance_to_view` 在跨 epoch 处理之后调用它，
+    所以 n 是新 view 所在 epoch 的集合大小。
+- `protocol/timeout.rs`：`on_timeout` 中三处 `reset_for_view`（观察者分支、重复超时、首次超时）改为 `arm_view_timer`。
+- 编排层 `reset_for_view(view, 0)`（启动 view ≤ 1 的检查）c = 0，不受影响，未改动。
+
+### 18.4 测试
+
+- `pacemaker.rs` 单元测试（6 个）：g 表（n = 0..7, 10, 100, 512）；n = 4（g = 2）24/24/48/48/96…；n = 7 与 n = 100（g = 3）6/6/6/12/12/12/24/24/24/30；
+  上限与指数饱和（c 到 `u32::MAX`）；`set_committee_size` 切换；与自适应基准组合（p95 = 3 s → base_eff 6 s，6/6/12/12/24/24）。
+- `tests/profile1_am33.rs`（3 个，先校验 SHA-256）：groups、timeouts（含旧规则列）、29 条 runs 在 pacemaker + `leader_index` + `view_after_tc` 上重放，
+  逐步核对 leader、进入时的 c、计时器、下一 view 与 `gapMs` / `previousRuleGapMs`。
+- `state_machine.rs` 引擎测试（4 个）：
+  - `am33_vector_runs_on_engine`：29 条 runs 全部在真实引擎上重放（Profile 1 用 H2-v4 签名；非缺席的观察者节点；缺席 view 由本地超时 + 其他验证者超时形成 TC，
+    存活 view 由 Decide 提交）。逐步核对 view、leader、g、进入时的 c、实际装填的计时器、下一 view，存活 view 后 c = 0 且计时器回到 base；
+    同一批 runs 在非 Profile-1 引擎上得到 `previousRuleGapMs`。覆盖 n = 4/7/100、上限、AM32 边界钳制、rotate-on-timeout（T = 8）。
+  - `am33_a_tc_in_a_new_view_keeps_the_timeout_count`：NewView 携带的 TC 不清零 c；未本地超时而被他人 TC 带走的 view 不计数；n = 7 时第三次超时才翻倍。
+  - `am33_a_qc_view_jump_resets_the_backoff`：n = 4 三次超时后（c = 3，计时器 2·base）QC 跳转到 view 100，c = 0、计时器回到 base。
+  - `am33_other_lines_keep_one_doubling_per_timeout`：非 Profile 1 每次超时翻倍（g = 1）。
+- clippy `-p n42-consensus -p n42-consensus-service --all-targets -D warnings` 通过；n42-consensus（lib 294、integration 67 等）与
+  n42-consensus-service（365 + 19）全部通过。
+
+### 18.5 遇到的问题
+
+- Profile 1 只允许 H2-v4 签名（A14），用 Native 签名的测试消息会被 `SigningProfileUnreachable` 拒绝；测试改为按引擎的 signing profile 构造 QC/TC/NewView/Proposal。
+- 引擎构造后、首次 `advance_to_view` 前，pacemaker 尚未拿到委员会规模；在构造函数与 `set_vote_rules` 中同步一次。
+
+### 18.6 状态与后续
+
+- [x] AM33 实现、gov5 向量全部通过（pacemaker 级与引擎级）、devlog。
+- [ ] 混合 5d 式重跑：6 个连续缺席 leader，base 24 s 下断档 ≤ 216 s（加出块间隔）。
+- 未处理（沿用现状）：从快照恢复且 c > 0 的节点，首个 view 的计时器仍是 base（`Pacemaker::new` 的初始 deadline），直到第一次 `arm_view_timer`。

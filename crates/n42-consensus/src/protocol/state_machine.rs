@@ -452,7 +452,7 @@ impl ConsensusEngine {
         vote_log: Arc<dyn VoteLogWriter>,
     ) -> Self {
         let local_public_key = secret_key.public_key();
-        Self {
+        let mut engine = Self {
             my_index,
             secret_key,
             local_public_key,
@@ -486,7 +486,9 @@ impl ConsensusEngine {
             held_prepare_qc: None,
             checked_parents: BoundedFifoMap::new(64),
             refused_blocks: BoundedFifoMap::new(64),
-        }
+        };
+        engine.sync_backoff_group();
+        engine
     }
 
     /// Creates a consensus engine with recovered state from a persisted snapshot.
@@ -559,7 +561,7 @@ impl ConsensusEngine {
             );
         }
         let local_public_key = secret_key.public_key();
-        Self {
+        let mut engine = Self {
             my_index,
             secret_key,
             local_public_key,
@@ -600,7 +602,9 @@ impl ConsensusEngine {
             held_prepare_qc: None,
             checked_parents: BoundedFifoMap::new(64),
             refused_blocks: BoundedFifoMap::new(64),
-        }
+        };
+        engine.sync_backoff_group();
+        engine
     }
 
     // ── Public accessors ──
@@ -626,6 +630,7 @@ impl ConsensusEngine {
     /// processes its first event (tests run several chains in one process).
     pub fn set_vote_rules(&mut self, rules: crate::VoteRules) {
         self.vote_rules = rules;
+        self.sync_backoff_group();
     }
 
     /// A14: refuses to act under a signing profile the chain's rules do not
@@ -1419,8 +1424,7 @@ impl ConsensusEngine {
         }
 
         self.round_state.advance_view(new_view);
-        self.pacemaker
-            .reset_for_view(new_view, self.round_state.consecutive_timeouts());
+        self.arm_view_timer(new_view);
         self.vote_collector = None;
         self.commit_collector = None;
         self.timeout_collector = None;
@@ -1488,6 +1492,27 @@ impl ConsensusEngine {
 
     pub(super) fn validator_set(&self) -> &ValidatorSet {
         self.epoch_manager.current_validator_set()
+    }
+
+    /// Gives the pacemaker the committee size its AM33 backoff group comes
+    /// from: the validator set held now on Profile 1, none (group 1, the
+    /// pre-AM33 rule) on the other lines.
+    fn sync_backoff_group(&mut self) {
+        let committee_size = if self.vote_rules.profile1 {
+            self.validator_set().len() as usize
+        } else {
+            0
+        };
+        self.pacemaker.set_committee_size(committee_size);
+    }
+
+    /// Starts `view`'s timer at `timeout(c)` with `c` as it stands. On
+    /// Profile 1 the backoff group comes from the validator set held now
+    /// (AM33: `g = min(f + 1, 3)`); the other lines keep group 1.
+    pub(super) fn arm_view_timer(&mut self, view: ViewNumber) {
+        self.sync_backoff_group();
+        self.pacemaker
+            .reset_for_view(view, self.round_state.consecutive_timeouts());
     }
 
     pub(super) fn validator_set_for_view(&self, view: ViewNumber) -> &ValidatorSet {
@@ -6190,5 +6215,384 @@ mod tests {
         // A QC still moves to the next view, and leaders are the grid.
         assert_eq!(engine.leader_index_for_view(6), 1);
         assert_eq!(engine.leader_index_for_view(8), 2);
+    }
+
+    // ── AM33: view-timeout backoff for consecutive absent leaders ──
+
+    /// An engine for `n` validators with explicit timeouts, epoch length,
+    /// tenure (rotate-on-timeout from genesis) and Profile-1 switch.
+    #[allow(clippy::type_complexity)]
+    fn am33_engine(
+        n: usize,
+        my_index: u32,
+        (base_ms, max_ms): (u64, u64),
+        epoch_length: u64,
+        tenure: u64,
+        profile1: bool,
+    ) -> (
+        ConsensusEngine,
+        Vec<n42_primitives::BlsSecretKey>,
+        ValidatorSet,
+        mpsc::Receiver<EngineOutput>,
+    ) {
+        let sks: Vec<_> = (0..n).map(|i| test_key(0x10 + i as u8)).collect();
+        let infos: Vec<_> = sks
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| ValidatorInfo {
+                address: Address::with_last_byte(i as u8),
+                bls_public_key: sk.public_key(),
+                p2p_peer_id: None,
+            })
+            .collect();
+        let vs = ValidatorSet::new(&infos, ((n as u32).saturating_sub(1)) / 3);
+        let epochs = if epoch_length > 0 {
+            EpochManager::with_epoch_length(vs.clone(), epoch_length)
+        } else {
+            EpochManager::new(vs.clone())
+        };
+        let (output_tx, output_rx) = mpsc::channel(4096);
+        let mut engine = ConsensusEngine::with_epoch_manager(
+            my_index,
+            sks[my_index as usize].clone(),
+            epochs,
+            base_ms,
+            max_ms,
+            output_tx,
+        );
+        if profile1 {
+            // Profile 1 signs with H2-v4 only.
+            enable_test_h2(&mut engine);
+            engine.set_vote_rules(crate::VoteRules::PROFILE1);
+        } else {
+            engine.set_vote_rules(crate::VoteRules::TODAY);
+        }
+        engine.set_leader_schedule(crate::validator::LeaderSchedule {
+            tenure,
+            rotate_on_timeout_from: Some(0),
+        });
+        (engine, sks, vs, output_rx)
+    }
+
+    fn am33_timeout_message(
+        engine: &ConsensusEngine,
+        view: ViewNumber,
+        sender: u32,
+        sks: &[n42_primitives::BlsSecretKey],
+    ) -> ConsensusEvent {
+        let message = engine.signing_profile.timeout_message(view);
+        ConsensusEvent::Message(ConsensusMessage::Timeout(TimeoutMessage {
+            view,
+            high_qc: QuorumCertificate::genesis(),
+            sender,
+            signature: engine.signing_profile.sign(&sks[sender as usize], &message),
+        }))
+    }
+
+    /// A QC under the engine's signing profile: a commit QC (`commit`) or a
+    /// prepare QC, signed by the first quorum of validators.
+    fn am33_qc(
+        engine: &ConsensusEngine,
+        view: ViewNumber,
+        block_hash: B256,
+        commit: bool,
+        sks: &[n42_primitives::BlsSecretKey],
+        vs: &ValidatorSet,
+    ) -> QuorumCertificate {
+        use crate::protocol::quorum::VoteCollector;
+        let profile = engine.signing_profile;
+        let message = if commit {
+            profile.commit_message(view, block_hash, B256::ZERO)
+        } else {
+            profile.vote_message(view, block_hash)
+        };
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+        for i in 0..vs.quorum_size() as u32 {
+            collector
+                .add_vote(i, profile.sign(&sks[i as usize], &message))
+                .unwrap();
+        }
+        collector
+            .build_qc_with_profile_message(vs, &message, profile)
+            .unwrap()
+    }
+
+    /// A NewView for `view` from `leader`, carrying a TC for `tc_view` signed
+    /// by the first quorum, under the engine's signing profile.
+    fn am33_new_view(
+        engine: &ConsensusEngine,
+        view: ViewNumber,
+        tc_view: ViewNumber,
+        leader: u32,
+        sks: &[n42_primitives::BlsSecretKey],
+        vs: &ValidatorSet,
+    ) -> ConsensusEvent {
+        use crate::protocol::quorum::TimeoutCollector;
+        let profile = engine.signing_profile;
+        let message = profile.timeout_message(tc_view);
+        let mut collector = TimeoutCollector::new(tc_view, vs.len());
+        for i in 0..vs.quorum_size() as u32 {
+            collector
+                .add_verified_timeout(
+                    i,
+                    profile.sign(&sks[i as usize], &message),
+                    QuorumCertificate::genesis(),
+                )
+                .unwrap();
+        }
+        let timeout_cert = collector.build_tc_with_profile(vs, profile).unwrap();
+        ConsensusEvent::Message(ConsensusMessage::NewView(
+            n42_primitives::consensus::NewView {
+                view,
+                timeout_cert,
+                leader,
+                signature: profile.sign(&sks[leader as usize], &profile.new_view_message(view)),
+            },
+        ))
+    }
+
+    /// The local timer fires in the current view, then the other validators'
+    /// timeouts arrive until a TC forms and the engine leaves the view.
+    fn am33_time_out_view(
+        engine: &mut ConsensusEngine,
+        sks: &[n42_primitives::BlsSecretKey],
+        rx: &mut mpsc::Receiver<EngineOutput>,
+    ) {
+        let view = engine.current_view();
+        engine.on_timeout().expect("own timeout");
+        let me = engine.my_index;
+        for sender in (0..sks.len() as u32).filter(|s| *s != me) {
+            if engine.current_view() != view {
+                break;
+            }
+            let event = am33_timeout_message(engine, view, sender, sks);
+            engine.process_event(event).expect("timeout");
+            while rx.try_recv().is_ok() {}
+        }
+        while rx.try_recv().is_ok() {}
+        assert_ne!(
+            engine.current_view(),
+            view,
+            "a TC must form for view {view}"
+        );
+    }
+
+    /// A Decide (commit QC) for the current view.
+    fn am33_decide_view(
+        engine: &mut ConsensusEngine,
+        sks: &[n42_primitives::BlsSecretKey],
+        vs: &ValidatorSet,
+        rx: &mut mpsc::Receiver<EngineOutput>,
+    ) {
+        let view = engine.current_view();
+        let block_hash = B256::from(alloy_primitives::U256::from(view).to_be_bytes::<32>());
+        let commit_qc = am33_qc(engine, view, block_hash, true, sks, vs);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                view,
+                block_hash,
+                commit_qc,
+                validator_changes_hash: B256::ZERO,
+            })))
+            .expect("decide");
+        while rx.try_recv().is_ok() {}
+        assert!(engine.current_view() > view, "a Decide leaves view {view}");
+    }
+
+    fn am33_ms(duration: std::time::Duration) -> u64 {
+        duration.as_millis() as u64
+    }
+
+    /// gov5's AM33 vector (`testdata/profile1/gov5/AM33/timeout_backoff.json`,
+    /// all 29 runs) replayed on one Profile-1 engine that is none of the
+    /// silent leaders: the silent views end in a TC formed from the other
+    /// validators' timeouts, the live view in a Decide. On entering each view
+    /// the engine holds the step's leader and `c`, and its timer is armed at
+    /// the step's timeout; the TC views' timers sum to `gapMs`. The same runs
+    /// on an engine of another line (no Profile 1) keep the pre-AM33 rule
+    /// (`previousRuleGapMs`).
+    #[test]
+    fn am33_vector_runs_on_engine() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/profile1/gov5/AM33/timeout_backoff.json");
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).expect("AM33 vector")).expect("json");
+        let num = |x: &serde_json::Value| x.as_u64().expect("number");
+        let runs = v["runs"].as_array().expect("runs");
+        assert_eq!(runs.len(), 29);
+        for run in runs {
+            let id = run["id"].as_str().expect("id");
+            let n = num(&run["n"]) as usize;
+            let dead: Vec<u64> = run["deadLeaders"]
+                .as_array()
+                .expect("dead")
+                .iter()
+                .map(num)
+                .collect();
+            let observer = (0..n as u64).find(|i| !dead.contains(i)).expect("observer") as u32;
+            for profile1 in [true, false] {
+                let rule = if profile1 { "AM33" } else { "previous" };
+                let (mut engine, sks, vs, mut rx) = am33_engine(
+                    n,
+                    observer,
+                    (num(&run["baseTimeoutMs"]), num(&run["maxTimeoutMs"])),
+                    num(&run["epochLength"]),
+                    num(&run["tenure"]),
+                    profile1,
+                );
+                let start = num(&run["startView"]);
+                if start > engine.current_view() {
+                    engine.advance_to_view(start).expect("start view");
+                }
+                while rx.try_recv().is_ok() {}
+                let group = if profile1 {
+                    Pacemaker::backoff_group_size(n)
+                } else {
+                    1
+                };
+                let mut gap = 0;
+                for (i, step) in run["steps"].as_array().expect("steps").iter().enumerate() {
+                    let what = format!("{id} ({rule}) step {i}");
+                    assert_eq!(engine.current_view(), num(&step["view"]), "{what}: view");
+                    assert_eq!(
+                        u64::from(engine.current_leader_index()),
+                        num(&step["leader"]),
+                        "{what}: leader"
+                    );
+                    assert_eq!(engine.pacemaker().backoff_group(), group, "{what}: g");
+                    let armed = am33_ms(engine.pacemaker().armed_timeout());
+                    if profile1 {
+                        assert_eq!(
+                            u64::from(engine.consecutive_timeouts()),
+                            num(&step["c"]),
+                            "{what}: c on entry"
+                        );
+                        assert_eq!(armed, num(&step["timeoutMs"]), "{what}: timer");
+                    }
+                    if step["event"] == "TC" {
+                        gap += armed;
+                        am33_time_out_view(&mut engine, &sks, &mut rx);
+                    } else {
+                        assert_eq!(step["event"], "QC", "{what}");
+                        am33_decide_view(&mut engine, &sks, &vs, &mut rx);
+                        assert_eq!(
+                            engine.consecutive_timeouts(),
+                            0,
+                            "{what}: a commit resets c"
+                        );
+                        assert_eq!(
+                            am33_ms(engine.pacemaker().armed_timeout()),
+                            num(&run["baseTimeoutMs"]),
+                            "{what}: the view after the commit starts at base"
+                        );
+                    }
+                    assert_eq!(
+                        engine.current_view(),
+                        num(&step["nextView"]),
+                        "{what}: next view"
+                    );
+                }
+                let expected = if profile1 {
+                    &run["gapMs"]
+                } else {
+                    &run["previousRuleGapMs"]
+                };
+                assert_eq!(gap, num(expected), "{id} ({rule}): gap");
+            }
+        }
+    }
+
+    /// AM33: a TC never resets `c`, a TC carried in a NewView included (the
+    /// counterpart of gov5's SyncInfo TC, whose reset gov5 dropped); and a
+    /// view entered on someone else's TC, without a local timeout, does not
+    /// count. n = 7: g = 3.
+    #[test]
+    fn am33_a_tc_in_a_new_view_keeps_the_timeout_count() {
+        let base = 6000;
+        let (mut engine, sks, vs, mut rx) = am33_engine(7, 6, (base, 30_000), 0, 1, true);
+        engine.on_timeout().expect("own timeout at view 1");
+        engine.on_timeout().expect("a repeat is not a new timeout");
+        while rx.try_recv().is_ok() {}
+        assert_eq!(engine.consecutive_timeouts(), 1);
+
+        let new_view = am33_new_view(&engine, 2, 1, 2, &sks, &vs);
+        engine.process_event(new_view).expect("NewView for view 2");
+        assert_eq!(engine.current_view(), 2);
+        assert_eq!(
+            engine.consecutive_timeouts(),
+            1,
+            "a NewView's TC never resets c"
+        );
+        assert_eq!(engine.pacemaker().backoff_group(), 3);
+        assert_eq!(am33_ms(engine.pacemaker().armed_timeout()), base);
+
+        // View 2 ends on the fleet's TC before this node's timer fires.
+        let new_view = am33_new_view(&engine, 3, 2, 3, &sks, &vs);
+        engine.process_event(new_view).expect("NewView for view 3");
+        assert_eq!(engine.current_view(), 3);
+        assert_eq!(
+            engine.consecutive_timeouts(),
+            1,
+            "only local timeouts count"
+        );
+
+        am33_time_out_view(&mut engine, &sks, &mut rx);
+        am33_time_out_view(&mut engine, &sks, &mut rx);
+        assert_eq!(engine.current_view(), 5);
+        assert_eq!(engine.consecutive_timeouts(), 3);
+        assert_eq!(am33_ms(engine.pacemaker().armed_timeout()), 2 * base);
+    }
+
+    /// AM33: a QC-based view jump resets `c`, and the next view starts at base.
+    /// n = 4: g = 2.
+    #[test]
+    fn am33_a_qc_view_jump_resets_the_backoff() {
+        let base = 1000;
+        let (mut engine, sks, vs, mut rx) = am33_engine(4, 0, (base, 60_000), 0, 1, true);
+        // Views 1..3: leaders 1, 2, 3 are absent.
+        for _ in 0..3 {
+            am33_time_out_view(&mut engine, &sks, &mut rx);
+        }
+        assert_eq!(engine.current_view(), 4);
+        assert_eq!(engine.consecutive_timeouts(), 3);
+        assert_eq!(am33_ms(engine.pacemaker().armed_timeout()), 2 * base);
+
+        let far_view = 100u64;
+        let block_hash = B256::repeat_byte(0xDD);
+        let justify_qc = am33_qc(&engine, 99, B256::repeat_byte(0xDE), false, &sks, &vs);
+        let msg = engine
+            .signing_profile
+            .proposal_message(far_view, block_hash, &None);
+        let leader = engine.leader_index_for_view(far_view);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                n42_primitives::consensus::Proposal {
+                    view: far_view,
+                    block_hash,
+                    justify_qc,
+                    proposer: leader,
+                    signature: engine.signing_profile.sign(&sks[leader as usize], &msg),
+                    prepare_qc: None,
+                    tx_root_hash: None,
+                    validator_changes: None,
+                },
+            )))
+            .expect("QC view jump");
+        assert_eq!(engine.current_view(), far_view);
+        assert_eq!(engine.consecutive_timeouts(), 0);
+        assert_eq!(am33_ms(engine.pacemaker().armed_timeout()), base);
+    }
+
+    /// The other lines (no Profile 1) keep the pre-AM33 rule: group 1, one
+    /// doubling per timeout.
+    #[test]
+    fn am33_other_lines_keep_one_doubling_per_timeout() {
+        let base = 1000;
+        let (mut engine, sks, _, mut rx) = am33_engine(7, 0, (base, 60_000), 0, 1, false);
+        for expected in [2 * base, 4 * base, 8 * base] {
+            am33_time_out_view(&mut engine, &sks, &mut rx);
+            assert_eq!(engine.pacemaker().backoff_group(), 1);
+            assert_eq!(am33_ms(engine.pacemaker().armed_timeout()), expected);
+        }
     }
 }
