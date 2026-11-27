@@ -1357,3 +1357,10 @@ rs 根据本节 19.7 的意见把 AM36 补成第 5-9 项。与 PR #58 的差异�
   - 断言 unreported = 0；观察者只收到 7 条 Accept；节点收到的 H2 view 为 {10, 20, 50, 100, 101, 1 000 000, 1 000 001}（两条过期消息仍交付）；交易批次只交付 1 个。
 
 状态：clippy（n42-network、n42-consensus-service、n42-node、n42-node-bin，-D warnings）通过；n42-network + n42-consensus-service + n42-node 测试 1020 通过、0 失败、20 忽略。
+
+### 19.9 Start-up refusal of altSigTx / frameBlocks on a Profile-1 genesis (2026-11-27)
+
+- **Decision**: A11/C4 (decision O3) keeps 0x50 out of Profile 1 everywhere, and A12 keeps frame blocks out. The standard also requires that a Profile-1 genesis enabling `altSigTx` be refused at start-up. n42-26 already refused 0x50 in the pool, in blocks and in execution (`check_profile1_tx_type`), but it started on such a genesis.
+- **Change**: `Profile1Config::from_genesis` now rejects `altSigTx: true` and `frameBlocks: true`. An explicit `false` stays valid. `resolve_genesis_profile` propagates the error, and `install_genesis_profile` then refuses to start.
+- **Test**: `a_profile1_genesis_with_alt_sig_tx_or_frame_blocks_is_refused` in crates/n42-chainspec/tests/profile1_vectors.rs.
+- **Note**: rs first suggested that 0x50 is valid when the genesis has altSigTx, then corrected it. fleet7 is an all-Rust bench chain outside Profile 1. AM36 item 8 uses the fixed set {0x00, 0x01, 0x02, 0x04}.

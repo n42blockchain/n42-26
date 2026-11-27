@@ -397,6 +397,19 @@ impl Profile1Config {
     pub fn from_genesis(genesis: &Genesis) -> Result<Self, Error> {
         let extra = &genesis.config.extra_fields;
         check_profile_field(extra.get("n42Profile"))?;
+        // A11/C4 (decision O3): 0x50 is not part of Profile 1, and A12: frame
+        // blocks are not either. A Profile-1 genesis that enables either is
+        // refused here, at start-up, instead of failing later on a block.
+        if crate::native::alt_sig_tx_enabled(genesis) {
+            return Err(Error(
+                "config: \"altSigTx\" is not allowed on profile 1 (A11/C4)".to_owned(),
+            ));
+        }
+        if crate::native::frame_blocks_enabled(genesis) {
+            return Err(Error(
+                "config: \"frameBlocks\" is not allowed on profile 1 (A12)".to_owned(),
+            ));
+        }
         let hotstuff = extra
             .get("hotstuff")
             .ok_or_else(|| Error("config: mandatory field \"hotstuff\" missing".to_owned()))?;
