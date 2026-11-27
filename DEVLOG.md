@@ -16,6 +16,7 @@ Logs are split into separate files by phase for easy maintenance:
 
 | File | Content | Phase |
 |------|---------|-------|
+| [devlog-190-profile1-genesis-20261124](docs/devlog-190-profile1-genesis-20261124.md) §18 | AM33 连续缺席 leader 超时退避（v1.2，仅 Profile 1）：`timeout(c) = min(base_eff·2^floor(c/g), max)`，`g = min(f+1, 3)`，c 只在 commit 与 QC 跳转清零、TC（含 NewView 携带）不清零；gov5 AM33 向量 29 条 runs 在 pacemaker 与引擎上全部一致 | Consensus |
 | [devlog-190-profile1-genesis-20261124](docs/devlog-190-profile1-genesis-20261124.md) §17.6 | 跨视图边界的迟到作恶证据：保留最近 3 个已关闭 view 的 equivocation tracker 与迟到消息（未验签存放、仅冲突时验签），CommitQC 之后才到的冲突 commit vote、R1 vote、proposal 均产出 AM28 证据 | Consensus |
 | [devlog-193-deferred-check-speed-20261126](docs/devlog-193-deferred-check-speed-20261126.md) | Profile 1 延迟预检查提速：gossip 入口把 secp256k1 发送者写入 reth 共享缓存，预检查先读缓存、少量未命中串行恢复，不再与导入争 rayon 池；1200 笔块单机 3.9→1.7 ms，新增阶段指标与 `deferred check stages` 日志 | Consensus |
 | [devlog-192-sync-v11-range-v2-commit-qc-20261126](docs/devlog-192-sync-v11-range-v2-commit-qc-20261126.md) | 同步标准 v1.1：`bodies_by_range/2` 服务端与客户端（字节预算、HEADERS_ONLY、END 原因，Identify 发现 `/2`，协商失败回退 `/1` 并记 1 小时）与 `commit_qc/1` 服务端与客户端（已提交头部嵌入 QC + 已提交 QC，哈希链与 §3.3 严格验证）；gov5 黄金向量全部用例逐字节一致 | Interop |
