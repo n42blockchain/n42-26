@@ -241,18 +241,11 @@ impl ConsensusEngine {
                 "leader already cast a commit vote in this view; suppressing R2 self-vote");
             return Ok(());
         }
-        let persist_started = std::time::Instant::now();
-        if let crate::BlockDurability::Unavailable { missing } =
-            self.vote_log.ensure_block_durable(view, block_hash)?
-        {
+        if let Some(missing) = self.persist_before_commit_vote(view, block_hash, "leader")? {
             tracing::info!(target: "n42::cl::voting", view, %block_hash, %missing, "holding the leader commit self-vote until the block can be made durable");
             self.held_self_commit_vote = Some((view, block_hash));
             return Ok(());
         }
-        self.vote_log.record_lock(self.round_state.locked_qc())?;
-        self.round_state.record_commit_vote(view);
-        self.vote_log.record_commit_vote(view)?;
-        self.view_timing.r2_persist_us = Some(persist_started.elapsed().as_micros() as u64);
         let changes_hash = self.cached_changes_hash(&block_hash);
         let commit_msg = self
             .signing_profile

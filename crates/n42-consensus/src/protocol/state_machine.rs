@@ -408,6 +408,12 @@ pub struct ConsensusEngine {
     /// AM35: the leader's R2 self-vote `(view, block_hash)` held because the
     /// block could not yet be made durable here.
     pub(super) held_self_commit_vote: Option<(ViewNumber, B256)>,
+    /// AM35: the highest lock this node has made durable through
+    /// `VoteLogWriter::record_lock`, which runs only after the locked block
+    /// is durable. The in-memory lock (`round_state.locked_qc()`) moves as
+    /// soon as a QC is seen, possibly onto a block no member journalled; the
+    /// consensus snapshot stores this one instead.
+    pub(super) durable_locked_qc: QuorumCertificate,
     /// Profile 1, Phase B: the parent of every block that passed the
     /// deferred proposal check here, before its import.
     pub(super) checked_parents: BoundedFifoMap<B256, B256>,
@@ -502,6 +508,7 @@ impl ConsensusEngine {
             vote_rules: crate::VoteRules::installed(),
             held_prepare_qc: None,
             held_self_commit_vote: None,
+            durable_locked_qc: QuorumCertificate::genesis(),
             checked_parents: BoundedFifoMap::new(64),
             refused_blocks: BoundedFifoMap::new(64),
         };
@@ -579,6 +586,9 @@ impl ConsensusEngine {
             );
         }
         let local_public_key = secret_key.public_key();
+        // A recovered lock was durable before the restart: the snapshot only
+        // stores durable locks, and `locked_qc.bin` is written by record_lock.
+        let durable_locked_qc = locked_qc.clone();
         let mut engine = Self {
             my_index,
             secret_key,
@@ -619,6 +629,7 @@ impl ConsensusEngine {
             vote_rules: crate::VoteRules::installed(),
             held_prepare_qc: None,
             held_self_commit_vote: None,
+            durable_locked_qc,
             checked_parents: BoundedFifoMap::new(64),
             refused_blocks: BoundedFifoMap::new(64),
         };
@@ -1024,6 +1035,62 @@ impl ConsensusEngine {
 
     pub fn locked_qc(&self) -> &QuorumCertificate {
         self.round_state.locked_qc()
+    }
+
+    /// AM35: the highest lock already made durable by `record_lock` (after
+    /// its block was made durable). Snapshots persist this, never the
+    /// in-memory [`Self::locked_qc`], so a restart can only adopt a lock
+    /// whose block this node can re-import.
+    pub fn durable_locked_qc(&self) -> &QuorumCertificate {
+        &self.durable_locked_qc
+    }
+
+    /// AM35: the R2 prologue shared by the follower commit vote and the
+    /// leader self-vote: make the voted block (and the locked block, should
+    /// it differ) durable, then the lock, then the R2 vote-log record. Returns
+    /// `Ok(Some(missing))` when block data is not here yet: nothing was
+    /// written and the caller holds the vote.
+    ///
+    /// On success it emits the fixed AM35 line (target `n42::am35`, message
+    /// "commit vote released after durable lock") that external kill tools
+    /// match; the caller signs and sends the R2 vote right after. `role` is
+    /// "follower" or "leader".
+    pub(super) fn persist_before_commit_vote(
+        &mut self,
+        view: ViewNumber,
+        block_hash: B256,
+        role: &'static str,
+    ) -> ConsensusResult<Option<B256>> {
+        let started = Instant::now();
+        let lock = self.round_state.locked_qc().clone();
+        let mut targets = vec![block_hash];
+        if lock.block_hash != block_hash && lock.view > 0 {
+            targets.push(lock.block_hash);
+        }
+        for hash in targets {
+            if let crate::BlockDurability::Unavailable { missing } =
+                self.vote_log.ensure_block_durable(view, hash)?
+            {
+                return Ok(Some(missing));
+            }
+        }
+        self.vote_log.record_lock(&lock)?;
+        if lock.view > self.durable_locked_qc.view {
+            self.durable_locked_qc = lock;
+        }
+        self.round_state.record_commit_vote(view);
+        self.vote_log.record_commit_vote(view)?;
+        self.view_timing.r2_persist_us = Some(started.elapsed().as_micros() as u64);
+        // Stable text: the mixed-gate kill tool (E9) regex-matches this line.
+        tracing::info!(
+            target: "n42::am35",
+            view,
+            block_hash = %block_hash,
+            // Debug renders the quoted form `role="follower"`.
+            role = ?role,
+            "commit vote released after durable lock"
+        );
+        Ok(None)
     }
 
     pub fn last_committed_qc(&self) -> &QuorumCertificate {

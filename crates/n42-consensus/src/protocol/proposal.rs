@@ -531,20 +531,14 @@ impl ConsensusEngine {
         // before the lock that names it, and both before the R2 signature. A
         // whole-set power loss can then never leave a durable lock on a block
         // that no member can produce.
-        let persist_started = std::time::Instant::now();
-        if let crate::BlockDurability::Unavailable { missing } =
-            self.vote_log.ensure_block_durable(view, pqc.block_hash)?
-        {
+        // Persist before signing for the same crash-safety reason as R1. The
+        // lock goes before the R2 record: losing it is what a restart must
+        // not be able to do.
+        if let Some(missing) = self.persist_before_commit_vote(view, pqc.block_hash, "follower")? {
             tracing::info!(target: "n42::cl::proposal", view, block_hash = %pqc.block_hash, %missing, "holding the commit vote until the block can be made durable");
             self.held_prepare_qc = Some(pqc);
             return Ok(());
         }
-        // Persist before signing for the same crash-safety reason as R1. The
-        // lock goes first: losing it is what a restart must not be able to do.
-        self.vote_log.record_lock(self.round_state.locked_qc())?;
-        self.round_state.record_commit_vote(view);
-        self.vote_log.record_commit_vote(view)?;
-        self.view_timing.r2_persist_us = Some(persist_started.elapsed().as_micros() as u64);
 
         // Bind this R2 commit-vote signature to the same changes_hash the
         // leader's proposal carried.
