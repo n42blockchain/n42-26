@@ -27,7 +27,8 @@
 //! frame that is short, oversized or fails its checksum: a torn tail from a
 //! crash during an append is dropped, and the append it belonged to never
 //! returned, so no vote rests on it. Entries leave the index once the
-//! execution layer has persisted their height; [`BlockJournal::maybe_compact`]
+//! execution layer has persisted their block (matched by hash), or once they
+//! are a dead fork below the finalized height; [`BlockJournal::maybe_compact`]
 //! reclaims the space off the vote path.
 
 use alloy_primitives::B256;
@@ -174,6 +175,11 @@ struct Inner {
     durable: HashMap<B256, DurableMeta>,
     staged: HashMap<B256, Staged>,
     staged_order: VecDeque<B256>,
+    lineage: Lineage,
+    /// Height of the highest block consensus finalized (committed and made
+    /// canonical). A journal entry at or below it whose height the
+    /// execution layer persisted under another hash is a dead fork.
+    finalized_number: Option<u64>,
 }
 
 /// The block journal. Shared between the vote log (appends before R2) and
@@ -192,40 +198,28 @@ impl std::fmt::Debug for BlockJournal {
     }
 }
 
-/// `hash -> (parent, number)`, with insertion order for the bound.
-type LineageRegistry = (HashMap<B256, (B256, u64)>, VecDeque<B256>);
-
-fn lineage_registry() -> &'static Mutex<LineageRegistry> {
-    static REGISTRY: std::sync::OnceLock<Mutex<LineageRegistry>> = std::sync::OnceLock::new();
-    REGISTRY.get_or_init(Default::default)
+/// `hash -> (parent, number)` known without decoding a payload, with
+/// insertion order for the bound.
+#[derive(Default)]
+struct Lineage {
+    map: HashMap<B256, (B256, u64)>,
+    order: VecDeque<B256>,
 }
 
-/// Records the parent and number of `hash` where the journal finds them
-/// without decoding the payload. Fed by the leader's build, imports and
-/// catch-up; bounded.
-pub fn note_block_lineage(hash: B256, parent_hash: B256, number: u64) {
-    const REMEMBERED: usize = 2048;
-    let mut guard = lineage_registry()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (map, order) = &mut *guard;
-    if map.insert(hash, (parent_hash, number)).is_none() {
-        order.push_back(hash);
-        if order.len() > REMEMBERED
-            && let Some(old) = order.pop_front()
-        {
-            map.remove(&old);
+/// Lineage entries remembered at most.
+const LINEAGE_REMEMBERED: usize = 2048;
+
+impl Lineage {
+    fn note(&mut self, hash: B256, parent_hash: B256, number: u64) {
+        if self.map.insert(hash, (parent_hash, number)).is_none() {
+            self.order.push_back(hash);
+            if self.order.len() > LINEAGE_REMEMBERED
+                && let Some(old) = self.order.pop_front()
+            {
+                self.map.remove(&old);
+            }
         }
     }
-}
-
-fn noted_lineage(hash: &B256) -> Option<(B256, u64)> {
-    lineage_registry()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .0
-        .get(hash)
-        .copied()
 }
 
 fn encode_frame(record: &JournalRecord) -> io::Result<Vec<u8>> {
@@ -353,6 +347,8 @@ impl BlockJournal {
                     durable,
                     staged: HashMap::new(),
                     staged_order: VecDeque::new(),
+                    lineage: Lineage::default(),
+                    finalized_number: None,
                 }),
                 persisted: RwLock::new(None),
             },
@@ -384,6 +380,39 @@ impl BlockJournal {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records the parent and number of `hash` so an append need not decode
+    /// its payload. Fed by the leader's build, imports and catch-up; bounded.
+    pub fn note_lineage(&self, hash: B256, parent_hash: B256, number: u64) {
+        self.lock().lineage.note(hash, parent_hash, number);
+    }
+
+    /// Records that consensus finalized `hash` (committed, forkchoice moved
+    /// to it). Its height bounds the dead-fork pruning; the height comes
+    /// from what the journal knows about `hash`, so an unknown hash is a
+    /// no-op.
+    pub fn note_finalized(&self, hash: B256) {
+        let mut inner = self.lock();
+        let number = inner
+            .lineage
+            .map
+            .get(&hash)
+            .map(|(_, number)| *number)
+            .or_else(|| inner.durable.get(&hash).map(|meta| meta.number));
+        if let Some(number) = number {
+            inner.finalized_number = Some(inner.finalized_number.unwrap_or(0).max(number));
+        }
+    }
+
+    /// Whether the execution layer persisted `hash` as its canonical block
+    /// at `number` (hash compared, not height alone).
+    pub fn is_persisted(&self, hash: B256, number: u64) -> bool {
+        let Some(chain) = self.persisted_chain() else {
+            return false;
+        };
+        chain.persisted_number().is_some_and(|tip| number <= tip)
+            && chain.persisted_hash(number) == Some(hash)
     }
 
     /// Holds the block data of `hash` (a bincode `BlockDataBroadcast`) until
@@ -474,7 +503,7 @@ impl BlockJournal {
         };
 
         let mut inner = self.lock();
-        Self::prune_below(&mut inner, persisted_number);
+        Self::prune(&mut inner, persisted.as_deref());
 
         // Walk from the voted block towards the persisted head, collecting
         // what is neither durable here nor persisted by the EL. A durable
@@ -496,7 +525,8 @@ impl BlockJournal {
                 return Ok(Durability::Unavailable { missing: current });
             };
             let view = staged.view;
-            let Some((parent, number)) = Self::staged_lineage(current, staged) else {
+            let Some((parent, number)) = Self::staged_lineage(&inner.lineage, current, staged)
+            else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("staged block data of {current} does not decode to its parent"),
@@ -512,14 +542,12 @@ impl BlockJournal {
                 metrics::counter!("n42_block_journal_skipped_persisted_total").increment(1);
                 break;
             }
-            if persisted_number.is_some_and(|tip| number <= tip) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "block {current} at height {number} is not the persisted canonical block there"
-                    ),
-                ));
-            }
+            // A block at a persisted height under another hash is a fork the
+            // execution layer does not hold durably: it is journalled like
+            // any unpersisted ancestor, and the walk goes on to the common
+            // ancestor. A QC on such a fork cannot conflict with a committed
+            // block, so this is normally a fork above the finalized height
+            // whose sibling reth persisted early.
             chain.push((current, number, parent, view));
             if chain.len() > MAX_ANCESTOR_WALK {
                 return Err(io::Error::new(
@@ -535,6 +563,13 @@ impl BlockJournal {
         }
 
         // Oldest first: a torn append can only lose a suffix of descendants.
+        let lineage: Vec<(B256, B256, u64)> = chain
+            .iter()
+            .map(|(block_hash, number, parent, _)| (*block_hash, *parent, *number))
+            .collect();
+        for (block_hash, parent, number) in lineage {
+            inner.lineage.note(block_hash, parent, number);
+        }
         let mut buffer = Vec::new();
         let mut frames = Vec::with_capacity(chain.len());
         for (block_hash, number, parent_hash, view) in chain.iter().rev().copied() {
@@ -631,18 +666,16 @@ impl BlockJournal {
         Ok(Durability::Durable(stats))
     }
 
-    fn staged_lineage(hash: B256, staged: &Staged) -> Option<(B256, u64)> {
-        if let Some(found) = noted_lineage(&hash) {
-            return Some(found);
+    fn staged_lineage(lineage: &Lineage, hash: B256, staged: &Staged) -> Option<(B256, u64)> {
+        if let Some(found) = lineage.map.get(&hash) {
+            return Some(*found);
         }
-        let found = match &staged.source {
-            StagedSource::Data(data) => crate::orchestrator::block_data_lineage(hash, data)?,
+        match &staged.source {
+            StagedSource::Data(data) => crate::orchestrator::block_data_lineage(hash, data),
             StagedSource::Execution { data, .. } => {
-                (data.block_hash() == hash).then(|| (data.parent_hash(), data.block_number()))?
+                (data.block_hash() == hash).then(|| (data.parent_hash(), data.block_number()))
             }
-        };
-        note_block_lineage(hash, found.0, found.1);
-        Some(found)
+        }
     }
 
     fn staged_block_data(hash: B256, staged: &Staged) -> io::Result<Vec<u8>> {
@@ -654,14 +687,36 @@ impl BlockJournal {
         }
     }
 
-    fn prune_below(inner: &mut Inner, persisted_number: Option<u64>) -> usize {
-        let Some(tip) = persisted_number else {
+    /// Drops the entries that are no longer needed, matched by hash:
+    /// - the execution layer persisted the entry's block (the persisted
+    ///   canonical block at its height has its hash);
+    /// - the entry is a dead fork: its height is at or below both the
+    ///   persisted tip and the finalized height, and the persisted block
+    ///   there has another hash. A finalized block is final, so no QC can
+    ///   ever extend a sibling below it.
+    ///
+    /// An entry at a persisted height under another hash but above the
+    /// finalized height stays: reth may persist an early sibling, and the
+    /// entry may still be the block consensus commits.
+    fn prune(inner: &mut Inner, persisted: Option<&dyn PersistedChain>) -> usize {
+        let Some(chain) = persisted else {
             return 0;
         };
+        let Some(tip) = chain.persisted_number() else {
+            return 0;
+        };
+        let finalized = inner.finalized_number;
         let before = inner.durable.len();
         let mut freed = 0u64;
-        inner.durable.retain(|_, meta| {
-            let keep = meta.number > tip;
+        inner.durable.retain(|hash, meta| {
+            if meta.number > tip {
+                return true;
+            }
+            let keep = match chain.persisted_hash(meta.number) {
+                Some(persisted) if persisted == *hash => false,
+                Some(_) => finalized.is_none_or(|finalized| meta.number > finalized),
+                None => true,
+            };
             if !keep {
                 freed += meta.len;
             }
@@ -671,15 +726,13 @@ impl BlockJournal {
         before - inner.durable.len()
     }
 
-    /// Drops entries at or below the execution layer's persisted height
-    /// (persisted, or a fork that can no longer be built on) and reclaims
-    /// file space when worthwhile. Runs off the vote path.
+    /// Drops entries the execution layer persisted (by hash) and dead forks
+    /// below the finalized height, and reclaims file space when worthwhile.
+    /// Runs off the vote path.
     pub fn maybe_compact(&self) -> io::Result<usize> {
-        let persisted_number = self
-            .persisted_chain()
-            .and_then(|chain| chain.persisted_number());
+        let persisted = self.persisted_chain();
         let mut inner = self.lock();
-        let pruned = Self::prune_below(&mut inner, persisted_number);
+        let pruned = Self::prune(&mut inner, persisted.as_deref());
         let dead = inner.len - inner.live_bytes;
         if inner.durable.is_empty() && inner.len > 0 {
             inner.file.set_len(0)?;
@@ -927,9 +980,26 @@ mod tests {
             Durability::Unavailable { missing: h(0x11) }
         );
         journal.stage_data(h(0x11), 1, block_data(h(0), h(0x11), 1, 1));
+        // The fork parent is journalled with its child (not refused): the
+        // EL holds a sibling at its height, not the parent itself.
+        assert!(matches!(
+            journal.ensure_durable(h(0x22)).unwrap(),
+            Durability::Durable(stats) if stats.blocks == 2
+        ));
+        assert!(journal.is_durable(&h(0x11)) && journal.is_durable(&h(0x22)));
+
+        // Pruning compares hashes: the fork entry at the persisted height 1
+        // survives the persisted sibling while nothing is finalized there.
+        assert_eq!(journal.maybe_compact().unwrap(), 0);
+        assert!(journal.is_durable(&h(0x11)));
+        // Once consensus finalizes the persisted sibling, the fork is dead.
+        journal.note_lineage(h(1), h(0), 1);
+        journal.note_finalized(h(1));
+        assert_eq!(journal.maybe_compact().unwrap(), 1);
+        assert!(!journal.is_durable(&h(0x11)));
         assert!(
-            journal.ensure_durable(h(0x22)).is_err(),
-            "a non-canonical block below the persisted head is refused"
+            journal.is_durable(&h(0x22)),
+            "height 2 is above the persisted tip"
         );
     }
 
@@ -1060,7 +1130,8 @@ mod tests {
         chain.0.lock().unwrap().push(h(1));
         {
             let mut inner = journal.lock();
-            BlockJournal::prune_below(&mut inner, Some(1));
+            let chain: Arc<dyn PersistedChain> = chain.clone();
+            BlockJournal::prune(&mut inner, Some(chain.as_ref()));
             journal.rewrite_live(&mut inner).unwrap();
         }
         assert_eq!(journal.get(&h(2)).unwrap().unwrap().number, 2);
@@ -1147,7 +1218,7 @@ mod tests {
                 native_header_rlp: None,
             })
             .unwrap();
-            note_block_lineage(hash, parent, n);
+            journal.note_lineage(hash, parent, n);
             journal.stage_data(hash, n, Arc::new(data));
             let started = Instant::now();
             let Durability::Durable(stats) = journal.ensure_durable(hash).unwrap() else {

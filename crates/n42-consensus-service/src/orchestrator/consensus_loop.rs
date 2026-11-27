@@ -1876,6 +1876,9 @@ impl ConsensusService {
         // validity advances so a crash/restart never observes a newer Reth head
         // paired with a stale execution guard.
         self.save_consensus_state();
+        if let Some(journal) = self.block_journal.as_ref() {
+            journal.note_finalized(hash);
+        }
         // AM35: journal entries the execution layer has persisted since are
         // dropped here, off the vote path.
         if let Some(journal) = self.block_journal.as_ref()
@@ -1988,7 +1991,24 @@ impl ConsensusService {
         has_staking_target: bool,
         state_diff: Option<n42_execution::state_diff::StateDiff>,
     ) {
-        crate::block_journal::note_block_lineage(hash, parent_hash, block_number);
+        if let Some(journal) = self.block_journal.as_ref() {
+            journal.note_lineage(hash, parent_hash, block_number);
+            // AM35: journal the validated block off the event loop now, so
+            // the R2 path's own `ensure_durable` (which still gates the vote)
+            // usually finds it durable instead of copying and syncing tens of
+            // MiB inline. The journal mutex orders the two writers.
+            if journal.holds(&hash)
+                && !journal.is_durable(&hash)
+                && tokio::runtime::Handle::try_current().is_ok()
+            {
+                let journal = Arc::clone(journal);
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) = journal.ensure_durable(hash) {
+                        warn!(target: "n42::cl::block_journal", %hash, %error, "background journal append failed; the R2 path retries it inline");
+                    }
+                });
+            }
+        }
         if self.h2_v4_identity.is_some() && block_number > self.head_block_number {
             // Gossip does not echo a leader's own body. Retain the height from
             // successful new_payload so its later Valid FCU advances both the
