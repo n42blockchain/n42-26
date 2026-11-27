@@ -1682,7 +1682,7 @@ fn main() {
             .config()
             .db
             .sync_mode
-            .is_none_or(|mode| format!("{mode:?}") == "Durable");
+            .is_none_or(|mode| mode == reth_db::mdbx::SyncMode::Durable);
         info!(target: "n42::cli", "Launching N42 node");
         let profile1 = install_genesis_profile(&builder.config().chain.genesis)?;
         install_genesis_leader_schedule(&builder.config().chain.genesis)?;

@@ -7372,6 +7372,7 @@ dependencies = [
  "reth-cli",
  "reth-cli-commands",
  "reth-cli-runner",
+ "reth-db",
  "reth-db-api",
  "reth-db-common",
  "reth-ethereum-cli",
