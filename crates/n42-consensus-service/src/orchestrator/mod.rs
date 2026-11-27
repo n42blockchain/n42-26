@@ -604,7 +604,7 @@ pub(super) fn ahead_step(
     output_enabled: bool,
     child_covered: bool,
 ) -> AheadStep {
-    if ready.context.view >= current_view + depth.max(1) {
+    if ready.context.view >= current_view.saturating_add(depth.max(1)) {
         // `depth` blocks ahead at most: wait for a later view.
         return AheadStep::Hold;
     }
@@ -612,7 +612,7 @@ pub(super) fn ahead_step(
         return AheadStep::Skip;
     }
     let child = PayloadBuildContext {
-        view: ready.context.view + 1,
+        view: ready.context.view.saturating_add(1),
         parent_hash: ready.block_hash,
     };
     match ready.kind {
@@ -3042,9 +3042,9 @@ impl ConsensusService {
                     ahead::tip_capacity(depth, execution_bridge::finalize_on_tip_chain()),
                 );
         }
-        let leads_next = self.engine.is_leader_for_view(ready.context.view + 1);
+        let leads_next = self.engine.is_leader_for_view(ready.context.view.saturating_add(1));
         let child = PayloadBuildContext {
-            view: ready.context.view + 1,
+            view: ready.context.view.saturating_add(1),
             parent_hash: ready.block_hash,
         };
         let on_output = self.ahead.output_build(child).is_some();

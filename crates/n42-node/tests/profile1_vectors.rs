@@ -15,6 +15,11 @@
 //! The block rewards (A8) are the withdrawals `devBlockReward` to the
 //! coinbase and to `devFaucetAddress`.
 //!
+//! V2 (roots, v1.2): the receipts block executed by this node, every
+//! receipt's fields and encoding, the receipts roots (with AM34 item 5's
+//! EIP-7708 transfer log), the withdrawals roots and the committee evidence
+//! (`v2_*`).
+//!
 //! V5's `builder_request_contracts.json` (EIP-8282 code at both builder
 //! request addresses, no call on a native chain) runs the same way
 //! (`v5_builder_request_contracts_*`); V5's header chain runs through the
@@ -930,4 +935,243 @@ fn v5_builder_request_contracts_with_eip8282_calls_write_the_slots() {
         assert_eq!(ours.gas_used, u64_of(&theirs["gasUsed"]), "{name}");
         assert_eq!(ours.requests.requests_hash(), b256(&theirs["requestsHash"]), "{name}");
     }
+}
+
+// --------------------------------------------------------------------- V2 --
+//
+// gov5's V2 (roots; `testdata/profile1/gov5/V2`, a byte-exact copy of gov5
+// 08ecf671 `internal/testdata/profile1/vectors/V2`). The receipts block is
+// executed here, by the node's executor, on V1's genesis plus the vector's
+// sender (the standard genesis and V1's share every execution-relevant
+// field), and each receipt must equal gov5's field by field and byte by
+// byte. AM34 item 5: the plain 1-wei transfer's receipt carries the
+// Amsterdam EIP-7708 transfer log from `0xff..fe`, and the receipts root
+// includes it.
+
+/// SHA-256 of `V2/roots.json` as gov5 published it.
+const V2_ROOTS_SHA256: &str = "deff5a4736778ef0b70aedc30f747d7ccd89422479393d37cba04fc541cdef18";
+
+fn v2() -> Value {
+    use sha2::Digest;
+    let raw = std::fs::read(testdata().join("V2/roots.json")).expect("V2/roots.json");
+    assert_eq!(
+        alloy_primitives::hex::encode(sha2::Sha256::digest(&raw)),
+        V2_ROOTS_SHA256,
+        "V2/roots.json is not gov5's byte-exact copy"
+    );
+    serde_json::from_slice(&raw).expect("json")
+}
+
+/// The vector's logs of one receipt.
+fn v2_logs(receipt: &Value) -> Vec<alloy_primitives::Log> {
+    receipt["logs"]
+        .as_array()
+        .expect("logs")
+        .iter()
+        .map(|log| {
+            alloy_primitives::Log::new_unchecked(
+                address(&log["address"]),
+                log["topics"].as_array().expect("topics").iter().map(b256).collect(),
+                hex(&log["data"]).into(),
+            )
+        })
+        .collect()
+}
+
+/// The receipts of V2's block as this node's executor produces them.
+fn v2_receipts(vector: &Value) -> Vec<n42_tx_types::Receipt> {
+    let (spec, config) = chain(&vector["allocAdditions"]);
+    let evm = N42EvmConfig::new(spec.clone());
+    let txs = vector["transactions"]
+        .as_array()
+        .expect("transactions")
+        .iter()
+        .map(|raw| decode(&hex(raw)).expect("a V2 transaction decodes"))
+        .collect();
+    let block = block_of(&config, &vector["receiptsBlock"], txs).expect("the V2 block");
+    let output = BasicBlockExecutor::new(evm, genesis_state(&spec))
+        .execute(&block)
+        .expect("the V2 block executes");
+    output.result.receipts
+}
+
+#[test]
+fn v2_receipts_and_receipts_roots_equal_gov5() {
+    let vector = v2();
+    let ours = v2_receipts(&vector);
+    let theirs = vector["receipts"].as_array().expect("receipts");
+    assert_eq!(ours.len(), theirs.len(), "receipt count");
+    for (i, (our, their)) in ours.iter().zip(theirs).enumerate() {
+        assert_eq!(u64_of(&their["txIndex"]), i as u64);
+        assert_eq!(u64::from(our.success), u64_of(&their["status"]), "receipt {i}: status");
+        assert_eq!(
+            our.cumulative_gas_used,
+            u64_of(&their["cumulativeGasUsed"]),
+            "receipt {i}: cumulative gas"
+        );
+        assert_eq!(our.logs, v2_logs(their), "receipt {i}: logs");
+        assert_eq!(
+            alloy_primitives::hex::encode_prefixed(n42_consensus::gov5_native_receipt_rlp(our)),
+            their["encoding"].as_str().expect("encoding"),
+            "receipt {i}: encoding"
+        );
+    }
+    // What the block is for: a reverted CREATE, and AM34 item 5's EIP-7708
+    // log on the plain transfer, from 0xff..fe with the ERC-20 Transfer
+    // topic (from, to) and the value.
+    assert!(!ours[1].success);
+    let transfer = &ours[2].logs;
+    assert_eq!(transfer.len(), 1, "the transfer's receipt carries one log");
+    let log = &transfer[0];
+    assert_eq!(log.address, evm2::evm::SYSTEM_ADDRESS);
+    assert_eq!(log.topics()[0], evm2::constants::EIP7708_TRANSFER_TOPIC);
+    let roots = vector["receiptsRoots"].as_array().expect("receiptsRoots");
+    assert_eq!(roots.len(), 4);
+    for row in roots {
+        let picked: Vec<_> = row["receiptIndexes"]
+            .as_array()
+            .expect("receiptIndexes")
+            .iter()
+            .map(|i| ours[u64_of(i) as usize].clone())
+            .collect();
+        assert_eq!(
+            n42_consensus::gov5_native_receipts_root(&picked),
+            b256(&row["receiptsRoot"]),
+            "{}",
+            row["name"]
+        );
+    }
+}
+
+/// Without EIP-7708 the transfer's receipt has no log and the block's
+/// receipts root is not gov5's: the log is what V2 pins.
+#[test]
+fn v2_the_transfer_log_is_part_of_the_receipts_root() {
+    let vector = v2();
+    let mut ours = v2_receipts(&vector);
+    let block_root = b256(&vector["receiptsRoots"][3]["receiptsRoot"]);
+    assert_eq!(n42_consensus::gov5_native_receipts_root(&ours), block_root);
+    ours[2].logs.clear();
+    assert_ne!(n42_consensus::gov5_native_receipts_root(&ours), block_root);
+}
+
+#[test]
+fn v2_withdrawals_roots_equal_gov5() {
+    let vector = v2();
+    let rows = vector["withdrawalsRoots"].as_array().expect("withdrawalsRoots");
+    assert_eq!(rows.len(), 6);
+    for row in rows {
+        let name = &row["name"];
+        let rewards: Vec<n42_consensus::Gov5Reward> = row["rewards"]
+            .as_array()
+            .expect("rewards")
+            .iter()
+            .map(|reward| {
+                let one = n42_consensus::Gov5Reward {
+                    address: address(&reward["address"]),
+                    amount: reward["amountWei"]
+                        .as_str()
+                        .expect("decimal")
+                        .parse::<U256>()
+                        .expect("wei"),
+                };
+                assert_eq!(
+                    n42_consensus::gov5_native_rewards_root(std::slice::from_ref(&one)),
+                    alloy_primitives::keccak256(hex(&reward["encoding"])),
+                    "{name}: encoding"
+                );
+                one
+            })
+            .collect();
+        let expected = b256(&row["withdrawalsRoot"]);
+        assert_eq!(n42_consensus::gov5_native_rewards_root(&rewards), expected, "{name}");
+        // Through the withdrawals a block carries them (the import path).
+        let withdrawals = n42_consensus::gov5_rewards_to_withdrawals(&rewards).expect("whole gwei");
+        assert_eq!(
+            n42_consensus::gov5_native_rewards_root(&n42_consensus::gov5_withdrawals_to_rewards(
+                &withdrawals
+            )),
+            expected,
+            "{name}: via withdrawals"
+        );
+    }
+}
+
+#[test]
+fn v2_committee_evidence_equals_gov5() {
+    use n42_consensus::committee_pool::{active_pool, committee, signing_message};
+    let vector = v2();
+    let cfg = &vector["committeePool"];
+    let pool = n42_consensus::SimulatedCommitteePool::new(n42_consensus::CommitteePoolConfig {
+        seed: b256(&cfg["seedHex"]),
+        pool_size: u64_of(&cfg["poolSize"]) as usize,
+        committee_size: u64_of(&cfg["committeeSize"]) as usize,
+        ramp_blocks: u64_of(&cfg["rampBlocks"]),
+    })
+    .expect("pool");
+    let config = pool.config().clone();
+    // The pool V1's genesis (this node's profile-1 parser) configures.
+    let (spec, _) = chain(&serde_json::json!({}));
+    assert_eq!(
+        n42_consensus::CommitteePoolConfig::from_genesis(&spec.genesis)
+            .expect("committeePool")
+            .expect("on"),
+        config
+    );
+    let number = |value: &Value| -> u64 {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+            .expect("a number")
+    };
+    let rows = vector["committeeEvidence"].as_array().expect("committeeEvidence");
+    assert_eq!(rows.len(), 10);
+    for row in rows {
+        let parent = number(&row["parentNumber"]);
+        let name = format!("{} (parent {parent})", row["name"].as_str().unwrap_or("?"));
+        let hash = b256(&row["parentHash"]);
+        let receipts_root = b256(&row["parentReceiptsRoot"]);
+        let active = number(&row["activePoolSize"]) as usize;
+        assert_eq!(
+            active_pool(parent, config.pool_size, config.committee_size, config.ramp_blocks),
+            active,
+            "{name}: active pool"
+        );
+        let members: Vec<usize> = row["committee"]
+            .as_array()
+            .expect("committee")
+            .iter()
+            .map(|i| number(i) as usize)
+            .collect();
+        assert_eq!(committee(parent, &hash, active, config.committee_size), members, "{name}: committee");
+        assert_eq!(pool.committee_at(parent, &hash), members, "{name}: committee");
+        assert_eq!(
+            signing_message(parent, &hash).as_slice(),
+            hex(&row["signingMessage"]),
+            "{name}: signing message"
+        );
+        let evidence = pool.build_evidence(parent, &hash, &receipts_root).expect("evidence");
+        assert_eq!(u64::from(evidence.signer_count), number(&row["signerCount"]), "{name}: signers");
+        assert_eq!(evidence.signers_packed, hex(&row["signersPacked"]), "{name}: signer bitmap");
+        assert_eq!(
+            evidence.aggregate_signature.as_slice(),
+            hex(&row["aggregateSignature"]),
+            "{name}: aggregate signature"
+        );
+        let marshalled = evidence.marshal();
+        assert_eq!(marshalled.len(), 405, "{name}: evidence length");
+        assert_eq!(marshalled, hex(&row["evidence"]), "{name}: evidence bytes");
+        let root = b256(&row["parentBeaconRoot"]);
+        assert_eq!(evidence.beacon_root(), root, "{name}: parentBeaconRoot");
+        assert_eq!(
+            pool.parent_beacon_root(parent, &hash, &receipts_root).expect("root"),
+            Some(root),
+            "{name}: parent_beacon_root"
+        );
+    }
+    // B5: a child of genesis carries the zero root.
+    assert_eq!(
+        pool.child_beacon_root(0, &B256::repeat_byte(1), &B256::ZERO).expect("root"),
+        B256::ZERO
+    );
 }

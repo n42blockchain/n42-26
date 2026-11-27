@@ -18,7 +18,7 @@ use crate::block_direct::{
 use crate::consensus_direct::{ConsensusDirectRequest, ConsensusDirectResponse};
 use crate::error::NetworkError;
 use crate::gossipsub::handlers::{
-    decode_consensus_message, encode_consensus_message, validate_message,
+    decode_consensus_message, encode_consensus_message, validate_message_with_gov5_block_cap,
 };
 use crate::gossipsub::topics::{
     blob_sidecar_topic, block_announce_topic, consensus_topic, gov5_block_topic, gov5_h2_topic,
@@ -27,10 +27,9 @@ use crate::gossipsub::topics::{
 use crate::gov5_block::{Gov5BlockError, attributable_hash, decode_wire_block_rlp};
 use crate::gov5_rpc::{
     GOV5_BLOCK_BY_HASH_PROTOCOL, GOV5_BLOCK_PUSH_PROTOCOL, GOV5_HOTSTUFF_DIRECT_PROTOCOL,
-    Gov5BlockByHashRequest, Gov5BlockByHashResponse,
-    Gov5BlockPushRequest, Gov5BlockPushResponse, Gov5BodiesByRangeRequest,
-    Gov5BodiesByRangeResponse, Gov5CanonicalBlockReader, Gov5HotstuffDirectRequest,
-    Gov5HotstuffDirectResponse, Gov5Status,
+    Gov5BlockByHashRequest, Gov5BlockByHashResponse, Gov5BlockPushRequest, Gov5BlockPushResponse,
+    Gov5BodiesByRangeRequest, Gov5BodiesByRangeResponse, Gov5CanonicalBlockReader,
+    Gov5HotstuffDirectRequest, Gov5HotstuffDirectResponse, Gov5Status,
 };
 use crate::h2_v4::{
     H2V4ChainIdentity, H2V4Envelope, decode_gossip as decode_h2_v4_gossip,
@@ -51,6 +50,8 @@ use crate::transport::{
 use crate::tx_forward::{TxForwardRequest, TxForwardResponse};
 
 // Keep send-side eligibility aligned with the receive-side decompression cap.
+// gov5's default `MaxGossipSize`; a profile-1 chain replaces it with its
+// `maxBlockBytes` (B15, vector V9).
 const MAX_GOV5_GOSSIP_BLOCK_BYTES: usize = 1 << 20;
 
 fn gov5_block_fits_gossip(bytes: usize) -> bool {
@@ -228,7 +229,9 @@ fn evict_served_gov5_blocks_over(
 ) {
     let mut held: usize = blocks.values().map(|block| block.rlp.len()).sum();
     while held > budget && order.len() > 1 {
-        let Some(oldest) = order.pop_front() else { break };
+        let Some(oldest) = order.pop_front() else {
+            break;
+        };
         if let Some(dropped) = blocks.remove(&oldest) {
             held -= dropped.rlp.len();
         }
@@ -1226,6 +1229,16 @@ pub struct NetworkService {
     h2_v4_topic_hash: Option<gossipsub::TopicHash>,
     h2_v4_identity: Option<H2V4ChainIdentity>,
     h2_v4_participant: bool,
+    /// On a standard-profile-1 chain: its `maxBlockBytes` (B15) and the G2
+    /// topics, the only ones this node joins or publishes on (AM34 items
+    /// 4-5).
+    profile1: Option<Profile1Gossip>,
+    /// The view of the newest CommitQC the node reported
+    /// ([`NetworkCommand::NoteCommittedQc`]); H2 gossip below it is stale on
+    /// profile 1 (AM36 rule 3).
+    profile1_committed_view: Option<u64>,
+    /// Gossip validation reports on profile 1 (AM36).
+    gossip_validation: Arc<GossipValidationStats>,
     gov5_status: Option<Gov5Status>,
     pending_gov5_status_peers: HashSet<PeerId>,
     /// Peers that completed a status exchange for this exact genesis. Range
@@ -1409,6 +1422,64 @@ fn push_bounded_backlog<T>(queue: &mut VecDeque<T>, max_len: usize, item: T, lab
     queue.push_back(item);
 }
 
+/// Gossip messages a profile-1 service received and the validation result it
+/// reported for each (AM36). With `validate_messages` the router keeps every
+/// message until it is reported, so `received` must equal the sum of the
+/// three verdicts whenever the handler is not running.
+#[derive(Debug, Default)]
+pub struct GossipValidationStats {
+    received: std::sync::atomic::AtomicU64,
+    accepted: std::sync::atomic::AtomicU64,
+    rejected: std::sync::atomic::AtomicU64,
+    ignored: std::sync::atomic::AtomicU64,
+}
+
+impl GossipValidationStats {
+    fn record(&self, verdict: gossipsub::MessageAcceptance) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.received.fetch_add(1, Relaxed);
+        match verdict {
+            gossipsub::MessageAcceptance::Accept => self.accepted.fetch_add(1, Relaxed),
+            gossipsub::MessageAcceptance::Reject => self.rejected.fetch_add(1, Relaxed),
+            gossipsub::MessageAcceptance::Ignore => self.ignored.fetch_add(1, Relaxed),
+        };
+    }
+
+    /// Messages received.
+    pub fn received(&self) -> u64 {
+        self.received.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Messages reported Accept (forwarded).
+    pub fn accepted(&self) -> u64 {
+        self.accepted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Messages reported Reject.
+    pub fn rejected(&self) -> u64 {
+        self.rejected.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Messages reported Ignore.
+    pub fn ignored(&self) -> u64 {
+        self.ignored.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Messages received but not reported.
+    pub fn unreported(&self) -> u64 {
+        self.received() - (self.accepted() + self.rejected() + self.ignored())
+    }
+}
+
+/// GossipSub on a standard-profile-1 chain (AM34 items 4-5, vector V9).
+#[derive(Clone, Debug)]
+struct Profile1Gossip {
+    /// Decoded size cap of a gov5 block on gossip (`maxBlockBytes`, B15).
+    max_block_bytes: usize,
+    /// The G2 topics joined; nothing is published anywhere else.
+    g2: HashSet<gossipsub::TopicHash>,
+}
+
 impl NetworkService {
     /// Creates a new network service. Returns the service, a handle, a consensus event
     /// receiver (high-priority), and a data event receiver (lower-priority).
@@ -1427,7 +1498,7 @@ impl NetworkService {
         ),
         NetworkError,
     > {
-        Self::new_with_options(swarm, HashMap::new(), true, None, None, None, false)
+        Self::new_with_options(swarm, HashMap::new(), true, None, None, None, false, None)
     }
 
     /// Creates a non-voting service which also subscribes to the gov5 H2 topic
@@ -1456,6 +1527,41 @@ impl NetworkService {
                 genesis_hash,
             }),
             false,
+            None,
+        )
+    }
+
+    /// [`Self::new_gov5_h2_observer`] on a standard-profile-1 chain whose
+    /// blocks are at most `max_block_bytes` (B15): only the G2 topics are
+    /// joined (AM34 items 4-5) and gov5 blocks up to that size are taken
+    /// from gossip (V9). The swarm must be built with the same bound
+    /// ([`crate::TransportConfig::profile1_max_block_bytes`]).
+    pub fn new_profile1_observer(
+        swarm: Swarm<N42Behaviour>,
+        chain_id: u64,
+        genesis_hash: B256,
+        max_block_bytes: u64,
+    ) -> Result<
+        (
+            Self,
+            NetworkHandle,
+            mpsc::Receiver<NetworkEvent>,
+            mpsc::Receiver<NetworkEvent>,
+        ),
+        NetworkError,
+    > {
+        Self::new_with_options(
+            swarm,
+            HashMap::new(),
+            true,
+            Some(gov5_h2_topic(genesis_hash)),
+            Some(gov5_block_topic(genesis_hash)),
+            Some(H2V4ChainIdentity {
+                chain_id,
+                genesis_hash,
+            }),
+            false,
+            Some(max_block_bytes),
         )
     }
 
@@ -1489,6 +1595,43 @@ impl NetworkService {
                 genesis_hash,
             }),
             true,
+            None,
+        )
+    }
+
+    /// [`Self::new_gov5_h2_participant`] on a standard-profile-1 chain whose
+    /// blocks are at most `max_block_bytes` (B15): only the G2 topics are
+    /// joined (AM34 items 4-5), nothing is published elsewhere, and gov5
+    /// blocks up to that size travel on gossip (V9). The swarm must be built
+    /// with the same bound ([`crate::TransportConfig::profile1_max_block_bytes`]).
+    pub fn new_profile1_participant(
+        swarm: Swarm<N42Behaviour>,
+        expected_validator_peer_ids: HashMap<u32, PeerId>,
+        allow_deterministic_peer_ids: bool,
+        chain_id: u64,
+        genesis_hash: B256,
+        max_block_bytes: u64,
+    ) -> Result<
+        (
+            Self,
+            NetworkHandle,
+            mpsc::Receiver<NetworkEvent>,
+            mpsc::Receiver<NetworkEvent>,
+        ),
+        NetworkError,
+    > {
+        Self::new_with_options(
+            swarm,
+            expected_validator_peer_ids,
+            allow_deterministic_peer_ids,
+            Some(gov5_h2_topic(genesis_hash)),
+            Some(gov5_block_topic(genesis_hash)),
+            Some(H2V4ChainIdentity {
+                chain_id,
+                genesis_hash,
+            }),
+            true,
+            Some(max_block_bytes),
         )
     }
 
@@ -1513,9 +1656,11 @@ impl NetworkService {
             None,
             None,
             false,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_options(
         mut swarm: Swarm<N42Behaviour>,
         expected_validator_peer_ids: HashMap<u32, PeerId>,
@@ -1524,6 +1669,7 @@ impl NetworkService {
         gov5_block_observer_topic: Option<gossipsub::IdentTopic>,
         h2_v4_identity: Option<H2V4ChainIdentity>,
         h2_v4_participant: bool,
+        profile1_max_block_bytes: Option<u64>,
     ) -> Result<
         (
             Self,
@@ -1553,7 +1699,27 @@ impl NetworkService {
             mempool_topic(),
             blob_sidecar_topic(),
         ];
+        // Profile 1 (AM34 items 4-5): the G2 topics only, joined below; none
+        // of the native `/n42/*/1` topics.
+        let profile1 = match (profile1_max_block_bytes, h2_v4_identity) {
+            (None, _) => None,
+            (Some(max_block_bytes), Some(identity)) => Some(Profile1Gossip {
+                max_block_bytes: usize::try_from(max_block_bytes).unwrap_or(usize::MAX),
+                g2: crate::gossipsub::profile1::g2_topics(identity.genesis_hash, h2_v4_participant)
+                    .iter()
+                    .map(|topic| topic.hash())
+                    .collect(),
+            }),
+            (Some(_), None) => {
+                return Err(NetworkError::Subscribe(
+                    "a profile-1 service needs the chain's H2-v4 identity".to_owned(),
+                ));
+            }
+        };
         for (i, topic) in topics.iter().enumerate() {
+            if profile1.is_some() {
+                break;
+            }
             // Skip mempool topic (index 3) when tx gossip is disabled
             if tx_gossip_disabled && i == 3 {
                 continue;
@@ -1647,6 +1813,9 @@ impl NetworkService {
             h2_v4_topic_hash,
             h2_v4_identity,
             h2_v4_participant,
+            profile1,
+            profile1_committed_view: None,
+            gossip_validation: Arc::default(),
             gov5_status,
             pending_gov5_status_peers: HashSet::new(),
             gov5_chain_authenticated_peers: HashSet::new(),
@@ -1937,9 +2106,9 @@ impl NetworkService {
             SwarmEvent::Behaviour(N42BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                 propagation_source,
                 message,
-                message_id: _,
+                message_id,
             })) => {
-                self.handle_gossipsub_message(propagation_source, message);
+                self.handle_gossipsub_message(propagation_source, message_id, message);
             }
             SwarmEvent::Behaviour(N42BehaviourEvent::Gossipsub(gossipsub::Event::Subscribed {
                 peer_id,
@@ -2008,7 +2177,11 @@ impl NetworkService {
                 }
                 self.emit_event(NetworkEvent::PeerConnected(peer_id));
             }
-            SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established,
+                ..
+            } => {
                 tracing::info!(%peer_id, "peer disconnected");
                 metrics::gauge!("n42_active_peer_connections").decrement(1.0);
                 self.reconnection.on_disconnected(&peer_id);
@@ -2196,8 +2369,7 @@ impl NetworkService {
                 // With no binding at all (an observer or a Profile-1
                 // follower, which route no direct consensus traffic) this
                 // fires for every verified message; it is expected there.
-                if self.expected_validator_peer_ids.is_empty()
-                    && !self.allow_deterministic_peer_ids
+                if self.expected_validator_peer_ids.is_empty() && !self.allow_deterministic_peer_ids
                 {
                     tracing::debug!(
                         %peer_id,
@@ -2492,11 +2664,72 @@ impl NetworkService {
         )
     }
 
-    fn handle_gossipsub_message(&mut self, source: PeerId, message: gossipsub::Message) {
+    fn handle_gossipsub_message(
+        &mut self,
+        source: PeerId,
+        message_id: gossipsub::MessageId,
+        message: gossipsub::Message,
+    ) {
         metrics::counter!("n42_gossipsub_messages_received").increment(1);
         tracing::info!(target: "n42::net", %source, topic = %message.topic, bytes = message.data.len(), "gossipsub message received");
+        // The topic hash string is bounded by the subscribed set (G2 only on
+        // Profile 1), so it is safe as a metric label.
+        let topic = message.topic.to_string();
+        let (verdict, event) = self.classify_gossipsub_message(source, message);
+        if self.profile1.is_none() {
+            // Other lines: the router forwarded the message already
+            // (Permissive, no validate_messages); the event goes up as before.
+            if let Some(event) = event {
+                self.emit_event(event);
+            }
+            return;
+        }
+        // Profile 1 (AM36): the router holds the message until this report.
+        // Every message gets exactly one, here; only Accept forwards it and
+        // hands it to the node.
+        self.gossip_validation.record(verdict);
+        let label = match verdict {
+            gossipsub::MessageAcceptance::Accept => "accept",
+            gossipsub::MessageAcceptance::Reject => "reject",
+            gossipsub::MessageAcceptance::Ignore => "ignore",
+        };
+        metrics::counter!(
+            "n42_profile1_gossip_validation_total",
+            "verdict" => label,
+            "topic" => topic.clone()
+        )
+        .increment(1);
+        if verdict != gossipsub::MessageAcceptance::Accept {
+            // Rejects penalise the source peer's gossipsub score; both are
+            // logged so a round can count them per topic and per peer.
+            tracing::info!(target: "n42::net", %source, %topic, verdict = label, "AM36 gossip verdict");
+        }
+        self.swarm
+            .behaviour_mut()
+            .gossipsub
+            .report_message_validation_result(&message_id, &source, verdict);
+        // Accept goes up; so does Ignore when it carries an event (a stale H2
+        // message, kept for late-message handling, AM36 rule 3). Reject never.
+        if verdict != gossipsub::MessageAcceptance::Reject
+            && let Some(event) = event
+        {
+            self.emit_event(event);
+        }
+    }
 
-        let acceptance = validate_message(
+    /// Decodes and checks one gossip message: the AM36 verdict and, if the
+    /// message decoded, the event for the node. On profile 1 the event goes up
+    /// unless the verdict is Reject; elsewhere whenever there is one (the
+    /// router forwarded already).
+    fn classify_gossipsub_message(
+        &mut self,
+        source: PeerId,
+        message: gossipsub::Message,
+    ) -> (gossipsub::MessageAcceptance, Option<NetworkEvent>) {
+        use gossipsub::MessageAcceptance::{Accept, Ignore, Reject};
+        let profile1 = self.profile1.is_some();
+
+        let acceptance = validate_message_with_gov5_block_cap(
             &message.topic,
             &message.data,
             &self.consensus_topic_hash,
@@ -2504,11 +2737,12 @@ impl NetworkService {
             &self.mempool_topic_hash,
             &self.blob_sidecar_topic_hash,
             self.gov5_block_topic_hash.as_ref(),
+            self.gov5_block_gossip_wire_cap(),
         );
 
-        if !matches!(acceptance, gossipsub::MessageAcceptance::Accept) {
+        if !matches!(acceptance, Accept) {
             tracing::warn!(%source, "rejected invalid gossipsub message");
-            return;
+            return (acceptance, None);
         }
 
         let topic = &message.topic;
@@ -2519,23 +2753,33 @@ impl NetworkService {
                 .is_some_and(|hash| topic == hash) =>
             {
                 let decoded_len = match snap::raw::decompress_len(&message.data) {
-                    Ok(len) if gov5_block_fits_gossip(len) => len,
+                    Ok(len) if self.gov5_block_fits_gossip(len) => len,
                     Ok(len) => {
                         metrics::counter!("n42_gov5_blocks_rejected_total", "reason" => "oversized")
                             .increment(1);
                         tracing::warn!(target: "n42::interop::block", %source, decoded_len = len, "rejected oversized gov5 block gossip");
-                        return;
+                        return (Reject, None);
                     }
                     Err(error) => {
                         metrics::counter!("n42_gov5_blocks_rejected_total", "reason" => "snappy")
                             .increment(1);
                         tracing::warn!(target: "n42::interop::block", %source, %error, "rejected invalid gov5 block snappy frame");
-                        return;
+                        return (Reject, None);
                     }
                 };
                 match crate::snappy_pool::raw_decompress(&message.data) {
                     Ok(rlp) if rlp.len() == decoded_len => {
                         metrics::counter!("n42_gov5_blocks_observed_total").increment(1);
+                        // AM36 rule 1 on profile 1: the whole block decodes in
+                        // the chain's 24-element layout before it is forwarded.
+                        if profile1
+                            && let Err(error) = crate::gov5_block::decode_profile1_block_rlp(&rlp)
+                        {
+                            metrics::counter!("n42_gov5_blocks_rejected_total", "reason" => "rlp")
+                                .increment(1);
+                            tracing::warn!(target: "n42::interop::block", %source, %error, "rejected undecodable profile-1 block gossip");
+                            return (Reject, None);
+                        }
                         if let Err(error) = self.retain_gov5_served_block_unverified(&rlp) {
                             tracing::warn!(
                                 target: "n42::interop::block",
@@ -2543,6 +2787,9 @@ impl NetworkService {
                                 %error,
                                 "refusing to retain malformed gov5 block gossip"
                             );
+                            if profile1 {
+                                return (Reject, None);
+                            }
                         }
                         NetworkEvent::Gov5Block { source, rlp }
                     }
@@ -2550,13 +2797,13 @@ impl NetworkService {
                         metrics::counter!("n42_gov5_blocks_rejected_total", "reason" => "length")
                             .increment(1);
                         tracing::warn!(target: "n42::interop::block", %source, "rejected inconsistent gov5 block snappy frame");
-                        return;
+                        return (Reject, None);
                     }
                     Err(error) => {
                         metrics::counter!("n42_gov5_blocks_rejected_total", "reason" => "snappy")
                             .increment(1);
                         tracing::warn!(target: "n42::interop::block", %source, %error, "rejected invalid gov5 block snappy frame");
-                        return;
+                        return (Reject, None);
                     }
                 }
             }
@@ -2566,9 +2813,26 @@ impl NetworkService {
                 .is_some_and(|hash| topic == hash) =>
             {
                 let Some(identity) = self.h2_v4_identity else {
-                    return;
+                    return (Ignore, None);
                 };
                 match decode_h2_v4_gossip(&message.data, identity) {
+                    Ok(envelope) if profile1 => {
+                        let verdict = self.profile1_h2_verdict(source, &envelope.message);
+                        if verdict == Reject {
+                            return (Reject, None);
+                        }
+                        let kind = envelope.message.kind().as_str();
+                        metrics::counter!("n42_h2_v4_messages_observed_total", "kind" => kind)
+                            .increment(1);
+                        // Ignore (stale) still reaches the handler (AM36 rule 3).
+                        return (
+                            verdict,
+                            Some(NetworkEvent::H2V4Message {
+                                source,
+                                envelope: Box::new(envelope),
+                            }),
+                        );
+                    }
                     Ok(envelope) => {
                         let kind = envelope.message.kind().as_str();
                         metrics::counter!("n42_h2_v4_messages_observed_total", "kind" => kind)
@@ -2581,7 +2845,7 @@ impl NetworkService {
                     Err(error) => {
                         metrics::counter!("n42_h2_v4_messages_rejected_total").increment(1);
                         tracing::warn!(target: "n42::interop::h2v4", %source, %error, "rejected invalid H2-v4 message");
-                        return;
+                        return (Reject, None);
                     }
                 }
             }
@@ -2592,19 +2856,31 @@ impl NetworkService {
             {
                 match decode_gov5_gossip_message(&message.data) {
                     Ok(msg) => {
+                        let verdict = if profile1 {
+                            self.profile1_h2_verdict(source, &msg)
+                        } else {
+                            Accept
+                        };
+                        if verdict == Reject {
+                            return (Reject, None);
+                        }
                         let kind = msg.kind().as_str();
                         metrics::counter!("n42_gov5_h2_messages_observed_total", "kind" => kind)
                             .increment(1);
                         tracing::debug!(target: "n42::interop::h2", %source, kind, "observed gov5 H2 message");
-                        NetworkEvent::Gov5H2Message {
-                            source,
-                            message: Box::new(msg),
-                        }
+                        // Ignore (stale) still reaches the handler (AM36 rule 3).
+                        return (
+                            verdict,
+                            Some(NetworkEvent::Gov5H2Message {
+                                source,
+                                message: Box::new(msg),
+                            }),
+                        );
                     }
                     Err(error) => {
                         metrics::counter!("n42_gov5_h2_messages_rejected_total").increment(1);
                         tracing::warn!(target: "n42::interop::h2", %source, %error, "rejected invalid gov5 H2 message");
-                        return;
+                        return (Reject, None);
                     }
                 }
             }
@@ -2619,7 +2895,7 @@ impl NetworkService {
                     }
                     Err(e) => {
                         tracing::warn!(%source, error = %e, "failed to decode consensus message");
-                        return;
+                        return (Reject, None);
                     }
                 }
             }
@@ -2631,7 +2907,7 @@ impl NetworkService {
                         bytes = message.data.len(),
                         "N42_DUP_BLOCK_ANNOUNCEMENT_RAW: dropped duplicate block announcement"
                     );
-                    return;
+                    return (Ignore, None);
                 }
                 NetworkEvent::BlockAnnouncement {
                     source,
@@ -2643,6 +2919,27 @@ impl NetworkService {
                 .as_ref()
                 .is_some_and(|hash| topic == hash) =>
             {
+                // AM36 items 5 and 8 on profile 1: bytes that do not decode as
+                // a transaction reject the batch; a batch that decodes but
+                // names a type outside the profile-1 set is ignored (neither
+                // forwarded nor delivered, no penalty).
+                if profile1 {
+                    match crate::gov5_tx_gossip::decode_gossip_message(&message.data)
+                        .map(|raws| crate::gossipsub::profile1::tx_batch_verdict(&raws))
+                    {
+                        Ok(Accept) => {}
+                        Ok(verdict) => {
+                            metrics::counter!("n42_gov5_tx_gossip_rejected_total").increment(1);
+                            tracing::debug!(target: "n42::interop::tx", %source, ?verdict, "gov5 transaction batch outside profile 1");
+                            return (verdict, None);
+                        }
+                        Err(error) => {
+                            metrics::counter!("n42_gov5_tx_gossip_rejected_total").increment(1);
+                            tracing::debug!(target: "n42::interop::tx", %source, %error, "rejected a gov5 transaction message");
+                            return (Reject, None);
+                        }
+                    }
+                }
                 match crate::gov5_tx_gossip::decode_gossip_to_network_rlp(&message.data) {
                     Ok((txs, dropped)) => {
                         metrics::counter!("n42_gov5_tx_gossip_received_total")
@@ -2653,14 +2950,14 @@ impl NetworkService {
                         }
                         tracing::debug!(target: "n42::interop::tx", %source, count = txs.len(), dropped, "gov5 transaction gossip received");
                         if txs.is_empty() {
-                            return;
+                            return (Ignore, None);
                         }
                         NetworkEvent::Gov5TransactionsReceived { source, txs }
                     }
                     Err(error) => {
                         metrics::counter!("n42_gov5_tx_gossip_rejected_total").increment(1);
                         tracing::debug!(target: "n42::interop::tx", %source, %error, "dropped a gov5 transaction message");
-                        return;
+                        return (Reject, None);
                     }
                 }
             }
@@ -2680,11 +2977,37 @@ impl NetworkService {
             }
             _ => {
                 tracing::warn!(%source, %topic, "received message on unknown topic");
-                return;
+                return (Ignore, None);
             }
         };
 
-        self.emit_event(event);
+        (Accept, Some(event))
+    }
+
+    /// AM36 rules 1 and 3 for a decoded H2 message on profile 1: `Reject` if
+    /// a field is out of range, `Ignore` if it is for a view this member has
+    /// left (strictly below the latest commit QC's view, item 6; it is still
+    /// handed to the handler), `Accept` otherwise, future views included.
+    fn profile1_h2_verdict(
+        &self,
+        source: PeerId,
+        message: &H2Message,
+    ) -> gossipsub::MessageAcceptance {
+        use crate::gossipsub::profile1::{
+            h2_fields_in_range, h2_message_is_stale, h2_message_view,
+        };
+        if let Err(reason) = h2_fields_in_range(message) {
+            metrics::counter!("n42_profile1_h2_out_of_range_total").increment(1);
+            tracing::warn!(target: "n42::interop::h2", %source, reason, "rejected H2 message with a field out of range");
+            return gossipsub::MessageAcceptance::Reject;
+        }
+        let view = h2_message_view(message);
+        if h2_message_is_stale(view, self.profile1_committed_view) {
+            metrics::counter!("n42_profile1_h2_stale_total").increment(1);
+            tracing::debug!(target: "n42::interop::h2", %source, view, committed_view = ?self.profile1_committed_view, "ignored H2 message for a view already left");
+            return gossipsub::MessageAcceptance::Ignore;
+        }
+        gossipsub::MessageAcceptance::Accept
     }
 
     fn handle_state_sync_event(
@@ -3635,11 +3958,27 @@ impl NetworkService {
                     .swarm
                     .behaviour_mut()
                     .gov5_block_by_hash
-                    .send_response(channel, Gov5BlockByHashResponse {
-                        rlp: response,
-                        fork_digest: self.gov5_status.map(|s| s.genesis_hash.as_slice()[..4].try_into().expect("four genesis bytes")).unwrap_or_default(),
-                        fallback: if found { None } else { self.gov5_canonical_blocks.clone().map(|r| (r, request.block_hash)) },
-                    })
+                    .send_response(
+                        channel,
+                        Gov5BlockByHashResponse {
+                            rlp: response,
+                            fork_digest: self
+                                .gov5_status
+                                .map(|s| {
+                                    s.genesis_hash.as_slice()[..4]
+                                        .try_into()
+                                        .expect("four genesis bytes")
+                                })
+                                .unwrap_or_default(),
+                            fallback: if found {
+                                None
+                            } else {
+                                self.gov5_canonical_blocks
+                                    .clone()
+                                    .map(|r| (r, request.block_hash))
+                            },
+                        },
+                    )
                     .is_err()
                 {
                     tracing::warn!(%peer, block_hash = %request.block_hash, "failed to answer Gov5 block-by-hash request");
@@ -4784,6 +5123,14 @@ impl NetworkService {
 
     /// Publish raw data to a gossipsub topic.
     fn gossipsub_publish(&mut self, topic: gossipsub::IdentTopic, data: Vec<u8>, label: &str) {
+        // Profile 1 (AM34 item 4): nothing leaves on a topic outside G2.
+        if let Some(profile1) = &self.profile1
+            && !profile1.g2.contains(&topic.hash())
+        {
+            metrics::counter!("n42_profile1_non_g2_publish_dropped_total").increment(1);
+            tracing::debug!(topic = %topic.hash(), "profile 1: not publishing {label} outside the G2 topics");
+            return;
+        }
         match self.swarm.behaviour_mut().gossipsub.publish(topic, data) {
             Ok(_) => {}
             Err(gossipsub::PublishError::NoPeersSubscribedToTopic) => {
@@ -4792,6 +5139,33 @@ impl NetworkService {
             Err(e) => {
                 tracing::warn!(error = %e, "failed to publish {label}");
             }
+        }
+    }
+
+    /// The validation reports of this service's gossip (AM36; profile 1
+    /// only, zero elsewhere).
+    pub fn gossip_validation_stats(&self) -> Arc<GossipValidationStats> {
+        Arc::clone(&self.gossip_validation)
+    }
+
+    /// The decoded size cap of a gov5 block on gossip: the chain's
+    /// `maxBlockBytes` on profile 1 (B15, V9), gov5's 1 MiB default otherwise.
+    fn gov5_block_fits_gossip(&self, decoded_bytes: usize) -> bool {
+        match &self.profile1 {
+            Some(profile1) => {
+                crate::gossipsub::profile1::gov5_block_fits(profile1.max_block_bytes, decoded_bytes)
+            }
+            None => gov5_block_fits_gossip(decoded_bytes),
+        }
+    }
+
+    /// The snappy-encoded size cap of a gov5 block message on gossip.
+    fn gov5_block_gossip_wire_cap(&self) -> usize {
+        match &self.profile1 {
+            Some(profile1) => {
+                crate::gossipsub::profile1::max_gossip_wire_size(profile1.max_block_bytes)
+            }
+            None => crate::transport::MAX_GOSSIP_MESSAGE_SIZE,
         }
     }
 
@@ -4908,7 +5282,7 @@ impl NetworkService {
                 // Large blocks were already retained and queued for direct
                 // delivery above. Our gossip receiver rejects their decoded
                 // size, so avoid compressing and publishing a useless duplicate.
-                if !gov5_block_fits_gossip(rlp.len()) {
+                if !self.gov5_block_fits_gossip(rlp.len()) {
                     metrics::counter!("n42_gov5_block_gossip_skipped_total", "reason" => "oversized")
                         .increment(1);
                     tracing::debug!(target: "n42::interop::h2v4", bytes = rlp.len(),
@@ -5162,6 +5536,10 @@ impl NetworkService {
                 if let Some(reader) = &self.gov5_canonical_blocks {
                     reader.note_committed(qc.block_hash);
                 }
+                self.profile1_committed_view = Some(
+                    self.profile1_committed_view
+                        .map_or(qc.view, |held| held.max(qc.view)),
+                );
                 self.gov5_committed_qc = Some(wire);
             }
             NetworkCommand::CancelGov5BlockFetch { block_hash } => {
@@ -5426,6 +5804,487 @@ mod tests {
         .unwrap()
     }
 
+    fn profile1_transport() -> crate::transport::TransportConfig {
+        let mut config = crate::transport::TransportConfig::for_network_size(4);
+        config.profile1_max_block_bytes = Some(64 << 20);
+        config
+    }
+
+    fn subscribed(service: &NetworkService) -> HashSet<gossipsub::TopicHash> {
+        service
+            .swarm
+            .behaviour()
+            .gossipsub
+            .topics()
+            .cloned()
+            .collect()
+    }
+
+    /// AM34 items 4-5: a profile-1 participant joins the G2 topics only
+    /// (gov5 block, hotstuff_consensus, H2-v4, transaction_v2), none of the
+    /// native `/n42/*/1` topics and no cohort topic.
+    #[test]
+    fn profile1_participant_joins_only_g2_topics() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (identity, _) = h2_v4_fixture_envelope();
+        let swarm = crate::transport::build_interop_participant_swarm(
+            libp2p::identity::Keypair::generate_ed25519(),
+            profile1_transport(),
+            0,
+            identity.genesis_hash,
+        )
+        .unwrap();
+        let (service, ..) = NetworkService::new_profile1_participant(
+            swarm,
+            HashMap::new(),
+            false,
+            identity.chain_id,
+            identity.genesis_hash,
+            64 << 20,
+        )
+        .unwrap();
+        let expected: HashSet<_> =
+            crate::gossipsub::profile1::g2_topics(identity.genesis_hash, true)
+                .iter()
+                .map(|topic| topic.hash())
+                .collect();
+        assert_eq!(subscribed(&service), expected);
+        assert!(expected.contains(&gov5_tx_topic(identity.genesis_hash).hash()));
+        for native in [
+            consensus_topic(),
+            block_announce_topic(),
+            verification_receipts_topic(),
+            mempool_topic(),
+            blob_sidecar_topic(),
+        ] {
+            assert!(!subscribed(&service).contains(&native.hash()), "{native}");
+        }
+        // The profile-1 router: V9's values and the 64 MiB block cap.
+        assert!(service.gov5_block_fits_gossip(64 << 20));
+        assert!(!service.gov5_block_fits_gossip((64 << 20) + 1));
+        assert_eq!(service.gov5_block_gossip_wire_cap(), 78_293_706);
+    }
+
+    /// The observer variant joins G2 without transaction_v2.
+    #[test]
+    fn profile1_observer_joins_only_g2_topics() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (identity, _) = h2_v4_fixture_envelope();
+        let swarm = crate::transport::build_interop_observer_swarm(
+            libp2p::identity::Keypair::generate_ed25519(),
+            profile1_transport(),
+            identity.genesis_hash,
+        )
+        .unwrap();
+        let (service, ..) = NetworkService::new_profile1_observer(
+            swarm,
+            identity.chain_id,
+            identity.genesis_hash,
+            64 << 20,
+        )
+        .unwrap();
+        let expected: HashSet<_> =
+            crate::gossipsub::profile1::g2_topics(identity.genesis_hash, false)
+                .iter()
+                .map(|topic| topic.hash())
+                .collect();
+        assert_eq!(subscribed(&service), expected);
+    }
+
+    /// AM34 item 4: nothing is published outside G2 on profile 1 (a native
+    /// block announcement or consensus message is dropped before the
+    /// router), while the non-profile service keeps its native topics.
+    #[test]
+    fn profile1_drops_publishes_outside_g2() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (identity, _) = h2_v4_fixture_envelope();
+        let swarm = crate::transport::build_interop_participant_swarm(
+            libp2p::identity::Keypair::generate_ed25519(),
+            profile1_transport(),
+            0,
+            identity.genesis_hash,
+        )
+        .unwrap();
+        let (mut service, ..) = NetworkService::new_profile1_participant(
+            swarm,
+            HashMap::new(),
+            false,
+            identity.chain_id,
+            identity.genesis_hash,
+            64 << 20,
+        )
+        .unwrap();
+        let g2 = service.profile1.as_ref().unwrap().g2.clone();
+        assert!(!g2.contains(&block_announce_topic().hash()));
+        assert!(!g2.contains(&consensus_topic().hash()));
+        // Dropped silently: no panic, and the router never learns the topic
+        // (a fanout entry would appear for a real publish).
+        service.gossipsub_publish(block_announce_topic(), vec![1, 2, 3], "test");
+        service.gossipsub_publish(consensus_topic(), vec![1, 2, 3], "test");
+        assert!(!subscribed(&service).contains(&block_announce_topic().hash()));
+
+        // Without profile 1 the gov5 H2 participant keeps the native topics.
+        let (plain, ..) = h2_participant_service(identity, 0, HashMap::new());
+        assert!(plain.profile1.is_none());
+        assert!(subscribed(&plain).contains(&consensus_topic().hash()));
+        assert!(!plain.gov5_block_fits_gossip((1 << 20) + 1));
+    }
+
+    /// AM36 on a live three-node line, publisher -> profile-1 service ->
+    /// observer (the publisher and observer are not connected): on every G2
+    /// topic a valid message is forwarded and a malformed one is reported
+    /// Reject and not forwarded; an out-of-range view (2^64-1) or an
+    /// undecodable transaction entry is Reject; an H2 message below the
+    /// committed view is Ignore. Every message received gets a report.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn profile1_validates_before_forwarding() {
+        use crate::h2_wire::{H2Decide, H2QuorumCertificate};
+        use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope};
+        use alloy_eips::eip2718::Encodable2718;
+        use futures::StreamExt;
+        use libp2p::swarm::SwarmEvent;
+
+        let (identity, _) = h2_v4_fixture_envelope();
+        let genesis = identity.genesis_hash;
+        let snappy = |raw: &[u8]| crate::snappy_pool::raw_compress(raw).unwrap();
+        let qc = |view| H2QuorumCertificate {
+            view,
+            block_hash: B256::repeat_byte(0x44),
+            aggregate_signature: vec![0xaa; 96],
+            signers_bitmap: vec![4, 0, 0x0f],
+        };
+        let decide = |view| {
+            H2Message::Decide(H2Decide {
+                view,
+                block_hash: B256::repeat_byte(0x44),
+                commit_qc: qc(view),
+            })
+        };
+        let h2 = |view| encode_gov5_gossip_message(&decide(view)).unwrap();
+        let h2_v4 = |view| {
+            crate::h2_v4::encode_gossip(&H2V4Envelope {
+                identity,
+                changes_hash: B256::ZERO,
+                message: decide(view),
+            })
+            .unwrap()
+        };
+        let tx = {
+            let tx = TxEip1559 {
+                chain_id: 94,
+                gas_limit: 21_000,
+                max_fee_per_gas: 2_000_000_000,
+                max_priority_fee_per_gas: 1,
+                to: alloy_primitives::TxKind::Call(alloy_primitives::Address::repeat_byte(0x33)),
+                ..Default::default()
+            };
+            let sig = alloy_primitives::Signature::new(
+                alloy_primitives::U256::from(1u64),
+                alloy_primitives::U256::from(2u64),
+                false,
+            );
+            alloy_primitives::Bytes::from(TxEnvelope::Eip1559(tx.into_signed(sig)).encoded_2718())
+        };
+        let txs = |entries: &[alloy_primitives::Bytes]| {
+            snappy(&crate::gov5_tx_gossip::encode_tx_batch(entries).unwrap())
+        };
+        let block = {
+            let v1: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../n42-chainspec/testdata/profile1/V1/header_profile_v1.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let raw = hex::decode(
+                v1["headers"][0]["rlp"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("0x"),
+            )
+            .unwrap();
+            let mut header = n42_chainspec::profile1::Profile1Header::decode(&raw).unwrap();
+            header.header.transactions_root = alloy_consensus::EMPTY_ROOT_HASH;
+            header.header.withdrawals_root = Some(n42_consensus::gov5_native_rewards_root(&[]));
+            snappy(&crate::gov5_block::encode_profile1_block_rlp(
+                &header,
+                &[],
+                &[],
+            ))
+        };
+        let garbage = |tag: u8| snappy(&[tag; 40]);
+        // AM36 item 5: a Decide whose commit QC is for another view, and a
+        // proposal whose justify QC is not for an earlier view.
+        let bad_decide = |view| {
+            H2Message::Decide(H2Decide {
+                view,
+                block_hash: B256::repeat_byte(0x44),
+                commit_qc: qc(view - 1),
+            })
+        };
+        let bad_proposal = H2Message::Proposal(crate::h2_wire::H2Proposal {
+            view: 200,
+            block_hash: B256::repeat_byte(0x45),
+            justify_qc: qc(200),
+            proposer: 0,
+            signature: n42_primitives::BlsSecretKey::random()
+                .unwrap()
+                .sign(b"am36"),
+            prepare_qc: None,
+            tx_root_hash: B256::ZERO,
+        });
+        // AM36 item 8: decodes, but a type outside profile 1 (a blob
+        // transaction; an unknown type byte).
+        let blob_tx = {
+            let tx = alloy_consensus::TxEip4844 {
+                chain_id: 94,
+                gas_limit: 21_000,
+                max_fee_per_gas: 2_000_000_000,
+                max_priority_fee_per_gas: 1,
+                max_fee_per_blob_gas: 1,
+                blob_versioned_hashes: vec![B256::repeat_byte(1)],
+                ..Default::default()
+            };
+            let sig = alloy_primitives::Signature::new(
+                alloy_primitives::U256::from(1u64),
+                alloy_primitives::U256::from(2u64),
+                false,
+            );
+            alloy_primitives::Bytes::from(TxEnvelope::from(tx.into_signed(sig)).encoded_2718())
+        };
+        let unknown_type_tx = alloy_primitives::Bytes::from_static(&[0x05, 0xc0]);
+
+        let block_topic = gov5_block_topic(genesis);
+        let h2_topic = gov5_h2_topic(genesis);
+        let h2_v4 = (h2_v4_topic(), h2_v4);
+        let tx_topic = gov5_tx_topic(genesis);
+        let valid = vec![
+            (block_topic.clone(), block),
+            (h2_topic.clone(), h2(100)),
+            (h2_v4.0.clone(), (h2_v4.1)(101)),
+            (tx_topic.clone(), txs(std::slice::from_ref(&tx))),
+            // AM36 item 6: the committed view itself is not stale, and a
+            // future view is accepted with no cap.
+            (h2_topic.clone(), h2(50)),
+            (h2_topic.clone(), h2(1_000_000)),
+            (h2_v4.0.clone(), (h2_v4.1)(1_000_001)),
+        ];
+        let invalid = vec![
+            // Malformed on every G2 topic.
+            (block_topic.clone(), garbage(1)),
+            (h2_topic.clone(), garbage(2)),
+            (h2_v4.0.clone(), garbage(3)),
+            (tx_topic.clone(), garbage(4)),
+            // Decodes, but a field is out of range.
+            (h2_topic.clone(), h2(u64::MAX)),
+            (h2_v4.0.clone(), (h2_v4.1)(u64::MAX)),
+            // Bytes that do not decode as a transaction of their type.
+            (
+                tx_topic.clone(),
+                txs(&[
+                    tx.clone(),
+                    alloy_primitives::Bytes::from_static(&[0x02, 1, 2]),
+                ]),
+            ),
+            // AM36 item 5.
+            (
+                h2_topic.clone(),
+                encode_gov5_gossip_message(&bad_decide(300)).unwrap(),
+            ),
+            (
+                h2_v4.0.clone(),
+                crate::h2_v4::encode_gossip(&H2V4Envelope {
+                    identity,
+                    changes_hash: B256::ZERO,
+                    message: bad_decide(301),
+                })
+                .unwrap(),
+            ),
+            (
+                h2_topic.clone(),
+                encode_gov5_gossip_message(&bad_proposal).unwrap(),
+            ),
+        ];
+        // Ignore: well-formed H2 for a view below the committed one (still
+        // delivered locally), and transaction batches naming a type outside
+        // profile 1 (neither forwarded nor delivered).
+        let stale = vec![
+            (h2_topic.clone(), h2(10)),
+            (h2_v4.0.clone(), (h2_v4.1)(20)),
+            (tx_topic.clone(), txs(std::slice::from_ref(&blob_tx))),
+            (
+                tx_topic.clone(),
+                txs(&[tx.clone(), unknown_type_tx.clone()]),
+            ),
+        ];
+
+        // The service under test.
+        let swarm = crate::transport::build_interop_participant_swarm(
+            libp2p::identity::Keypair::generate_ed25519(),
+            profile1_transport(),
+            0,
+            genesis,
+        )
+        .unwrap();
+        let (mut service, handle, mut consensus_rx, mut data_rx) =
+            NetworkService::new_profile1_participant(
+                swarm,
+                HashMap::new(),
+                false,
+                identity.chain_id,
+                genesis,
+                64 << 20,
+            )
+            .unwrap();
+        let stats = service.gossip_validation_stats();
+        service
+            .listen_on("/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap())
+            .unwrap();
+        let listen_addr = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let SwarmEvent::NewListenAddr { address, .. } =
+                    service.swarm.select_next_some().await
+                {
+                    break address;
+                }
+            }
+        })
+        .await
+        .expect("listener ready");
+        let service_task = tokio::spawn(service.run());
+        handle
+            .note_committed_qc(crate::h2_wire::encode_h2_qc(&qc(50)).unwrap())
+            .unwrap();
+
+        let g2 = crate::gossipsub::profile1::g2_topics(genesis, true);
+        let peer = || {
+            let mut swarm = crate::transport::build_interop_participant_swarm(
+                libp2p::identity::Keypair::generate_ed25519(),
+                profile1_transport(),
+                0,
+                genesis,
+            )
+            .unwrap();
+            for topic in &g2 {
+                swarm.behaviour_mut().gossipsub.subscribe(topic).unwrap();
+            }
+            swarm.dial(listen_addr.clone()).unwrap();
+            swarm
+        };
+        let mut publisher = peer();
+        let mut observer = peer();
+
+        let all: Vec<_> = valid
+            .iter()
+            .chain(&invalid)
+            .chain(&stale)
+            .cloned()
+            .collect();
+        let mut unpublished = all.clone();
+        let mut heard: Vec<Vec<u8>> = Vec::new();
+        // What the node was handed: H2 views and transaction batches.
+        let mut delivered_views: Vec<u64> = Vec::new();
+        let mut delivered_tx_batches = 0usize;
+        let mut note = |event: NetworkEvent| match event {
+            NetworkEvent::Gov5H2Message { message, .. } => {
+                delivered_views.push(crate::gossipsub::profile1::h2_message_view(&message));
+            }
+            NetworkEvent::H2V4Message { envelope, .. } => {
+                delivered_views.push(crate::gossipsub::profile1::h2_message_view(
+                    &envelope.message,
+                ));
+            }
+            NetworkEvent::Gov5TransactionsReceived { .. } => delivered_tx_batches += 1,
+            _ => {}
+        };
+        let start = tokio::time::Instant::now();
+        let settle = Duration::from_secs(3);
+        let deadline = start + Duration::from_secs(25);
+        let mut tick = tokio::time::interval(Duration::from_millis(200));
+        let mut done_at = None;
+        loop {
+            tokio::select! {
+                _ = publisher.select_next_some() => {}
+                Some(event) = consensus_rx.recv() => note(event),
+                Some(event) = data_rx.recv() => note(event),
+                event = observer.select_next_some() => {
+                    if let SwarmEvent::Behaviour(crate::transport::N42BehaviourEvent::Gossipsub(
+                        libp2p::gossipsub::Event::Message { message, .. },
+                    )) = event
+                    {
+                        heard.push(message.data);
+                    }
+                }
+                _ = tick.tick() => {
+                    // Publish once the mesh had a few heartbeats to form.
+                    if start.elapsed() > Duration::from_secs(2) {
+                        unpublished.retain(|(topic, data)| {
+                            publisher
+                                .behaviour_mut()
+                                .gossipsub
+                                .publish(topic.clone(), data.clone())
+                                .is_err()
+                        });
+                    }
+                    let received_all = unpublished.is_empty()
+                        && stats.received() as usize >= all.len()
+                        && heard.len() >= valid.len();
+                    if received_all && done_at.is_none() {
+                        done_at = Some(tokio::time::Instant::now());
+                    }
+                    // Wait a little longer so a wrongly forwarded message
+                    // would still arrive.
+                    if done_at.is_some_and(|at| at.elapsed() > settle)
+                        || tokio::time::Instant::now() > deadline
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        service_task.abort();
+
+        assert!(unpublished.is_empty(), "the publisher never found peers");
+        assert_eq!(stats.received() as usize, all.len());
+        assert_eq!(stats.accepted() as usize, valid.len());
+        assert_eq!(stats.rejected() as usize, invalid.len());
+        assert_eq!(stats.ignored() as usize, stale.len());
+        assert_eq!(stats.unreported(), 0, "a message left without a report");
+        // Accepted H2 and the stale ones go to the handler; rejected and
+        // outside-profile transactions do not.
+        delivered_views.sort_unstable();
+        assert_eq!(
+            delivered_views,
+            [10, 20, 50, 100, 101, 1_000_000, 1_000_001]
+        );
+        assert_eq!(delivered_tx_batches, 1);
+        heard.sort();
+        let mut expected: Vec<Vec<u8>> = valid.into_iter().map(|(_, data)| data).collect();
+        expected.sort();
+        assert_eq!(
+            heard, expected,
+            "the observer hears the valid messages only"
+        );
+    }
+
+    /// A profile-1 swarm needs the gov5 transport (anonymous envelope).
+    #[test]
+    fn profile1_swarm_needs_the_gov5_transport() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let result = crate::transport::build_swarm_with_validator_index(
+            libp2p::identity::Keypair::generate_ed25519(),
+            profile1_transport(),
+            Some(0),
+            B256::ZERO,
+        );
+        assert!(result.is_err());
+    }
+
     #[test]
     fn unbound_signed_trust_is_refused_when_bindings_exist() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -5446,10 +6305,16 @@ mod tests {
         let (mut native, ..) =
             NetworkService::new_with_expected_validator_peer_ids(swarm, HashMap::new(), false)
                 .unwrap();
-        assert!(native.trust_signed_messages_without_peer_bindings().is_err());
+        assert!(
+            native
+                .trust_signed_messages_without_peer_bindings()
+                .is_err()
+        );
 
         let (mut unbound, ..) = h2_participant_service(identity, 0, HashMap::new());
-        unbound.trust_signed_messages_without_peer_bindings().unwrap();
+        unbound
+            .trust_signed_messages_without_peer_bindings()
+            .unwrap();
         assert!(unbound.trusts_signed_messages_without_peer_bindings());
     }
 
@@ -5466,7 +6331,9 @@ mod tests {
         let (mut service, handle, mut consensus_rx, _data_rx) =
             h2_participant_service(identity, 3, HashMap::new());
         if trust_unbound {
-            service.trust_signed_messages_without_peer_bindings().unwrap();
+            service
+                .trust_signed_messages_without_peer_bindings()
+                .unwrap();
         }
         let service_peer = *service.swarm.local_peer_id();
         service
@@ -5804,8 +6671,13 @@ mod tests {
         let mut order = VecDeque::new();
         let hashes: Vec<_> = (1..=4u64)
             .map(|number| {
-                cache_gov5_served_block(&mut blocks, &mut order, &served_block_fixture(number), None)
-                    .unwrap()
+                cache_gov5_served_block(
+                    &mut blocks,
+                    &mut order,
+                    &served_block_fixture(number),
+                    None,
+                )
+                .unwrap()
             })
             .collect();
         let size = blocks[&hashes[0]].rlp.len();

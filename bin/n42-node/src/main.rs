@@ -3146,6 +3146,10 @@ fn main() {
 
                     let mut transport_config =
                         TransportConfig::for_network_size(startup_validator_set.len() as usize);
+                    // Profile 1: V9's router values, G2 topics only (AM34).
+                    let profile1_max_block_bytes = n42_chainspec::profile1::profile1_config()
+                        .map(|config| config.max_block_bytes);
+                    transport_config.profile1_max_block_bytes = profile1_max_block_bytes;
                     transport_config.enable_mdns = env_bool("N42_ENABLE_MDNS");
                     transport_config.enable_kademlia = env_bool("N42_ENABLE_DHT");
 
@@ -3156,12 +3160,21 @@ fn main() {
                     )
                         .map_err(|e| eyre::eyre!("failed to build observer libp2p swarm: {e}"))?;
 
+                    let chain_id = full_node.provider.chain_spec().chain().id();
                     let (mut net_service, net_handle, _consensus_event_rx, net_event_rx) =
-                        NetworkService::new_gov5_h2_observer(
-                            swarm,
-                            full_node.provider.chain_spec().chain().id(),
-                            interop_genesis_hash,
-                        )
+                        match profile1_max_block_bytes {
+                            Some(max_block_bytes) => NetworkService::new_profile1_observer(
+                                swarm,
+                                chain_id,
+                                interop_genesis_hash,
+                                max_block_bytes,
+                            ),
+                            None => NetworkService::new_gov5_h2_observer(
+                                swarm,
+                                chain_id,
+                                interop_genesis_hash,
+                            ),
+                        }
                             .map_err(|e| eyre::eyre!("failed to create observer network service: {e}"))?;
                     net_service.set_gov5_canonical_block_reader(gov5_canonical_block_reader(
                         full_node.provider.clone(),
@@ -3287,6 +3300,11 @@ fn main() {
 
                 let mut transport_config =
                     TransportConfig::for_network_size(startup_validator_set.len() as usize);
+                // Profile 1: gov5's GossipSub values and the size cap after
+                // maxBlockBytes (G4, B15, vector V9); G2 topics only (AM34).
+                let profile1_max_block_bytes = n42_chainspec::profile1::profile1_config()
+                    .map(|config| config.max_block_bytes);
+                transport_config.profile1_max_block_bytes = profile1_max_block_bytes;
                 transport_config.enable_mdns = env_bool("N42_ENABLE_MDNS");
                 transport_config.enable_kademlia = env_bool("N42_ENABLE_DHT");
                 if transport_config.enable_mdns {
@@ -3321,7 +3339,16 @@ fn main() {
                 .map_err(|e| eyre::eyre!("failed to build consensus libp2p swarm: {e}"))?;
 
                 let (mut net_service, net_handle, consensus_event_rx, net_event_rx) =
-                    if h2_v4_participant {
+                    if let Some(max_block_bytes) = profile1_max_block_bytes {
+                        NetworkService::new_profile1_participant(
+                            swarm,
+                            expected_validator_peer_ids.clone(),
+                            allow_deterministic_validator_peers,
+                            full_node.provider.chain_spec().chain().id(),
+                            interop_genesis_hash,
+                            max_block_bytes,
+                        )
+                    } else if h2_v4_participant {
                         NetworkService::new_gov5_h2_participant(
                             swarm,
                             expected_validator_peer_ids.clone(),
