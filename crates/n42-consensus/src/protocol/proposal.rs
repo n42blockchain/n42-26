@@ -132,6 +132,13 @@ impl ConsensusEngine {
     ) -> ConsensusResult<()> {
         let view = self.round_state.current_view();
 
+        // AM34 item 3: no certificate can exist for the last view, so nothing
+        // is proposed in it.
+        if !crate::validator::certifiable_view(view) {
+            tracing::error!(target: "n42::cl::proposal", view, %block_hash, "view 2^64-1 reached, not proposing (AM34)");
+            return Ok(());
+        }
+
         if !self.is_current_leader() {
             tracing::debug!(target: "n42::cl::proposal", view, "not leader, ignoring block ready");
             return Ok(());
@@ -260,6 +267,14 @@ impl ConsensusEngine {
             return Err(ConsensusError::ViewMismatch {
                 current: view,
                 received: proposal.view,
+            });
+        }
+        // AM34 item 3: a proposal for the last view could only lead to a QC
+        // for it, which is invalid.
+        if !crate::validator::certifiable_view(view) {
+            return Err(ConsensusError::InvalidQC {
+                view,
+                reason: super::quorum::AM34_LAST_VIEW.to_string(),
             });
         }
 
@@ -561,6 +576,11 @@ impl ConsensusEngine {
     /// Checks `last_voted_view` to prevent double-voting after crash recovery
     /// (fundamental BFT safety invariant).
     pub(super) fn send_vote(&mut self, view: ViewNumber, block_hash: B256) -> ConsensusResult<()> {
+        // AM34 item 3: no vote is signed for the last view.
+        if !crate::validator::certifiable_view(view) {
+            tracing::error!(target: "n42::cl::proposal", view, "view 2^64-1 reached, not voting (AM34)");
+            return Ok(());
+        }
         if !self.is_local_validator_active_for_view(view) {
             tracing::debug!(
                 target: "n42::cl::proposal",

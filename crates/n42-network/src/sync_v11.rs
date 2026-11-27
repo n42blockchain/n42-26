@@ -1188,6 +1188,10 @@ pub fn check_commit_qc_reply(
     if qc.view == 0 || qc.block_hash == B256::ZERO {
         return Err("QC is the genesis sentinel");
     }
+    // AM34 (v1.2): no QC names view 2^64-1.
+    if qc.view == u64::MAX {
+        return Err("QC is for view 2^64-1 (AM34)");
+    }
     if payload.headers.len() > MAX_COMMIT_QC_HEADERS {
         return Err("more than 256 headers");
     }

@@ -15,7 +15,7 @@ use n42_primitives::{
 use std::collections::{HashMap, HashSet};
 
 use crate::error::{ConsensusError, ConsensusResult};
-use crate::validator::ValidatorSet;
+use crate::validator::{ValidatorSet, certifiable_view};
 
 /// Selects the BLS ciphersuite and signed bytes used by the consensus engine.
 /// Native remains the default; H2-v4 is enabled only by an explicit participant
@@ -266,6 +266,9 @@ impl VoteCollector {
         message: &[u8],
         signing_profile: ConsensusSigningProfile,
     ) -> ConsensusResult<QuorumCertificate> {
+        if !certifiable_view(self.view) {
+            return Err(CertKind::QC.invalid_error(self.view, AM34_LAST_VIEW.to_string()));
+        }
         // Guard: the validator_set passed here must match the set_size this collector
         // was created with. A mismatch (e.g. during epoch transitions) would cause
         // bitvec index out-of-bounds panics in release builds or UB in debug builds.
@@ -436,6 +439,9 @@ impl TimeoutCollector {
         validator_set: &ValidatorSet,
         signing_profile: ConsensusSigningProfile,
     ) -> ConsensusResult<TimeoutCertificate> {
+        if !certifiable_view(self.view) {
+            return Err(CertKind::TC.invalid_error(self.view, AM34_LAST_VIEW.to_string()));
+        }
         if validator_set.len() != self.set_size {
             return Err(ConsensusError::InvalidTC {
                 view: self.view,
@@ -542,6 +548,9 @@ impl TimeoutCollector {
     }
 }
 
+/// Why a certificate for the last view is refused (AM34 item 3).
+pub(crate) const AM34_LAST_VIEW: &str = "AM34: no QC or TC for view 2^64-1";
+
 /// Distinguishes QC vs TC for error reporting in shared validation logic.
 #[derive(Debug, Clone, Copy)]
 enum CertKind {
@@ -569,6 +578,12 @@ fn collect_signer_keys<'a>(
     view: ViewNumber,
     cert_kind: CertKind,
 ) -> ConsensusResult<Vec<&'a BlsPublicKey>> {
+    // AM34 (v1.2): a QC or TC for view 2^64-1 is invalid, however it is
+    // signed. Every certificate check (prepare, commit, either domain, TC)
+    // comes through here.
+    if !certifiable_view(view) {
+        return Err(cert_kind.invalid_error(view, AM34_LAST_VIEW.to_string()));
+    }
     let expected_len = validator_set.len() as usize;
     if signers.len() != expected_len {
         let reason = format!(
@@ -1637,4 +1652,122 @@ mod tests {
             "native signing must keep binding validator changes"
         );
     }
+
+    /// Signs `message` with the first three keys and aggregates the result
+    /// into a certificate shape, bypassing the collectors (which refuse the
+    /// last view themselves).
+    fn signed_by_three(
+        sks: &[BlsSecretKey],
+        vs: &ValidatorSet,
+        profile: ConsensusSigningProfile,
+        message: &[u8],
+    ) -> (BlsSignature, BitVec<u8, Msb0>) {
+        let sigs: Vec<_> = (0..3).map(|i| profile.sign(&sks[i], message)).collect();
+        let refs: Vec<_> = sigs.iter().collect();
+        let mut signers = bitvec![u8, Msb0; 0; vs.len() as usize];
+        for i in 0..3 {
+            signers.set(i, true);
+        }
+        (AggregateSignature::aggregate(&refs).unwrap(), signers)
+    }
+
+    /// AM34 item 3 (v1.2): a QC or TC for view 2^64-1 is invalid even when
+    /// a quorum signed it, in every domain and profile; the collectors refuse
+    /// to form one; the view before it still certifies.
+    #[test]
+    fn am34_certificates_for_the_last_view_are_refused() {
+        let (sks, vs) = test_validator_set(4);
+        let h2 = ConsensusSigningProfile::H2V4(H2V4ChainIdentity {
+            chain_id: 42,
+            genesis_hash: B256::repeat_byte(0xA3),
+        });
+        let block = B256::repeat_byte(0x34);
+        let refused = |result: &ConsensusResult<()>| match result {
+            Err(ConsensusError::InvalidQC { view, reason })
+            | Err(ConsensusError::InvalidTC { view, reason }) => {
+                *view == u64::MAX && reason == AM34_LAST_VIEW
+            }
+            _ => false,
+        };
+        for profile in [ConsensusSigningProfile::Native, h2] {
+            for view in [u64::MAX, u64::MAX - 1] {
+                let last = view == u64::MAX;
+                // Prepare-domain QC.
+                let (sig, signers) =
+                    signed_by_three(&sks, &vs, profile, &profile.vote_message(view, block));
+                let qc = QuorumCertificate {
+                    view,
+                    block_hash: block,
+                    aggregate_signature: sig,
+                    signers,
+                };
+                let prepare = verify_qc_with_profile(&qc, &vs, profile);
+                let any = verify_qc_any_domain_with_profile(&qc, &vs, &B256::ZERO, profile);
+                if last {
+                    assert!(refused(&prepare), "{profile:?}: {prepare:?}");
+                    assert!(refused(&any), "{profile:?}: {any:?}");
+                } else {
+                    prepare.unwrap();
+                    any.unwrap();
+                }
+                // Commit-domain QC.
+                let (sig, signers) = signed_by_three(
+                    &sks,
+                    &vs,
+                    profile,
+                    &profile.commit_message(view, block, B256::ZERO),
+                );
+                let commit_qc = QuorumCertificate {
+                    view,
+                    block_hash: block,
+                    aggregate_signature: sig,
+                    signers,
+                };
+                let commit = verify_commit_qc_with_profile(&commit_qc, &vs, &B256::ZERO, profile);
+                assert_eq!(refused(&commit), last, "{profile:?}: {commit:?}");
+                if !last {
+                    commit.unwrap();
+                }
+                // TC.
+                let (sig, signers) =
+                    signed_by_three(&sks, &vs, profile, &profile.timeout_message(view));
+                let tc = TimeoutCertificate {
+                    view,
+                    aggregate_signature: sig,
+                    signers,
+                    high_qc: QuorumCertificate::genesis(),
+                };
+                let checked = verify_tc_with_profile(&tc, &vs, profile);
+                assert_eq!(refused(&checked), last, "{profile:?}: {checked:?}");
+                if !last {
+                    checked.unwrap();
+                }
+
+                // The collectors.
+                let mut votes = VoteCollector::new(view, block, vs.len());
+                let mut timeouts = TimeoutCollector::new(view, vs.len());
+                for i in 0..3u32 {
+                    votes
+                        .add_vote(i, profile.sign(&sks[i as usize], &profile.vote_message(view, block)))
+                        .unwrap();
+                    timeouts
+                        .add_timeout(
+                            i,
+                            profile.sign(&sks[i as usize], &profile.timeout_message(view)),
+                            QuorumCertificate::genesis(),
+                        )
+                        .unwrap();
+                }
+                let built_qc = votes.build_qc_with_profile_message(
+                    &vs,
+                    &profile.vote_message(view, block),
+                    profile,
+                );
+                let built_tc = timeouts.build_tc_with_profile(&vs, profile);
+                assert_eq!(built_qc.is_err(), last, "{profile:?}: {built_qc:?}");
+                assert_eq!(built_tc.is_err(), last, "{profile:?}: {built_tc:?}");
+            }
+        }
+    }
+
 }

@@ -1094,7 +1094,7 @@ impl ConsensusEngine {
             );
 
             if view > current_view && !is_exempt {
-                if view <= current_view + FUTURE_VIEW_WINDOW {
+                if view <= current_view.saturating_add(FUTURE_VIEW_WINDOW) {
                     if let ConsensusMessage::Timeout(ref timeout) = msg
                         && self.collect_future_timeout(timeout.clone())?
                     {
@@ -1112,7 +1112,7 @@ impl ConsensusEngine {
                             return self.dispatch_message(msg, authenticated_proof);
                         }
                         if view > new_current
-                            && view <= new_current + FUTURE_VIEW_WINDOW
+                            && view <= new_current.saturating_add(FUTURE_VIEW_WINDOW)
                             && self.future_msg_buffer.len() < MAX_FUTURE_MESSAGES
                         {
                             self.future_msg_buffer.push((view, msg));
@@ -1147,7 +1147,7 @@ impl ConsensusEngine {
                     if view == new_current {
                         return self.dispatch_message(msg, authenticated_proof);
                     } else if view > new_current
-                        && view <= new_current + FUTURE_VIEW_WINDOW
+                        && view <= new_current.saturating_add(FUTURE_VIEW_WINDOW)
                         && self.future_msg_buffer.len() < MAX_FUTURE_MESSAGES
                     {
                         self.future_msg_buffer.push((view, msg));
@@ -1470,7 +1470,7 @@ impl ConsensusEngine {
         for (view, msg) in drained {
             if view == new_view {
                 to_replay.push(msg);
-            } else if view > new_view && view <= new_view + FUTURE_VIEW_WINDOW {
+            } else if view > new_view && view <= new_view.saturating_add(FUTURE_VIEW_WINDOW) {
                 self.future_msg_buffer.push((view, msg));
             }
             // else: expired — discard silently
@@ -6595,4 +6595,122 @@ mod tests {
             assert_eq!(am33_ms(engine.pacemaker().armed_timeout()), expected);
         }
     }
+
+    /// AM34 item 3 (v1.2) in the engine: at view 2^64-1 a member neither
+    /// proposes, votes nor signs a timeout; a timeout, proposal or NewView
+    /// whose certificate would be for that view is refused, and nothing
+    /// moves a member back to view 0.
+    #[test]
+    fn am34_engine_refuses_the_last_view() {
+        use crate::protocol::quorum::{AM34_LAST_VIEW, timeout_signing_message};
+        use n42_primitives::consensus::{NewView, Proposal, TimeoutCertificate, TimeoutMessage};
+
+        const LAST: ViewNumber = ViewNumber::MAX;
+        let am34 = |result: ConsensusResult<()>| match result {
+            Err(ConsensusError::InvalidQC { view, reason })
+            | Err(ConsensusError::InvalidTC { view, reason }) => {
+                view == LAST && reason == AM34_LAST_VIEW
+            }
+            _ => false,
+        };
+        let signed_outputs = |rx: &mut mpsc::Receiver<EngineOutput>| {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|output| {
+                    matches!(
+                        output,
+                        EngineOutput::BroadcastMessage(
+                            ConsensusMessage::Proposal(_)
+                                | ConsensusMessage::Vote(_)
+                                | ConsensusMessage::Timeout(_)
+                        ) | EngineOutput::SendToValidator(
+                            _,
+                            ConsensusMessage::Vote(_) | ConsensusMessage::Timeout(_)
+                        )
+                    )
+                })
+                .count()
+        };
+
+        // The leader of the last view (tenure 1, n = 4: 2^64-1 mod 4 = 3).
+        let (mut leader, sks, vs, mut rx) = make_engine(4, 3);
+        leader.set_leader_schedule(rotation(false));
+        leader.advance_to_view(LAST).unwrap();
+        assert_eq!(leader.current_view(), LAST);
+        assert!(leader.is_current_leader());
+        while rx.try_recv().is_ok() {}
+        leader.on_block_ready(B256::repeat_byte(0x34), None).unwrap();
+        leader.on_timeout().unwrap();
+        assert_eq!(signed_outputs(&mut rx), 0, "nothing is signed in the last view");
+        assert_eq!(leader.current_view(), LAST, "no view follows the last one");
+
+        // A follower at the last view: a timeout for it and a proposal in it
+        // are refused.
+        let (mut follower, _, _, mut rx) = make_engine(4, 0);
+        follower.set_leader_schedule(rotation(false));
+        follower.advance_to_view(LAST).unwrap();
+        while rx.try_recv().is_ok() {}
+        let timeout = TimeoutMessage {
+            view: LAST,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 1,
+            signature: sks[1].sign(&timeout_signing_message(LAST)),
+        };
+        assert!(am34(follower.process_event(ConsensusEvent::Message(
+            ConsensusMessage::Timeout(timeout)
+        ))));
+        let block = B256::repeat_byte(0x35);
+        let message = ConsensusSigningProfile::Native.proposal_message(LAST, block, &None);
+        let proposal = Proposal {
+            view: LAST,
+            block_hash: block,
+            justify_qc: QuorumCertificate::genesis(),
+            proposer: 3,
+            signature: sks[3].sign(&message),
+            prepare_qc: None,
+            tx_root_hash: None,
+            validator_changes: None,
+        };
+        assert!(am34(follower.process_event(ConsensusEvent::Message(
+            ConsensusMessage::Proposal(proposal)
+        ))));
+        assert_eq!(signed_outputs(&mut rx), 0, "no vote for the last view");
+
+        // A member at view 1 refuses a NewView whose TC is for the last view
+        // (a quorum signed it; the collector would not have formed it).
+        let (mut member, _, _, _rx) = make_engine(4, 2);
+        member.set_leader_schedule(rotation(false));
+        let msg = timeout_signing_message(LAST);
+        let sigs: Vec<_> = (0..3).map(|i| sks[i].sign(&msg)).collect();
+        let mut signers = bitvec::bitvec![u8, bitvec::order::Msb0; 0; vs.len() as usize];
+        for i in 0..3 {
+            signers.set(i, true);
+        }
+        let tc = TimeoutCertificate {
+            view: LAST,
+            aggregate_signature: n42_primitives::bls::AggregateSignature::aggregate(
+                &sigs.iter().collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            signers,
+            high_qc: QuorumCertificate::genesis(),
+        };
+        for nv_view in [LAST, 0, 2] {
+            let leader_index = (nv_view % 4) as u32;
+            let new_view = NewView {
+                view: nv_view,
+                timeout_cert: tc.clone(),
+                leader: leader_index,
+                signature: sks[leader_index as usize]
+                    .sign(&ConsensusSigningProfile::Native.new_view_message(nv_view)),
+            };
+            assert!(
+                am34(member.process_event(ConsensusEvent::Message(ConsensusMessage::NewView(
+                    new_view
+                )))),
+                "NewView for view {nv_view}"
+            );
+            assert_eq!(member.current_view(), 1);
+        }
+    }
+
 }

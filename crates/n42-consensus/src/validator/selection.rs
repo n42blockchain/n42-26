@@ -219,6 +219,16 @@ impl LeaderSchedule {
     }
 }
 
+/// The last view, 2^64-1. Under AM34 (v1.2) no QC or TC for it is valid: no
+/// client signs, accepts or advances past it, and the view after a TC for it
+/// is undefined.
+pub const MAX_CERTIFIED_VIEW: ViewNumber = ViewNumber::MAX;
+
+/// Whether a QC or TC may exist for `view` (AM34: every view but 2^64-1).
+pub const fn certifiable_view(view: ViewNumber) -> bool {
+    view != MAX_CERTIFIED_VIEW
+}
+
 /// The view a validator enters once it holds a timeout certificate for
 /// `tc_view` (sync standard section 10.2; gov5 `ViewAfterTimeout`).
 ///
@@ -229,14 +239,23 @@ impl LeaderSchedule {
 /// one; the jump is clamped to the first epoch-boundary view above `tc_view`
 /// (boundary `b`: `(b - 1) % E == 0`), so every client enters that view. A
 /// window start that overflows falls back to `tc_view + 1`.
+///
+/// AM34 (v1.2): the rule is defined only for `tc_view < 2^64-1`; a TC for
+/// the last view is invalid and is refused by certificate verification
+/// before any caller gets here. For that view this returns `2^64-1` itself
+/// (never view 0, which a wrapping successor would be), so it can never move
+/// a caller backwards.
 pub fn view_after_tc(
     tc_view: ViewNumber,
     tenure: u64,
     epoch_length: u64,
     rotate: bool,
 ) -> ViewNumber {
-    let next = tc_view.wrapping_add(1);
-    if !rotate || tenure <= 1 || next == 0 {
+    if tc_view == MAX_CERTIFIED_VIEW {
+        return MAX_CERTIFIED_VIEW;
+    }
+    let next = tc_view + 1;
+    if !rotate || tenure <= 1 {
         return next;
     }
     let Some(target) = (tc_view / tenure + 1)
@@ -387,6 +406,35 @@ mod tests {
                 view_after_tc(x, tenure, epoch, active),
                 expected,
                 "x={x} T={tenure} E={epoch} active={active}"
+            );
+        }
+    }
+
+    /// AM34 item 3: `view_after_tc` is undefined at 2^64-1; it must never
+    /// move a caller back to view 0 (gov5 wrapped before its 9ef2b803, and so
+    /// did this function). It saturates; every certificate for that view is
+    /// refused before it is used.
+    #[test]
+    fn view_after_tc_never_wraps_to_view_zero() {
+        assert!(!certifiable_view(u64::MAX));
+        assert!(certifiable_view(u64::MAX - 1));
+        for (tenure, epoch_length, rotate) in
+            [(1, 0, false), (8, 0, false), (8, 0, true), (8, 200, true), (1, 10_800, true)]
+        {
+            assert_eq!(
+                view_after_tc(u64::MAX, tenure, epoch_length, rotate),
+                u64::MAX,
+                "T = {tenure} E = {epoch_length} rotate = {rotate}"
+            );
+            let schedule = LeaderSchedule {
+                tenure,
+                rotate_on_timeout_from: rotate.then_some(0),
+            };
+            assert_eq!(schedule.view_after_tc(u64::MAX, epoch_length), u64::MAX);
+            // The view before it still leads to it.
+            assert_eq!(
+                view_after_tc(u64::MAX - 1, tenure, epoch_length, rotate),
+                u64::MAX
             );
         }
     }
