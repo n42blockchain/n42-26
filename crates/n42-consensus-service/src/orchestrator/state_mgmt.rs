@@ -40,6 +40,22 @@ static CFG_MAX_EMPTY_SKIPS: LazyLock<u32> = LazyLock::new(|| {
         .unwrap_or(3)
 });
 
+static CFG_SYNC_BUFFER_BYTES: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("N42_SYNC_BUFFER_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SYNC_BUFFER_BYTES)
+});
+
+/// Block bytes the committed-block ring keeps by default: about 2,700 blocks
+/// of 1,200 transfers (98 KB envelopes), all 10,000 of small blocks. Legacy
+/// `SyncBlock` serving reads only this ring; Profile 1 range catch-up
+/// (`bodies_by_range/2`, `commit_qc/1`) reads storage and is unaffected.
+const DEFAULT_SYNC_BUFFER_BYTES: usize = 256 * 1024 * 1024;
+
+/// The newest committed blocks kept whatever their size.
+const MIN_COMMITTED_BLOCKS: usize = 64;
+
 const MAX_SYNC_BLOCKS: usize = 128;
 
 fn sync_response_fits_frame(response: &BlockSyncResponse) -> bool {
@@ -63,6 +79,39 @@ fn try_append_lineage_within_frame(response: &mut BlockSyncResponse, payload: Sy
 /// Configurable via `N42_SYNC_BUFFER_SIZE` (read once at startup).
 pub(super) fn max_committed_blocks() -> usize {
     *CFG_SYNC_BUFFER_SIZE
+}
+
+/// Bytes of block data (envelopes, payloads, lineage) the committed-block
+/// ring retains; the oldest entries leave first. Every entry used to keep
+/// its full envelope for 10,000 blocks, about 1 GB at 1,200 transactions a
+/// block. Configurable via `N42_SYNC_BUFFER_BYTES` (read once at startup).
+pub(super) fn max_committed_block_bytes() -> usize {
+    *CFG_SYNC_BUFFER_BYTES
+}
+
+/// Drops the oldest committed blocks while the ring holds more than
+/// `max_blocks` entries, or more than `max_bytes` of block data and more
+/// than [`MIN_COMMITTED_BLOCKS`] entries. Returns the bytes retained.
+pub(super) fn trim_committed_blocks(
+    blocks: &mut std::collections::VecDeque<super::CommittedBlock>,
+    max_blocks: usize,
+    max_bytes: usize,
+) -> usize {
+    let mut bytes: usize = blocks
+        .iter()
+        .map(super::CommittedBlock::retained_bytes)
+        .sum();
+    while blocks.len() > max_blocks || (bytes > max_bytes && blocks.len() > MIN_COMMITTED_BLOCKS) {
+        let Some(oldest) = blocks.pop_front() else {
+            break;
+        };
+        bytes -= oldest.retained_bytes();
+    }
+    crate::mem_stats::COMMITTED_BLOCKS
+        .store(blocks.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    crate::mem_stats::COMMITTED_BLOCK_BYTES
+        .store(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+    bytes
 }
 
 /// Timeout for a state sync request; resets the in-flight flag on expiry.
@@ -189,9 +238,6 @@ impl ConsensusService {
             .map(|entry| entry.payload_len)
             .unwrap_or_default();
 
-        if self.committed_blocks.len() >= max_committed_blocks() {
-            self.committed_blocks.pop_front();
-        }
         self.committed_blocks.push_back(CommittedBlock {
             view,
             block_hash,
@@ -202,6 +248,11 @@ impl ConsensusService {
             validator_changes,
             execution_lineage,
         });
+        trim_committed_blocks(
+            &mut self.committed_blocks,
+            max_committed_blocks(),
+            max_committed_block_bytes(),
+        );
     }
 
     /// Backfills validator changes for an already-cached committed block.
@@ -1314,9 +1365,11 @@ impl ConsensusService {
             self.committed_blocks
                 .make_contiguous()
                 .sort_by_key(|block| block.view);
-            while self.committed_blocks.len() > max_committed_blocks() {
-                self.committed_blocks.pop_front();
-            }
+            trim_committed_blocks(
+                &mut self.committed_blocks,
+                max_committed_blocks(),
+                max_committed_block_bytes(),
+            );
 
             imported += 1;
         }

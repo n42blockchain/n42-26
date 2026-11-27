@@ -8,19 +8,32 @@ use alloy_rlp::{Encodable, Header};
 pub fn gov5_native_receipts_root<T>(receipts: &[EthereumReceipt<T>]) -> B256 {
     let mut encoded = Vec::new();
     for receipt in receipts {
-        let status = u64::from(receipt.success);
-        let payload_length =
-            status.length() + receipt.cumulative_gas_used.length() + receipt.logs.length();
-        Header {
-            list: true,
-            payload_length,
-        }
-        .encode(&mut encoded);
-        status.encode(&mut encoded);
-        receipt.cumulative_gas_used.encode(&mut encoded);
-        receipt.logs.encode(&mut encoded);
+        encode_gov5_native_receipt(receipt, &mut encoded);
     }
     keccak256(encoded)
+}
+
+/// One receipt as gov5's receipts root hashes it (standard profile 1, B7):
+/// `rlp([status, cumulativeGasUsed, logs])`, log = `rlp([address, topics,
+/// data])`; no type byte, no bloom. Vector V2 pins these bytes.
+pub fn gov5_native_receipt_rlp<T>(receipt: &EthereumReceipt<T>) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    encode_gov5_native_receipt(receipt, &mut encoded);
+    encoded
+}
+
+fn encode_gov5_native_receipt<T>(receipt: &EthereumReceipt<T>, out: &mut Vec<u8>) {
+    let status = u64::from(receipt.success);
+    let payload_length =
+        status.length() + receipt.cumulative_gas_used.length() + receipt.logs.length();
+    Header {
+        list: true,
+        payload_length,
+    }
+    .encode(out);
+    status.encode(out);
+    receipt.cumulative_gas_used.encode(out);
+    receipt.logs.encode(out);
 }
 
 #[cfg(test)]

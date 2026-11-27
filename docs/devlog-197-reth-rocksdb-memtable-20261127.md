@@ -122,3 +122,7 @@ n42-26：
   以及持久化耗时（`save_blocks_rocksdb_*`）、RocksDB L0 文件数 / compaction 是否变差；
   高 TPS 原生路线也要对比一次。若持久化变慢，可调大 `N42_ROCKSDB_MEMTABLE_MB`（例如 1024 → 32 MiB memtable）。
 - 若以后真的要在生产中使用 `RocksTx`，需重新评估历史上限（历史不足时乐观提交返回 `TryAgain`）。
+
+## Merge with main (2026-11-27)
+
+- Main (#51) had meanwhile added a `structures=` source named `rocksdb_memtable_mib`, which summed `table_stats().memtable_size_bytes`. This branch logs `rocksdb_memtable_mib` and `rocksdb_memtable_unflushed_mib` as fields of their own, from `memtable_usage()`. Keeping both would print two fields with the same name, so the merge drops main's structure source and keeps this branch's, because it separates flushed history from unflushed memtables.

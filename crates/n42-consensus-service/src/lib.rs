@@ -17,6 +17,7 @@ pub mod epoch_schedule;
 pub mod exec_cache;
 pub mod fcu_tags;
 pub mod halt;
+pub mod mem_stats;
 pub mod h2_finality;
 pub mod ingest;
 pub mod net_port;

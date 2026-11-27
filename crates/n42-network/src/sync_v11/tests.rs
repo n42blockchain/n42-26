@@ -788,6 +788,28 @@ fn commit_qc_client_rejects_a_chain_that_does_not_reach_the_request() {
     );
 }
 
+/// AM34 item 3 (v1.2): a `commit_qc/1` reply whose QC names view 2^64-1 is
+/// refused structurally, before any signature check (the signature check
+/// refuses it too, `h2_finality::verify_h2_v4_sync_anchor`).
+#[test]
+fn commit_qc_client_refuses_a_qc_for_the_last_view() {
+    let (request, payload) = by_number_payload();
+    let mut qc = decode_h2_qc(&payload.qc_wire).unwrap();
+    for (view, refused) in [(u64::MAX, true), (u64::MAX - 1, false)] {
+        qc.view = view;
+        let reply = CommitQcPayload {
+            qc_wire: encode_h2_qc(&qc).unwrap(),
+            ..payload.clone()
+        };
+        let checked = check_commit_qc_reply(&request, &reply);
+        if refused {
+            assert_eq!(checked, Err("QC is for view 2^64-1 (AM34)"));
+        } else {
+            assert_eq!(checked.unwrap().qc.view, view);
+        }
+    }
+}
+
 #[test]
 fn commit_qc_server_prefers_the_lowest_qc_and_reads_the_persisted_one() {
     let source = CommitQcSource {
