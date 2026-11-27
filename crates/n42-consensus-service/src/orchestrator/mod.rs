@@ -1218,6 +1218,12 @@ pub struct ConsensusService {
     /// incoming ancestors.
     h2_v4_last_pruned_head_block_number: Option<u64>,
     h2_v4_catchup_active: bool,
+    /// Blocks reth already holds as persisted canonical above the recovered
+    /// consensus head (hash -> number), set once at start-up. Startup can
+    /// rewind the consensus head below reth's persisted head (a stale
+    /// snapshot); catch-up must then not FCU to these blocks, since an FCU to
+    /// an ancestor of reth's persisted head fails with "too deep reorg".
+    persisted_canonical_suffix: HashMap<B256, u64>,
     /// Range catch-up client over gov5 bodies-by-range (`range_sync.rs`).
     /// Idle unless an authenticated block reveals a gap above its threshold.
     range_catchup: crate::range_catchup::RangeCatchup,
@@ -2223,49 +2229,26 @@ impl ConsensusService {
             return true;
         }
 
+        // Already reth's persisted canonical block at this height: new_payload
+        // above proved the parent chain, and an FCU here would point reth at an
+        // ancestor of its persisted head ("too deep reorg"). The first block
+        // that differs from reth's chain still takes the FCU (a sibling reorg).
+        if self.persisted_canonical_suffix.get(&block_hash) == Some(&block_number) {
+            self.persisted_canonical_suffix.remove(&block_hash);
+            info!(target: "n42::interop::h2v4", %block_hash, block_number, view, "authenticated Gov5 catch-up block is already reth's persisted canonical block; skipping its FCU");
+            return self
+                .finish_h2_v4_catchup_block(block_hash, block_number, block_timestamp, block.header.parent_hash, view)
+                .await;
+        }
+
         let forkchoice = self.fcu_state(block_hash, block_hash);
         match el
             .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, forkchoice)
             .await
         {
             Ok(result) if matches!(result.payload_status.status, PayloadStatusEnum::Valid) => {
-                self.last_committed_timestamp = self.last_committed_timestamp.max(block_timestamp);
-                self.advance_execution_validated_head(
-                    view,
-                    block_hash,
-                    "authenticated Gov5 catch-up",
-                );
-                self.head_block_number = self.head_block_number.max(block_number);
-                // The FCU above already made this exact hash canonical. Close
-                // matching lifecycle entries so they cannot block the next
-                // live commit behind a redundant execution-ready notification.
-                self.mark_catchup_commits_finalized(block_hash);
-                self.prune_executed_h2_v4_catchup_history();
-                crate::qualification_abort_at("execution_validated");
-                // This synchronous catch-up path bypasses handle_valid_import,
-                // which normally releases the H2 execution-gated vote and
-                // closes a matching deferred finalization. Omitting these
-                // notifications leaves the consensus state machine waiting
-                // forever even though Reth is already canonical at this hash.
-                let imported = BlockDataBroadcast {
-                    block_hash,
-                    view,
-                    payload_json: Vec::new(),
-                    timestamp: block_timestamp,
-                    execution_output: None,
-                    leader_ready_unix_ms: 0,
-                    native_header_rlp: None,
-                };
-                self.complete_deferred_finalization(&imported).await;
-                if let Err(error) = self.engine.process_event(
-                    n42_consensus::ConsensusEvent::BlockImportedWithParent {
-                        block_hash,
-                        parent_hash: block.header.parent_hash,
-                    },
-                ) {
-                    error!(target: "n42::interop::h2v4", %block_hash, view, %error, "could not release execution-gated vote for Gov5 catch-up block");
-                }
-                true
+                self.finish_h2_v4_catchup_block(block_hash, block_number, block_timestamp, block.header.parent_hash, view)
+                    .await
             }
             Ok(result) => {
                 error!(target: "n42::interop::h2v4", %source, %block_hash, block_number, view, status = ?result.payload_status.status, "authenticated Gov5 catch-up FCU was not Valid");
@@ -2276,6 +2259,55 @@ impl ConsensusService {
                 false
             }
         }
+    }
+
+    /// The bookkeeping after a catch-up block became canonical in reth, by
+    /// its FCU or because reth already held it as persisted canonical.
+    async fn finish_h2_v4_catchup_block(
+        &mut self,
+        block_hash: B256,
+        block_number: u64,
+        block_timestamp: u64,
+        parent_hash: B256,
+        view: u64,
+    ) -> bool {
+        self.last_committed_timestamp = self.last_committed_timestamp.max(block_timestamp);
+        self.advance_execution_validated_head(
+            view,
+            block_hash,
+            "authenticated Gov5 catch-up",
+        );
+        self.head_block_number = self.head_block_number.max(block_number);
+        // Reth is canonical at this exact hash now. Close
+        // matching lifecycle entries so they cannot block the next
+        // live commit behind a redundant execution-ready notification.
+        self.mark_catchup_commits_finalized(block_hash);
+        self.prune_executed_h2_v4_catchup_history();
+        crate::qualification_abort_at("execution_validated");
+        // This synchronous catch-up path bypasses handle_valid_import,
+        // which normally releases the H2 execution-gated vote and
+        // closes a matching deferred finalization. Omitting these
+        // notifications leaves the consensus state machine waiting
+        // forever even though Reth is already canonical at this hash.
+        let imported = BlockDataBroadcast {
+            block_hash,
+            view,
+            payload_json: Vec::new(),
+            timestamp: block_timestamp,
+            execution_output: None,
+            leader_ready_unix_ms: 0,
+            native_header_rlp: None,
+        };
+        self.complete_deferred_finalization(&imported).await;
+        if let Err(error) = self.engine.process_event(
+            n42_consensus::ConsensusEvent::BlockImportedWithParent {
+                block_hash,
+                parent_hash,
+            },
+        ) {
+            error!(target: "n42::interop::h2v4", %block_hash, view, %error, "could not release execution-gated vote for Gov5 catch-up block");
+        }
+        true
     }
 
     async fn process_h2_v4_gov5_block(
@@ -3475,6 +3507,7 @@ impl ConsensusService {
             h2_v4_catchup_buffer_blocks: h2_v4_catchup_buffer_blocks(),
             h2_v4_last_pruned_head_block_number: None,
             h2_v4_catchup_active: false,
+            persisted_canonical_suffix: HashMap::new(),
             range_catchup: crate::range_catchup::RangeCatchup::new(
                 crate::range_catchup::RangeCatchupConfig::default(),
                 range_sync::range_anchor_mode(),
@@ -3755,6 +3788,7 @@ impl ConsensusService {
             h2_v4_catchup_buffer_blocks,
             h2_v4_last_pruned_head_block_number: None,
             h2_v4_catchup_active: false,
+            persisted_canonical_suffix: HashMap::new(),
             range_catchup: crate::range_catchup::RangeCatchup::new(
                 crate::range_catchup::RangeCatchupConfig::default(),
                 range_sync::range_anchor_mode(),
@@ -4237,6 +4271,14 @@ impl ConsensusService {
     /// reth and is never replaced from the snapshot.
     pub fn with_recovered_execution_validated_head(mut self, view: u64) -> Self {
         self.execution_validated_head_view = view;
+        self
+    }
+
+    /// Hands over the blocks reth holds as persisted canonical above the
+    /// recovered consensus head (hash -> number). See
+    /// `persisted_canonical_suffix`.
+    pub fn with_persisted_canonical_suffix(mut self, suffix: HashMap<B256, u64>) -> Self {
+        self.persisted_canonical_suffix = suffix;
         self
     }
 
@@ -8750,6 +8792,71 @@ mod tests {
             orch.async_commit_states[&203].stage,
             AsyncCommitStage::Finalized
         );
+    }
+
+    /// E9 kill 10: a stale snapshot rewound the consensus head below reth's
+    /// persisted head. A catch-up block reth already holds as persisted
+    /// canonical must not get an FCU (reth answers "too deep reorg"), yet it
+    /// must still advance the execution head and release the gated vote.
+    #[tokio::test(flavor = "current_thread")]
+    async fn catchup_skips_fcu_for_reth_persisted_canonical_block() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+        orch.async_finalize_fcu = false;
+        orch.head_block_number = 100;
+        orch.head_block_hash = B256::repeat_byte(0x70);
+        orch.execution_validated_head_view = 200;
+        let (hash, rlp) = test_gov5_block_rlp(orch.head_block_hash, 101, 201);
+        orch = orch.with_persisted_canonical_suffix(HashMap::from([(hash, 101)]));
+        assert!(
+            orch.import_h2_v4_catchup_block(
+                n42_network::PeerId::random(),
+                n42_network::decode_gov5_block_rlp(&rlp).unwrap(),
+                201,
+            )
+            .await
+        );
+        assert!(mock.fcu_heads().is_empty(), "no FCU to reth's own persisted block");
+        assert_eq!(orch.head_block_number, 101);
+        assert_eq!(orch.execution_validated_head_view, 201);
+        assert!(orch.persisted_canonical_suffix.is_empty());
+    }
+
+    /// A block at the same height as a persisted one but with another hash is
+    /// a sibling reorg; it keeps its FCU.
+    #[tokio::test(flavor = "current_thread")]
+    async fn catchup_keeps_fcu_for_block_off_reth_persisted_chain() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+        orch.async_finalize_fcu = false;
+        orch.head_block_number = 100;
+        orch.head_block_hash = B256::repeat_byte(0x70);
+        orch.execution_validated_head_view = 200;
+        let (hash, rlp) = test_gov5_block_rlp(orch.head_block_hash, 101, 201);
+        orch = orch.with_persisted_canonical_suffix(HashMap::from([(B256::repeat_byte(0x99), 101)]));
+        assert!(
+            orch.import_h2_v4_catchup_block(
+                n42_network::PeerId::random(),
+                n42_network::decode_gov5_block_rlp(&rlp).unwrap(),
+                201,
+            )
+            .await
+        );
+        assert_eq!(mock.fcu_heads(), vec![hash]);
     }
 
     #[tokio::test(flavor = "current_thread")]

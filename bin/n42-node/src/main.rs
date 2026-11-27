@@ -1541,6 +1541,11 @@ fn install_genesis_leader_schedule(genesis: &alloy_genesis::Genesis) -> eyre::Re
 /// Default size of reth's cross-block execution cache, in MiB.
 const N42_CROSS_BLOCK_CACHE_MIB: usize = 1024;
 
+/// Upper bound on how many of reth's persisted canonical blocks above a
+/// rewound consensus head are handed to catch-up (see
+/// `ConsensusService::with_persisted_canonical_suffix`).
+const PERSISTED_SUFFIX_MAX_BLOCKS: u64 = 4096;
+
 fn main() {
     // Install a global panic hook so that panics in ANY thread or tokio task
     // produce visible output on stderr.  Without this, panics in non-critical
@@ -2810,6 +2815,7 @@ fn main() {
                 // its exact hash is independently retained in the
                 // authenticated QMDB lineage, and derive its block number
                 // from parent edges rather than guessing from its view.
+                let mut persisted_canonical_suffix = std::collections::HashMap::new();
                 if bootstrap_replay_plan.is_none()
                     && h2_v4_participant
                     && let (Some(snap), Some(store), Some((base_number, _, _))) = (
@@ -2842,6 +2848,15 @@ fn main() {
                                 recovered_hash = %candidate,
                                 "persisted canonical marker differs from the QMDB-proven execution snapshot; starting catch-up from their highest retained common ancestor"
                             );
+                            // Reth keeps its persisted blocks above the recovered
+                            // head; catch-up must not FCU back to them.
+                            let suffix_end = best_block_number
+                                .min(candidate_number.saturating_add(PERSISTED_SUFFIX_MAX_BLOCKS));
+                            for number in candidate_number + 1..=suffix_end {
+                                if let Some(hash) = full_node.provider.block_hash(number)? {
+                                    persisted_canonical_suffix.insert(hash, number);
+                                }
+                            }
                             consensus_head_number = candidate_number;
                             consensus_head_hash = candidate;
                             break;
@@ -4157,6 +4172,17 @@ fn main() {
                         orchestrator.with_recovered_execution_validated_head(seeded_view);
                 }
 
+                if !persisted_canonical_suffix.is_empty() {
+                    info!(
+                        target: "n42::cli",
+                        blocks = persisted_canonical_suffix.len(),
+                        recovered_head = consensus_head_number,
+                        reth_head = best_block_number,
+                        "reth holds persisted canonical blocks above the recovered head; catch-up will not FCU back to them"
+                    );
+                    orchestrator = orchestrator
+                        .with_persisted_canonical_suffix(std::mem::take(&mut persisted_canonical_suffix));
+                }
                 if let Some(schedule) = epoch_schedule {
                     orchestrator = orchestrator.with_epoch_schedule(schedule);
                 }
