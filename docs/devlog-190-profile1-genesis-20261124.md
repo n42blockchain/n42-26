@@ -1081,3 +1081,53 @@ n42-26 此前只返回前五个字段，证据仅存内存（500 条环形队列
 - [x] AM28 RPC 形状、`equivocations.jsonl` 落盘与重启加载
 - [x] 单元测试（证据可独立验证）
 - [ ] 混合轮次中的跨客户端验证：需要一个故意双签的节点，目前三方都没有作恶注入工具，暂以单元测试为准。
+
+### 17.6 跨视图边界的迟到作恶证据（2026-11-26 追加）
+
+**问题**：
+- leader 在 CommitQC 形成的那一刻就推进 view（`try_form_commit_qc`），而 `advance_to_view` 每次推进都会清空三个 equivocation tracker。
+- 之后到达的旧 view 消息，在 `process_message_inner` 里被当作过期消息直接丢弃，根本到不了 `process_commit_vote_inner` 的 `check_equivocation`。
+- 结果有两类双签漏检：
+  - 一个 commit vote 已被计入 QC，冲突的另一个在 QC 之后才到；
+  - quorum 之外的成员，两个 commit vote 都迟到。
+- R1 vote 和 proposal 同理。
+- n42-rs 在 d0d01fe7b（"late commit votes"）发现并修复了同一问题，见其 `docs/P1_EQUIVOCATION_INJECTOR.md`。
+
+**设计**（与 n42-rs 一致）：
+- 新模块 `protocol/late_evidence.rs`：
+  - `LateEvidence` 在推进 view 时接收被关闭 view 的三个 tracker，只保留最近 `LATE_EVIDENCE_VIEWS = 3` 个 view；
+  - 同时保存这些 view 内迟到的消息：每个（kind, view, signer）一条，按到达原样存放、不验签。
+- 迟到消息由 `note_late_message` 处理，只做取证：不进 collector，不改共识状态。
+  - vote 和 commit vote 只在本节点担任该 view leader 时检查，与当前 view 的规则一致（投票只发给 leader）；不是 leader 的 view，tracker 本来就是空的。
+  - proposal 所有节点都检查：proposer 必须是该 view 的 leader；gov5 下带非空 validator changes 的 proposal 被拒，与当前 view 的规则一致。
+- 只在冲突时验签：
+  - 与已关闭 tracker 中的同一 commitment 相同的消息，或与已存的迟到消息相同的消息（例如 vote resend），直接返回，不做 BLS 运算。
+  - 冲突时才验签。先验已存的未验证消息：如果它是伪造的，就用新消息替换它，不出证据。再验新消息。
+  - 两边都验证通过才发 `EquivocationDetected`。
+  - 已经被批量验签认证过的 vote 或 commit vote（proof 匹配当前 changes hash）不再重复验签。
+- 证据形状与当前 view 相同（AM28）：
+  - hash1/hash2 取两边的块哈希；
+  - 两个 proposal 块哈希相同、只有 validator changes 不同时，取两边签名消息的 commitment。
+- 内存上限：3 个 view × n 个签名者 × 3 种消息，view 推进时裁剪。
+
+**实施**：
+- `state_machine.rs`：
+  - 新增 `late_evidence` 字段；
+  - `advance_to_view` 改为 `mem::take` 三个 tracker 并调用 `close_view(closing, new_view, ..)`；
+  - 过期消息分支先调用 `note_late_message`，再走原来的 `recover_late_committed_proposal`；
+  - `EquivocationKind` 增加 `Hash` derive，`AuthenticatedVoteProof` 改为 `pub(super)`。
+- 检查编排层：过去 view 的 vote 不经批量验签（只有当前 view 的才进批），直接进引擎的过期分支，所以会走到新逻辑。
+
+**测试**（`n42-consensus` 新增 6 个）：
+- `a_conflicting_commit_vote_after_the_commit_qc_is_evidence`：两种情况都能检出：计入 QC 的投票之后才到的冲突 commit vote；quorum 外成员两次都迟到的 commit vote。
+- `a_conflicting_r1_vote_after_the_view_closed_is_evidence`
+- `a_conflicting_proposal_after_the_view_closed_is_evidence`：follower 侧。
+- `honest_late_messages_produce_nothing`
+- `a_forged_late_message_is_never_evidence`：伪造的先到消息被替换，伪造的后到消息被忽略，都不产生证据。
+- `late_messages_outside_the_window_are_ignored_and_dropped`：超出窗口的 view 被忽略，且内存清零。
+
+去掉 `note_late_message` 调用后，其中 4 个测试失败，确认它们覆盖了这个缺口。
+
+**状态**：
+- [x] 修复与测试；clippy -D warnings 通过；n42-consensus、n42-consensus-service 全部测试通过。
+- [ ] 与 n42-rs 注入器（`N42_TEST_EQUIVOCATE=commit_vote:every-1`）做混合轮次验证：n42-26 作为 leader 时，应在 `n42_equivocations` 中记录对方的 commit_vote 双签对。
