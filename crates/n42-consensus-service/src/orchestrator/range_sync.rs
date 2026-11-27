@@ -27,6 +27,7 @@
 //!   and the decode lane is not polled.
 
 use super::ConsensusService;
+use super::range_import::BatchEnd;
 use crate::h2_finality::{H2V4AnchorVerdict, verify_h2_v4_sync_anchor};
 use crate::range_catchup::{
     AnchorMode, CommitQcRejection, Deactivation, QcCheck, RangeBlock, RangeReply, extra_qc,
@@ -410,63 +411,21 @@ impl ConsensusService {
             stop_at,
             RANGE_IMPORT_BATCH,
         );
-        for block in ready {
-            let decoded = match self.decode_wire_block(&block.rlp) {
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    warn!(target: "n42::interop::range", number = block.number, %error, "buffered range block failed repeat decoding");
-                    if let Some(reason) = self.range_catchup.import_failed(block.number, now) {
-                        self.on_range_catchup_stopped(reason).await;
-                    }
-                    return;
-                }
+        if !ready.is_empty() {
+            self.catchup_timings.begin_batch();
+            let (end, imported) = if self.range_pipeline_depth == 0 {
+                self.import_range_batch_serial(ready, now).await
+            } else {
+                self.import_range_batch_pipelined(ready, now).await
             };
-            // A certificate view, when one bound this hash, orders execution
-            // exactly as the reverse walk does; the header view otherwise.
-            let view = self
-                .h2_v4_block_views
-                .get(&block.hash)
-                .copied()
-                .filter(|view| *view > 0)
-                .unwrap_or(block.view);
-            // `true` without a head move is a block at or below the
-            // execution-validated view (a repeated header view): executed,
-            // made canonical by the next forkchoice update. The reverse walk
-            // treats it the same way.
-            if !self
-                .import_h2_v4_catchup_block(block.source, decoded, view)
-                .await
-            {
-                warn!(
-                    target: "n42::interop::range",
-                    number = block.number,
-                    hash = %block.hash,
-                    view,
-                    "range catch-up block was not executed"
-                );
-                // E12 on a deferred chain: a block below a strict (commit)
-                // anchor is committed. If this node refused it for carrying
-                // a result other than its own, it halts with the evidence.
-                if !block.loose_only
-                    && self.profile1.is_some()
-                    && self.profile1_check_committed(view, block.hash, None)
-                {
+            self.catchup_timings.end_batch(imported);
+            match end {
+                BatchEnd::Done => {}
+                BatchEnd::Return => return,
+                BatchEnd::Stop(reason) => {
+                    self.on_range_catchup_stopped(reason).await;
                     return;
                 }
-                if let Some(reason) = self.range_catchup.import_failed(block.number, now) {
-                    self.on_range_catchup_stopped(reason).await;
-                }
-                return;
-            }
-            self.range_catchup.imported(block.number, block.hash);
-            // Below a strict (commit) anchor: committed, so `/1`, `/2` and
-            // commit_qc may serve it once it is canonical.
-            if !block.loose_only && self.h2_v4_identity.is_some() {
-                self.network.note_committed_block(block.hash);
-            }
-            counter!("n42_range_catchup_imported_total").increment(1);
-            if block.loose_only {
-                counter!("n42_range_catchup_loose_only_total").increment(1);
             }
         }
         if let Some(reason) = self.range_catchup.take_stop() {
@@ -515,6 +474,7 @@ impl ConsensusService {
             qc_verifications = stats.qc_verifications,
             "range catch-up stopped"
         );
+        self.catchup_timings.log_and_reset(self.head_block_number);
         counter!("n42_range_catchup_stops_total", "reason" => match reason {
             Deactivation::CaughtUp => "caught_up",
             Deactivation::Stalled => "stalled",

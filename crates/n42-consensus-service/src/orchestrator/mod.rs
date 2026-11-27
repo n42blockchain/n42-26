@@ -4,6 +4,7 @@ mod consensus_loop;
 mod execution_bridge;
 pub mod frame_ref;
 pub use execution_bridge::{compact_block_enabled, shared_execution_enabled};
+mod range_import;
 mod range_sync;
 mod state_mgmt;
 mod view_jump_throttle;
@@ -1211,6 +1212,11 @@ pub struct ConsensusService {
     /// Range replies decoded off the loop (`spawn_blocking`), back in order
     /// of completion. Polled only while the client is active.
     range_decoded: range_sync::RangeDecodeLane,
+    /// Stage timings of the current range catch-up run (devlog-195).
+    catchup_timings: range_import::CatchupTimings,
+    /// Payloads prepared ahead of the engine in range catch-up; 0 imports
+    /// block by block (`N42_RANGE_PIPELINE`).
+    range_pipeline_depth: usize,
     /// Peers that failed to serve an authenticated block hash during the
     /// current bounded retry round. A mixed Rust/Gov set may gossip a child
     /// from a Rust validator whose execution head is also behind; retrying
@@ -2157,9 +2163,13 @@ impl ConsensusService {
         block: n42_network::Gov5GossipBlock,
         view: u64,
     ) -> bool {
+        use range_import::Stage;
         // Profile 1: the header is checked against its parent before the
         // payload reaches execution (reverse-walk and range catch-up alike).
-        if !self.profile1_admit_block(&block, "catchup") {
+        let started = Instant::now();
+        let admitted = self.profile1_admit_block(&block, "catchup");
+        self.catchup_timings.record(Stage::Admit, started.elapsed());
+        if !admitted {
             return false;
         }
         let Some(el) = self.el.clone() else {
@@ -2169,7 +2179,10 @@ impl ConsensusService {
         let block_hash = block.block_hash;
         let block_number = block.header.number;
         let block_timestamp = block.header.timestamp;
-        let execution_data = match crate::replay_import::build_gov5_gossip_execution_data(&block) {
+        let started = Instant::now();
+        let execution_data = crate::replay_import::build_gov5_gossip_execution_data(&block);
+        self.catchup_timings.record(Stage::Build, started.elapsed());
+        let execution_data = match execution_data {
             Ok(data) => data,
             Err(error) => {
                 error!(target: "n42::interop::h2v4", %source, %block_hash, block_number, view, %error, "could not reconstruct authenticated Gov5 catch-up payload");
@@ -2177,10 +2190,13 @@ impl ConsensusService {
             }
         };
 
-        match el
+        let started = Instant::now();
+        let status = el
             .new_payload_for(ExecutionPath::HISTORICAL_SEQUENTIAL, execution_data)
-            .await
-        {
+            .await;
+        self.catchup_timings
+            .record(Stage::NewPayload, started.elapsed());
+        match status {
             Ok(status) if matches!(status.status, PayloadStatusEnum::Valid) => {
                 info!(target: "n42::interop::h2v4", %block_hash, block_number, view, "authenticated Gov5 catch-up parent reached new_payload(Valid)");
             }
@@ -2198,6 +2214,7 @@ impl ConsensusService {
         // bootstrap or an earlier run. Re-submitting them to new_payload proves
         // the complete parent chain without issuing a backward FCU.
         if view <= self.execution_validated_head_view {
+            let started = Instant::now();
             if let Err(error) =
                 self.engine
                     .process_event(n42_consensus::ConsensusEvent::BlockImportedWithParent {
@@ -2207,14 +2224,19 @@ impl ConsensusService {
             {
                 error!(target: "n42::interop::h2v4", %block_hash, view, %error, "could not release execution-gated vote for replayed Gov5 parent");
             }
+            self.catchup_timings.record(Stage::Post, started.elapsed());
             return true;
         }
 
         let forkchoice = self.fcu_state(block_hash, block_hash);
-        match el
+        let started = Instant::now();
+        let result = el
             .fork_choice_updated_for(ExecutionPath::HISTORICAL_SEQUENTIAL, forkchoice)
-            .await
-        {
+            .await;
+        self.catchup_timings.record(Stage::Fcu, started.elapsed());
+        self.catchup_timings.note_fcu();
+        let started = Instant::now();
+        match result {
             Ok(result) if matches!(result.payload_status.status, PayloadStatusEnum::Valid) => {
                 self.last_committed_timestamp = self.last_committed_timestamp.max(block_timestamp);
                 self.advance_execution_validated_head(
@@ -2252,6 +2274,7 @@ impl ConsensusService {
                 ) {
                     error!(target: "n42::interop::h2v4", %block_hash, view, %error, "could not release execution-gated vote for Gov5 catch-up block");
                 }
+                self.catchup_timings.record(Stage::Post, started.elapsed());
                 true
             }
             Ok(result) => {
@@ -3467,6 +3490,8 @@ impl ConsensusService {
                 range_sync::range_anchor_mode(),
             ),
             range_decoded: range_sync::RangeDecodeLane::new(),
+            catchup_timings: Default::default(),
+            range_pipeline_depth: range_import::range_pipeline_depth_from_env(),
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
             gov5_execution_pull_rounds: 0,
@@ -3747,6 +3772,8 @@ impl ConsensusService {
                 range_sync::range_anchor_mode(),
             ),
             range_decoded: range_sync::RangeDecodeLane::new(),
+            catchup_timings: Default::default(),
+            range_pipeline_depth: range_import::range_pipeline_depth_from_env(),
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
             gov5_execution_pull_rounds: 0,
@@ -11136,6 +11163,343 @@ mod tests {
             .await;
         let (source, start, reply) = orch.range_decoded.rx.recv().await.expect("decoded reply");
         orch.on_range_reply_decoded(source, start, reply).await;
+    }
+
+    /// A Gov5 block carrying `transactions` transfers (fixed test
+    /// signatures: nothing on these paths recovers senders).
+    fn test_gov5_block_rlp_with_txs(
+        parent_hash: B256,
+        number: u64,
+        view: u64,
+        transactions: usize,
+    ) -> (B256, Vec<u8>) {
+        let mut extra_data = Vec::with_capacity(12);
+        extra_data.extend_from_slice(b"N42H");
+        extra_data.extend_from_slice(&view.to_le_bytes());
+        let txs: Vec<TxEnvelope> = (0..transactions as u64)
+            .map(|nonce| {
+                let tx = alloy_consensus::TxEip1559 {
+                    chain_id: 1144,
+                    nonce: number * 100_000 + nonce,
+                    gas_limit: 21_000,
+                    max_fee_per_gas: 1_000_000_000,
+                    max_priority_fee_per_gas: 1,
+                    to: alloy_primitives::TxKind::Call(Address::with_last_byte(7)),
+                    value: U256::from(1),
+                    ..Default::default()
+                };
+                TxEnvelope::Eip1559(alloy_consensus::Signed::new_unhashed(
+                    tx,
+                    alloy_primitives::Signature::test_signature(),
+                ))
+            })
+            .collect();
+        let block = Block::<TxEnvelope> {
+            header: Header {
+                parent_hash,
+                ommers_hash: B256::ZERO,
+                transactions_root: calculate_transaction_root(&txs),
+                number,
+                gas_limit: 2_000_000_000,
+                base_fee_per_gas: Some(0),
+                extra_data: extra_data.into(),
+                ..Default::default()
+            },
+            body: BlockBody {
+                transactions: txs,
+                ..Default::default()
+            },
+        };
+        let block_hash = block.header.hash_slow();
+        let execution = ExecutionData::from_block_unchecked(block_hash, &block);
+        let rlp =
+            n42_network::encode_gov5_block_rlp(&execution).expect("test Gov5 block must encode");
+        (block_hash, rlp)
+    }
+
+    /// An engine that validates one payload at a time for `delay`, in the
+    /// order it receives them, and records the calls.
+    #[derive(Default)]
+    struct TimedEngine {
+        delay: Duration,
+        busy: tokio::sync::Mutex<()>,
+        /// `(hash, status)` answered for every new_payload, in order.
+        payloads: Mutex<Vec<B256>>,
+        /// The hash answered Invalid (once).
+        invalid: Mutex<Option<B256>>,
+        fcu_heads: Mutex<Vec<B256>>,
+        /// Highest number of new_payload calls under way at once.
+        concurrent: std::sync::atomic::AtomicUsize,
+        max_concurrent: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionLayer for TimedEngine {
+        async fn new_payload(
+            &self,
+            payload: ExecutionData,
+        ) -> Result<PayloadStatus, crate::el::ElError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.concurrent.fetch_add(1, SeqCst) + 1;
+            self.max_concurrent.fetch_max(now, SeqCst);
+            let _busy = self.busy.lock().await;
+            let hash = payload.payload.block_hash();
+            self.payloads.lock().unwrap().push(hash);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            self.concurrent.fetch_sub(1, SeqCst);
+            let mut invalid = self.invalid.lock().unwrap();
+            if *invalid == Some(hash) {
+                *invalid = None;
+                return Ok(PayloadStatus::from_status(PayloadStatusEnum::Invalid {
+                    validation_error: "test".into(),
+                }));
+            }
+            Ok(PayloadStatus::from_status(PayloadStatusEnum::Valid))
+        }
+
+        async fn fork_choice_updated(
+            &self,
+            state: ForkchoiceState,
+        ) -> Result<ForkchoiceUpdated, crate::el::ElError> {
+            self.fcu_heads.lock().unwrap().push(state.head_block_hash);
+            Ok(ForkchoiceUpdated::from_status(PayloadStatusEnum::Valid))
+        }
+
+        async fn fork_choice_updated_with_attrs(
+            &self,
+            _state: ForkchoiceState,
+            _attrs: PayloadAttributes,
+        ) -> Result<ForkchoiceUpdated, crate::el::ElError> {
+            Ok(ForkchoiceUpdated::from_status(PayloadStatusEnum::Valid))
+        }
+
+        async fn resolve_payload(
+            &self,
+            _id: PayloadId,
+            _kind: crate::el::ResolveKind,
+        ) -> Option<Result<crate::el::BuiltBlock, crate::el::ElError>> {
+            None
+        }
+    }
+
+    /// A fresh node (head at genesis) and a chain of `blocks` blocks of
+    /// `transactions` transfers each; the top block is staged as the
+    /// gossiped block that starts the range client.
+    async fn range_pipeline_orchestrator(
+        blocks: u64,
+        transactions: usize,
+        engine: Arc<TimedEngine>,
+        depth: usize,
+    ) -> (
+        ConsensusService,
+        MockConsensusNetwork,
+        n42_network::PeerId,
+        Vec<(B256, Vec<u8>)>,
+    ) {
+        let (consensus, output_rx) = make_test_engine();
+        let network = MockConsensusNetwork::default();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mut orch = ConsensusService::new(
+            consensus,
+            Arc::new(network.clone()),
+            net_event_rx,
+            output_rx,
+        )
+        .with_h2_v4_participant(test_h2_identity());
+        orch.el = Some(engine);
+        orch.async_finalize_fcu = false;
+        orch.range_pipeline_depth = depth;
+        orch.range_catchup = crate::range_catchup::RangeCatchup::new(
+            crate::range_catchup::RangeCatchupConfig::default(),
+            crate::range_catchup::AnchorMode::Observe,
+        );
+        let genesis = B256::repeat_byte(0x10);
+        orch.head_block_hash = genesis;
+        orch.head_block_number = 0;
+        let mut chain = Vec::new();
+        let mut parent = genesis;
+        for number in 1..=blocks {
+            let (hash, rlp) = test_gov5_block_rlp_with_txs(parent, number, number, transactions);
+            chain.push((hash, rlp));
+            parent = hash;
+        }
+        let peer = n42_network::PeerId::random();
+        orch.note_range_peer_status(peer, blocks);
+        let (top_hash, top_rlp) = chain.last().cloned().expect("a chain");
+        orch.remember_h2_v4_block_view(top_hash, blocks);
+        orch.handle_h2_v4_gov5_block(peer, top_rlp, None).await;
+        assert!(orch.range_catchup.is_active());
+        (orch, network, peer, chain)
+    }
+
+    /// Serves every range request from `chain` and drives the client until
+    /// the head reaches `target` (or `rounds` run out).
+    async fn run_range_catchup(
+        orch: &mut ConsensusService,
+        network: &MockConsensusNetwork,
+        peer: n42_network::PeerId,
+        chain: &[(B256, Vec<u8>)],
+        target: u64,
+        rounds: usize,
+    ) {
+        let mut served = 0;
+        for _ in 0..rounds {
+            orch.drive_range_catchup().await;
+            let requests = network.range_requests.lock().unwrap().clone();
+            for (_, start, count) in requests[served..].iter().copied() {
+                let rlps = chain[(start - 1) as usize..(start - 1 + count) as usize]
+                    .iter()
+                    .map(|(_, rlp)| rlp.clone())
+                    .collect();
+                deliver_range_reply(orch, peer, start, rlps).await;
+            }
+            served = requests.len();
+            if orch.head_block_number >= target {
+                return;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pipelined_range_import_matches_the_serial_import_with_one_fcu_per_batch() {
+        let mut outcomes = Vec::new();
+        for depth in [0usize, 4] {
+            let engine = Arc::new(TimedEngine::default());
+            let (mut orch, network, peer, chain) =
+                range_pipeline_orchestrator(300, 2, engine.clone(), depth).await;
+            run_range_catchup(&mut orch, &network, peer, &chain, 300, 200).await;
+            let expected: Vec<B256> = chain.iter().map(|(hash, _)| *hash).collect();
+            assert_eq!(orch.head_block_number, 300, "depth {depth}");
+            assert_eq!(orch.head_block_hash, expected[299], "depth {depth}");
+            assert_eq!(
+                *engine.payloads.lock().unwrap(),
+                expected,
+                "depth {depth}: each height once, in order"
+            );
+            let fcus = engine.fcu_heads.lock().unwrap().clone();
+            assert_eq!(fcus.last(), Some(&expected[299]), "depth {depth}");
+            assert_eq!(
+                engine
+                    .max_concurrent
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the engine sees one payload at a time"
+            );
+            outcomes.push((orch.execution_validated_head_view, fcus.len()));
+        }
+        assert_eq!(
+            outcomes[0].0, outcomes[1].0,
+            "same execution-validated view"
+        );
+        assert_eq!(outcomes[0].1, 300, "serial: one update per block");
+        assert!(
+            outcomes[1].1 <= 300 / 32 + 2,
+            "pipelined: one update per batch, got {}",
+            outcomes[1].1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_invalid_block_mid_batch_stops_the_batch_without_an_update_past_it() {
+        let engine = Arc::new(TimedEngine::default());
+        let (mut orch, network, peer, chain) =
+            range_pipeline_orchestrator(100, 1, engine.clone(), 4).await;
+        // Block 10 of the first batch (1..=32) is refused once.
+        *engine.invalid.lock().unwrap() = Some(chain[9].0);
+        orch.drive_range_catchup().await;
+        let requests = network.range_requests.lock().unwrap().clone();
+        for (_, start, count) in requests {
+            let rlps = chain[(start - 1) as usize..(start - 1 + count) as usize]
+                .iter()
+                .map(|(_, rlp)| rlp.clone())
+                .collect();
+            deliver_range_reply(&mut orch, peer, start, rlps).await;
+        }
+        let first: Vec<B256> = chain[..10].iter().map(|(hash, _)| *hash).collect();
+        assert_eq!(
+            *engine.payloads.lock().unwrap(),
+            first,
+            "nothing after the refused block is submitted"
+        );
+        assert_eq!(
+            *engine.fcu_heads.lock().unwrap(),
+            vec![chain[8].0],
+            "one update, to the block before the refused one"
+        );
+        assert_eq!(orch.head_block_number, 9);
+        assert_eq!(orch.head_block_hash, chain[8].0);
+        assert!(orch.range_catchup.is_active(), "one failure is retried");
+
+        // The retry imports the rest, each remaining height once.
+        run_range_catchup(&mut orch, &network, peer, &chain, 100, 200).await;
+        assert_eq!(orch.head_block_number, 100);
+        let payloads = engine.payloads.lock().unwrap().clone();
+        let expected: Vec<B256> = chain[..10]
+            .iter()
+            .chain(chain[9..].iter())
+            .map(|(hash, _)| *hash)
+            .collect();
+        assert_eq!(payloads, expected, "the refused block again, then the rest");
+    }
+
+    /// Range catch-up wall time per block on this host, serial against
+    /// pipelined, with real 1,200-transfer blocks and an engine that takes a
+    /// fixed time per payload (`N42_RANGE_BENCH_ENGINE_MS`, default 17, the
+    /// S1 `new_payload` mean). Prints each run's stage breakdown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "bench"]
+    async fn range_catchup_ms_per_block_bench() {
+        let engine_ms: u64 = std::env::var("N42_RANGE_BENCH_ENGINE_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(17);
+        let blocks: u64 = std::env::var("N42_RANGE_BENCH_BLOCKS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(300);
+        for depth in [0usize, 4] {
+            let engine = Arc::new(TimedEngine {
+                delay: Duration::from_millis(engine_ms),
+                ..Default::default()
+            });
+            let (mut orch, network, peer, chain) =
+                range_pipeline_orchestrator(blocks, 1_200, engine.clone(), depth).await;
+            run_range_catchup(&mut orch, &network, peer, &chain, blocks - 1, 1_000).await;
+            let (wall, attributed) = orch.catchup_timings.wall_and_attributed_ms();
+            let imported = engine.payloads.lock().unwrap().len();
+            let stages = [
+                range_import::Stage::Decode,
+                range_import::Stage::Admit,
+                range_import::Stage::Build,
+                range_import::Stage::NewPayload,
+                range_import::Stage::Wait,
+                range_import::Stage::Fcu,
+                range_import::Stage::Post,
+                range_import::Stage::Other,
+                range_import::Stage::Gap,
+                range_import::Stage::Prep,
+                range_import::Stage::Engine,
+            ]
+            .iter()
+            .map(|stage| {
+                format!(
+                    "{}={:.2}",
+                    stage.as_str(),
+                    orch.catchup_timings.total_ms(*stage) / imported as f64
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+            println!(
+                "depth {depth}, engine {engine_ms} ms: {imported} blocks, {:.2} ms/block wall, \
+                 {:.2} attributed | per block: {stages} | updates {}",
+                wall / imported as f64,
+                attributed / imported as f64,
+                engine.fcu_heads.lock().unwrap().len()
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
