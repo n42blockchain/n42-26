@@ -177,3 +177,141 @@ For comparison the existing lock write (`record_lock`: tmp + fdatasync + rename 
 2. Optional: fold the lock into the journal frame to share one fsync.
 3. The by-hash serve cache after replay holds only republished blocks; a direct journal lookup in the
    network's by-hash handler would cover peers that ask later.
+
+## 9. Review round 1 (2026-11-27)
+
+An external review of the wip commit `b3265ad` raised three blockers and five minor points. All are fixed
+on `fix/profile1-am35-block-journal`.
+
+### 9.1 Blocker 1: the snapshot could store a non-durable lock
+
+`process_prepare_qc` (and the leader's `try_form_prepare_qc`) move the in-memory lock to B as soon as the
+PrepareQC is verified. That happens before B is durable. While R2 is held, any `save_consensus_state` call
+could write that lock into `consensus_state.json`, and on restart `higher_lock` would adopt it.
+
+**Decision.** The in-memory lock keeps moving early. The engine now tracks a separate
+`durable_locked_qc`, and the snapshot stores only that one.
+- `durable_locked_qc` advances only in `persist_before_commit_vote`, after `ensure_block_durable` and
+  `record_lock` have both succeeded.
+- A recovered engine starts with `durable_locked_qc` equal to the recovered lock. That lock was durable
+  before the restart: it came from either the snapshot or `locked_qc.bin`.
+
+**Why not defer the in-memory lock.** We rejected deferring `update_locked_qc` until after the journal
+write.
+- The in-memory lock is the safety rule for R1 voting (`safe_node`). A lower lock only makes a node more
+  permissive, so deferring it would widen what a node may vote for in the meantime.
+- The lock also feeds the leader's parent choice and the TC high-QC.
+- Losing a lock this node never commit-voted is safe across a restart. The locks that make a CommitQC
+  safe are the ones held by its R2 voters, and every R2 voter writes its lock before signing.
+
+**Shared R2 prologue.** The follower R2, the held-release R2 and the leader self-vote now all call one
+function, `ConsensusEngine::persist_before_commit_vote`. It runs these steps in order:
+1. Make the voted block durable (`ensure_block_durable`). If the current lock names a different block,
+   make that block durable too.
+2. `record_lock`.
+3. Advance `durable_locked_qc`.
+4. `record_commit_vote`.
+5. Record `r2_persist_us`.
+
+### 9.2 Blocker 2: pruning and replay compared heights, not hashes
+
+- `BlockJournal::prune` drops an entry in two cases:
+  - The persisted canonical block at the entry's height has the entry's hash.
+  - The entry is a **dead fork**: its height is at or below both the persisted tip and the finalized
+    height (`note_finalized`, fed from `advance_execution_validated_head`), and the persisted block at
+    that height has a different hash.
+
+  A fork entry above the finalized height survives an early persisted sibling.
+- `ensure_durable` no longer returns `Err` for a staged ancestor that sits at a persisted height under a
+  different hash. Such an ancestor is journalled like any other unpersisted block, and the walk continues
+  down to the common ancestor. Previously this case dropped the vote.
+- Replay skips a record only when `journal.is_persisted(hash, number)` is true. A record whose parent is a
+  persisted block (matched by hash) is replayed even below the EL head, so a fork sibling comes back.
+- The lineage registry was a process-global map, and parallel tests polluted each other through it
+  (`unstage_drops_forged_copy` was flaky). It is now owned by each journal (`note_lineage`).
+
+### 9.3 Blocker 3: replay failures were ignored
+
+`replay_block_journal` now returns `Result<usize, ReplayFailure>`.
+- **Required blocks.** These are the locked block, the committed block, and their journalled ancestors.
+  Each one must end up either persisted (by hash) or replayed.
+- **Retries.** `new_payload` is retried up to 5 times with backoff starting at 250 ms and doubling each
+  time, on an EL error or a non-final status (SYNCING/ACCEPTED). INVALID is final and is not retried.
+- **Fail closed.** If a required block is still missing after the retries, `run()` panics with
+  `AM35: journalled <role> block <hash> (height n) could not be replayed into the execution layer: <reason>`.
+  The orchestrator is a critical task, so the node stops before it serves, votes or builds.
+- **Other failures.** A failed block that nothing rests on is logged and skipped.
+
+### 9.4 Minor points
+
+1. **Held R2 retry.** A held R2 is retried on a 200 ms tick in the event loop
+   (`HELD_COMMIT_VOTE_RETRY`, armed only while a vote is held). It is also retried after replay, in
+   addition to the existing retry on staged data.
+2. **Off-loop journal writes.** The R2 path still calls `ensure_durable` inline, and that call remains the
+   gate. In addition, `record_eager_import_completion` now journals the just-validated block on
+   `spawn_blocking`. On Profile 1, R2 waits for the node's own execution, so the background append has
+   normally finished, and the inline call is a lookup under the journal mutex. If the background write is
+   still in flight, the inline call waits on the mutex for the rest of it. The mutex orders the two
+   writers, and the vote is still signed only after `ensure_durable` returns Durable.
+
+   Measured inline costs (section 5):
+   - 1200-tx block: append + fdatasync about 0.45 ms p50.
+   - 12000-tx block: about 2.2 ms p50.
+
+   A 30 MiB block costs roughly two copies plus blake3 plus fdatasync, an estimated 20-40 ms. That is the
+   case the background append keeps off the loop.
+3. **Sync-mode check.** The durable-sync-mode check compares the enum directly:
+   `mode == reth_db::mdbx::SyncMode::Durable`. `n42-node-bin` now depends on `reth-db` with the `mdbx`
+   feature.
+4. **Replay through `run()`.** Two tests drive `run()` itself:
+   - `run_replays_the_journal_before_the_first_build`: the mock EL's ordered call log shows
+     `new_payload(B)` before `build(parent = B)`.
+   - `run_stops_before_the_event_loop_when_the_locked_block_cannot_be_replayed`: `run()` panics with the
+     AM35 message, and nothing is built.
+5. **Stale comment.** The comment at the eager import site said "new_payload + fcu". It now says the eager
+   import runs `new_payload` only.
+
+### 9.5 Stable log line for the E9 kill tool
+
+On every R2 path, right after the journal fsync and `record_lock`, and immediately before the R2
+signature, the node logs:
+
+```text
+INFO n42::am35: commit vote released after durable lock view=<u64> block_hash=0x<64 hex> role="follower"|"leader"
+```
+
+- The line is emitted only from `persist_before_commit_vote`. That covers the follower direct path, the
+  follower released after holding, and the leader self-vote.
+- `block_hash` uses `Display`, which prints the full hash. `role` uses `Debug`, which prints it quoted.
+- The text is fixed because the mixed-gate kill tool (E9) regex-matches it.
+- The `N42_COMMIT_STATE: Committed` line in `consensus_loop` is unchanged.
+
+### 9.6 New tests
+
+- `whole_set_kill_between_prepare_qc_and_commit_qc_replays_the_locked_block` now also checks that while
+  R2 is held, the in-memory lock is B but `build_snapshot().locked_qc` is still genesis. After the R2, the
+  snapshot lock is B.
+- `persisted_block_is_not_journalled_and_ancestors_match_by_hash`: a fork parent is journalled together
+  with its child. Pruning keeps it while the height is not finalized and drops it after
+  `note_finalized`.
+- New replay tests:
+  - `replay_retries_a_transient_execution_layer_failure`
+  - `replay_fails_closed_when_the_locked_block_cannot_be_replayed`
+  - `replay_matches_persisted_blocks_by_hash_not_height`
+- New `run()` tests: the two listed in 9.4 item 4.
+
+Results:
+- n42-consensus: 296 lib tests plus integration tests, all pass.
+- n42-consensus-service: 380 lib tests pass (3 consecutive runs) and `profile1_v6` passes 20.
+- n42-node-bin: tests pass.
+- clippy `-D warnings` is clean on all three crates.
+
+### 9.7 E2E runbook (local 4-node Profile 1; not run here because live rounds own the box)
+
+See the AM35 report for the exact commands. In summary:
+- At least 5 whole-set `kill -9` after a commit, triggered on `N42_COMMIT_STATE: Committed`.
+- At least 5 whole-set `kill -9` between PrepareQC and CommitQC, triggered by
+  `N42_QUALIFICATION_ABORT_AT=block_journal_synced` on all four nodes, or by the `n42::am35` line above.
+- After each restart, every node must log `AM35: block journal replayed` with `locked_replayed=true`
+  (when the lock was above the EL head). The chain must commit a higher block within 60 s, and the nodes
+  must agree on the committed hashes.
