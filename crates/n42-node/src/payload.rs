@@ -483,6 +483,12 @@ pub fn set_builder_qmdb_store(
     let _ = BUILDER_QMDB_STORE.set(store);
 }
 
+/// The registered QMDB store, whether or not the builder uses it.
+pub(crate) fn registered_qmdb_store()
+-> Option<&'static std::sync::Arc<crate::qmdb_state_root::Gov5QmdbStateRootStore>> {
+    BUILDER_QMDB_STORE.get()
+}
+
 /// The store the builder derives the replacing root from, when it does.
 pub(crate) fn builder_qmdb_store()
 -> Option<&'static std::sync::Arc<crate::qmdb_state_root::Gov5QmdbStateRootStore>> {
