@@ -3731,6 +3731,8 @@ fn main() {
                 // operations (validation, nonce checks) consume significant CPU
                 // and would otherwise compete with consensus message processing.
                 let pool_for_bridge = full_node.pool.clone();
+                let bridge_sender_cache =
+                    full_node.evm_config.inner().sender_recovery_cache.clone();
                 let bridge_workers = if low_mem { 1 } else { 2 };
                 std::thread::Builder::new()
                     .name("n42-tx-pool-bridge".into())
@@ -3752,6 +3754,7 @@ fn main() {
                         };
                         rt.block_on(
                             TxPoolBridge::new(pool_for_bridge, tx_import_rx, tx_broadcast_tx)
+                                .with_sender_recovery_cache(bridge_sender_cache)
                                 .run(),
                         );
                     })
@@ -3868,6 +3871,9 @@ fn main() {
                             ))
                             .with_deferred_check(profile1.as_ref().map(|_| {
                                 profile1_deferred_checker(full_node.provider.clone())
+                                    .with_sender_recovery_cache(
+                                        full_node.evm_config.inner().sender_recovery_cache.clone(),
+                                    )
                             })),
                         ),
                         Err(error) => {

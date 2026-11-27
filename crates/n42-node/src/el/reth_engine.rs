@@ -233,11 +233,17 @@ impl ExecutionLayer for RethExecutionLayer {
             return n42_consensus_service::deferred_check::DeferredCheck::Unsupported;
         };
         let payload = payload.clone();
-        tokio::task::spawn_blocking(move || checker.check(&payload))
-            .await
-            .unwrap_or_else(|error| {
-                n42_consensus_service::deferred_check::DeferredCheck::Retry(error.to_string())
-            })
+        let queued = std::time::Instant::now();
+        tokio::task::spawn_blocking(move || {
+            // Time spent waiting for a blocking thread.
+            metrics::histogram!("n42_deferred_check_stage_ms", "stage" => "queue")
+                .record(queued.elapsed().as_secs_f64() * 1000.0);
+            checker.check(&payload)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            n42_consensus_service::deferred_check::DeferredCheck::Retry(error.to_string())
+        })
     }
 
     async fn build_on_sealed(
