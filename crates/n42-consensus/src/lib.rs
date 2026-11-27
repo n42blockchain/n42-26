@@ -53,7 +53,7 @@ pub use protocol::{
     ConsensusEngine, ConsensusEvent, EngineOutput, EquivocationKind, EquivocationProof,
     SignedMessage, ViewTiming,
 };
-pub use receipt::gov5_native_receipts_root;
+pub use receipt::{gov5_native_receipt_rlp, gov5_native_receipts_root};
 pub use validator::{
     DEFAULT_MAX_HISTORICAL_EPOCHS, EpochManager, LeaderSelector, MAX_HISTORICAL_EPOCHS_LIMIT,
     LEADER_TENURE_ENV, LeaderSchedule, LeaderScheduleError, MAX_CERTIFIED_VIEW, certifiable_view, ROTATE_ON_TIMEOUT_ENV,
