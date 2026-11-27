@@ -1201,3 +1201,90 @@ n{4,7,100}-T8-k3、AM32 边界钳制及其 -p1 / -next-dead 变体）。n42-rs m
 - [x] AM33 实现、gov5 向量全部通过（pacemaker 级与引擎级）、devlog。
 - [ ] 混合 5d 式重跑：6 个连续缺席 leader，base 24 s 下断档 ≤ 216 s（加出块间隔）。
 - 未处理（沿用现状）：从快照恢复且 c > 0 的节点，首个 view 的计时器仍是 base（`Pacemaker::new` 的初始 deadline），直到第一次 `arm_view_timer`。
+
+## 19. 混合生产标准 v1.2 补齐（计划 F1：V2、V7、V9、AM34 第 3-5 项）（2026-11-27 追加）
+
+分支 `feat/profile1-v12-f1`（基于 origin/main b64f650）。向量均从 gov5 main 08ecf671 `internal/testdata/profile1/vectors/` 逐字节复制
+（与 qs-scratch 副本一致），按 AM33 的做法放 `testdata/profile1/gov5/<V>/`，测试先校验 SHA-256。gov5 没有单独的 AM34 向量目录。
+
+| 向量 | 文件 | SHA-256 | 位置 |
+| --- | --- | --- | --- |
+| V2 | `roots.json` | `deff5a4736778ef0b70aedc30f747d7ccd89422479393d37cba04fc541cdef18` | `crates/n42-node/testdata/profile1/gov5/V2/` |
+| V7 | `leader_schedule.json` | `a08180b1fc9625c0b6cd6128b775e40dcdf04a900b9ba3bf45aa9210340fd445` | `crates/n42-consensus/testdata/profile1/gov5/V7/` |
+| V9 | `gossipsub_parameters.json` | `b315f30b8b9682486ab750f7aa7ab3bbaa84bd62f8941c74492208479fad8716` | `crates/n42-network/testdata/profile1/gov5/V9/` |
+
+### 19.1 V7 leader 调度（无 2^64-1 行）— 已满足，补测试（4ea2dff）
+
+- `crates/n42-consensus/tests/profile1_v7.rs`（6 个）：profiles、leader 表、tenure 窗口、epoch、51 行 `view_after_tc`、11 条序列，
+  全部与 gov5 一致，调度代码未改。
+
+### 19.2 AM34 第 3 项：view 2^64-1 的 QC/TC 无效（425bbe6）— 实际缺口
+
+- 修复前：`view_after_tc(MAX)` 用 `wrapping_add` 回绕到 view 0；签名正确的 view = MAX 的 QC/TC 会被接受。
+- 设计：拒绝点放在所有入口的公共底层，而不是逐个调用点：
+  - `validator/selection.rs`：`MAX_CERTIFIED_VIEW`、`certifiable_view()`；`view_after_tc` 只对 MAX 以下有定义，MAX 饱和不回绕。
+  - `protocol/quorum.rs`：`collect_signer_keys` 拒绝 MAX（覆盖 verify_qc、commit、any-domain、TC），构建 QC/TC 同样拒绝。
+  - 引擎：`on_block_ready` / `send_vote` / `on_timeout` 在 MAX 不提议、不签名；proposal、timeout、future timeout、NewView 携带的 TC 均拒绝；
+    `current_view + FUTURE_VIEW_WINDOW` 与编排层 build-ahead 的加法改 `saturating_add`。
+  - `n42-consensus-service/src/h2_finality.rs`：Decide、sync anchor、shadow 校验与 NewView 分支新增 `LastView` 错误。
+  - `n42-network/src/sync_v11.rs`：`check_commit_qc_reply` 拒绝 view = MAX 的 commit_qc。
+- 测试：选择层、quorum（Native 与 H2V4，MAX 与 MAX-1）、引擎、h2_finality、sync_v11 各一个。
+
+### 19.3 V2 收据根含 EIP-7708 转账日志（AM34 第 5 项）— 已满足，补测试（131f229）
+
+- n42-26 经 evm2 Amsterdam（`amsterdamTime`）已产出来自 `0xff…fe` 的 7708 日志，无需开关；`fast_transfer` 路径（默认关闭）同样产出。
+- `n42-consensus` 新增 `gov5_native_receipt_rlp`（收据根共用编码）；`crates/n42-node/tests/profile1_vectors.rs` 新增 4 个 V2 测试：
+  收据与收据根、转账日志属于收据根、withdrawals 根、committee evidence，全部等于 gov5。
+
+### 19.4 V9 GossipSub 参数与 AM34 第 4-5 项：只订阅 G2 主题（85111b1）
+
+修复前（Profile 1 节点）：
+
+| 项 | n42-26 原值 | V9 / gov5 |
+| --- | --- | --- |
+| heartbeat / 初始延迟 | 1 s / 5 s | 700 ms / 100 ms |
+| history length | 5 | 6 |
+| seen TTL | 60 s | 30 s |
+| IDONTWANT 阈值 | 1000 | 1024 |
+| mesh D/Dlo/Dhi | 按网络规模缩放（环境变量可调） | 8 / 6 / 12 |
+| 校验模式 | Permissive | Anonymous（StrictNoSign + 无 author） |
+| max transmit size | 16 MiB | 78 293 706（32 + n + n/6，n = 64 MiB） |
+| gov5 块 gossip 解码上限 | 1 MiB | maxBlockBytes = 64 MiB |
+| 订阅主题 | G2 之外还订阅 `/n42/{consensus,blocks,verification,mempool,blobs}/1` | 只 G2 |
+
+设计与实现：
+
+- 新模块 `n42-network/src/gossipsub/profile1.rs`：V9 常量、`gossipsub_config(genesis, max_block_bytes)`、`max_gossip_wire_size`、`g2_topics`。
+  线上契约（主题串、G3 消息 id、大小上限）必须相等；mesh/history 等属于本地路由行为，但同样取 gov5 值，使 Rust 成员 graft/prune 行为与 Go 一致。
+  peer scoring 按 AM34 属本地选择，保留原有参数。
+- `TransportConfig::profile1_max_block_bytes`：设置时 swarm 用 profile-1 配置；非 gov5 传输（无匿名信封）直接报错。
+- `NetworkService::new_profile1_participant` / `new_profile1_observer`：只订阅 G2（gov5 block、hotstuff_consensus、H2-v4，participant 另加
+  `transaction_v2`）；`gossipsub_publish` 丢弃 G2 之外的发布（计数 `n42_profile1_non_g2_publish_dropped_total`）；gov5 块 gossip 的解码上限与
+  原始上限改为 maxBlockBytes 及其 snappy 上界（`validate_message_with_gov5_block_cap`）。
+- `bin/n42-node/src/main.rs`：验证者与观察者两条路径按 `profile1_config().max_block_bytes` 选择上述构造。
+- 请求-响应协议（sync v1.1 range/commit_qc、block-by-hash、bodies-by-range、status、direct H2、block_direct）不受影响；
+  n42-26 之间的原生块数据仍经 block_direct 推送，gov5 `block` 主题携带完整块，原生 `/n42/blocks/1` gossip 后备在 Profile 1 上被丢弃不损失路径。
+- G2 中的 `mobileverify_{packet,registration}` 暂不加入：n42-26 尚无 mobileverify 服务（I1），加入一个无法校验的主题只会成为转发方。
+  cohort 主题（`mobileverify_cohort_{index,reveal,cert}`）永不订阅。
+
+测试：
+
+- `crates/n42-network/tests/profile1_v9.rs`（4 个，先校验 SHA-256）：11 个主题串、inG2 列表与本节点订阅集合的关系（不含 cohort）、
+  4 条消息 id、router 选项（大小上限、Anonymous、seen TTL）、`gossipSubParams` 逐字段比较；rust-libp2p 无对应项的字段
+  （ConnectionTimeout、Connectors、MaxPendingConnections、DirectConnectInitialDelay、SlowHeartbeatWarning、IDontWantMessageTTL、
+  MaxIDontWantLength、MaxIDontWantMessages）列入 `NO_COUNTERPART`，向量新增字段未归类即失败（与 n42-rs 测试相同做法）。
+- `service::tests`（4 个）：participant 与 observer 只订阅 G2；G2 之外的发布被丢弃、非 Profile-1 服务仍订阅原生主题；profile-1 swarm 需要 gov5 传输。
+
+### 19.5 问题与解决
+
+- rustfmt 会顺带重排 `main.rs` 中原本未格式化的代码；回退后只重放本次改动。
+- `new_with_options` 增加参数后触发 clippy `too_many_arguments`，按现有写法加 allow。
+
+### 19.6 状态与后续
+
+- [x] V7、V2 已满足（补向量测试）；AM34 第 3 项修复；V9 与 AM34 第 4-5 项实现。
+- [x] clippy `-p n42-network -p n42-consensus -p n42-consensus-service -p n42-node -p n42-node-bin --all-targets -D warnings` 通过；
+  `cargo test -p n42-consensus -p n42-consensus-service -p n42-network -p n42-node -p n42-execution`：1565 通过、0 失败、29 忽略（既有 #[ignore] 基准）。
+- [ ] 混合集群实跑确认：700 ms heartbeat 与 G2-only 下 n42-26 与 gov5 成员的 mesh 形成、64 MiB 块 gossip。
+- [ ] mobileverify G2 主题（I1）落地后加入订阅集合。
+- 待与 gov5/rs 确认：gov5 是否在 validate 之后才转发（rust-libp2p Anonymous 模式下本节点仍是立即转发，未启用 `validate_messages()`）。
