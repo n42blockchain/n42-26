@@ -1440,6 +1440,7 @@ impl ConsensusEngine {
         if !self.signing_profile.is_gov5() {
             self.imported_blocks.clear();
             self.imported_block_fifo.clear();
+            self.imported_parents.clear();
         }
         // The closing view's trackers stay checkable for a few views: a
         // commit vote that arrives after the CommitQC is otherwise never
@@ -4798,6 +4799,27 @@ mod tests {
                 .all(|hash| engine.imported_blocks.contains(hash)),
             "parent metadata must never outlive its import evidence"
         );
+    }
+
+    #[test]
+    fn native_timeout_clears_parent_metadata_with_import_evidence() {
+        let (mut engine, _sks, _, _rx) = make_engine(4, 0);
+        assert!(!engine.signing_profile.is_gov5());
+        for i in 0..8u8 {
+            engine
+                .process_event(ConsensusEvent::BlockImportedWithParent {
+                    block_hash: B256::repeat_byte(i),
+                    parent_hash: B256::repeat_byte(i.wrapping_sub(1)),
+                })
+                .expect("authenticated import should succeed");
+        }
+        assert_eq!(engine.imported_parents.len(), 8);
+
+        engine.on_timeout().expect("timeout should succeed");
+        assert!(engine.imported_blocks.is_empty());
+        // Native profiles drop import evidence every view; parent edges left
+        // behind would accumulate one per block for good.
+        assert!(engine.imported_parents.is_empty());
     }
 
     /// A deferred H2 vote waits on one specific hash, and catching up imports

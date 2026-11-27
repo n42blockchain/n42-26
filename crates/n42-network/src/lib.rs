@@ -1,5 +1,6 @@
 pub mod block_direct;
 pub mod codec;
+pub mod mem_stats;
 pub mod compact_receipts;
 pub mod consensus_direct;
 pub mod dissemination;

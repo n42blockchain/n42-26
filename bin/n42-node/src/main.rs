@@ -1538,6 +1538,9 @@ fn install_genesis_leader_schedule(genesis: &alloy_genesis::Genesis) -> eyre::Re
     Ok(())
 }
 
+/// Default size of reth's cross-block execution cache, in MiB.
+const N42_CROSS_BLOCK_CACHE_MIB: usize = 1024;
+
 fn main() {
     // Install a global panic hook so that panics in ANY thread or tokio task
     // produce visible output on stderr.  Without this, panics in non-critical
@@ -1609,11 +1612,16 @@ fn main() {
     // Parallel state-root computation currently falls back repeatedly on this workload,
     // so make the synchronous path the default unless the operator overrides it explicitly.
     // Keep Reth 2.6+'s persistence window and state masking disabled for N42/QMDB.
+    // The cross-block execution cache defaults to 4 GiB of lazily touched
+    // slots, so its resident share grows with every distinct account and slot
+    // the chain executes; 1 GiB bounds it (`--engine.cross-block-cache-size`
+    // still overrides).
     let engine_defaults = DefaultEngineValues::default()
         .with_persistence_threshold(0)
         .with_num_state_masking_blocks(0)
         .with_memory_block_buffer_target(0)
-        .with_state_root_fallback(true);
+        .with_state_root_fallback(true)
+        .with_cross_block_cache_size(N42_CROSS_BLOCK_CACHE_MIB);
     if let Err(error) = engine_defaults.try_init() {
         warn!(
             target: "n42::cli",
@@ -2614,6 +2622,21 @@ fn main() {
                     .flatten()
                     .unwrap_or_default();
 
+                {
+                    // RocksDB memtables (history and tx-hash indexes) live in
+                    // RocksDB's own allocator, outside the jemalloc counters.
+                    let provider = full_node.provider.clone();
+                    n42_node::memory_watch::add_structure_source(move || {
+                        use reth_provider::RocksDBProviderFactory;
+                        let memtables: u64 = provider
+                            .rocksdb_provider()
+                            .table_stats()
+                            .iter()
+                            .map(|table| table.memtable_size_bytes)
+                            .sum();
+                        vec![("rocksdb_memtable_mib", memtables >> 20)]
+                    });
+                }
                 {
                     // Canonical blocks leave the in-memory state once persisted.
                     let provider = full_node.provider.clone();

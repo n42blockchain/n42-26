@@ -95,6 +95,10 @@ pub struct MobileVerificationBridge {
     /// Per-block BLS aggregate signature builders.
     /// Created when a block is registered with `expected_receipts_root = Some(...)`.
     attestation_builders: HashMap<B256, AttestationBuilder>,
+    /// Registration order of `attestation_builders`, bounded by `max_tracked`:
+    /// a block whose phones never reach the threshold is dropped once it is
+    /// that many registrations old.
+    attestation_builder_order: VecDeque<B256>,
     /// Persistent store for completed aggregated attestations and reward tracking.
     attestation_store: Option<Arc<Mutex<AttestationStore>>>,
 }
@@ -128,6 +132,7 @@ impl MobileVerificationBridge {
             block_first_receipt_order: VecDeque::new(),
             max_tracked: max_tracked_blocks,
             attestation_builders: HashMap::new(),
+            attestation_builder_order: VecDeque::new(),
             attestation_store: None,
             attestation_progress_tx: None,
         }
@@ -199,12 +204,21 @@ impl MobileVerificationBridge {
             .register_block(block_hash, block_number, expected_receipts_root);
 
         // Create an AttestationBuilder for BLS aggregation when we know the expected root.
-        if let Some(receipts_root) = expected_receipts_root {
-            self.attestation_builders
-                .entry(block_hash)
-                .or_insert_with(|| {
-                    AttestationBuilder::new(block_hash, block_number, receipts_root)
-                });
+        if let Some(receipts_root) = expected_receipts_root
+            && !self.attestation_builders.contains_key(&block_hash)
+        {
+            self.attestation_builders.insert(
+                block_hash,
+                AttestationBuilder::new(block_hash, block_number, receipts_root),
+            );
+            self.attestation_builder_order.push_back(block_hash);
+            // Finalized builders already left the map; their stale order
+            // entries go here too, which keeps the queue bounded as well.
+            while self.attestation_builder_order.len() > self.max_tracked.max(1) {
+                if let Some(oldest) = self.attestation_builder_order.pop_front() {
+                    self.attestation_builders.remove(&oldest);
+                }
+            }
         }
     }
 
@@ -1644,6 +1658,30 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&store_path);
+    }
+
+    #[test]
+    fn unattested_builders_are_bounded_by_tracked_blocks() {
+        let (_hub_tx, hub_rx) = make_hub_channel();
+        let mut bridge = MobileVerificationBridge::new(hub_rx, 3, 4);
+        for n in 0..10u8 {
+            bridge.register_dispatched_block(B256::with_last_byte(n), n.into(), Some(TEST_RR));
+        }
+        assert_eq!(bridge.attestation_builders.len(), 4);
+        assert_eq!(bridge.attestation_builder_order.len(), 4);
+        assert!(
+            bridge
+                .attestation_builders
+                .contains_key(&B256::with_last_byte(9))
+        );
+        assert!(
+            !bridge
+                .attestation_builders
+                .contains_key(&B256::with_last_byte(5))
+        );
+        // Re-registering a tracked block keeps one entry.
+        bridge.register_dispatched_block(B256::with_last_byte(9), 9, Some(TEST_RR));
+        assert_eq!(bridge.attestation_builder_order.len(), 4);
     }
 
     #[test]
