@@ -1,5 +1,6 @@
 mod bounded_fifo;
 mod decision;
+mod late_evidence;
 mod pacemaker;
 mod proposal;
 pub mod quorum;
