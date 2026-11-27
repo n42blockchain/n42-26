@@ -26,6 +26,7 @@ PATCH_NAMES = (
     "reth-parallel-account-history",
     "reth-sorted-tx-hashes",
     "reth-sf-parallel-finalize",
+    "reth-rocksdb-memtable-history",
 )
 
 

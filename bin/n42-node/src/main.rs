@@ -2633,6 +2633,18 @@ fn main() {
                         backlog
                     });
                 }
+                {
+                    // All memtables, the flushed ones RocksDB still holds included.
+                    use reth_provider::RocksDBProviderFactory;
+                    let rocksdb = full_node.provider.rocksdb_provider();
+                    n42_node::memory_watch::set_rocksdb_source(move || {
+                        let usage = rocksdb.memtable_usage();
+                        n42_node::memory_watch::RocksdbMemtables {
+                            all: usage.all_bytes,
+                            unflushed: usage.unflushed_bytes,
+                        }
+                    });
+                }
                 let best_block_number = full_node.provider.best_block_number().unwrap_or(0);
                 let head_block_hash = {
                     if best_block_number > 0 {
