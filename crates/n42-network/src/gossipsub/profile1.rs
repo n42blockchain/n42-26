@@ -154,9 +154,12 @@ pub const fn gov5_block_fits(max_block_bytes: usize, decoded_bytes: usize) -> bo
 /// `Reject` drops and penalises the sender, `Ignore` drops without penalty.
 pub type Verdict = gossipsub::MessageAcceptance;
 
-/// AM36 rule 1 for an H2 message (gov5 `hotstuff_consensus` and H2-v4): every
-/// view it carries -- its own and those of the certificates inside it -- is a
-/// view a certificate may exist for (AM34 item 3: not 2^64-1).
+/// AM36 rule 1 / item 5 for an H2 message (gov5 `hotstuff_consensus` and
+/// H2-v4): every view it carries -- its own and those of the certificates
+/// inside it -- is a view a certificate may exist for (AM34 item 3: not
+/// 2^64-1); a proposal's justify QC view is below the proposal's view; a
+/// Decide's commit QC view equals its view. Signer bitmap format is checked
+/// by the decoder.
 ///
 /// Stateless: it needs no committee, no current view and no signature check.
 /// Signer bitmaps and BLS signatures are checked by the consensus handler
@@ -169,6 +172,17 @@ pub fn h2_fields_in_range(message: &crate::h2_wire::H2Message) -> Result<(), &'s
     }
     fn tc(tc: &H2TimeoutCertificate) -> bool {
         n42_consensus::certifiable_view(tc.view) && qc(&tc.high_qc)
+    }
+    // AM36 item 5: a proposal's justify QC is for an earlier view, a
+    // Decide's commit QC for its own view.
+    match message {
+        H2Message::Proposal(p) if p.justify_qc.view >= p.view => {
+            return Err("a proposal's justify QC view is not below the proposal view (AM36)");
+        }
+        H2Message::Decide(d) if d.commit_qc.view != d.view => {
+            return Err("a Decide's commit QC view differs from its view (AM36)");
+        }
+        _ => {}
     }
     let in_range = match message {
         H2Message::Proposal(p) => {
@@ -219,5 +233,154 @@ pub const fn h2_message_is_stale(view: u64, committed_view: Option<u64>) -> bool
     match committed_view {
         Some(committed) => view < committed,
         None => false,
+    }
+}
+
+/// AM36 items 5 and 8 for one `transaction_v2` batch, entries in EIP-2718 form:
+/// Reject if any entry's bytes do not decode as a transaction; Ignore if all
+/// decode but one names a type outside profile 1's set
+/// ([`n42_chainspec::profile1::check_profile1_tx_type`]: legacy, 2930, 1559,
+/// 7702; profile 1 has no `altSigTx`); Accept otherwise. An empty batch is
+/// Ignore.
+///
+/// A typed entry whose type byte this client has no decoder for counts as a
+/// type outside the set (Ignore), not as undecodable bytes: a client that
+/// knows one more type is not penalised (item 8's intent).
+pub fn tx_batch_verdict(entries: &[alloy_primitives::Bytes]) -> Verdict {
+    use alloy_eips::eip2718::Decodable2718;
+    if entries.is_empty() {
+        return gossipsub::MessageAcceptance::Ignore;
+    }
+    let mut outside = false;
+    for raw in entries {
+        let Some(&first) = raw.first() else {
+            return gossipsub::MessageAcceptance::Reject;
+        };
+        // EIP-2718: a first byte up to 0x7f is a type; 0xc0.. a legacy list.
+        let ty = if first <= 0x7f { first } else { 0x00 };
+        if n42_chainspec::profile1::check_profile1_tx_type(ty).is_err() {
+            if first <= 0x7f && n42_tx_types::N42TxEnvelope::decode_2718_exact(raw).is_err() {
+                let known = matches!(first, 0x00..=0x04 | 0x50);
+                if known {
+                    // A type this client decodes, but these bytes do not.
+                    return gossipsub::MessageAcceptance::Reject;
+                }
+            }
+            outside = true;
+            continue;
+        }
+        if n42_tx_types::N42TxEnvelope::decode_2718_exact(raw).is_err() {
+            return gossipsub::MessageAcceptance::Reject;
+        }
+    }
+    if outside {
+        gossipsub::MessageAcceptance::Ignore
+    } else {
+        gossipsub::MessageAcceptance::Accept
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::h2_wire::{H2Decide, H2Message, H2Proposal, H2QuorumCertificate};
+    use alloy_primitives::Bytes;
+    use gossipsub::MessageAcceptance::{Accept, Ignore, Reject};
+
+    fn qc(view: u64) -> H2QuorumCertificate {
+        H2QuorumCertificate {
+            view,
+            block_hash: B256::repeat_byte(1),
+            aggregate_signature: vec![0; 96],
+            signers_bitmap: vec![4, 0, 0x0f],
+        }
+    }
+
+    #[test]
+    fn am36_proposal_and_decide_view_relations() {
+        let signature = n42_primitives::BlsSecretKey::random().unwrap().sign(b"x");
+        let proposal = |view, justify| {
+            H2Message::Proposal(H2Proposal {
+                view,
+                block_hash: B256::ZERO,
+                justify_qc: qc(justify),
+                proposer: 0,
+                signature: signature.clone(),
+                prepare_qc: None,
+                tx_root_hash: B256::ZERO,
+            })
+        };
+        assert!(h2_fields_in_range(&proposal(10, 9)).is_ok());
+        assert!(h2_fields_in_range(&proposal(10, 0)).is_ok());
+        assert!(h2_fields_in_range(&proposal(10, 10)).is_err());
+        assert!(h2_fields_in_range(&proposal(10, 11)).is_err());
+        let decide = |view, commit| {
+            H2Message::Decide(H2Decide {
+                view,
+                block_hash: B256::ZERO,
+                commit_qc: qc(commit),
+            })
+        };
+        assert!(h2_fields_in_range(&decide(10, 10)).is_ok());
+        assert!(h2_fields_in_range(&decide(10, 9)).is_err());
+        assert!(h2_fields_in_range(&decide(10, 11)).is_err());
+        assert!(h2_fields_in_range(&decide(u64::MAX, u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn am36_stale_is_strictly_below_the_committed_view() {
+        assert!(!h2_message_is_stale(5, None));
+        assert!(h2_message_is_stale(49, Some(50)));
+        assert!(!h2_message_is_stale(50, Some(50)));
+        assert!(!h2_message_is_stale(u64::MAX - 1, Some(50)));
+    }
+
+    #[test]
+    fn am36_transaction_batch_verdicts() {
+        use alloy_consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
+        use alloy_eips::eip2718::Encodable2718;
+        let sig = alloy_primitives::Signature::new(
+            alloy_primitives::U256::from(1u64),
+            alloy_primitives::U256::from(2u64),
+            false,
+        );
+        let eip1559 =
+            Bytes::from(TxEnvelope::Eip1559(TxEip1559::default().into_signed(sig)).encoded_2718());
+        let legacy =
+            Bytes::from(TxEnvelope::Legacy(TxLegacy::default().into_signed(sig)).encoded_2718());
+        let blob = Bytes::from(
+            TxEnvelope::from(
+                alloy_consensus::TxEip4844 {
+                    blob_versioned_hashes: vec![B256::repeat_byte(1)],
+                    ..Default::default()
+                }
+                .into_signed(sig),
+            )
+            .encoded_2718(),
+        );
+        assert_eq!(tx_batch_verdict(&[eip1559.clone(), legacy.clone()]), Accept);
+        // Undecodable bytes: Reject, whatever else the batch holds.
+        assert_eq!(tx_batch_verdict(&[Bytes::new()]), Reject);
+        assert_eq!(
+            tx_batch_verdict(&[eip1559.clone(), Bytes::from_static(&[0x02, 1])]),
+            Reject
+        );
+        assert_eq!(tx_batch_verdict(&[Bytes::from_static(&[0x90, 1])]), Reject);
+        assert_eq!(
+            tx_batch_verdict(&[blob.clone(), Bytes::from_static(&[0xc1])]),
+            Reject
+        );
+        assert_eq!(
+            tx_batch_verdict(&[Bytes::from_static(&[0x03, 1, 2])]),
+            Reject
+        );
+        // Decodes, but outside profile 1: Ignore.
+        assert_eq!(tx_batch_verdict(std::slice::from_ref(&blob)), Ignore);
+        assert_eq!(tx_batch_verdict(&[eip1559, blob]), Ignore);
+        assert_eq!(
+            tx_batch_verdict(&[legacy, Bytes::from_static(&[0x05, 0xc0])]),
+            Ignore
+        );
+        assert_eq!(tx_batch_verdict(&[]), Ignore);
     }
 }

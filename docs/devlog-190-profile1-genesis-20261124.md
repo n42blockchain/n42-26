@@ -1331,3 +1331,29 @@ n{4,7,100}-T8-k3、AM32 边界钳制及其 -p1 / -next-dead 变体）。n42-rs m
 状态：
 - [x] 实现、测试；clippy（n42-network、n42-consensus-service、n42-node、n42-node-bin，-D warnings）通过；n42-network + n42-consensus-service + n42-node 测试 1017 通过、0 失败、20 忽略。
 - [ ] 混合集群实跑：确认 gov5 不在 HotStuff/H2-v4 主题上注册校验器时，n42-26 的 Reject 不会误罚 gov5 成员（gov5 不会发送畸形消息，应无影响）。
+
+### 19.8 追加：对齐 AM36 第 5-9 项（n42-rs 741d71ed7）（2026-11-27）
+
+rs 根据本节 19.7 的意见把 AM36 补成第 5-9 项。与 PR #58 的差异及处理：
+
+- 第 5 项（无状态字段检查）新增两条，失败即 Reject：proposal 的 justify QC view 必须小于 proposal view；Decide 的 commit QC view 必须等于 Decide view
+  （`gossipsub::profile1::h2_fields_in_range`）。签名者编号与委员会规模、头部 view/slot、BLS 仍在处理器，不在转发前检查。
+- 第 8 项（`transaction_v2`）：新增 `tx_batch_verdict`。任一条字节不能解码为交易（空条目、非法 legacy 前缀、已知类型但字节损坏）→ Reject；
+  全部可解码但有类型不在 Profile-1 集合（`check_profile1_tx_type`：0x00/0x01/0x02/0x04；Profile 1 无 `altSigTx`，0x50 不在内）→ Ignore，
+  不转发、不交给交易池、不惩罚。本客户端没有解码器的类型字节（如 0x05）按"集合外类型"处理为 Ignore，不按"不可解码"Reject，
+  以符合第 8 项"多认识一种类型的客户端不受罚"的本意。空批次 Ignore。
+- 第 3 项新增说明：Ignore 会同时阻止本地交付，因此过期 H2 消息要先交给迟到消息存储。原实现过期消息直接丢弃；现在过期的 gov5 H2 / H2-v4 消息
+  上报 Ignore（不转发、不惩罚），但仍以事件交给共识处理器（AM28/§17.6 的迟到消息与作恶证据路径照常工作）。外层改为：判定不是 Reject 且有事件就交付。
+- 已一致、无需改动：第 6 项过期 = 严格低于最新 CommitQC 的 view，已提交 view 本身不过期；未来 view 无上限 Accept；第 7 项 block 与
+  `transaction_v2` 没有过期规则，合法即 Accept，重复由 message id 去重。
+
+测试：
+
+- `gossipsub::profile1::tests`（3 个）：proposal / Decide 的 view 关系；过期边界（49 过期、50 不过期、远期不过期）；交易批次判定的 Accept / Reject / Ignore 各情形。
+- `service::tests::profile1_validates_before_forwarding` 扩展为 21 条消息：
+  - Accept 7（含已提交 view 50、未来 view 1 000 000 / 1 000 001）；
+  - Reject 10（新增 commit QC view 不符的 Decide ×2、justify QC view 不小于 view 的 proposal、类型内容损坏的交易条目）；
+  - Ignore 4（过期 gov5 H2 与 H2-v4、blob 交易批次、含 0x05 类型条目的批次）。
+  - 断言 unreported = 0；观察者只收到 7 条 Accept；节点收到的 H2 view 为 {10, 20, 50, 100, 101, 1 000 000, 1 000 001}（两条过期消息仍交付）；交易批次只交付 1 个。
+
+状态：clippy（n42-network、n42-consensus-service、n42-node、n42-node-bin，-D warnings）通过；n42-network + n42-consensus-service + n42-node 测试 1020 通过、0 失败、20 忽略。
