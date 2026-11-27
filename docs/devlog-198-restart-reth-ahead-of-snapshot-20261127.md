@@ -30,3 +30,14 @@
 ## 5. Next
 
 - Gate it with a whole-set or single-node kill in which the snapshot deliberately lags reth, for example by injecting a snapshot-save failure.
+
+## 6. Local gate (2026-11-27, 4 validators, ~120 tx/block)
+
+- **Method**: at block H, save node 3's `consensus_state.json`. Let reth advance 5–6 blocks, SIGKILL node 3 only, restore the saved file, and restart on the same datadir.
+- **Fixed binary e79f60a, 3 restarts (H = 12, 33, 53; reth head at the kill = 17, 38, 59)**:
+  - all 3 recovered and passed the pre-kill head in about 6 s; 0 "too deep reorg";
+  - each restart logged the "reth holds persisted canonical blocks" start-up line plus one "skipping its FCU" line per block in the suffix (5, 5, 6);
+  - after 120 s all 4 nodes stood at the same height.
+- **Control 10952c3 (no fix), 1 restart (H = 12, reth 17)**: "authenticated Gov5 catch-up FCU failed … too deep reorg" at block 13. Node 3 stayed at 17 while the others reached 25, so the bug reproduces.
+- **Side note**: each fixed restart also logged one snapshot-save refusal per skipped block, `locked_qc.view (19) > current_view (15)`, during the ~ms of catch-up only. It comes from the test method: only the JSON snapshot was rolled back, while `locked_qc.bin` kept the newer lock. It did not affect recovery.
+- Files: /data/n42-build/recov59-n42-26/.
