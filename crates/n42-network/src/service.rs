@@ -18,7 +18,7 @@ use crate::block_direct::{
 use crate::consensus_direct::{ConsensusDirectRequest, ConsensusDirectResponse};
 use crate::error::NetworkError;
 use crate::gossipsub::handlers::{
-    decode_consensus_message, encode_consensus_message, validate_message,
+    decode_consensus_message, encode_consensus_message, validate_message_with_gov5_block_cap,
 };
 use crate::gossipsub::topics::{
     blob_sidecar_topic, block_announce_topic, consensus_topic, gov5_block_topic, gov5_h2_topic,
@@ -27,10 +27,9 @@ use crate::gossipsub::topics::{
 use crate::gov5_block::{Gov5BlockError, attributable_hash, decode_wire_block_rlp};
 use crate::gov5_rpc::{
     GOV5_BLOCK_BY_HASH_PROTOCOL, GOV5_BLOCK_PUSH_PROTOCOL, GOV5_HOTSTUFF_DIRECT_PROTOCOL,
-    Gov5BlockByHashRequest, Gov5BlockByHashResponse,
-    Gov5BlockPushRequest, Gov5BlockPushResponse, Gov5BodiesByRangeRequest,
-    Gov5BodiesByRangeResponse, Gov5CanonicalBlockReader, Gov5HotstuffDirectRequest,
-    Gov5HotstuffDirectResponse, Gov5Status,
+    Gov5BlockByHashRequest, Gov5BlockByHashResponse, Gov5BlockPushRequest, Gov5BlockPushResponse,
+    Gov5BodiesByRangeRequest, Gov5BodiesByRangeResponse, Gov5CanonicalBlockReader,
+    Gov5HotstuffDirectRequest, Gov5HotstuffDirectResponse, Gov5Status,
 };
 use crate::h2_v4::{
     H2V4ChainIdentity, H2V4Envelope, decode_gossip as decode_h2_v4_gossip,
@@ -51,6 +50,8 @@ use crate::transport::{
 use crate::tx_forward::{TxForwardRequest, TxForwardResponse};
 
 // Keep send-side eligibility aligned with the receive-side decompression cap.
+// gov5's default `MaxGossipSize`; a profile-1 chain replaces it with its
+// `maxBlockBytes` (B15, vector V9).
 const MAX_GOV5_GOSSIP_BLOCK_BYTES: usize = 1 << 20;
 
 fn gov5_block_fits_gossip(bytes: usize) -> bool {
@@ -227,7 +228,9 @@ fn evict_served_gov5_blocks_over(
 ) {
     let mut held: usize = blocks.values().map(|block| block.rlp.len()).sum();
     while held > budget && order.len() > 1 {
-        let Some(oldest) = order.pop_front() else { break };
+        let Some(oldest) = order.pop_front() else {
+            break;
+        };
         if let Some(dropped) = blocks.remove(&oldest) {
             held -= dropped.rlp.len();
         }
@@ -1221,6 +1224,10 @@ pub struct NetworkService {
     h2_v4_topic_hash: Option<gossipsub::TopicHash>,
     h2_v4_identity: Option<H2V4ChainIdentity>,
     h2_v4_participant: bool,
+    /// On a standard-profile-1 chain: its `maxBlockBytes` (B15) and the G2
+    /// topics, the only ones this node joins or publishes on (AM34 items
+    /// 4-5).
+    profile1: Option<Profile1Gossip>,
     gov5_status: Option<Gov5Status>,
     pending_gov5_status_peers: HashSet<PeerId>,
     /// Peers that completed a status exchange for this exact genesis. Range
@@ -1404,6 +1411,15 @@ fn push_bounded_backlog<T>(queue: &mut VecDeque<T>, max_len: usize, item: T, lab
     queue.push_back(item);
 }
 
+/// GossipSub on a standard-profile-1 chain (AM34 items 4-5, vector V9).
+#[derive(Clone, Debug)]
+struct Profile1Gossip {
+    /// Decoded size cap of a gov5 block on gossip (`maxBlockBytes`, B15).
+    max_block_bytes: usize,
+    /// The G2 topics joined; nothing is published anywhere else.
+    g2: HashSet<gossipsub::TopicHash>,
+}
+
 impl NetworkService {
     /// Creates a new network service. Returns the service, a handle, a consensus event
     /// receiver (high-priority), and a data event receiver (lower-priority).
@@ -1422,7 +1438,7 @@ impl NetworkService {
         ),
         NetworkError,
     > {
-        Self::new_with_options(swarm, HashMap::new(), true, None, None, None, false)
+        Self::new_with_options(swarm, HashMap::new(), true, None, None, None, false, None)
     }
 
     /// Creates a non-voting service which also subscribes to the gov5 H2 topic
@@ -1451,6 +1467,41 @@ impl NetworkService {
                 genesis_hash,
             }),
             false,
+            None,
+        )
+    }
+
+    /// [`Self::new_gov5_h2_observer`] on a standard-profile-1 chain whose
+    /// blocks are at most `max_block_bytes` (B15): only the G2 topics are
+    /// joined (AM34 items 4-5) and gov5 blocks up to that size are taken
+    /// from gossip (V9). The swarm must be built with the same bound
+    /// ([`crate::TransportConfig::profile1_max_block_bytes`]).
+    pub fn new_profile1_observer(
+        swarm: Swarm<N42Behaviour>,
+        chain_id: u64,
+        genesis_hash: B256,
+        max_block_bytes: u64,
+    ) -> Result<
+        (
+            Self,
+            NetworkHandle,
+            mpsc::Receiver<NetworkEvent>,
+            mpsc::Receiver<NetworkEvent>,
+        ),
+        NetworkError,
+    > {
+        Self::new_with_options(
+            swarm,
+            HashMap::new(),
+            true,
+            Some(gov5_h2_topic(genesis_hash)),
+            Some(gov5_block_topic(genesis_hash)),
+            Some(H2V4ChainIdentity {
+                chain_id,
+                genesis_hash,
+            }),
+            false,
+            Some(max_block_bytes),
         )
     }
 
@@ -1484,6 +1535,43 @@ impl NetworkService {
                 genesis_hash,
             }),
             true,
+            None,
+        )
+    }
+
+    /// [`Self::new_gov5_h2_participant`] on a standard-profile-1 chain whose
+    /// blocks are at most `max_block_bytes` (B15): only the G2 topics are
+    /// joined (AM34 items 4-5), nothing is published elsewhere, and gov5
+    /// blocks up to that size travel on gossip (V9). The swarm must be built
+    /// with the same bound ([`crate::TransportConfig::profile1_max_block_bytes`]).
+    pub fn new_profile1_participant(
+        swarm: Swarm<N42Behaviour>,
+        expected_validator_peer_ids: HashMap<u32, PeerId>,
+        allow_deterministic_peer_ids: bool,
+        chain_id: u64,
+        genesis_hash: B256,
+        max_block_bytes: u64,
+    ) -> Result<
+        (
+            Self,
+            NetworkHandle,
+            mpsc::Receiver<NetworkEvent>,
+            mpsc::Receiver<NetworkEvent>,
+        ),
+        NetworkError,
+    > {
+        Self::new_with_options(
+            swarm,
+            expected_validator_peer_ids,
+            allow_deterministic_peer_ids,
+            Some(gov5_h2_topic(genesis_hash)),
+            Some(gov5_block_topic(genesis_hash)),
+            Some(H2V4ChainIdentity {
+                chain_id,
+                genesis_hash,
+            }),
+            true,
+            Some(max_block_bytes),
         )
     }
 
@@ -1508,9 +1596,11 @@ impl NetworkService {
             None,
             None,
             false,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_options(
         mut swarm: Swarm<N42Behaviour>,
         expected_validator_peer_ids: HashMap<u32, PeerId>,
@@ -1519,6 +1609,7 @@ impl NetworkService {
         gov5_block_observer_topic: Option<gossipsub::IdentTopic>,
         h2_v4_identity: Option<H2V4ChainIdentity>,
         h2_v4_participant: bool,
+        profile1_max_block_bytes: Option<u64>,
     ) -> Result<
         (
             Self,
@@ -1548,7 +1639,27 @@ impl NetworkService {
             mempool_topic(),
             blob_sidecar_topic(),
         ];
+        // Profile 1 (AM34 items 4-5): the G2 topics only, joined below; none
+        // of the native `/n42/*/1` topics.
+        let profile1 = match (profile1_max_block_bytes, h2_v4_identity) {
+            (None, _) => None,
+            (Some(max_block_bytes), Some(identity)) => Some(Profile1Gossip {
+                max_block_bytes: usize::try_from(max_block_bytes).unwrap_or(usize::MAX),
+                g2: crate::gossipsub::profile1::g2_topics(identity.genesis_hash, h2_v4_participant)
+                    .iter()
+                    .map(|topic| topic.hash())
+                    .collect(),
+            }),
+            (Some(_), None) => {
+                return Err(NetworkError::Subscribe(
+                    "a profile-1 service needs the chain's H2-v4 identity".to_owned(),
+                ));
+            }
+        };
         for (i, topic) in topics.iter().enumerate() {
+            if profile1.is_some() {
+                break;
+            }
             // Skip mempool topic (index 3) when tx gossip is disabled
             if tx_gossip_disabled && i == 3 {
                 continue;
@@ -1642,6 +1753,7 @@ impl NetworkService {
             h2_v4_topic_hash,
             h2_v4_identity,
             h2_v4_participant,
+            profile1,
             gov5_status,
             pending_gov5_status_peers: HashSet::new(),
             gov5_chain_authenticated_peers: HashSet::new(),
@@ -2003,7 +2115,11 @@ impl NetworkService {
                 }
                 self.emit_event(NetworkEvent::PeerConnected(peer_id));
             }
-            SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established,
+                ..
+            } => {
                 tracing::info!(%peer_id, "peer disconnected");
                 metrics::gauge!("n42_active_peer_connections").decrement(1.0);
                 self.reconnection.on_disconnected(&peer_id);
@@ -2191,8 +2307,7 @@ impl NetworkService {
                 // With no binding at all (an observer or a Profile-1
                 // follower, which route no direct consensus traffic) this
                 // fires for every verified message; it is expected there.
-                if self.expected_validator_peer_ids.is_empty()
-                    && !self.allow_deterministic_peer_ids
+                if self.expected_validator_peer_ids.is_empty() && !self.allow_deterministic_peer_ids
                 {
                     tracing::debug!(
                         %peer_id,
@@ -2491,7 +2606,7 @@ impl NetworkService {
         metrics::counter!("n42_gossipsub_messages_received").increment(1);
         tracing::info!(target: "n42::net", %source, topic = %message.topic, bytes = message.data.len(), "gossipsub message received");
 
-        let acceptance = validate_message(
+        let acceptance = validate_message_with_gov5_block_cap(
             &message.topic,
             &message.data,
             &self.consensus_topic_hash,
@@ -2499,6 +2614,7 @@ impl NetworkService {
             &self.mempool_topic_hash,
             &self.blob_sidecar_topic_hash,
             self.gov5_block_topic_hash.as_ref(),
+            self.gov5_block_gossip_wire_cap(),
         );
 
         if !matches!(acceptance, gossipsub::MessageAcceptance::Accept) {
@@ -2514,7 +2630,7 @@ impl NetworkService {
                 .is_some_and(|hash| topic == hash) =>
             {
                 let decoded_len = match snap::raw::decompress_len(&message.data) {
-                    Ok(len) if gov5_block_fits_gossip(len) => len,
+                    Ok(len) if self.gov5_block_fits_gossip(len) => len,
                     Ok(len) => {
                         metrics::counter!("n42_gov5_blocks_rejected_total", "reason" => "oversized")
                             .increment(1);
@@ -3630,11 +3746,27 @@ impl NetworkService {
                     .swarm
                     .behaviour_mut()
                     .gov5_block_by_hash
-                    .send_response(channel, Gov5BlockByHashResponse {
-                        rlp: response,
-                        fork_digest: self.gov5_status.map(|s| s.genesis_hash.as_slice()[..4].try_into().expect("four genesis bytes")).unwrap_or_default(),
-                        fallback: if found { None } else { self.gov5_canonical_blocks.clone().map(|r| (r, request.block_hash)) },
-                    })
+                    .send_response(
+                        channel,
+                        Gov5BlockByHashResponse {
+                            rlp: response,
+                            fork_digest: self
+                                .gov5_status
+                                .map(|s| {
+                                    s.genesis_hash.as_slice()[..4]
+                                        .try_into()
+                                        .expect("four genesis bytes")
+                                })
+                                .unwrap_or_default(),
+                            fallback: if found {
+                                None
+                            } else {
+                                self.gov5_canonical_blocks
+                                    .clone()
+                                    .map(|r| (r, request.block_hash))
+                            },
+                        },
+                    )
                     .is_err()
                 {
                     tracing::warn!(%peer, block_hash = %request.block_hash, "failed to answer Gov5 block-by-hash request");
@@ -4779,6 +4911,14 @@ impl NetworkService {
 
     /// Publish raw data to a gossipsub topic.
     fn gossipsub_publish(&mut self, topic: gossipsub::IdentTopic, data: Vec<u8>, label: &str) {
+        // Profile 1 (AM34 item 4): nothing leaves on a topic outside G2.
+        if let Some(profile1) = &self.profile1
+            && !profile1.g2.contains(&topic.hash())
+        {
+            metrics::counter!("n42_profile1_non_g2_publish_dropped_total").increment(1);
+            tracing::debug!(topic = %topic.hash(), "profile 1: not publishing {label} outside the G2 topics");
+            return;
+        }
         match self.swarm.behaviour_mut().gossipsub.publish(topic, data) {
             Ok(_) => {}
             Err(gossipsub::PublishError::NoPeersSubscribedToTopic) => {
@@ -4787,6 +4927,27 @@ impl NetworkService {
             Err(e) => {
                 tracing::warn!(error = %e, "failed to publish {label}");
             }
+        }
+    }
+
+    /// The decoded size cap of a gov5 block on gossip: the chain's
+    /// `maxBlockBytes` on profile 1 (B15, V9), gov5's 1 MiB default otherwise.
+    fn gov5_block_fits_gossip(&self, decoded_bytes: usize) -> bool {
+        match &self.profile1 {
+            Some(profile1) => {
+                crate::gossipsub::profile1::gov5_block_fits(profile1.max_block_bytes, decoded_bytes)
+            }
+            None => gov5_block_fits_gossip(decoded_bytes),
+        }
+    }
+
+    /// The snappy-encoded size cap of a gov5 block message on gossip.
+    fn gov5_block_gossip_wire_cap(&self) -> usize {
+        match &self.profile1 {
+            Some(profile1) => {
+                crate::gossipsub::profile1::max_gossip_wire_size(profile1.max_block_bytes)
+            }
+            None => crate::transport::MAX_GOSSIP_MESSAGE_SIZE,
         }
     }
 
@@ -4903,7 +5064,7 @@ impl NetworkService {
                 // Large blocks were already retained and queued for direct
                 // delivery above. Our gossip receiver rejects their decoded
                 // size, so avoid compressing and publishing a useless duplicate.
-                if !gov5_block_fits_gossip(rlp.len()) {
+                if !self.gov5_block_fits_gossip(rlp.len()) {
                     metrics::counter!("n42_gov5_block_gossip_skipped_total", "reason" => "oversized")
                         .increment(1);
                     tracing::debug!(target: "n42::interop::h2v4", bytes = rlp.len(),
@@ -5421,6 +5582,149 @@ mod tests {
         .unwrap()
     }
 
+    fn profile1_transport() -> crate::transport::TransportConfig {
+        let mut config = crate::transport::TransportConfig::for_network_size(4);
+        config.profile1_max_block_bytes = Some(64 << 20);
+        config
+    }
+
+    fn subscribed(service: &NetworkService) -> HashSet<gossipsub::TopicHash> {
+        service
+            .swarm
+            .behaviour()
+            .gossipsub
+            .topics()
+            .cloned()
+            .collect()
+    }
+
+    /// AM34 items 4-5: a profile-1 participant joins the G2 topics only
+    /// (gov5 block, hotstuff_consensus, H2-v4, transaction_v2), none of the
+    /// native `/n42/*/1` topics and no cohort topic.
+    #[test]
+    fn profile1_participant_joins_only_g2_topics() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (identity, _) = h2_v4_fixture_envelope();
+        let swarm = crate::transport::build_interop_participant_swarm(
+            libp2p::identity::Keypair::generate_ed25519(),
+            profile1_transport(),
+            0,
+            identity.genesis_hash,
+        )
+        .unwrap();
+        let (service, ..) = NetworkService::new_profile1_participant(
+            swarm,
+            HashMap::new(),
+            false,
+            identity.chain_id,
+            identity.genesis_hash,
+            64 << 20,
+        )
+        .unwrap();
+        let expected: HashSet<_> =
+            crate::gossipsub::profile1::g2_topics(identity.genesis_hash, true)
+                .iter()
+                .map(|topic| topic.hash())
+                .collect();
+        assert_eq!(subscribed(&service), expected);
+        assert!(expected.contains(&gov5_tx_topic(identity.genesis_hash).hash()));
+        for native in [
+            consensus_topic(),
+            block_announce_topic(),
+            verification_receipts_topic(),
+            mempool_topic(),
+            blob_sidecar_topic(),
+        ] {
+            assert!(!subscribed(&service).contains(&native.hash()), "{native}");
+        }
+        // The profile-1 router: V9's values and the 64 MiB block cap.
+        assert!(service.gov5_block_fits_gossip(64 << 20));
+        assert!(!service.gov5_block_fits_gossip((64 << 20) + 1));
+        assert_eq!(service.gov5_block_gossip_wire_cap(), 78_293_706);
+    }
+
+    /// The observer variant joins G2 without transaction_v2.
+    #[test]
+    fn profile1_observer_joins_only_g2_topics() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (identity, _) = h2_v4_fixture_envelope();
+        let swarm = crate::transport::build_interop_observer_swarm(
+            libp2p::identity::Keypair::generate_ed25519(),
+            profile1_transport(),
+            identity.genesis_hash,
+        )
+        .unwrap();
+        let (service, ..) = NetworkService::new_profile1_observer(
+            swarm,
+            identity.chain_id,
+            identity.genesis_hash,
+            64 << 20,
+        )
+        .unwrap();
+        let expected: HashSet<_> =
+            crate::gossipsub::profile1::g2_topics(identity.genesis_hash, false)
+                .iter()
+                .map(|topic| topic.hash())
+                .collect();
+        assert_eq!(subscribed(&service), expected);
+    }
+
+    /// AM34 item 4: nothing is published outside G2 on profile 1 (a native
+    /// block announcement or consensus message is dropped before the
+    /// router), while the non-profile service keeps its native topics.
+    #[test]
+    fn profile1_drops_publishes_outside_g2() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (identity, _) = h2_v4_fixture_envelope();
+        let swarm = crate::transport::build_interop_participant_swarm(
+            libp2p::identity::Keypair::generate_ed25519(),
+            profile1_transport(),
+            0,
+            identity.genesis_hash,
+        )
+        .unwrap();
+        let (mut service, ..) = NetworkService::new_profile1_participant(
+            swarm,
+            HashMap::new(),
+            false,
+            identity.chain_id,
+            identity.genesis_hash,
+            64 << 20,
+        )
+        .unwrap();
+        let g2 = service.profile1.as_ref().unwrap().g2.clone();
+        assert!(!g2.contains(&block_announce_topic().hash()));
+        assert!(!g2.contains(&consensus_topic().hash()));
+        // Dropped silently: no panic, and the router never learns the topic
+        // (a fanout entry would appear for a real publish).
+        service.gossipsub_publish(block_announce_topic(), vec![1, 2, 3], "test");
+        service.gossipsub_publish(consensus_topic(), vec![1, 2, 3], "test");
+        assert!(!subscribed(&service).contains(&block_announce_topic().hash()));
+
+        // Without profile 1 the gov5 H2 participant keeps the native topics.
+        let (plain, ..) = h2_participant_service(identity, 0, HashMap::new());
+        assert!(plain.profile1.is_none());
+        assert!(subscribed(&plain).contains(&consensus_topic().hash()));
+        assert!(!plain.gov5_block_fits_gossip((1 << 20) + 1));
+    }
+
+    /// A profile-1 swarm needs the gov5 transport (anonymous envelope).
+    #[test]
+    fn profile1_swarm_needs_the_gov5_transport() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let result = crate::transport::build_swarm_with_validator_index(
+            libp2p::identity::Keypair::generate_ed25519(),
+            profile1_transport(),
+            Some(0),
+            B256::ZERO,
+        );
+        assert!(result.is_err());
+    }
+
     #[test]
     fn unbound_signed_trust_is_refused_when_bindings_exist() {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -5441,10 +5745,16 @@ mod tests {
         let (mut native, ..) =
             NetworkService::new_with_expected_validator_peer_ids(swarm, HashMap::new(), false)
                 .unwrap();
-        assert!(native.trust_signed_messages_without_peer_bindings().is_err());
+        assert!(
+            native
+                .trust_signed_messages_without_peer_bindings()
+                .is_err()
+        );
 
         let (mut unbound, ..) = h2_participant_service(identity, 0, HashMap::new());
-        unbound.trust_signed_messages_without_peer_bindings().unwrap();
+        unbound
+            .trust_signed_messages_without_peer_bindings()
+            .unwrap();
         assert!(unbound.trusts_signed_messages_without_peer_bindings());
     }
 
@@ -5461,7 +5771,9 @@ mod tests {
         let (mut service, handle, mut consensus_rx, _data_rx) =
             h2_participant_service(identity, 3, HashMap::new());
         if trust_unbound {
-            service.trust_signed_messages_without_peer_bindings().unwrap();
+            service
+                .trust_signed_messages_without_peer_bindings()
+                .unwrap();
         }
         let service_peer = *service.swarm.local_peer_id();
         service
@@ -5799,8 +6111,13 @@ mod tests {
         let mut order = VecDeque::new();
         let hashes: Vec<_> = (1..=4u64)
             .map(|number| {
-                cache_gov5_served_block(&mut blocks, &mut order, &served_block_fixture(number), None)
-                    .unwrap()
+                cache_gov5_served_block(
+                    &mut blocks,
+                    &mut order,
+                    &served_block_fixture(number),
+                    None,
+                )
+                .unwrap()
             })
             .collect();
         let size = blocks[&hashes[0]].rlp.len();
