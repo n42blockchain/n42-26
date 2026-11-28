@@ -16,6 +16,7 @@ Logs are split into separate files by phase for easy maintenance:
 
 | File | Content | Phase |
 |------|---------|-------|
+| [devlog-195-range-catchup-pipeline-20261126](docs/devlog-195-range-catchup-pipeline-20261126.md) | Range 追块提速：Stage 0 分段计时（`n42_range_catchup_stage_ms{stage}` 与 stopped 时的汇总行，墙钟可完整拆分）；Stage 1 流水线导入（解码与 payload 构建移到 worker、有序 submitter、每批一次 FCU，INVALID 中途停止不越过）；本机 1200 笔块 + 17 ms engine：20.2→18.2 ms/块，FCU 300→11 | Interop |
 | [devlog-199-deps-update-20261128](docs/devlog-199-deps-update-20261128.md) | 依赖更新：reth 上游仍是 v2.11.0 无新版；`cargo update` 184 项均为兼容升级（alloy 2.6.1 等），git rev 依赖与 reth v2.11.0 保持一致；base64 升到 0.23，rand_core / bincode / sp1 大版本暂不升并说明原因 | Build |
 | [devlog-197-reth-rocksdb-memtable-20261127](docs/devlog-197-reth-rocksdb-memtable-20261127.md) | 第二十个 reth 补丁 `reth-rocksdb-memtable-history`：OptimisticTransactionDB 把每列族 2×128 MiB 已 flush 的 memtable 留作冲突检查历史（节点只写 WriteBatch，`RocksTx` 仅测试使用），改为历史上限 1 字节、`N42_ROCKSDB_MEMTABLE_MB` 预算默认 512 MiB（每列族 16 MiB，0 回到上游）；写 1 GiB 后 memtable 581→32 MiB；`N42_MEM` 加 `rocksdb_memtable_mib`；锁文件 adapted `61b79664` | Storage |
 | [devlog-198-restart-reth-ahead-of-snapshot-20261127](docs/devlog-198-restart-reth-ahead-of-snapshot-20261127.md) | 重启时 reth 已持久化的头高于共识快照：启动回退到公共祖先后，把 reth 已持久化的规范块交给补块，补块对这些块只做 new_payload、不再发回退 FCU（"too deep reorg"），第一个不同的块仍 FCU；E9 第 10 次 kill 的 v3 卡住即此 | Consensus |
