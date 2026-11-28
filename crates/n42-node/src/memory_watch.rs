@@ -13,7 +13,8 @@
 //!
 //! `N42_MEM_LOG_SECS=<s>` logs an `N42_MEM` line every `s` seconds (0: off):
 //! resident memory, the allocator's counters when the binary registers them,
-//! the unpersisted backlog, the frame queue, and the sizes of the long-lived
+//! RocksDB's memtables, the unpersisted backlog, the frame queue, and the
+//! sizes of the long-lived
 //! structures (`structures=`: entry counts and bytes by name; `_mib` names
 //! are MiB, the rest counts). Structures outside this crate's dependencies
 //! register through [`add_structure_source`].
@@ -32,6 +33,18 @@ type BacklogSource = Box<dyn Fn() -> Backlog + Send + Sync>;
 
 /// Allocator counters, in bytes, by name.
 type AllocatorSource = Box<dyn Fn() -> Vec<(&'static str, u64)> + Send + Sync>;
+
+/// Memtable memory of reth's RocksDB tables, in bytes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RocksdbMemtables {
+    /// Every memtable still allocated, flushed ones RocksDB keeps as history
+    /// included (`rocksdb.size-all-mem-tables`).
+    pub all: u64,
+    /// The unflushed memtables only (`rocksdb.cur-size-all-mem-tables`).
+    pub unflushed: u64,
+}
+
+type RocksdbSource = Box<dyn Fn() -> RocksdbMemtables + Send + Sync>;
 
 /// Structure sizes by name.
 type StructureSource = Box<dyn Fn() -> Vec<(&'static str, u64)> + Send + Sync>;
@@ -104,6 +117,11 @@ fn allocator_source() -> &'static OnceLock<AllocatorSource> {
     &SOURCE
 }
 
+fn rocksdb_source() -> &'static OnceLock<RocksdbSource> {
+    static SOURCE: OnceLock<RocksdbSource> = OnceLock::new();
+    &SOURCE
+}
+
 /// Registers how to read the engine's unpersisted backlog; the first
 /// registration wins.
 pub fn set_backlog_source(source: impl Fn() -> Backlog + Send + Sync + 'static) {
@@ -114,6 +132,11 @@ pub fn set_backlog_source(source: impl Fn() -> Backlog + Send + Sync + 'static) 
 /// wins.
 pub fn set_allocator_source(source: impl Fn() -> Vec<(&'static str, u64)> + Send + Sync + 'static) {
     let _ = allocator_source().set(Box::new(source));
+}
+
+/// Registers how to read RocksDB's memtables; the first registration wins.
+pub fn set_rocksdb_source(source: impl Fn() -> RocksdbMemtables + Send + Sync + 'static) {
+    let _ = rocksdb_source().set(Box::new(source));
 }
 
 /// The unpersisted backlog, when a source is registered.
@@ -223,6 +246,12 @@ fn log_memory() {
         .map(|(name, bytes)| format!("{name}={}", mib(*bytes)))
         .collect::<Vec<_>>()
         .join(" ");
+    let memtables = rocksdb_source()
+        .get()
+        .map(|source| source())
+        .unwrap_or_default();
+    metrics::gauge!("n42_mem_rocksdb_memtable_bytes").set(memtables.all as f64);
+    metrics::gauge!("n42_mem_rocksdb_memtable_unflushed_bytes").set(memtables.unflushed as f64);
     let backlog = backlog().unwrap_or_default();
     metrics::gauge!("n42_unpersisted_blocks").set(backlog.blocks as f64);
     metrics::gauge!("n42_unpersisted_transactions").set(backlog.transactions as f64);
@@ -249,6 +278,8 @@ fn log_memory() {
         target: "n42::mem",
         rss_mib = mib(rss),
         allocator_mib = %allocator_mib,
+        rocksdb_memtable_mib = mib(memtables.all),
+        rocksdb_memtable_unflushed_mib = mib(memtables.unflushed),
         unpersisted_blocks = backlog.blocks,
         unpersisted_txs = backlog.transactions,
         frame_queue_pending,

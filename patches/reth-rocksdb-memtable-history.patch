@@ -1,0 +1,475 @@
+diff --git a/crates/storage/provider/src/providers/mod.rs b/crates/storage/provider/src/providers/mod.rs
+index 1e93bb71f..0587f2760 100644
+--- a/crates/storage/provider/src/providers/mod.rs
++++ b/crates/storage/provider/src/providers/mod.rs
+@@ -29,8 +29,8 @@ pub(crate) mod rocksdb;
+ 
+ pub use rocksdb::{
+     parallel_account_history, OwnedRocksReadSnapshot, PruneShardOutcome, PrunedIndices,
+-    RocksDBBatch, RocksDBBuilder, RocksDBIter, RocksDBProvider, RocksDBRawIter, RocksDBStats,
+-    RocksDBTableStats, RocksReadSnapshot, RocksTx,
++    RocksDBBatch, RocksDBBuilder, RocksDBIter, RocksDBMemtableUsage, RocksDBProvider,
++    RocksDBRawIter, RocksDBStats, RocksDBTableStats, RocksReadSnapshot, RocksTx,
+ };
+ 
+ /// Helper trait to bound [`NodeTypes`] so that combined with database they satisfy
+diff --git a/crates/storage/provider/src/providers/rocksdb/mod.rs b/crates/storage/provider/src/providers/rocksdb/mod.rs
+index f40520a30..65210c55b 100644
+--- a/crates/storage/provider/src/providers/rocksdb/mod.rs
++++ b/crates/storage/provider/src/providers/rocksdb/mod.rs
+@@ -6,7 +6,7 @@ mod provider;
+ 
+ pub use provider::{
+     parallel_account_history, OwnedRocksReadSnapshot, PruneShardOutcome, PrunedIndices,
+-    RocksDBBatch, RocksDBBuilder, RocksDBIter, RocksDBProvider, RocksDBRawIter, RocksDBStats,
+-    RocksDBTableStats, RocksReadSnapshot, RocksTx,
++    RocksDBBatch, RocksDBBuilder, RocksDBIter, RocksDBMemtableUsage, RocksDBProvider,
++    RocksDBRawIter, RocksDBStats, RocksDBTableStats, RocksReadSnapshot, RocksTx,
+ };
+ pub(crate) use provider::{PendingRocksDBBatches, RocksDBWriteCtx};
+diff --git a/crates/storage/provider/src/providers/rocksdb/provider.rs b/crates/storage/provider/src/providers/rocksdb/provider.rs
+index f0d5b50fb..52c177bea 100644
+--- a/crates/storage/provider/src/providers/rocksdb/provider.rs
++++ b/crates/storage/provider/src/providers/rocksdb/provider.rs
+@@ -110,6 +110,16 @@ pub struct RocksDBTableStats {
+     pub pending_compaction_bytes: u64,
+ }
+ 
++/// Memtable memory of the `RocksDB` tables, summed over column families.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct RocksDBMemtableUsage {
++    /// All memtables: unflushed ones and flushed ones kept as history
++    /// (`rocksdb.size-all-mem-tables`).
++    pub all_bytes: u64,
++    /// Unflushed memtables only, mutable and immutable (`rocksdb.cur-size-all-mem-tables`).
++    pub unflushed_bytes: u64,
++}
++
+ /// Database-level statistics for `RocksDB`.
+ ///
+ /// Contains both per-table statistics and DB-level metrics like WAL size.
+@@ -189,6 +199,60 @@ const DEFAULT_WRITE_BUFFER_SIZE: usize = 128 << 20;
+ /// memtable arena usage exceeds the budget.
+ const DEFAULT_WRITE_BUFFER_MANAGER_SIZE: usize = 4 * 1024 * 1024 * 1024;
+ 
++/// Default N42 memtable budget across column families (512 MiB), see [`memtable_budget`].
++const DEFAULT_N42_MEMTABLE_BUDGET: usize = 512 << 20;
++
++/// Bound on the flushed memtables a column family keeps as history under a memtable budget.
++///
++/// `OptimisticTransactionDB::Open` replaces 0 with -1 (`max_write_buffer_number x
++/// write_buffer_size`), so 0 cannot switch the history off. One byte is the smallest bound it
++/// keeps: a flush still moves the newest flushed memtable into the history, and the next write
++/// to that column family frees it. The history serves only conflict checks of optimistic
++/// transactions, which the node does not commit (it writes `WriteBatch`es).
++const BOUNDED_MEMTABLE_HISTORY: i64 = 1;
++
++/// The memtable budget in bytes (`N42_ROCKSDB_MEMTABLE_MB`).
++///
++/// Unset: [`DEFAULT_N42_MEMTABLE_BUDGET`]. `0`: none, upstream's memtables
++/// ([`DEFAULT_WRITE_BUFFER_MANAGER_SIZE`], [`DEFAULT_WRITE_BUFFER_SIZE`], history of
++/// `OptimisticTransactionDB`'s default two memtables per column family).
++///
++/// Upstream's memtables are not bounded by the write buffer manager alone:
++/// `OptimisticTransactionDB` keeps up to two flushed memtables per column family as conflict
++/// check history, still charged to the manager, so a node's memtables grow towards
++/// `2 x 128 MiB` per column family even when it writes little. With a budget, the write buffer
++/// manager is the budget, each column family's memtable is `budget / 32` (1 to 128 MiB) and
++/// its history is bounded by [`BOUNDED_MEMTABLE_HISTORY`]. At most one flushed memtable per
++/// column family then stays charged, which keeps it well under half the budget, so a write
++/// stalled on the budget always ends with a flush.
++fn memtable_budget() -> Option<usize> {
++    parse_memtable_budget(std::env::var("N42_ROCKSDB_MEMTABLE_MB").ok().as_deref())
++}
++
++/// Parses `N42_ROCKSDB_MEMTABLE_MB`, see [`memtable_budget`].
++fn parse_memtable_budget(value: Option<&str>) -> Option<usize> {
++    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
++        return Some(DEFAULT_N42_MEMTABLE_BUDGET);
++    };
++    match value.parse::<usize>() {
++        Ok(0) => None,
++        Ok(mb) => Some(mb.saturating_mul(1 << 20)),
++        Err(_) => {
++            tracing::warn!(
++                target: "providers::rocksdb",
++                value,
++                "N42_ROCKSDB_MEMTABLE_MB is not a number of MiB, using the default"
++            );
++            Some(DEFAULT_N42_MEMTABLE_BUDGET)
++        }
++    }
++}
++
++/// Each column family's memtable size under a memtable budget, see [`memtable_budget`].
++fn bounded_memtable_size(budget: usize) -> usize {
++    (budget / 32).clamp(1 << 20, DEFAULT_WRITE_BUFFER_SIZE)
++}
++
+ /// Default buffer capacity for compression in batches.
+ /// 4 KiB matches common block/page sizes and comfortably holds typical history values,
+ /// reducing the first few reallocations without over-allocating.
+@@ -219,6 +283,10 @@ pub struct RocksDBBuilder {
+     log_level: rocksdb::LogLevel,
+     block_cache: Cache,
+     read_only: bool,
++    /// Memtable budget in bytes (see [`memtable_budget`]); `None` keeps upstream's memtables.
++    memtable_budget: Option<usize>,
++    /// History bound of each column family under a memtable budget.
++    memtable_history: i64,
+ }
+ 
+ impl fmt::Debug for RocksDBBuilder {
+@@ -227,6 +295,7 @@ impl fmt::Debug for RocksDBBuilder {
+             .field("path", &self.path)
+             .field("column_families", &self.column_families)
+             .field("enable_metrics", &self.enable_metrics)
++            .field("memtable_budget", &self.memtable_budget)
+             .finish()
+     }
+ }
+@@ -243,6 +312,31 @@ impl RocksDBBuilder {
+             log_level: rocksdb::LogLevel::Info,
+             block_cache: cache,
+             read_only: false,
++            memtable_budget: memtable_budget(),
++            memtable_history: BOUNDED_MEMTABLE_HISTORY,
++        }
++    }
++
++    /// Sets the memtable budget in bytes (see [`memtable_budget`]); `None` keeps upstream's
++    /// memtables. Overrides `N42_ROCKSDB_MEMTABLE_MB`.
++    pub const fn with_memtable_budget(mut self, budget_bytes: Option<usize>) -> Self {
++        self.memtable_budget = budget_bytes;
++        self
++    }
++
++    /// Sets the history bound used under a memtable budget (measurements only).
++    #[cfg(test)]
++    const fn with_memtable_history(mut self, bytes: i64) -> Self {
++        self.memtable_history = bytes;
++        self
++    }
++
++    /// Applies a memtable budget to one column family's options.
++    fn bound_memtables(cf_options: &mut Options, memtable_budget: Option<usize>, history: i64) {
++        if let Some(budget) = memtable_budget {
++            cf_options.set_write_buffer_size(bounded_memtable_size(budget));
++            // Positive, so `OptimisticTransactionDB::Open` keeps it instead of setting -1.
++            cf_options.set_max_write_buffer_size_to_maintain(history);
+         }
+     }
+ 
+@@ -262,6 +356,7 @@ impl RocksDBBuilder {
+         log_level: rocksdb::LogLevel,
+         cache: &Cache,
+         enable_statistics: bool,
++        write_buffer_manager_size: usize,
+     ) -> Options {
+         // Follow recommend tuning guide from RocksDB wiki, see https://github.com/facebook/rocksdb/wiki/Setup-Options-and-Basic-Tuning
+         let table_options = Self::default_table_options(cache);
+@@ -273,7 +368,7 @@ impl RocksDBBuilder {
+         options.set_max_background_jobs(DEFAULT_MAX_BACKGROUND_JOBS);
+         options.set_bytes_per_sync(DEFAULT_BYTES_PER_SYNC);
+         let write_buffer_manager =
+-            WriteBufferManager::new_write_buffer_manager(DEFAULT_WRITE_BUFFER_MANAGER_SIZE, true);
++            WriteBufferManager::new_write_buffer_manager(write_buffer_manager_size, true);
+         options.set_write_buffer_manager(&write_buffer_manager);
+ 
+         options.set_bottommost_compression_type(DBCompressionType::Zstd);
+@@ -433,20 +528,35 @@ impl RocksDBBuilder {
+ 
+     /// Builds the [`RocksDBProvider`].
+     pub fn build(self) -> ProviderResult<RocksDBProvider> {
+-        let options =
+-            Self::default_options(self.log_level, &self.block_cache, self.enable_statistics);
++        let mut options = Self::default_options(
++            self.log_level,
++            &self.block_cache,
++            self.enable_statistics,
++            self.memtable_budget.unwrap_or(DEFAULT_WRITE_BUFFER_MANAGER_SIZE),
++        );
++        // The default column family is opened with the database options.
++        Self::bound_memtables(&mut options, self.memtable_budget, self.memtable_history);
++        if !self.read_only {
++            tracing::debug!(
++                target: "providers::rocksdb",
++                budget_mib = self.memtable_budget.map(|b| b >> 20),
++                memtable_mib = self.memtable_budget.map(|b| bounded_memtable_size(b) >> 20),
++                "RocksDB memtable budget"
++            );
++        }
+ 
+         let mut cf_descriptors: Vec<ColumnFamilyDescriptor> = self
+             .column_families
+             .iter()
+             .map(|name| {
+-                let cf_options = if name == tables::TransactionHashNumbers::NAME {
++                let mut cf_options = if name == tables::TransactionHashNumbers::NAME {
+                     Self::tx_hash_numbers_column_family_options(&self.block_cache)
+                 } else if name == tables::BlockAccessLists::NAME {
+                     Self::block_access_lists_column_family_options(&self.block_cache)
+                 } else {
+                     Self::default_column_family_options(&self.block_cache)
+                 };
++                Self::bound_memtables(&mut cf_options, self.memtable_budget, self.memtable_history);
+                 ColumnFamilyDescriptor::new(name.clone(), cf_options)
+             })
+             .collect();
+@@ -483,10 +593,13 @@ impl RocksDBBuilder {
+                     "Preserving unknown column families"
+                 );
+                 cf_descriptors.extend(unknown_column_families.into_iter().map(|name| {
+-                    ColumnFamilyDescriptor::new(
+-                        name,
+-                        Self::default_column_family_options(&self.block_cache),
+-                    )
++                    let mut cf_options = Self::default_column_family_options(&self.block_cache);
++                    Self::bound_memtables(
++                        &mut cf_options,
++                        self.memtable_budget,
++                        self.memtable_history,
++                    );
++                    ColumnFamilyDescriptor::new(name, cf_options)
+                 }));
+             }
+         }
+@@ -793,6 +906,29 @@ impl RocksDBProviderInner {
+         stats
+     }
+ 
++    /// Returns the memtable memory of the `RocksDB` tables.
++    fn memtable_usage(&self) -> RocksDBMemtableUsage {
++        let mut usage = RocksDBMemtableUsage::default();
++        macro_rules! collect_usage {
++            ($db:expr) => {
++                for cf_name in ROCKSDB_TABLES {
++                    if let Some(cf) = $db.cf_handle(cf_name) {
++                        let int = |property| {
++                            $db.property_int_value_cf(cf, property).ok().flatten().unwrap_or(0)
++                        };
++                        usage.all_bytes += int(rocksdb::properties::SIZE_ALL_MEM_TABLES);
++                        usage.unflushed_bytes += int(rocksdb::properties::CUR_SIZE_ALL_MEM_TABLES);
++                    }
++                }
++            };
++        }
++        match self {
++            Self::ReadWrite { db, .. } => collect_usage!(db),
++            Self::Secondary { db, .. } => collect_usage!(db),
++        }
++        usage
++    }
++
+     /// Returns database-level statistics including per-table stats and WAL size.
+     fn db_stats(&self) -> RocksDBStats {
+         RocksDBStats { tables: self.table_stats(), wal_size_bytes: self.wal_size_bytes() }
+@@ -1195,6 +1331,12 @@ impl RocksDBProvider {
+         self.0.table_stats()
+     }
+ 
++    /// Returns the memtable memory of the `RocksDB` tables, including flushed memtables kept
++    /// as history. Cheaper than [`Self::table_stats`]: two properties per column family.
++    pub fn memtable_usage(&self) -> RocksDBMemtableUsage {
++        self.0.memtable_usage()
++    }
++
+     /// Returns the total size of WAL (Write-Ahead Log) files in bytes.
+     ///
+     /// This scans the `RocksDB` directory for `.log` files and sums their sizes.
+@@ -3451,6 +3593,181 @@ mod tests {
+         type Value = Vec<u8>;
+     }
+ 
++    #[derive(Debug)]
++    struct TestTable2;
++
++    impl Table for TestTable2 {
++        const NAME: &'static str = "TestTable2";
++        const DUPSORT: bool = false;
++        type Key = u64;
++        type Value = Vec<u8>;
++    }
++
++    /// Memtable memory of one column family: (all memtables including flushed ones kept as
++    /// history, unflushed memtables).
++    fn cf_memtables(provider: &RocksDBProvider, name: &str) -> (u64, u64) {
++        let db = provider.0.db_rw();
++        let cf = db.cf_handle(name).unwrap();
++        let int = |p| db.property_int_value_cf(cf, p).unwrap().unwrap_or(0);
++        (
++            int(rocksdb::properties::SIZE_ALL_MEM_TABLES),
++            int(rocksdb::properties::CUR_SIZE_ALL_MEM_TABLES),
++        )
++    }
++
++    /// Writes `total` bytes as `value_len`-byte values to `TestTable` and `TestTable2` in
++    /// `WriteBatch`es of about 4 MiB (the production write path), on a thread. Returns the
++    /// write time, or `None` when it did not finish within `timeout` (the writer, provider and
++    /// directory are then leaked, so a stalled write cannot hang the test).
++    fn write_batches_within(
++        provider: &RocksDBProvider,
++        total: usize,
++        value_len: usize,
++        timeout: std::time::Duration,
++    ) -> Option<std::time::Duration> {
++        let writer = provider.clone();
++        let (done_tx, done_rx) = std::sync::mpsc::channel();
++        std::thread::spawn(move || {
++            let started = std::time::Instant::now();
++            let value = vec![7u8; value_len];
++            let per_batch = ((4 << 20) / value_len).max(1) as u64;
++            let count = (total / value_len) as u64;
++            let mut key = 0;
++            while key < count {
++                let end = (key + per_batch).min(count);
++                writer
++                    .write_batch(|batch| {
++                        for k in key..end {
++                            if k % 2 == 0 {
++                                batch.put::<TestTable>(k, &value)?;
++                            } else {
++                                batch.put::<TestTable2>(k, &value)?;
++                            }
++                        }
++                        Ok(())
++                    })
++                    .unwrap();
++                key = end;
++            }
++            let _ = done_tx.send(started.elapsed());
++        });
++        done_rx.recv_timeout(timeout).ok()
++    }
++
++    #[test]
++    fn test_memtable_budget_parsing() {
++        assert_eq!(parse_memtable_budget(None), Some(DEFAULT_N42_MEMTABLE_BUDGET));
++        assert_eq!(parse_memtable_budget(Some(" ")), Some(DEFAULT_N42_MEMTABLE_BUDGET));
++        assert_eq!(parse_memtable_budget(Some("x")), Some(DEFAULT_N42_MEMTABLE_BUDGET));
++        assert_eq!(parse_memtable_budget(Some("0")), None);
++        assert_eq!(parse_memtable_budget(Some(" 128 ")), Some(128 << 20));
++        assert_eq!(bounded_memtable_size(512 << 20), 16 << 20);
++        assert_eq!(bounded_memtable_size(8 << 20), 1 << 20);
++        assert_eq!(bounded_memtable_size(16 << 30), DEFAULT_WRITE_BUFFER_SIZE);
++    }
++
++    /// Under a memtable budget the flushed memtables are not kept as conflict-check history:
++    /// 8x a 32 MiB budget goes through without a stall, and the memtables left are the
++    /// unflushed ones, within the budget.
++    #[test]
++    fn test_memtable_budget_frees_flushed_memtables() {
++        let temp_dir = TempDir::new().unwrap();
++        let provider = RocksDBBuilder::new(temp_dir.path())
++            .with_table::<TestTable>()
++            .with_table::<TestTable2>()
++            .with_memtable_budget(Some(32 << 20))
++            .build()
++            .unwrap();
++        assert!(
++            write_batches_within(
++                &provider,
++                256 << 20,
++                64 << 10,
++                std::time::Duration::from_secs(300)
++            )
++            .is_some(),
++            "writes stalled under a memtable budget"
++        );
++        let (all1, cur1) = cf_memtables(&provider, TestTable::NAME);
++        let (all2, cur2) = cf_memtables(&provider, TestTable2::NAME);
++        assert!(all1 + all2 < 32 << 20, "memtables {} exceed the budget", all1 + all2);
++        // At most the newest flushed memtable of each column family is still held.
++        assert!(
++            (all1 - cur1) + (all2 - cur2) <=
++                2 * (bounded_memtable_size(32 << 20) as u64 + (1 << 20)),
++            "flushed memtables kept: {}",
++            (all1 - cur1) + (all2 - cur2)
++        );
++        assert_eq!(provider.get::<TestTable>(0).unwrap().map(|v| v.len()), Some(64 << 10));
++        assert_eq!(provider.get::<TestTable2>(1).unwrap().map(|v| v.len()), Some(64 << 10));
++    }
++
++    /// The memtable usage sums the reth tables' memtables, flushed history included.
++    #[test]
++    fn test_memtable_usage_counts_reth_tables() {
++        let temp_dir = TempDir::new().unwrap();
++        let provider = RocksDBBuilder::new(temp_dir.path()).with_default_tables().build().unwrap();
++        let before = provider.memtable_usage();
++        provider
++            .write_batch(|batch| {
++                for i in 0..10_000u64 {
++                    batch.put::<tables::TransactionHashNumbers>(
++                        B256::left_padding_from(&i.to_be_bytes()),
++                        &i,
++                    )?;
++                }
++                Ok(())
++            })
++            .unwrap();
++        let after = provider.memtable_usage();
++        assert!(after.unflushed_bytes > before.unflushed_bytes);
++        assert!(after.all_bytes >= after.unflushed_bytes);
++    }
++
++    /// Memtable footprint of 1 GiB written through the provider's batch path, upstream's
++    /// memtables against the N42 budget. Run with
++    /// `cargo test -p reth-provider --lib memtable_footprint -- --ignored --nocapture`.
++    #[test]
++    #[ignore = "measurement, writes 1 GiB per configuration and value size"]
++    fn bench_memtable_footprint() {
++        let configurations: [(&str, Option<usize>, i64); 5] = [
++            ("upstream (4 GiB manager, 128 MiB memtables, history -1)", None, 0),
++            ("budget 512 MiB, history one memtable", Some(512 << 20), (16 << 20) as i64),
++            ("budget 512 MiB (default), history 1 byte", Some(512 << 20), BOUNDED_MEMTABLE_HISTORY),
++            ("budget 1024 MiB, history 1 byte", Some(1024 << 20), BOUNDED_MEMTABLE_HISTORY),
++            ("budget 128 MiB, history 1 byte", Some(128 << 20), BOUNDED_MEMTABLE_HISTORY),
++        ];
++        for value_len in [64 << 10, 64] {
++            for (label, budget, history) in configurations {
++                let temp_dir = TempDir::new().unwrap();
++                let provider = RocksDBBuilder::new(temp_dir.path())
++                    .with_table::<TestTable>()
++                    .with_table::<TestTable2>()
++                    .with_memtable_budget(budget)
++                    .with_memtable_history(history)
++                    .build()
++                    .unwrap();
++                let elapsed = write_batches_within(
++                    &provider,
++                    1 << 30,
++                    value_len,
++                    std::time::Duration::from_secs(1200),
++                )
++                .expect("writes stalled");
++                let (all1, cur1) = cf_memtables(&provider, TestTable::NAME);
++                let (all2, cur2) = cf_memtables(&provider, TestTable2::NAME);
++                eprintln!(
++                    "{value_len:>6} B values | {label:<58} | all {:>4} MiB | unflushed {:>4} MiB | \
++                     flushed kept {:>4} MiB | {:.2} s",
++                    (all1 + all2) >> 20,
++                    (cur1 + cur2) >> 20,
++                    ((all1 - cur1) + (all2 - cur2)) >> 20,
++                    elapsed.as_secs_f64()
++                );
++            }
++        }
++    }
++
+     #[test]
+     fn test_reopens_with_unknown_column_family() {
+         let temp_dir = TempDir::new().unwrap();
+@@ -3627,7 +3944,12 @@ mod tests {
+     fn test_statistics_level_skips_timers() {
+         let temp_dir = TempDir::new().unwrap();
+         let cache = Cache::new_lru_cache(1 << 20);
+-        let options = RocksDBBuilder::default_options(rocksdb::LogLevel::Info, &cache, true);
++        let options = RocksDBBuilder::default_options(
++            rocksdb::LogLevel::Info,
++            &cache,
++            true,
++            DEFAULT_WRITE_BUFFER_MANAGER_SIZE,
++        );
+ 
+         let db = DB::open(&options, temp_dir.path()).unwrap();
+         for i in 0..10u8 {

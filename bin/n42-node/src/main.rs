@@ -2693,21 +2693,6 @@ fn main() {
                     .unwrap_or_default();
 
                 {
-                    // RocksDB memtables (history and tx-hash indexes) live in
-                    // RocksDB's own allocator, outside the jemalloc counters.
-                    let provider = full_node.provider.clone();
-                    n42_node::memory_watch::add_structure_source(move || {
-                        use reth_provider::RocksDBProviderFactory;
-                        let memtables: u64 = provider
-                            .rocksdb_provider()
-                            .table_stats()
-                            .iter()
-                            .map(|table| table.memtable_size_bytes)
-                            .sum();
-                        vec![("rocksdb_memtable_mib", memtables >> 20)]
-                    });
-                }
-                {
                     // Canonical blocks leave the in-memory state once persisted.
                     let provider = full_node.provider.clone();
                     n42_node::memory_watch::set_backlog_source(move || {
@@ -2724,6 +2709,18 @@ fn main() {
                             }
                         }
                         backlog
+                    });
+                }
+                {
+                    // All memtables, the flushed ones RocksDB still holds included.
+                    use reth_provider::RocksDBProviderFactory;
+                    let rocksdb = full_node.provider.rocksdb_provider();
+                    n42_node::memory_watch::set_rocksdb_source(move || {
+                        let usage = rocksdb.memtable_usage();
+                        n42_node::memory_watch::RocksdbMemtables {
+                            all: usage.all_bytes,
+                            unflushed: usage.unflushed_bytes,
+                        }
                     });
                 }
                 let best_block_number = full_node.provider.best_block_number().unwrap_or(0);
