@@ -39,6 +39,9 @@ pub struct ViewTiming {
     pub prepare_vote_count: u32,
     /// Number of Round 2 votes collected when CommitQC formed.
     pub commit_vote_count: u32,
+    /// Time spent making the R2 vote durable before signing it (AM35 block
+    /// journal + lock + R2 vote-log fsyncs), in microseconds.
+    pub r2_persist_us: Option<u64>,
 }
 
 impl ViewTiming {
@@ -53,6 +56,7 @@ impl ViewTiming {
             commit_qc_formed: None,
             prepare_vote_count: 0,
             commit_vote_count: 0,
+            r2_persist_us: None,
         }
     }
 
@@ -84,26 +88,32 @@ impl ViewTiming {
             opt.map(|v| format!("{v}ms"))
                 .unwrap_or_else(|| "-".to_string())
         };
+        let r2_persist = self
+            .r2_persist_us
+            .map(|us| format!("{:.2}ms", us as f64 / 1000.0))
+            .unwrap_or_else(|| "-".to_string());
 
         if self.proposal_sent.is_some() {
             // Leader view
             format!(
-                "leader proposal=@{} R1_collect={} R2_collect={} total={} votes={}+{}",
+                "leader proposal=@{} R1_collect={} R2_collect={} total={} votes={}+{} r2_persist={}",
                 ms(self.proposal_sent),
                 d(prepare_delta),
                 d(commit_delta),
                 d(total),
                 self.prepare_vote_count,
                 self.commit_vote_count,
+                r2_persist,
             )
         } else {
             // Follower view
             format!(
-                "follower proposal=@{} vote_delay={} commit_vote=@{} total=@{}",
+                "follower proposal=@{} vote_delay={} commit_vote=@{} total=@{} r2_persist={}",
                 ms(self.proposal_received),
                 d(vote_delta),
                 ms(self.commit_vote_sent),
                 ms(self.commit_qc_formed),
+                r2_persist,
             )
         }
     }
@@ -147,6 +157,10 @@ pub enum ConsensusEvent {
     /// vote is withheld even if its import later succeeds (gov5 votes on the
     /// check, not on the import).
     BlockRefused(B256),
+    /// AM35: the orchestrator now holds the data of this block where the
+    /// vote log can make it durable. Retries an R2 vote (follower commit vote
+    /// or leader self-vote) held because the block data was unavailable.
+    BlockDataStaged(B256),
 }
 
 /// A vote message whose single-validator BLS signature was verified by the
@@ -175,7 +189,7 @@ impl AuthenticatedConsensusMessage {
 /// consumed, so the engine must only skip individual verification while that
 /// domain is still canonical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthenticatedVoteProof {
+pub(super) enum AuthenticatedVoteProof {
     Vote {
         signer: u32,
     },
@@ -194,7 +208,7 @@ impl AuthenticatedVoteProof {
 }
 
 /// What a validator signed twice in one view (E15).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EquivocationKind {
     /// Two Round-1 votes.
     Vote,
@@ -358,6 +372,9 @@ pub struct ConsensusEngine {
     /// changes, so reusing a block hash with a different reconfiguration
     /// payload is still detected.
     pub(super) proposal_equivocation_tracker: HashMap<u32, (B256, B256, SignedMessage)>,
+    /// The three trackers of the last few closed views and the late messages
+    /// of those views, for conflicts that cross the view boundary.
+    pub(super) late_evidence: super::late_evidence::LateEvidence,
     /// Buffer for messages arriving for future views (within FUTURE_VIEW_WINDOW).
     pub(super) future_msg_buffer: Vec<(ViewNumber, ConsensusMessage)>,
     /// Per-view timing for commit latency diagnosis.
@@ -388,6 +405,15 @@ pub struct ConsensusEngine {
     /// A PrepareQC whose commit vote waits for this node's own execution of
     /// the block (Profile 1, A13/AM19); `on_block_imported` releases it.
     pub(super) held_prepare_qc: Option<PrepareQC>,
+    /// AM35: the leader's R2 self-vote `(view, block_hash)` held because the
+    /// block could not yet be made durable here.
+    pub(super) held_self_commit_vote: Option<(ViewNumber, B256)>,
+    /// AM35: the highest lock this node has made durable through
+    /// `VoteLogWriter::record_lock`, which runs only after the locked block
+    /// is durable. The in-memory lock (`round_state.locked_qc()`) moves as
+    /// soon as a QC is seen, possibly onto a block no member journalled; the
+    /// consensus snapshot stores this one instead.
+    pub(super) durable_locked_qc: QuorumCertificate,
     /// Profile 1, Phase B: the parent of every block that passed the
     /// deferred proposal check here, before its import.
     pub(super) checked_parents: BoundedFifoMap<B256, B256>,
@@ -449,7 +475,7 @@ impl ConsensusEngine {
         vote_log: Arc<dyn VoteLogWriter>,
     ) -> Self {
         let local_public_key = secret_key.public_key();
-        Self {
+        let mut engine = Self {
             my_index,
             secret_key,
             local_public_key,
@@ -471,6 +497,7 @@ impl ConsensusEngine {
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
+            late_evidence: Default::default(),
             future_msg_buffer: Vec::new(),
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
@@ -480,9 +507,13 @@ impl ConsensusEngine {
             leader_schedule: crate::validator::leader_schedule(),
             vote_rules: crate::VoteRules::installed(),
             held_prepare_qc: None,
+            held_self_commit_vote: None,
+            durable_locked_qc: QuorumCertificate::genesis(),
             checked_parents: BoundedFifoMap::new(64),
             refused_blocks: BoundedFifoMap::new(64),
-        }
+        };
+        engine.sync_backoff_group();
+        engine
     }
 
     /// Creates a consensus engine with recovered state from a persisted snapshot.
@@ -555,7 +586,10 @@ impl ConsensusEngine {
             );
         }
         let local_public_key = secret_key.public_key();
-        Self {
+        // A recovered lock was durable before the restart: the snapshot only
+        // stores durable locks, and `locked_qc.bin` is written by record_lock.
+        let durable_locked_qc = locked_qc.clone();
+        let mut engine = Self {
             my_index,
             secret_key,
             local_public_key,
@@ -584,6 +618,7 @@ impl ConsensusEngine {
             equivocation_tracker: HashMap::new(),
             commit_equivocation_tracker: HashMap::new(),
             proposal_equivocation_tracker: HashMap::new(),
+            late_evidence: Default::default(),
             future_msg_buffer: Vec::new(),
             view_timing: ViewTiming::new(),
             last_committed_timing: None,
@@ -593,9 +628,13 @@ impl ConsensusEngine {
             leader_schedule: crate::validator::leader_schedule(),
             vote_rules: crate::VoteRules::installed(),
             held_prepare_qc: None,
+            held_self_commit_vote: None,
+            durable_locked_qc,
             checked_parents: BoundedFifoMap::new(64),
             refused_blocks: BoundedFifoMap::new(64),
-        }
+        };
+        engine.sync_backoff_group();
+        engine
     }
 
     // ── Public accessors ──
@@ -617,10 +656,17 @@ impl ConsensusEngine {
         self.vote_rules
     }
 
+    /// Replaces the durable vote sink. Call before the engine processes its
+    /// first event (tests that build an engine with [`Self::new`]).
+    pub fn set_vote_log(&mut self, vote_log: Arc<dyn VoteLogWriter>) {
+        self.vote_log = vote_log;
+    }
+
     /// Replaces the vote rules. A chain constant: call before the engine
     /// processes its first event (tests run several chains in one process).
     pub fn set_vote_rules(&mut self, rules: crate::VoteRules) {
         self.vote_rules = rules;
+        self.sync_backoff_group();
     }
 
     /// A14: refuses to act under a signing profile the chain's rules do not
@@ -991,6 +1037,88 @@ impl ConsensusEngine {
         self.round_state.locked_qc()
     }
 
+    /// AM35: the highest lock already made durable by `record_lock` (after
+    /// its block was made durable). Snapshots persist this, never the
+    /// in-memory [`Self::locked_qc`], so a restart can only adopt a lock
+    /// whose block this node can re-import.
+    pub fn durable_locked_qc(&self) -> &QuorumCertificate {
+        &self.durable_locked_qc
+    }
+
+    /// AM35: after a commit, raise the durable lock to the CommitQC when it is
+    /// higher. A node that imports slowly may hold its R2 votes for several
+    /// views while the others commit; without this its durable lock stays
+    /// behind `last_committed_qc` and every snapshot is refused
+    /// (`last_committed_qc.view > locked_qc.view`).
+    ///
+    /// The CommitQC is a safe durable lock even when this node never
+    /// journalled the block: it carries 2f+1 R2 votes, and every R2 voter
+    /// made the block durable before signing, so after a whole-set power loss
+    /// at least 2f+1 members can re-import and serve it. `Round::commit`
+    /// already treats the CommitQC as the in-memory lock.
+    pub(super) fn advance_durable_lock_on_commit(&mut self, commit_qc: &QuorumCertificate) {
+        if commit_qc.view <= self.durable_locked_qc.view {
+            return;
+        }
+        match self.vote_log.record_lock(commit_qc) {
+            Ok(()) => self.durable_locked_qc = commit_qc.clone(),
+            Err(error) => tracing::warn!(
+                target: "n42::am35",
+                view = commit_qc.view,
+                %error,
+                "could not persist the CommitQC as the durable lock"
+            ),
+        }
+    }
+
+    /// AM35: the R2 prologue shared by the follower commit vote and the
+    /// leader self-vote: make the voted block (and the locked block, should
+    /// it differ) durable, then the lock, then the R2 vote-log record. Returns
+    /// `Ok(Some(missing))` when block data is not here yet: nothing was
+    /// written and the caller holds the vote.
+    ///
+    /// On success it emits the fixed AM35 line (target `n42::am35`, message
+    /// "commit vote released after durable lock") that external kill tools
+    /// match; the caller signs and sends the R2 vote right after. `role` is
+    /// "follower" or "leader".
+    pub(super) fn persist_before_commit_vote(
+        &mut self,
+        view: ViewNumber,
+        block_hash: B256,
+        role: &'static str,
+    ) -> ConsensusResult<Option<B256>> {
+        let started = Instant::now();
+        let lock = self.round_state.locked_qc().clone();
+        let mut targets = vec![block_hash];
+        if lock.block_hash != block_hash && lock.view > 0 {
+            targets.push(lock.block_hash);
+        }
+        for hash in targets {
+            if let crate::BlockDurability::Unavailable { missing } =
+                self.vote_log.ensure_block_durable(view, hash)?
+            {
+                return Ok(Some(missing));
+            }
+        }
+        self.vote_log.record_lock(&lock)?;
+        if lock.view > self.durable_locked_qc.view {
+            self.durable_locked_qc = lock;
+        }
+        self.round_state.record_commit_vote(view);
+        self.vote_log.record_commit_vote(view)?;
+        self.view_timing.r2_persist_us = Some(started.elapsed().as_micros() as u64);
+        // Stable text: the mixed-gate kill tool (E9) regex-matches this line.
+        tracing::info!(
+            target: "n42::am35",
+            view,
+            block_hash = %block_hash,
+            // Debug renders the quoted form `role="follower"`.
+            role = ?role,
+            "commit vote released after durable lock"
+        );
+        Ok(None)
+    }
+
     pub fn last_committed_qc(&self) -> &QuorumCertificate {
         self.round_state.last_committed_qc()
     }
@@ -1007,6 +1135,28 @@ impl ConsensusEngine {
         self.round_state.last_commit_voted_view()
     }
 
+    /// Whether an R2 vote for `block_hash` is held in the current view (for
+    /// this node's execution or for the block's durability).
+    pub fn holds_commit_vote_for(&self, block_hash: B256) -> bool {
+        self.held_commit_vote_block() == Some(block_hash)
+    }
+
+    /// The block of the R2 vote held in the current view, if any. Staging
+    /// block data (the block's own or a missing ancestor's) is a reason to
+    /// retry it with [`ConsensusEvent::BlockDataStaged`].
+    pub fn held_commit_vote_block(&self) -> Option<B256> {
+        let view = self.round_state.current_view();
+        if let Some((held_view, block_hash)) = self.held_self_commit_vote
+            && held_view == view
+        {
+            return Some(block_hash);
+        }
+        self.held_prepare_qc
+            .as_ref()
+            .filter(|held| held.view == view)
+            .map(|held| held.block_hash)
+    }
+
     // ── Event processing ──
 
     /// Processes a consensus event and generates outputs.
@@ -1019,6 +1169,7 @@ impl ConsensusEngine {
             }
             ConsensusEvent::BlockChecked { .. } => "block_checked",
             ConsensusEvent::BlockRefused(_) => "block_refused",
+            ConsensusEvent::BlockDataStaged(_) => "block_data_staged",
         };
         let _span = tracing::info_span!(
             target: "n42.cl.consensus.event",
@@ -1046,6 +1197,7 @@ impl ConsensusEngine {
                 self.on_block_refused(block_hash);
                 Ok(())
             }
+            ConsensusEvent::BlockDataStaged(block_hash) => self.on_block_data_staged(block_hash),
         }
     }
 
@@ -1084,7 +1236,7 @@ impl ConsensusEngine {
             );
 
             if view > current_view && !is_exempt {
-                if view <= current_view + FUTURE_VIEW_WINDOW {
+                if view <= current_view.saturating_add(FUTURE_VIEW_WINDOW) {
                     if let ConsensusMessage::Timeout(ref timeout) = msg
                         && self.collect_future_timeout(timeout.clone())?
                     {
@@ -1102,7 +1254,7 @@ impl ConsensusEngine {
                             return self.dispatch_message(msg, authenticated_proof);
                         }
                         if view > new_current
-                            && view <= new_current + FUTURE_VIEW_WINDOW
+                            && view <= new_current.saturating_add(FUTURE_VIEW_WINDOW)
                             && self.future_msg_buffer.len() < MAX_FUTURE_MESSAGES
                         {
                             self.future_msg_buffer.push((view, msg));
@@ -1137,7 +1289,7 @@ impl ConsensusEngine {
                     if view == new_current {
                         return self.dispatch_message(msg, authenticated_proof);
                     } else if view > new_current
-                        && view <= new_current + FUTURE_VIEW_WINDOW
+                        && view <= new_current.saturating_add(FUTURE_VIEW_WINDOW)
                         && self.future_msg_buffer.len() < MAX_FUTURE_MESSAGES
                     {
                         self.future_msg_buffer.push((view, msg));
@@ -1158,6 +1310,8 @@ impl ConsensusEngine {
                 ConsensusMessage::Decide(_) | ConsensusMessage::NewView(_)
             )
         {
+            // Evidence only: a late message never reaches a collector.
+            self.note_late_message(&msg, authenticated_proof)?;
             if let ConsensusMessage::Proposal(ref proposal) = msg
                 && self.recover_late_committed_proposal(proposal)?
             {
@@ -1334,12 +1488,14 @@ impl ConsensusEngine {
         if new_view <= self.round_state.current_view() {
             return Ok(());
         }
+        let closing_view = self.round_state.current_view();
 
         // Save current PrepareQC for piggybacking into the next Proposal (chained mode).
         self.previous_prepare_qc = self.prepare_qc.take();
         // A commit vote held for this node's execution belongs to the view
         // being left.
         self.held_prepare_qc = None;
+        self.held_self_commit_vote = None;
 
         // Epoch numbers follow fixed view ranges even when validator membership
         // is unchanged. Advance every crossed boundary so live execution,
@@ -1411,8 +1567,7 @@ impl ConsensusEngine {
         }
 
         self.round_state.advance_view(new_view);
-        self.pacemaker
-            .reset_for_view(new_view, self.round_state.consecutive_timeouts());
+        self.arm_view_timer(new_view);
         self.vote_collector = None;
         self.commit_collector = None;
         self.timeout_collector = None;
@@ -1428,10 +1583,16 @@ impl ConsensusEngine {
         if !self.signing_profile.is_gov5() {
             self.imported_blocks.clear();
             self.imported_block_fifo.clear();
+            self.imported_parents.clear();
         }
-        self.equivocation_tracker.clear();
-        self.commit_equivocation_tracker.clear();
-        self.proposal_equivocation_tracker.clear();
+        // The closing view's trackers stay checkable for a few views: a
+        // commit vote that arrives after the CommitQC is otherwise never
+        // compared with the one already counted.
+        let votes = std::mem::take(&mut self.equivocation_tracker);
+        let commit_votes = std::mem::take(&mut self.commit_equivocation_tracker);
+        let proposals = std::mem::take(&mut self.proposal_equivocation_tracker);
+        self.late_evidence
+            .close_view(closing_view, new_view, votes, commit_votes, proposals);
 
         // Defense-in-depth: re-derive my_index from the current set on every view
         // advance. The epoch-boundary branch above only fires for live consensus
@@ -1453,7 +1614,7 @@ impl ConsensusEngine {
         for (view, msg) in drained {
             if view == new_view {
                 to_replay.push(msg);
-            } else if view > new_view && view <= new_view + FUTURE_VIEW_WINDOW {
+            } else if view > new_view && view <= new_view.saturating_add(FUTURE_VIEW_WINDOW) {
                 self.future_msg_buffer.push((view, msg));
             }
             // else: expired — discard silently
@@ -1475,6 +1636,27 @@ impl ConsensusEngine {
 
     pub(super) fn validator_set(&self) -> &ValidatorSet {
         self.epoch_manager.current_validator_set()
+    }
+
+    /// Gives the pacemaker the committee size its AM33 backoff group comes
+    /// from: the validator set held now on Profile 1, none (group 1, the
+    /// pre-AM33 rule) on the other lines.
+    fn sync_backoff_group(&mut self) {
+        let committee_size = if self.vote_rules.profile1 {
+            self.validator_set().len() as usize
+        } else {
+            0
+        };
+        self.pacemaker.set_committee_size(committee_size);
+    }
+
+    /// Starts `view`'s timer at `timeout(c)` with `c` as it stands. On
+    /// Profile 1 the backoff group comes from the validator set held now
+    /// (AM33: `g = min(f + 1, 3)`); the other lines keep group 1.
+    pub(super) fn arm_view_timer(&mut self, view: ViewNumber) {
+        self.sync_backoff_group();
+        self.pacemaker
+            .reset_for_view(view, self.round_state.consecutive_timeouts());
     }
 
     pub(super) fn validator_set_for_view(&self, view: ViewNumber) -> &ValidatorSet {
@@ -3288,6 +3470,225 @@ mod tests {
             self.0.lock().unwrap().push(format!("lock:{}", qc.view));
             Ok(())
         }
+
+        fn ensure_block_durable(
+            &self,
+            view: u64,
+            _block_hash: B256,
+        ) -> ConsensusResult<crate::BlockDurability> {
+            self.0.lock().unwrap().push(format!("block:{view}"));
+            Ok(crate::BlockDurability::Durable)
+        }
+    }
+
+    /// A vote log standing in for the AM35 block journal. It owns the
+    /// engine's output receiver and drains it on every call, so the event
+    /// list shows exactly which outputs left the engine before each durable
+    /// write: an R2 vote emitted before the journal fsync would appear before
+    /// `block:durable`.
+    #[derive(Debug)]
+    struct OrderingVoteLog {
+        events: std::sync::Mutex<Vec<String>>,
+        outputs: std::sync::Mutex<mpsc::Receiver<EngineOutput>>,
+        available: std::sync::atomic::AtomicBool,
+    }
+
+    impl OrderingVoteLog {
+        fn new(outputs: mpsc::Receiver<EngineOutput>, available: bool) -> Self {
+            Self {
+                events: Default::default(),
+                outputs: std::sync::Mutex::new(outputs),
+                available: std::sync::atomic::AtomicBool::new(available),
+            }
+        }
+
+        fn push(&self, event: String) {
+            self.drain();
+            self.events.lock().unwrap().push(event);
+        }
+
+        fn drain(&self) {
+            let mut outputs = self.outputs.lock().unwrap();
+            while let Ok(output) = outputs.try_recv() {
+                let label = match output {
+                    EngineOutput::SendToValidator(_, ConsensusMessage::CommitVote(cv)) => {
+                        format!("out:commit_vote:{}", cv.view)
+                    }
+                    EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(pqc)) => {
+                        format!("out:prepare_qc:{}", pqc.view)
+                    }
+                    EngineOutput::BroadcastMessage(ConsensusMessage::Decide(d)) => {
+                        format!("out:decide:{}", d.view)
+                    }
+                    _ => continue,
+                };
+                self.events.lock().unwrap().push(label);
+            }
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.drain();
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl VoteLogWriter for OrderingVoteLog {
+        fn record_vote(&self, view: u64) -> ConsensusResult<()> {
+            self.push(format!("vote:{view}"));
+            Ok(())
+        }
+
+        fn record_commit_vote(&self, view: u64) -> ConsensusResult<()> {
+            self.push(format!("commit:{view}"));
+            Ok(())
+        }
+
+        fn record_lock(&self, qc: &QuorumCertificate) -> ConsensusResult<()> {
+            self.push(format!("lock:{}", qc.view));
+            Ok(())
+        }
+
+        fn ensure_block_durable(
+            &self,
+            view: u64,
+            block_hash: B256,
+        ) -> ConsensusResult<crate::BlockDurability> {
+            if self.available.load(std::sync::atomic::Ordering::SeqCst) {
+                self.push(format!("block:durable:{view}"));
+                Ok(crate::BlockDurability::Durable)
+            } else {
+                self.push(format!("block:unavailable:{view}"));
+                Ok(crate::BlockDurability::Unavailable { missing: block_hash })
+            }
+        }
+    }
+
+    /// AM35: a follower's R2 vote leaves the engine only after the block is
+    /// durable, then the lock, then the R2 vote-log record. While the block
+    /// data is missing the vote is held; staging the data releases it.
+    #[test]
+    fn test_follower_r2_never_leaves_before_block_journal_fsync() {
+        let (_fresh_engine, sks, vs, _fresh_rx) = make_engine(4, 0);
+        let (output_tx, output_rx) = mpsc::channel(64);
+        let log = Arc::new(OrderingVoteLog::new(output_rx, false));
+        let mut engine = ConsensusEngine::with_recovered_state_and_vote_log(
+            0,
+            sks[0].clone(),
+            EpochManager::new(vs.clone()),
+            60_000,
+            120_000,
+            output_tx,
+            1,
+            QuorumCertificate::genesis(),
+            QuorumCertificate::genesis(),
+            0,
+            0,
+            0,
+            log.clone(),
+        );
+        let block_hash = B256::repeat_byte(0xD1);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(
+                n42_primitives::consensus::PrepareQC {
+                    view: 1,
+                    block_hash,
+                    qc: build_test_prepare_qc(1, block_hash, &sks, &vs, &[0, 1, 2]),
+                },
+            )))
+            .unwrap();
+        assert_eq!(log.events(), ["block:unavailable:1"]);
+        assert!(engine.holds_commit_vote_for(block_hash));
+        assert_eq!(engine.last_commit_voted_view(), 0, "no R2 recorded while held");
+
+        // Staging another block's data changes nothing.
+        engine
+            .process_event(ConsensusEvent::BlockDataStaged(B256::repeat_byte(0xEE)))
+            .unwrap();
+        assert_eq!(log.events(), ["block:unavailable:1"]);
+
+        log.available.store(true, std::sync::atomic::Ordering::SeqCst);
+        engine
+            .process_event(ConsensusEvent::BlockDataStaged(block_hash))
+            .unwrap();
+        assert_eq!(
+            log.events(),
+            [
+                "block:unavailable:1",
+                "block:durable:1",
+                "lock:1",
+                "commit:1",
+                "out:commit_vote:1"
+            ]
+        );
+        assert!(!engine.holds_commit_vote_for(block_hash));
+        assert!(engine.view_timing.r2_persist_us.is_some());
+    }
+
+    /// AM35: the leader's own R2 counts toward the CommitQC quorum, so it is
+    /// gated exactly like a follower's: no lock, no R2 record and no self
+    /// signature until the block is durable.
+    #[test]
+    fn test_leader_r2_self_vote_is_gated_on_block_durability() {
+        use crate::protocol::quorum::signing_message;
+
+        let (_fresh_engine, sks, vs, _fresh_rx) = make_engine(4, 0);
+        let (output_tx, output_rx) = mpsc::channel(64);
+        let log = Arc::new(OrderingVoteLog::new(output_rx, false));
+        let mut engine = ConsensusEngine::with_recovered_state_and_vote_log(
+            1,
+            sks[1].clone(),
+            EpochManager::new(vs.clone()),
+            60_000,
+            120_000,
+            output_tx,
+            1,
+            QuorumCertificate::genesis(),
+            QuorumCertificate::genesis(),
+            0,
+            0,
+            0,
+            log.clone(),
+        );
+        let block_hash = B256::repeat_byte(0xD2);
+        engine
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
+            .unwrap();
+        for voter in [0u32, 2] {
+            let vote = Vote {
+                view: 1,
+                block_hash,
+                voter,
+                signature: sks[voter as usize].sign(&signing_message(1, &block_hash)),
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+                .unwrap();
+        }
+        assert_eq!(
+            log.events(),
+            ["vote:1", "out:prepare_qc:1", "block:unavailable:1"],
+            "PrepareQC goes out, the self R2 waits"
+        );
+        assert!(engine.holds_commit_vote_for(block_hash));
+        assert_eq!(engine.last_commit_voted_view(), 0);
+
+        log.available.store(true, std::sync::atomic::Ordering::SeqCst);
+        engine
+            .process_event(ConsensusEvent::BlockDataStaged(block_hash))
+            .unwrap();
+        assert_eq!(
+            log.events(),
+            [
+                "vote:1",
+                "out:prepare_qc:1",
+                "block:unavailable:1",
+                "block:durable:1",
+                "lock:1",
+                "commit:1"
+            ]
+        );
+        assert_eq!(engine.last_commit_voted_view(), 1);
+        assert!(!engine.holds_commit_vote_for(block_hash));
     }
 
     /// A CommitVote can help commit a block, so the lock it rests on must be
@@ -3323,7 +3724,7 @@ mod tests {
             )))
             .unwrap();
 
-        assert_eq!(*log.0.lock().unwrap(), ["lock:1", "commit:1"]);
+        assert_eq!(*log.0.lock().unwrap(), ["block:1", "lock:1", "commit:1"]);
         assert!(output_rx.try_recv().is_ok());
     }
 
@@ -3365,8 +3766,49 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(*log.0.lock().unwrap(), ["vote:1", "lock:1", "commit:1"]);
+        assert_eq!(*log.0.lock().unwrap(), ["vote:1", "block:1", "lock:1", "commit:1"]);
         assert!(output_rx.try_recv().is_ok());
+    }
+
+    /// A follower that never sent R2 (its import was too slow) still commits
+    /// on the Decide; its durable lock must follow the CommitQC, or every
+    /// snapshot is refused for `last_committed_qc.view > locked_qc.view`.
+    #[test]
+    fn test_decide_without_own_commit_vote_advances_durable_lock() {
+        let (_fresh_engine, sks, vs, _fresh_rx) = make_engine(4, 0);
+        let (output_tx, _output_rx) = mpsc::channel(32);
+        let log = Arc::new(RecordingVoteLog::default());
+        let mut engine = ConsensusEngine::with_recovered_state_and_vote_log(
+            3,
+            sks[3].clone(),
+            EpochManager::new(vs.clone()),
+            60_000,
+            120_000,
+            output_tx,
+            1,
+            QuorumCertificate::genesis(),
+            QuorumCertificate::genesis(),
+            0,
+            0,
+            0,
+            log.clone(),
+        );
+        let block_hash = B256::repeat_byte(0xDA);
+        let commit_qc = build_test_commit_qc(1, block_hash, &sks, &vs, &[0, 1, 2]);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                view: 1,
+                block_hash,
+                commit_qc,
+                validator_changes_hash: B256::ZERO,
+            })))
+            .unwrap();
+
+        assert_eq!(engine.last_committed_qc().view, 1);
+        assert_eq!(engine.durable_locked_qc().view, 1);
+        assert_eq!(engine.durable_locked_qc().block_hash, block_hash);
+        // Persisted as the durable lock; no R2 was recorded for this node.
+        assert_eq!(*log.0.lock().unwrap(), ["lock:1"]);
     }
 
     #[test]
@@ -3825,6 +4267,278 @@ mod tests {
             )));
             assert_equivocation_proof_verifies(&outputs, EquivocationKind::Vote);
         }
+    }
+
+    fn drain_outputs(rx: &mut mpsc::Receiver<EngineOutput>) -> Vec<EngineOutput> {
+        let mut outputs = Vec::new();
+        while let Ok(output) = rx.try_recv() {
+            outputs.push(output);
+        }
+        outputs
+    }
+
+    fn equivocations(outputs: &[EngineOutput]) -> Vec<(u64, u32, B256, B256, EquivocationKind)> {
+        outputs
+            .iter()
+            .filter_map(|output| match output {
+                EngineOutput::EquivocationDetected {
+                    view,
+                    validator,
+                    hash1,
+                    hash2,
+                    proof,
+                } => Some((*view, *validator, *hash1, *hash2, proof.kind)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Leader 1 of a four-validator set commits view 1 with votes of 0 and 2
+    /// and moves to view 2; returns the engine past its CommitQC.
+    fn leader_past_commit_qc(
+        block_hash: B256,
+    ) -> (
+        ConsensusEngine,
+        Vec<BlsSecretKey>,
+        mpsc::Receiver<EngineOutput>,
+    ) {
+        use crate::protocol::quorum::{commit_signing_message, signing_message};
+        let (mut engine, sks, _, mut rx) = make_engine(4, 1);
+        engine
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
+            .expect("leader initializes its collectors");
+        for voter in [0u32, 2] {
+            let vote = Vote {
+                view: 1,
+                block_hash,
+                voter,
+                signature: sks[voter as usize].sign(&signing_message(1, &block_hash)),
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+                .expect("R1 vote");
+        }
+        for voter in [0u32, 2] {
+            let commit_vote = CommitVote {
+                view: 1,
+                block_hash,
+                voter,
+                signature: sks[voter as usize].sign(&commit_signing_message(
+                    1,
+                    &block_hash,
+                    &B256::ZERO,
+                )),
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::CommitVote(
+                    commit_vote,
+                )))
+                .expect("commit vote");
+        }
+        assert_eq!(engine.current_view(), 2, "the CommitQC moved the leader on");
+        assert!(engine.commit_equivocation_tracker.is_empty());
+        drain_outputs(&mut rx);
+        (engine, sks, rx)
+    }
+
+    fn late_commit_vote(sk: &BlsSecretKey, voter: u32, block_hash: B256) -> ConsensusEvent {
+        use crate::protocol::quorum::commit_signing_message;
+        ConsensusEvent::Message(ConsensusMessage::CommitVote(CommitVote {
+            view: 1,
+            block_hash,
+            voter,
+            signature: sk.sign(&commit_signing_message(1, &block_hash, &B256::ZERO)),
+        }))
+    }
+
+    fn late_vote(sk: &BlsSecretKey, voter: u32, block_hash: B256) -> ConsensusEvent {
+        use crate::protocol::quorum::signing_message;
+        ConsensusEvent::Message(ConsensusMessage::Vote(Vote {
+            view: 1,
+            block_hash,
+            voter,
+            signature: sk.sign(&signing_message(1, &block_hash)),
+        }))
+    }
+
+    #[test]
+    fn a_conflicting_commit_vote_after_the_commit_qc_is_evidence() {
+        let block = B256::repeat_byte(0xC1);
+        let twin = B256::repeat_byte(0xD2);
+        let (mut engine, sks, mut rx) = leader_past_commit_qc(block);
+
+        // Voter 0's counted commit vote is the first of the pair.
+        engine
+            .process_event(late_commit_vote(&sks[0], 0, twin))
+            .unwrap();
+        let outputs = drain_outputs(&mut rx);
+        assert_eq!(
+            equivocations(&outputs),
+            vec![(1, 0, block, twin, EquivocationKind::CommitVote)]
+        );
+        assert_equivocation_proof_verifies(&outputs, EquivocationKind::CommitVote);
+
+        // Voter 3 was outside the quorum: both of its commit votes are late,
+        // in either order.
+        engine
+            .process_event(late_commit_vote(&sks[3], 3, twin))
+            .unwrap();
+        assert!(
+            drain_outputs(&mut rx).is_empty(),
+            "one late vote is no evidence"
+        );
+        engine
+            .process_event(late_commit_vote(&sks[3], 3, block))
+            .unwrap();
+        let outputs = drain_outputs(&mut rx);
+        assert_eq!(
+            equivocations(&outputs),
+            vec![(1, 3, twin, block, EquivocationKind::CommitVote)]
+        );
+        assert_equivocation_proof_verifies(&outputs, EquivocationKind::CommitVote);
+        assert_eq!(
+            engine.current_view(),
+            2,
+            "late messages never move the view"
+        );
+    }
+
+    #[test]
+    fn a_conflicting_r1_vote_after_the_view_closed_is_evidence() {
+        let block = B256::repeat_byte(0xA1);
+        let twin = B256::repeat_byte(0xB2);
+        let (mut engine, sks, mut rx) = leader_past_commit_qc(block);
+
+        engine.process_event(late_vote(&sks[2], 2, twin)).unwrap();
+        let outputs = drain_outputs(&mut rx);
+        assert_eq!(
+            equivocations(&outputs),
+            vec![(1, 2, block, twin, EquivocationKind::Vote)]
+        );
+        assert_equivocation_proof_verifies(&outputs, EquivocationKind::Vote);
+    }
+
+    #[test]
+    fn honest_late_messages_produce_nothing() {
+        let block = B256::repeat_byte(0xE1);
+        let (mut engine, sks, mut rx) = leader_past_commit_qc(block);
+
+        // Repeats of counted votes, and a late voter's matching pair.
+        engine.process_event(late_vote(&sks[0], 0, block)).unwrap();
+        engine
+            .process_event(late_commit_vote(&sks[2], 2, block))
+            .unwrap();
+        engine.process_event(late_vote(&sks[3], 3, block)).unwrap();
+        engine
+            .process_event(late_commit_vote(&sks[3], 3, block))
+            .unwrap();
+        engine
+            .process_event(late_commit_vote(&sks[3], 3, block))
+            .unwrap();
+        assert!(drain_outputs(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_forged_late_message_is_never_evidence() {
+        let block = B256::repeat_byte(0xF1);
+        let twin = B256::repeat_byte(0xF2);
+        let (mut engine, sks, mut rx) = leader_past_commit_qc(block);
+
+        // A commit vote for voter 3 signed by another key arrives first and is
+        // kept unverified; voter 3's real vote does not convict it.
+        engine
+            .process_event(late_commit_vote(&sks[0], 3, twin))
+            .unwrap();
+        engine
+            .process_event(late_commit_vote(&sks[3], 3, block))
+            .unwrap();
+        assert!(drain_outputs(&mut rx).is_empty());
+        // A forged second against a verified first is not evidence either.
+        engine
+            .process_event(late_commit_vote(&sks[0], 2, twin))
+            .unwrap();
+        assert!(drain_outputs(&mut rx).is_empty());
+        // The real one took the forged one's place: a real conflict still is.
+        engine
+            .process_event(late_commit_vote(&sks[3], 3, twin))
+            .unwrap();
+        assert_eq!(
+            equivocations(&drain_outputs(&mut rx)),
+            vec![(1, 3, block, twin, EquivocationKind::CommitVote)]
+        );
+    }
+
+    #[test]
+    fn late_messages_outside_the_window_are_ignored_and_dropped() {
+        let block = B256::repeat_byte(0x71);
+        let twin = B256::repeat_byte(0x72);
+        let (mut engine, sks, mut rx) = leader_past_commit_qc(block);
+        engine
+            .process_event(late_commit_vote(&sks[3], 3, twin))
+            .unwrap();
+        assert_ne!(engine.late_evidence.retained(), (0, 0));
+
+        engine
+            .advance_to_view(1 + super::super::late_evidence::LATE_EVIDENCE_VIEWS + 1)
+            .unwrap();
+        assert_eq!(
+            engine.late_evidence.retained(),
+            (0, 0),
+            "view 1 left the window"
+        );
+        drain_outputs(&mut rx);
+        engine
+            .process_event(late_commit_vote(&sks[0], 0, twin))
+            .unwrap();
+        engine
+            .process_event(late_commit_vote(&sks[3], 3, block))
+            .unwrap();
+        engine.process_event(late_vote(&sks[2], 2, twin)).unwrap();
+        assert!(equivocations(&drain_outputs(&mut rx)).is_empty());
+        assert_eq!(engine.late_evidence.retained(), (0, 0));
+    }
+
+    #[test]
+    fn a_conflicting_proposal_after_the_view_closed_is_evidence() {
+        use crate::protocol::quorum::proposal_signing_message;
+        let block = B256::repeat_byte(0x81);
+        let twin = B256::repeat_byte(0x82);
+        let (mut engine, sks, _, mut rx) = make_engine(4, 0);
+        let proposal = |hash: B256| n42_primitives::consensus::Proposal {
+            view: 1,
+            block_hash: hash,
+            justify_qc: QuorumCertificate::genesis(),
+            proposer: 1,
+            signature: sks[1].sign(&proposal_signing_message(1, &hash, &None)),
+            prepare_qc: None,
+            tx_root_hash: None,
+            validator_changes: None,
+        };
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal(block),
+            )))
+            .expect("proposal");
+        engine.advance_to_view(2).unwrap();
+        drain_outputs(&mut rx);
+
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal(block),
+            )))
+            .unwrap();
+        assert!(equivocations(&drain_outputs(&mut rx)).is_empty());
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                proposal(twin),
+            )))
+            .unwrap();
+        let outputs = drain_outputs(&mut rx);
+        assert_eq!(
+            equivocations(&outputs),
+            vec![(1, 1, block, twin, EquivocationKind::Proposal)]
+        );
+        assert_equivocation_proof_verifies(&outputs, EquivocationKind::Proposal);
     }
 
     #[test]
@@ -4488,6 +5202,27 @@ mod tests {
                 .all(|hash| engine.imported_blocks.contains(hash)),
             "parent metadata must never outlive its import evidence"
         );
+    }
+
+    #[test]
+    fn native_timeout_clears_parent_metadata_with_import_evidence() {
+        let (mut engine, _sks, _, _rx) = make_engine(4, 0);
+        assert!(!engine.signing_profile.is_gov5());
+        for i in 0..8u8 {
+            engine
+                .process_event(ConsensusEvent::BlockImportedWithParent {
+                    block_hash: B256::repeat_byte(i),
+                    parent_hash: B256::repeat_byte(i.wrapping_sub(1)),
+                })
+                .expect("authenticated import should succeed");
+        }
+        assert_eq!(engine.imported_parents.len(), 8);
+
+        engine.on_timeout().expect("timeout should succeed");
+        assert!(engine.imported_blocks.is_empty());
+        // Native profiles drop import evidence every view; parent edges left
+        // behind would accumulate one per block for good.
+        assert!(engine.imported_parents.is_empty());
     }
 
     /// A deferred H2 vote waits on one specific hash, and catching up imports
@@ -5906,4 +6641,501 @@ mod tests {
         assert_eq!(engine.leader_index_for_view(6), 1);
         assert_eq!(engine.leader_index_for_view(8), 2);
     }
+
+    // ── AM33: view-timeout backoff for consecutive absent leaders ──
+
+    /// An engine for `n` validators with explicit timeouts, epoch length,
+    /// tenure (rotate-on-timeout from genesis) and Profile-1 switch.
+    #[allow(clippy::type_complexity)]
+    fn am33_engine(
+        n: usize,
+        my_index: u32,
+        (base_ms, max_ms): (u64, u64),
+        epoch_length: u64,
+        tenure: u64,
+        profile1: bool,
+    ) -> (
+        ConsensusEngine,
+        Vec<n42_primitives::BlsSecretKey>,
+        ValidatorSet,
+        mpsc::Receiver<EngineOutput>,
+    ) {
+        let sks: Vec<_> = (0..n).map(|i| test_key(0x10 + i as u8)).collect();
+        let infos: Vec<_> = sks
+            .iter()
+            .enumerate()
+            .map(|(i, sk)| ValidatorInfo {
+                address: Address::with_last_byte(i as u8),
+                bls_public_key: sk.public_key(),
+                p2p_peer_id: None,
+            })
+            .collect();
+        let vs = ValidatorSet::new(&infos, ((n as u32).saturating_sub(1)) / 3);
+        let epochs = if epoch_length > 0 {
+            EpochManager::with_epoch_length(vs.clone(), epoch_length)
+        } else {
+            EpochManager::new(vs.clone())
+        };
+        let (output_tx, output_rx) = mpsc::channel(4096);
+        let mut engine = ConsensusEngine::with_epoch_manager(
+            my_index,
+            sks[my_index as usize].clone(),
+            epochs,
+            base_ms,
+            max_ms,
+            output_tx,
+        );
+        if profile1 {
+            // Profile 1 signs with H2-v4 only.
+            enable_test_h2(&mut engine);
+            engine.set_vote_rules(crate::VoteRules::PROFILE1);
+        } else {
+            engine.set_vote_rules(crate::VoteRules::TODAY);
+        }
+        engine.set_leader_schedule(crate::validator::LeaderSchedule {
+            tenure,
+            rotate_on_timeout_from: Some(0),
+        });
+        (engine, sks, vs, output_rx)
+    }
+
+    fn am33_timeout_message(
+        engine: &ConsensusEngine,
+        view: ViewNumber,
+        sender: u32,
+        sks: &[n42_primitives::BlsSecretKey],
+    ) -> ConsensusEvent {
+        let message = engine.signing_profile.timeout_message(view);
+        ConsensusEvent::Message(ConsensusMessage::Timeout(TimeoutMessage {
+            view,
+            high_qc: QuorumCertificate::genesis(),
+            sender,
+            signature: engine.signing_profile.sign(&sks[sender as usize], &message),
+        }))
+    }
+
+    /// A QC under the engine's signing profile: a commit QC (`commit`) or a
+    /// prepare QC, signed by the first quorum of validators.
+    fn am33_qc(
+        engine: &ConsensusEngine,
+        view: ViewNumber,
+        block_hash: B256,
+        commit: bool,
+        sks: &[n42_primitives::BlsSecretKey],
+        vs: &ValidatorSet,
+    ) -> QuorumCertificate {
+        use crate::protocol::quorum::VoteCollector;
+        let profile = engine.signing_profile;
+        let message = if commit {
+            profile.commit_message(view, block_hash, B256::ZERO)
+        } else {
+            profile.vote_message(view, block_hash)
+        };
+        let mut collector = VoteCollector::new(view, block_hash, vs.len());
+        for i in 0..vs.quorum_size() as u32 {
+            collector
+                .add_vote(i, profile.sign(&sks[i as usize], &message))
+                .unwrap();
+        }
+        collector
+            .build_qc_with_profile_message(vs, &message, profile)
+            .unwrap()
+    }
+
+    /// A NewView for `view` from `leader`, carrying a TC for `tc_view` signed
+    /// by the first quorum, under the engine's signing profile.
+    fn am33_new_view(
+        engine: &ConsensusEngine,
+        view: ViewNumber,
+        tc_view: ViewNumber,
+        leader: u32,
+        sks: &[n42_primitives::BlsSecretKey],
+        vs: &ValidatorSet,
+    ) -> ConsensusEvent {
+        use crate::protocol::quorum::TimeoutCollector;
+        let profile = engine.signing_profile;
+        let message = profile.timeout_message(tc_view);
+        let mut collector = TimeoutCollector::new(tc_view, vs.len());
+        for i in 0..vs.quorum_size() as u32 {
+            collector
+                .add_verified_timeout(
+                    i,
+                    profile.sign(&sks[i as usize], &message),
+                    QuorumCertificate::genesis(),
+                )
+                .unwrap();
+        }
+        let timeout_cert = collector.build_tc_with_profile(vs, profile).unwrap();
+        ConsensusEvent::Message(ConsensusMessage::NewView(
+            n42_primitives::consensus::NewView {
+                view,
+                timeout_cert,
+                leader,
+                signature: profile.sign(&sks[leader as usize], &profile.new_view_message(view)),
+            },
+        ))
+    }
+
+    /// The local timer fires in the current view, then the other validators'
+    /// timeouts arrive until a TC forms and the engine leaves the view.
+    fn am33_time_out_view(
+        engine: &mut ConsensusEngine,
+        sks: &[n42_primitives::BlsSecretKey],
+        rx: &mut mpsc::Receiver<EngineOutput>,
+    ) {
+        let view = engine.current_view();
+        engine.on_timeout().expect("own timeout");
+        let me = engine.my_index;
+        for sender in (0..sks.len() as u32).filter(|s| *s != me) {
+            if engine.current_view() != view {
+                break;
+            }
+            let event = am33_timeout_message(engine, view, sender, sks);
+            engine.process_event(event).expect("timeout");
+            while rx.try_recv().is_ok() {}
+        }
+        while rx.try_recv().is_ok() {}
+        assert_ne!(
+            engine.current_view(),
+            view,
+            "a TC must form for view {view}"
+        );
+    }
+
+    /// A Decide (commit QC) for the current view.
+    fn am33_decide_view(
+        engine: &mut ConsensusEngine,
+        sks: &[n42_primitives::BlsSecretKey],
+        vs: &ValidatorSet,
+        rx: &mut mpsc::Receiver<EngineOutput>,
+    ) {
+        let view = engine.current_view();
+        let block_hash = B256::from(alloy_primitives::U256::from(view).to_be_bytes::<32>());
+        let commit_qc = am33_qc(engine, view, block_hash, true, sks, vs);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                view,
+                block_hash,
+                commit_qc,
+                validator_changes_hash: B256::ZERO,
+            })))
+            .expect("decide");
+        while rx.try_recv().is_ok() {}
+        assert!(engine.current_view() > view, "a Decide leaves view {view}");
+    }
+
+    fn am33_ms(duration: std::time::Duration) -> u64 {
+        duration.as_millis() as u64
+    }
+
+    /// gov5's AM33 vector (`testdata/profile1/gov5/AM33/timeout_backoff.json`,
+    /// all 29 runs) replayed on one Profile-1 engine that is none of the
+    /// silent leaders: the silent views end in a TC formed from the other
+    /// validators' timeouts, the live view in a Decide. On entering each view
+    /// the engine holds the step's leader and `c`, and its timer is armed at
+    /// the step's timeout; the TC views' timers sum to `gapMs`. The same runs
+    /// on an engine of another line (no Profile 1) keep the pre-AM33 rule
+    /// (`previousRuleGapMs`).
+    #[test]
+    fn am33_vector_runs_on_engine() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/profile1/gov5/AM33/timeout_backoff.json");
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).expect("AM33 vector")).expect("json");
+        let num = |x: &serde_json::Value| x.as_u64().expect("number");
+        let runs = v["runs"].as_array().expect("runs");
+        assert_eq!(runs.len(), 29);
+        for run in runs {
+            let id = run["id"].as_str().expect("id");
+            let n = num(&run["n"]) as usize;
+            let dead: Vec<u64> = run["deadLeaders"]
+                .as_array()
+                .expect("dead")
+                .iter()
+                .map(num)
+                .collect();
+            let observer = (0..n as u64).find(|i| !dead.contains(i)).expect("observer") as u32;
+            for profile1 in [true, false] {
+                let rule = if profile1 { "AM33" } else { "previous" };
+                let (mut engine, sks, vs, mut rx) = am33_engine(
+                    n,
+                    observer,
+                    (num(&run["baseTimeoutMs"]), num(&run["maxTimeoutMs"])),
+                    num(&run["epochLength"]),
+                    num(&run["tenure"]),
+                    profile1,
+                );
+                let start = num(&run["startView"]);
+                if start > engine.current_view() {
+                    engine.advance_to_view(start).expect("start view");
+                }
+                while rx.try_recv().is_ok() {}
+                let group = if profile1 {
+                    Pacemaker::backoff_group_size(n)
+                } else {
+                    1
+                };
+                let mut gap = 0;
+                for (i, step) in run["steps"].as_array().expect("steps").iter().enumerate() {
+                    let what = format!("{id} ({rule}) step {i}");
+                    assert_eq!(engine.current_view(), num(&step["view"]), "{what}: view");
+                    assert_eq!(
+                        u64::from(engine.current_leader_index()),
+                        num(&step["leader"]),
+                        "{what}: leader"
+                    );
+                    assert_eq!(engine.pacemaker().backoff_group(), group, "{what}: g");
+                    let armed = am33_ms(engine.pacemaker().armed_timeout());
+                    if profile1 {
+                        assert_eq!(
+                            u64::from(engine.consecutive_timeouts()),
+                            num(&step["c"]),
+                            "{what}: c on entry"
+                        );
+                        assert_eq!(armed, num(&step["timeoutMs"]), "{what}: timer");
+                    }
+                    if step["event"] == "TC" {
+                        gap += armed;
+                        am33_time_out_view(&mut engine, &sks, &mut rx);
+                    } else {
+                        assert_eq!(step["event"], "QC", "{what}");
+                        am33_decide_view(&mut engine, &sks, &vs, &mut rx);
+                        assert_eq!(
+                            engine.consecutive_timeouts(),
+                            0,
+                            "{what}: a commit resets c"
+                        );
+                        assert_eq!(
+                            am33_ms(engine.pacemaker().armed_timeout()),
+                            num(&run["baseTimeoutMs"]),
+                            "{what}: the view after the commit starts at base"
+                        );
+                    }
+                    assert_eq!(
+                        engine.current_view(),
+                        num(&step["nextView"]),
+                        "{what}: next view"
+                    );
+                }
+                let expected = if profile1 {
+                    &run["gapMs"]
+                } else {
+                    &run["previousRuleGapMs"]
+                };
+                assert_eq!(gap, num(expected), "{id} ({rule}): gap");
+            }
+        }
+    }
+
+    /// AM33: a TC never resets `c`, a TC carried in a NewView included (the
+    /// counterpart of gov5's SyncInfo TC, whose reset gov5 dropped); and a
+    /// view entered on someone else's TC, without a local timeout, does not
+    /// count. n = 7: g = 3.
+    #[test]
+    fn am33_a_tc_in_a_new_view_keeps_the_timeout_count() {
+        let base = 6000;
+        let (mut engine, sks, vs, mut rx) = am33_engine(7, 6, (base, 30_000), 0, 1, true);
+        engine.on_timeout().expect("own timeout at view 1");
+        engine.on_timeout().expect("a repeat is not a new timeout");
+        while rx.try_recv().is_ok() {}
+        assert_eq!(engine.consecutive_timeouts(), 1);
+
+        let new_view = am33_new_view(&engine, 2, 1, 2, &sks, &vs);
+        engine.process_event(new_view).expect("NewView for view 2");
+        assert_eq!(engine.current_view(), 2);
+        assert_eq!(
+            engine.consecutive_timeouts(),
+            1,
+            "a NewView's TC never resets c"
+        );
+        assert_eq!(engine.pacemaker().backoff_group(), 3);
+        assert_eq!(am33_ms(engine.pacemaker().armed_timeout()), base);
+
+        // View 2 ends on the fleet's TC before this node's timer fires.
+        let new_view = am33_new_view(&engine, 3, 2, 3, &sks, &vs);
+        engine.process_event(new_view).expect("NewView for view 3");
+        assert_eq!(engine.current_view(), 3);
+        assert_eq!(
+            engine.consecutive_timeouts(),
+            1,
+            "only local timeouts count"
+        );
+
+        am33_time_out_view(&mut engine, &sks, &mut rx);
+        am33_time_out_view(&mut engine, &sks, &mut rx);
+        assert_eq!(engine.current_view(), 5);
+        assert_eq!(engine.consecutive_timeouts(), 3);
+        assert_eq!(am33_ms(engine.pacemaker().armed_timeout()), 2 * base);
+    }
+
+    /// AM33: a QC-based view jump resets `c`, and the next view starts at base.
+    /// n = 4: g = 2.
+    #[test]
+    fn am33_a_qc_view_jump_resets_the_backoff() {
+        let base = 1000;
+        let (mut engine, sks, vs, mut rx) = am33_engine(4, 0, (base, 60_000), 0, 1, true);
+        // Views 1..3: leaders 1, 2, 3 are absent.
+        for _ in 0..3 {
+            am33_time_out_view(&mut engine, &sks, &mut rx);
+        }
+        assert_eq!(engine.current_view(), 4);
+        assert_eq!(engine.consecutive_timeouts(), 3);
+        assert_eq!(am33_ms(engine.pacemaker().armed_timeout()), 2 * base);
+
+        let far_view = 100u64;
+        let block_hash = B256::repeat_byte(0xDD);
+        let justify_qc = am33_qc(&engine, 99, B256::repeat_byte(0xDE), false, &sks, &vs);
+        let msg = engine
+            .signing_profile
+            .proposal_message(far_view, block_hash, &None);
+        let leader = engine.leader_index_for_view(far_view);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Proposal(
+                n42_primitives::consensus::Proposal {
+                    view: far_view,
+                    block_hash,
+                    justify_qc,
+                    proposer: leader,
+                    signature: engine.signing_profile.sign(&sks[leader as usize], &msg),
+                    prepare_qc: None,
+                    tx_root_hash: None,
+                    validator_changes: None,
+                },
+            )))
+            .expect("QC view jump");
+        assert_eq!(engine.current_view(), far_view);
+        assert_eq!(engine.consecutive_timeouts(), 0);
+        assert_eq!(am33_ms(engine.pacemaker().armed_timeout()), base);
+    }
+
+    /// The other lines (no Profile 1) keep the pre-AM33 rule: group 1, one
+    /// doubling per timeout.
+    #[test]
+    fn am33_other_lines_keep_one_doubling_per_timeout() {
+        let base = 1000;
+        let (mut engine, sks, _, mut rx) = am33_engine(7, 0, (base, 60_000), 0, 1, false);
+        for expected in [2 * base, 4 * base, 8 * base] {
+            am33_time_out_view(&mut engine, &sks, &mut rx);
+            assert_eq!(engine.pacemaker().backoff_group(), 1);
+            assert_eq!(am33_ms(engine.pacemaker().armed_timeout()), expected);
+        }
+    }
+
+    /// AM34 item 3 (v1.2) in the engine: at view 2^64-1 a member neither
+    /// proposes, votes nor signs a timeout; a timeout, proposal or NewView
+    /// whose certificate would be for that view is refused, and nothing
+    /// moves a member back to view 0.
+    #[test]
+    fn am34_engine_refuses_the_last_view() {
+        use crate::protocol::quorum::{AM34_LAST_VIEW, timeout_signing_message};
+        use n42_primitives::consensus::{NewView, Proposal, TimeoutCertificate, TimeoutMessage};
+
+        const LAST: ViewNumber = ViewNumber::MAX;
+        let am34 = |result: ConsensusResult<()>| match result {
+            Err(ConsensusError::InvalidQC { view, reason })
+            | Err(ConsensusError::InvalidTC { view, reason }) => {
+                view == LAST && reason == AM34_LAST_VIEW
+            }
+            _ => false,
+        };
+        let signed_outputs = |rx: &mut mpsc::Receiver<EngineOutput>| {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|output| {
+                    matches!(
+                        output,
+                        EngineOutput::BroadcastMessage(
+                            ConsensusMessage::Proposal(_)
+                                | ConsensusMessage::Vote(_)
+                                | ConsensusMessage::Timeout(_)
+                        ) | EngineOutput::SendToValidator(
+                            _,
+                            ConsensusMessage::Vote(_) | ConsensusMessage::Timeout(_)
+                        )
+                    )
+                })
+                .count()
+        };
+
+        // The leader of the last view (tenure 1, n = 4: 2^64-1 mod 4 = 3).
+        let (mut leader, sks, vs, mut rx) = make_engine(4, 3);
+        leader.set_leader_schedule(rotation(false));
+        leader.advance_to_view(LAST).unwrap();
+        assert_eq!(leader.current_view(), LAST);
+        assert!(leader.is_current_leader());
+        while rx.try_recv().is_ok() {}
+        leader.on_block_ready(B256::repeat_byte(0x34), None).unwrap();
+        leader.on_timeout().unwrap();
+        assert_eq!(signed_outputs(&mut rx), 0, "nothing is signed in the last view");
+        assert_eq!(leader.current_view(), LAST, "no view follows the last one");
+
+        // A follower at the last view: a timeout for it and a proposal in it
+        // are refused.
+        let (mut follower, _, _, mut rx) = make_engine(4, 0);
+        follower.set_leader_schedule(rotation(false));
+        follower.advance_to_view(LAST).unwrap();
+        while rx.try_recv().is_ok() {}
+        let timeout = TimeoutMessage {
+            view: LAST,
+            high_qc: QuorumCertificate::genesis(),
+            sender: 1,
+            signature: sks[1].sign(&timeout_signing_message(LAST)),
+        };
+        assert!(am34(follower.process_event(ConsensusEvent::Message(
+            ConsensusMessage::Timeout(timeout)
+        ))));
+        let block = B256::repeat_byte(0x35);
+        let message = ConsensusSigningProfile::Native.proposal_message(LAST, block, &None);
+        let proposal = Proposal {
+            view: LAST,
+            block_hash: block,
+            justify_qc: QuorumCertificate::genesis(),
+            proposer: 3,
+            signature: sks[3].sign(&message),
+            prepare_qc: None,
+            tx_root_hash: None,
+            validator_changes: None,
+        };
+        assert!(am34(follower.process_event(ConsensusEvent::Message(
+            ConsensusMessage::Proposal(proposal)
+        ))));
+        assert_eq!(signed_outputs(&mut rx), 0, "no vote for the last view");
+
+        // A member at view 1 refuses a NewView whose TC is for the last view
+        // (a quorum signed it; the collector would not have formed it).
+        let (mut member, _, _, _rx) = make_engine(4, 2);
+        member.set_leader_schedule(rotation(false));
+        let msg = timeout_signing_message(LAST);
+        let sigs: Vec<_> = (0..3).map(|i| sks[i].sign(&msg)).collect();
+        let mut signers = bitvec::bitvec![u8, bitvec::order::Msb0; 0; vs.len() as usize];
+        for i in 0..3 {
+            signers.set(i, true);
+        }
+        let tc = TimeoutCertificate {
+            view: LAST,
+            aggregate_signature: n42_primitives::bls::AggregateSignature::aggregate(
+                &sigs.iter().collect::<Vec<_>>(),
+            )
+            .unwrap(),
+            signers,
+            high_qc: QuorumCertificate::genesis(),
+        };
+        for nv_view in [LAST, 0, 2] {
+            let leader_index = (nv_view % 4) as u32;
+            let new_view = NewView {
+                view: nv_view,
+                timeout_cert: tc.clone(),
+                leader: leader_index,
+                signature: sks[leader_index as usize]
+                    .sign(&ConsensusSigningProfile::Native.new_view_message(nv_view)),
+            };
+            assert!(
+                am34(member.process_event(ConsensusEvent::Message(ConsensusMessage::NewView(
+                    new_view
+                )))),
+                "NewView for view {nv_view}"
+            );
+            assert_eq!(member.current_view(), 1);
+        }
+    }
+
 }

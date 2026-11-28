@@ -151,6 +151,10 @@ pub struct TransportConfig {
     pub quic_max_concurrent_streams: u32,
     /// Timeout for a negotiated block-direct request/response substream.
     pub block_direct_request_timeout: Duration,
+    /// On a standard-profile-1 chain, its `maxBlockBytes` (B15). The gossip
+    /// router then runs gov5's parameters (G4, vector V9) with the size cap
+    /// derived from it, and the mesh settings above are not used.
+    pub profile1_max_block_bytes: Option<u64>,
 }
 
 impl TransportConfig {
@@ -228,6 +232,7 @@ impl TransportConfig {
             quic_max_connection_data,
             quic_max_concurrent_streams,
             block_direct_request_timeout,
+            profile1_max_block_bytes: None,
         }
     }
 }
@@ -368,6 +373,7 @@ impl Default for TransportConfig {
             block_direct_request_timeout: Duration::from_millis(
                 DEFAULT_BLOCK_DIRECT_REQUEST_TIMEOUT_MS,
             ),
+            profile1_max_block_bytes: None,
         }
     }
 }
@@ -426,6 +432,42 @@ pub fn deterministic_validator_peer_id(index: u32) -> eyre::Result<PeerId> {
         .to_peer_id())
 }
 
+/// The router configuration of a swarm: gov5's profile-1 values (V9) on a
+/// profile-1 chain, this node's own otherwise.
+fn gossipsub_config_for(
+    config: &TransportConfig,
+    enable_gov5_tcp: bool,
+    genesis_hash: B256,
+) -> eyre::Result<gossipsub::Config> {
+    if let Some(max_block_bytes) = config.profile1_max_block_bytes {
+        // Profile 1 is a gov5-wire chain: StrictNoSign needs the anonymous
+        // envelope, which only the gov5 transport publishes.
+        if !enable_gov5_tcp {
+            return Err(eyre::eyre!(
+                "a profile-1 swarm needs the gov5 transport (anonymous GossipSub envelope)"
+            ));
+        }
+        return crate::gossipsub::profile1::gossipsub_config(genesis_hash, max_block_bytes)
+            .map_err(|e| eyre::eyre!("profile-1 gossipsub config error: {e}"));
+    }
+    gossipsub::ConfigBuilder::default()
+        .heartbeat_interval(config.heartbeat_interval)
+        // Permissive: messages forwarded automatically after delivery.
+        // Application-level validation is in handle_gossipsub_message.
+        .validation_mode(gossipsub::ValidationMode::Permissive)
+        // High-throughput compact blocks can reach several MiB. Keep this in
+        // lockstep with per-topic receiver validation and the producer budget.
+        .max_transmit_size(MAX_GOSSIP_MESSAGE_SIZE)
+        .mesh_n(config.mesh_d)
+        .mesh_n_low(config.mesh_d_low)
+        .mesh_n_high(config.mesh_d_high)
+        .mesh_outbound_min(config.mesh_outbound_min)
+        .retain_scores(config.retain_scores)
+        .message_id_fn(message_id_fn(genesis_hash))
+        .build()
+        .map_err(|e| eyre::eyre!("gossipsub config error: {e}"))
+}
+
 /// Builds the swarm with an optional validator index for directed messaging.
 ///
 /// When set, the validator index is embedded in the Identify `agent_version`
@@ -446,22 +488,7 @@ fn build_swarm_with_transports(
     enable_gov5_tcp: bool,
     genesis_hash: B256,
 ) -> eyre::Result<Swarm<N42Behaviour>> {
-    let gossipsub_config = gossipsub::ConfigBuilder::default()
-        .heartbeat_interval(config.heartbeat_interval)
-        // Permissive: messages forwarded automatically after delivery.
-        // Application-level validation is in handle_gossipsub_message.
-        .validation_mode(gossipsub::ValidationMode::Permissive)
-        // High-throughput compact blocks can reach several MiB. Keep this in
-        // lockstep with per-topic receiver validation and the producer budget.
-        .max_transmit_size(MAX_GOSSIP_MESSAGE_SIZE)
-        .mesh_n(config.mesh_d)
-        .mesh_n_low(config.mesh_d_low)
-        .mesh_n_high(config.mesh_d_high)
-        .mesh_outbound_min(config.mesh_outbound_min)
-        .retain_scores(config.retain_scores)
-        .message_id_fn(message_id_fn(genesis_hash))
-        .build()
-        .map_err(|e| eyre::eyre!("gossipsub config error: {e}"))?;
+    let gossipsub_config = gossipsub_config_for(&config, enable_gov5_tcp, genesis_hash)?;
 
     let peer_id = keypair.public().to_peer_id();
 

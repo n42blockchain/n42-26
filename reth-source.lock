@@ -3,7 +3,7 @@
   "source": "https://github.com/paradigmxyz/reth",
   "upstream_tag": "v2.11.0",
   "upstream_commit": "b9abbcc1b982755baa9021e6874e2e58936ca65f",
-  "adapted_commit": "5a81f36296936cc9f1bda1142141861ced558bcf",
+  "adapted_commit": "61b79664195f5ffe61870f612620085ac00358d8",
   "patch_series": [
     {
       "name": "reth-qmdb-state-reader",
@@ -80,6 +80,10 @@
     {
       "name": "reth-sf-parallel-finalize",
       "commit": "5a81f36296936cc9f1bda1142141861ced558bcf"
+    },
+    {
+      "name": "reth-rocksdb-memtable-history",
+      "commit": "61b79664195f5ffe61870f612620085ac00358d8"
     }
   ],
   "workspace_dependency_versions": {

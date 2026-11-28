@@ -5,6 +5,14 @@ use super::round::Phase;
 use super::state_machine::{ConsensusEngine, EngineOutput};
 use crate::error::{ConsensusError, ConsensusResult};
 
+/// AM34 item 3: the refusal of a timeout or TC for view 2^64-1.
+fn am34_invalid_tc(view: u64) -> ConsensusError {
+    ConsensusError::InvalidTC {
+        view,
+        reason: super::quorum::AM34_LAST_VIEW.to_string(),
+    }
+}
+
 impl ConsensusEngine {
     /// Verifies and collects a timeout vote for a bounded future view.
     ///
@@ -17,6 +25,9 @@ impl ConsensusEngine {
         timeout: TimeoutMessage,
     ) -> ConsensusResult<bool> {
         let current_view = self.round_state.current_view();
+        if !crate::validator::certifiable_view(timeout.view) {
+            return Err(am34_invalid_tc(timeout.view));
+        }
         if timeout.view <= current_view
             || timeout.view > current_view.saturating_add(super::state_machine::FUTURE_VIEW_WINDOW)
         {
@@ -157,6 +168,14 @@ impl ConsensusEngine {
         self.check_signing_profile()?;
         let view = self.round_state.current_view();
 
+        // AM34 item 3: a TC for the last view is invalid, so no timeout is
+        // signed for it.
+        if !crate::validator::certifiable_view(view) {
+            tracing::error!(target: "n42::cl::timeout", view, "view 2^64-1 reached, not signing a timeout (AM34)");
+            self.arm_view_timer(view);
+            return Ok(());
+        }
+
         // Observer guard: if our local key is not a validator for this view
         // (or my_index is stale and points at someone else's key), do not
         // broadcast a timeout. Sending one would carry our signature under
@@ -170,8 +189,7 @@ impl ConsensusEngine {
                 "observer (or stale my_index): skipping timeout broadcast"
             );
             self.round_state.timeout();
-            self.pacemaker
-                .reset_for_view(view, self.round_state.consecutive_timeouts());
+            self.arm_view_timer(view);
             return Ok(());
         }
 
@@ -180,8 +198,7 @@ impl ConsensusEngine {
             // Re-broadcasting ensures validators who missed the first message (network
             // jitter, late join) can still collect our vote for TC formation.
             tracing::warn!(target: "n42::cl::timeout", view, "view timed out (repeat, re-broadcasting timeout)");
-            self.pacemaker
-                .reset_for_view(view, self.round_state.consecutive_timeouts());
+            self.arm_view_timer(view);
 
             let message = self.signing_profile.timeout_message(view);
             let signature = self.signing_profile.sign(&self.secret_key, &message);
@@ -213,14 +230,14 @@ impl ConsensusEngine {
         // Reset pacemaker BEFORE processing to prevent the select! loop from spinning
         // on a deadline that stays in the past. If process_timeout forms a TC and calls
         // advance_to_view, the pacemaker will be reset again — a harmless double reset.
-        self.pacemaker
-            .reset_for_view(view, self.round_state.consecutive_timeouts());
+        self.arm_view_timer(view);
 
         // Clear pending block data: similar to Tendermint's "prevote nil".
         self.pending_proposal = None;
         if !self.signing_profile.is_gov5() {
             self.imported_blocks.clear();
             self.imported_block_fifo.clear();
+            self.imported_parents.clear();
         }
 
         // Preserve any timeouts already collected from validators who timed out before us.
@@ -253,6 +270,10 @@ impl ConsensusEngine {
     /// timeout is never sufficient evidence to advance the local view.
     pub(super) fn process_timeout(&mut self, timeout: TimeoutMessage) -> ConsensusResult<()> {
         let view = self.round_state.current_view();
+
+        if !crate::validator::certifiable_view(timeout.view) {
+            return Err(am34_invalid_tc(timeout.view));
+        }
 
         if timeout.view < view {
             return Ok(());
@@ -364,6 +385,12 @@ impl ConsensusEngine {
     /// Processes a NewView message from the new leader.
     pub(super) fn process_new_view(&mut self, nv: NewView) -> ConsensusResult<()> {
         let view = self.round_state.current_view();
+
+        // AM34 item 3: a TC for the last view is invalid; refuse it before
+        // its (undefined) successor is computed.
+        if !crate::validator::certifiable_view(nv.timeout_cert.view) {
+            return Err(am34_invalid_tc(nv.timeout_cert.view));
+        }
 
         if nv.view <= view {
             return Ok(());

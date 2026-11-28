@@ -219,18 +219,33 @@ impl ConsensusEngine {
             prepare_qc_msg,
         )))?;
 
-        // Leader self-vote for CommitVote (Round 2). Bind to the same
-        // changes_hash on_block_ready cached so this self-vote signs the
-        // same domain as every follower's commit vote.
+        self.cast_leader_commit_self_vote(view, block_hash)
+    }
+
+    /// The leader's Round-2 self-vote for `block_hash` in `view`, after its
+    /// PrepareQC formed. Bound to the same changes_hash `on_block_ready`
+    /// cached so it signs the same domain as every follower's commit vote.
+    /// AM35: gated on the block's durability like every other R2 vote; held
+    /// (and retried on `BlockDataStaged`) while the block data is not here.
+    pub(super) fn cast_leader_commit_self_vote(
+        &mut self,
+        view: u64,
+        block_hash: B256,
+    ) -> ConsensusResult<()> {
+        if view != self.round_state.current_view() || self.prepare_qc.is_none() {
+            return Ok(());
+        }
         if !self.round_state.may_commit_vote_in(view) {
             tracing::warn!(target: "n42::cl::voting", view,
                 last_commit_voted = self.round_state.last_commit_voted_view(),
                 "leader already cast a commit vote in this view; suppressing R2 self-vote");
             return Ok(());
         }
-        self.vote_log.record_lock(self.round_state.locked_qc())?;
-        self.round_state.record_commit_vote(view);
-        self.vote_log.record_commit_vote(view)?;
+        if let Some(missing) = self.persist_before_commit_vote(view, block_hash, "leader")? {
+            tracing::info!(target: "n42::cl::voting", view, %block_hash, %missing, "holding the leader commit self-vote until the block can be made durable");
+            self.held_self_commit_vote = Some((view, block_hash));
+            return Ok(());
+        }
         let changes_hash = self.cached_changes_hash(&block_hash);
         let commit_msg = self
             .signing_profile
@@ -382,6 +397,7 @@ impl ConsensusEngine {
             "block committed!");
 
         self.round_state.commit(commit_qc.clone());
+        self.advance_durable_lock_on_commit(&commit_qc);
 
         // The Decide must carry the hash the commit votes signed. Changes queued
         // after the proposal stay pending for a later block; staging them here
