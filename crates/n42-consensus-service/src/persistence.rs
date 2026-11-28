@@ -515,6 +515,10 @@ pub fn higher_lock(
 pub struct FileVoteLog {
     path: PathBuf,
     file: Mutex<File>,
+    /// AM35: the block journal an R2 vote's block is made durable in before
+    /// the lock is written. `None` only where AM35 is explicitly off (never
+    /// on Profile 1) and in tests.
+    block_journal: Option<std::sync::Arc<crate::block_journal::BlockJournal>>,
 }
 
 impl std::fmt::Debug for FileVoteLog {
@@ -569,7 +573,18 @@ impl FileVoteLog {
         Ok(Self {
             path,
             file: Mutex::new(file),
+            block_journal: None,
         })
+    }
+
+    /// Makes every R2 vote wait until its block is durable in `journal`
+    /// (AM35). See [`VoteLogWriter::ensure_block_durable`].
+    pub fn with_block_journal(
+        mut self,
+        journal: std::sync::Arc<crate::block_journal::BlockJournal>,
+    ) -> Self {
+        self.block_journal = Some(journal);
+        self
     }
 
     fn record_at(&self, offset: u64, view: u64) -> ConsensusResult<()> {
@@ -588,6 +603,43 @@ impl FileVoteLog {
 impl VoteLogWriter for FileVoteLog {
     fn record_vote(&self, view: u64) -> ConsensusResult<()> {
         self.record_at(0, view)
+    }
+
+    fn ensure_block_durable(
+        &self,
+        view: u64,
+        block_hash: B256,
+    ) -> ConsensusResult<n42_consensus::BlockDurability> {
+        let Some(journal) = self.block_journal.as_ref() else {
+            return Ok(n42_consensus::BlockDurability::Durable);
+        };
+        match journal.ensure_durable(block_hash) {
+            Ok(crate::block_journal::Durability::Durable(stats)) => {
+                if stats.blocks > 0 {
+                    tracing::debug!(
+                        target: "n42::cl::block_journal",
+                        view,
+                        %block_hash,
+                        blocks = stats.blocks,
+                        bytes = stats.bytes,
+                        write_us = stats.write_us,
+                        fdatasync_us = stats.sync_us,
+                        "R2 block made durable"
+                    );
+                }
+                crate::qualification_abort_at("block_journal_synced");
+                Ok(n42_consensus::BlockDurability::Durable)
+            }
+            Ok(crate::block_journal::Durability::Unavailable { missing }) => {
+                Ok(n42_consensus::BlockDurability::Unavailable { missing })
+            }
+            Err(error) => {
+                tracing::error!(target: "n42::cl::block_journal", view, %block_hash, %error, "cannot make the R2 block durable; the commit vote is not signed");
+                Err(ConsensusError::VoteLogFsync(format!(
+                    "block journal for {block_hash}: {error}"
+                )))
+            }
+        }
     }
 
     fn record_commit_vote(&self, view: u64) -> ConsensusResult<()> {

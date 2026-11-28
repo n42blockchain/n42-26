@@ -51,6 +51,7 @@ reth-rpc-server-types.workspace = true
 reth-storage-api.workspace = true
 reth-provider.workspace = true
 reth-db-common.workspace = true
+reth-db = { workspace = true, features = ["mdbx"] }
 reth-db-api.workspace = true
 reth-cli.workspace = true
 reth-cli-commands.workspace = true

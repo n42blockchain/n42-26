@@ -139,7 +139,7 @@ impl ConsensusService {
     }
 
     /// Builds a snapshot of the current consensus state for persistence.
-    fn build_snapshot(&self) -> ConsensusSnapshot {
+    pub(super) fn build_snapshot(&self) -> ConsensusSnapshot {
         let em = self.engine.epoch_manager();
         let current_epoch_validators = if em.epochs_enabled() {
             let vs = em.current_validator_set();
@@ -154,7 +154,11 @@ impl ConsensusService {
         ConsensusSnapshot {
             version: 5,
             current_view: self.engine.current_view(),
-            locked_qc: self.engine.locked_qc().clone(),
+            // AM35: only a lock record_lock already made durable, after its
+            // block. The in-memory lock may name a block no member journalled
+            // (a PrepareQC whose R2 is still held, a justify QC, a TC's high
+            // QC); a whole-set restart adopting it would halt on that block.
+            locked_qc: self.engine.durable_locked_qc().clone(),
             last_committed_qc: self.engine.last_committed_qc().clone(),
             consecutive_timeouts: self.engine.consecutive_timeouts(),
             scheduled_epoch_transition: self.collect_scheduled_epoch(),

@@ -82,6 +82,7 @@ impl ConsensusEngine {
 
         self.round_state.update_locked_qc(&decide.commit_qc);
         self.round_state.commit(decide.commit_qc.clone());
+        self.advance_durable_lock_on_commit(&decide.commit_qc);
 
         // Commit-then-Activate: only commit/stage validator changes when the decided
         // block actually carried them (hash != ZERO).  Gating on the Decide hash
