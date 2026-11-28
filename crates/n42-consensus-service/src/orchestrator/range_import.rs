@@ -13,6 +13,15 @@
 //!
 //! `N42_RANGE_PIPELINE=<n>`: payloads prepared and admitted ahead of the
 //! engine (default 4, at most 32); `0` keeps the serial path.
+//!
+//! Stage 2: the pipelined path also verifies the transaction senders of the
+//! next `N42_RANGE_SENDER_AHEAD` blocks (default 8, at most 32; `0` off)
+//! ahead of the engine, on the execution layer's own small pool
+//! ([`n42_execution::SenderWarmup`]), into the caches the engine's payload
+//! conversion reads. The window counts from the block the engine is on, so
+//! the entries waiting for the engine stay bounded whatever the reply size.
+//! Only verified senders are cached; a block with a bad signature meets the
+//! engine's own verification and is refused as before.
 
 use super::BlockDataBroadcast;
 use super::ConsensusService;
@@ -28,6 +37,25 @@ use tracing::{error, info, warn};
 
 /// Default depth of the pipelined import.
 const DEFAULT_RANGE_PIPELINE_DEPTH: usize = 4;
+
+/// Default sender warm-up window, in blocks ahead of the engine.
+const DEFAULT_RANGE_SENDER_AHEAD: usize = 8;
+
+/// Largest sender warm-up window: at ~1,200 transactions a block, 32 blocks
+/// are ~38k entries of the 131,072-entry secp256k1 cache.
+pub(super) const MAX_RANGE_SENDER_AHEAD: usize = 32;
+
+/// `N42_RANGE_SENDER_AHEAD`, read once.
+pub(super) fn range_sender_ahead_from_env() -> usize {
+    static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *AHEAD.get_or_init(|| {
+        std::env::var("N42_RANGE_SENDER_AHEAD")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_RANGE_SENDER_AHEAD)
+            .min(MAX_RANGE_SENDER_AHEAD)
+    })
+}
 
 /// `N42_RANGE_PIPELINE`, read once.
 pub(super) fn range_pipeline_depth_from_env() -> usize {
@@ -70,10 +98,13 @@ pub(super) enum Stage {
     Prep,
     /// Pipelined path, off the loop: `new_payload` as the submitter saw it.
     Engine,
+    /// Pipelined path, off the loop: sender verification ahead of the
+    /// engine (decode included), per block.
+    Warm,
 }
 
 impl Stage {
-    const ALL: [Stage; 11] = [
+    pub(super) const ALL: [Stage; 12] = [
         Stage::Decode,
         Stage::Admit,
         Stage::Build,
@@ -85,6 +116,7 @@ impl Stage {
         Stage::Gap,
         Stage::Prep,
         Stage::Engine,
+        Stage::Warm,
     ];
 
     pub(super) const fn as_str(self) -> &'static str {
@@ -100,13 +132,14 @@ impl Stage {
             Stage::Gap => "gap",
             Stage::Prep => "prep",
             Stage::Engine => "engine",
+            Stage::Warm => "warm",
         }
     }
 
     /// Off the loop: overlapped with the loop's stages, not part of the
     /// wall-time sum.
     const fn overlapped(self) -> bool {
-        matches!(self, Stage::Prep | Stage::Engine)
+        matches!(self, Stage::Prep | Stage::Engine | Stage::Warm)
     }
 }
 
@@ -119,6 +152,14 @@ pub(super) struct CatchupTimings {
     blocks: u64,
     batches: u64,
     fcus: u64,
+    /// Senders the engine's payload conversion found cached, and verified
+    /// itself, during the run's batches (process-wide counters, so another
+    /// import running at the same time is counted too).
+    engine_sender_hits: u64,
+    engine_sender_misses: u64,
+    /// Senders verified ahead of the engine, and those that failed there.
+    warmed: u64,
+    warm_failed: u64,
     started: Option<Instant>,
     last_end: Option<Instant>,
     /// Open batch: its start and the loop-side stage time recorded in it.
@@ -177,6 +218,28 @@ impl CatchupTimings {
         self.fcus += 1;
     }
 
+    /// The engine's sender lookups during one batch.
+    pub(super) fn note_engine_senders(&mut self, counts: n42_execution::PayloadSenderCounts) {
+        self.engine_sender_hits += counts.hits;
+        self.engine_sender_misses += counts.misses;
+        counter!("n42_range_catchup_engine_senders_total", "cache" => "hit").increment(counts.hits);
+        counter!("n42_range_catchup_engine_senders_total", "cache" => "miss")
+            .increment(counts.misses);
+    }
+
+    /// One block's sender warm-up.
+    fn note_warm(&mut self, stats: n42_execution::WarmStats, elapsed: Duration) {
+        self.record(Stage::Warm, elapsed);
+        self.warmed += stats.recovered as u64;
+        self.warm_failed += stats.failed as u64;
+        counter!("n42_range_catchup_warmed_senders_total", "outcome" => "recovered")
+            .increment(stats.recovered as u64);
+        counter!("n42_range_catchup_warmed_senders_total", "outcome" => "cached")
+            .increment(stats.cached as u64);
+        counter!("n42_range_catchup_warmed_senders_total", "outcome" => "failed")
+            .increment(stats.failed as u64);
+    }
+
     /// Logs the run's breakdown and starts a new run.
     pub(super) fn log_and_reset(&mut self, head: u64) {
         let (Some(started), Some(ended)) = (self.started, self.last_end) else {
@@ -205,6 +268,10 @@ impl CatchupTimings {
             blocks = self.blocks,
             batches = self.batches,
             fcus = self.fcus,
+            engine_sender_hits = self.engine_sender_hits,
+            engine_sender_misses = self.engine_sender_misses,
+            warmed = self.warmed,
+            warm_failed = self.warm_failed,
             wall_ms = format!("{wall_ms:.0}"),
             ms_per_block = format!("{:.2}", wall_ms / blocks),
             attributed_ms = format!("{attributed:.0}"),
@@ -217,6 +284,16 @@ impl CatchupTimings {
     #[cfg(test)]
     pub(super) fn total_ms(&self, stage: Stage) -> f64 {
         self.totals_ms[stage as usize]
+    }
+
+    #[cfg(test)]
+    pub(super) fn engine_senders(&self) -> (u64, u64) {
+        (self.engine_sender_hits, self.engine_sender_misses)
+    }
+
+    #[cfg(test)]
+    pub(super) fn warmed(&self) -> (u64, u64) {
+        (self.warmed, self.warm_failed)
     }
 
     #[cfg(test)]
@@ -242,6 +319,68 @@ pub(super) enum BatchEnd {
     Return,
     /// A block failed and the client stopped.
     Stop(Deactivation),
+}
+
+/// How far the engine is through a batch: the window of the sender
+/// warm-up counts from here.
+#[derive(Default)]
+struct EngineProgress {
+    /// Blocks of the batch the engine has answered, and whether the batch
+    /// is over.
+    state: std::sync::Mutex<(usize, bool)>,
+    changed: std::sync::Condvar,
+}
+
+impl EngineProgress {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (usize, bool)> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The engine has answered the first `count` blocks.
+    fn answered(&self, count: usize) {
+        let mut state = self.lock();
+        state.0 = state.0.max(count);
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    /// The batch is over: the warm-up stops.
+    fn stop(&self) {
+        self.lock().1 = true;
+        self.changed.notify_all();
+    }
+
+    /// Blocks until block `index` is inside the window of `window` blocks
+    /// from the one the engine is on. `Some(true)`: warm it; `Some(false)`:
+    /// the engine is already past it; `None`: the batch is over.
+    fn wait_for(&self, index: usize, window: usize) -> Option<bool> {
+        let mut state = self.lock();
+        loop {
+            let (answered, stopped) = *state;
+            if stopped {
+                return None;
+            }
+            if index < answered + window {
+                return Some(index >= answered);
+            }
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+
+/// Stops the warm-up when the batch ends, however it ends (a dropped
+/// future included), so its blocking thread never waits on for good.
+struct StopWarmup(std::sync::Arc<EngineProgress>);
+
+impl Drop for StopWarmup {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
 }
 
 /// A block made ready off the loop.
@@ -430,23 +569,54 @@ impl ConsensusService {
         // Decode and payload build, ahead of the engine, on the blocking
         // pool. The bounded channel keeps it at most `depth` blocks ahead
         // of the loop; it stops at its next send once the loop is done.
-        let rlps: Vec<Vec<u8>> = ready
-            .iter_mut()
-            .map(|block| std::mem::take(&mut block.rlp))
-            .collect();
+        let rlps: std::sync::Arc<Vec<Vec<u8>>> = std::sync::Arc::new(
+            ready
+                .iter_mut()
+                .map(|block| std::mem::take(&mut block.rlp))
+                .collect(),
+        );
         drop(ready);
+        let progress = std::sync::Arc::new(EngineProgress::default());
+        let stop_warmup = StopWarmup(progress.clone());
+        let (warm_tx, warm_rx) = std::sync::mpsc::channel::<(n42_execution::WarmStats, Duration)>();
+        if let Some(warmup) = el.sender_warmup().filter(|_| self.range_sender_ahead > 0) {
+            // Sender verification for the blocks inside the window, ahead
+            // of the engine, on the warm-up's own pool. Its own decode keeps
+            // it independent of the payload worker's shorter lead.
+            let (rlps, progress, window) =
+                (rlps.clone(), progress.clone(), self.range_sender_ahead);
+            tokio::task::spawn_blocking(move || {
+                for (index, rlp) in rlps.iter().enumerate() {
+                    match progress.wait_for(index, window) {
+                        None => break,
+                        Some(false) => continue,
+                        Some(true) => {}
+                    }
+                    let started = Instant::now();
+                    // A block that does not decode fails in the payload
+                    // worker; there is nothing to warm.
+                    let Ok(block) = n42_network::decode_block_rlp_for(rlp, profile1) else {
+                        continue;
+                    };
+                    let stats = warmup.warm(&block.transactions);
+                    if warm_tx.send((stats, started.elapsed())).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
         let (prep_tx, mut prep_rx) = mpsc::channel::<(Prepared, Duration)>(depth);
+        let prep_rlps = rlps.clone();
         tokio::task::spawn_blocking(move || {
-            for (index, rlp) in rlps.into_iter().enumerate() {
+            for (index, rlp) in prep_rlps.iter().enumerate() {
                 let started = Instant::now();
-                let outcome = n42_network::decode_block_rlp_for(&rlp, profile1)
+                let outcome = n42_network::decode_block_rlp_for(rlp, profile1)
                     .map_err(|error| PrepError::Decode(error.to_string()))
                     .and_then(|block| {
                         crate::replay_import::build_gov5_gossip_execution_data(&block)
                             .map(|data| (block, data))
                             .map_err(|error| PrepError::Build(error.to_string()))
                     });
-                drop(rlp);
                 if prep_tx
                     .blocking_send((Prepared { index, outcome }, started.elapsed()))
                     .is_err()
@@ -463,12 +633,14 @@ impl ConsensusService {
         // engine validates one block at a time in any case.
         let (submit_tx, mut submit_rx) = mpsc::channel::<(usize, ExecutionData)>(depth);
         let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let submitter_progress = progress.clone();
         let submitter = tokio::spawn(async move {
             while let Some((index, data)) = submit_rx.recv().await {
                 let started = Instant::now();
                 let result = el
                     .new_payload_for(ExecutionPath::HISTORICAL_SEQUENTIAL, data)
                     .await;
+                submitter_progress.answered(index + 1);
                 let valid = matches!(&result, Ok(status) if matches!(status.status, PayloadStatusEnum::Valid));
                 if result_tx.send((index, result, started.elapsed())).is_err() || !valid {
                     break;
@@ -566,6 +738,11 @@ impl ConsensusService {
         drop(submit_tx);
         drop(prep_rx);
         submitter.abort();
+        drop(stop_warmup);
+        // What the warm-up finished; a block it is still on is left out.
+        for (stats, elapsed) in warm_rx.try_iter() {
+            self.catchup_timings.note_warm(stats, elapsed);
+        }
 
         // The head-advancing blocks of the valid prefix: a view above the
         // execution-validated view (and above every earlier block's in the

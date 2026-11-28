@@ -211,4 +211,12 @@ pub trait ExecutionLayer: Send + Sync + 'static {
     ) -> crate::deferred_check::DeferredCheck {
         crate::deferred_check::DeferredCheck::Unsupported
     }
+
+    /// Range catch-up (Stage 2 of `docs/devlog-195`): verifies transaction
+    /// senders into the caches this layer's payload conversion reads, ahead
+    /// of the blocks' `new_payload`. `None` by default: the engine then
+    /// recovers every sender itself.
+    fn sender_warmup(&self) -> Option<std::sync::Arc<n42_execution::SenderWarmup>> {
+        None
+    }
 }

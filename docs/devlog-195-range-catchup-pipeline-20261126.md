@@ -235,3 +235,112 @@ Stages 1 and 2 touch only the CL and the payload conversion, and keep every reth
 as it is today. Stage 3 is the first change to the root-job contract and needs its own review.
 Expected end state: ~1.6× (≈70–75 blocks/s, ~85k tx/s at S1 block size), after which EVM execution
 (~10 ms/block) is the floor.
+
+---
+
+## Stage 2：发送者提前验证（选项 c）
+
+日期：2026-11-26　分支：`perf/profile1-catchup-sender-ahead`（基于 PR #53，6cb0953）
+
+### S2.1 现状核对
+
+- 引擎导入时确实读共享缓存。reth `payload_processor::spawn_tx_iterator` 对每笔交易调用 `N42EvmConfig::tx_iterator_for_payload` 给出的转换闭包，即 `recover_payload_transaction`：
+  - secp256k1 走 PR #50 的共享 `SenderRecoveryCache`（131072 项，直接映射，`recover` 命中即返回，失败不缓存）；
+  - 0x50 走 `AltSigSenderCache::global()`，未命中时再查已持有的 frame，最后自行验证并写入。
+- 引擎的恢复本身就是并行的：交易数 ≥ 30 时，先串行转换前 4 笔，再在 reth 的 `cpu_pool` 上按 64、128、256… 的指数窗口并行转换，执行线程按序消费。`transaction_wait` 记录的就是执行等转换的时间。所以追块时发送者恢复全部 miss，但多数时间与执行重叠，主要代价是首个窗口的等待，以及与 prewarm、state root 争用同一个 CPU 池。
+- 追块中的块从未经过本节点准入，两个缓存在 import 时都是 miss（设计说明 §1 已指出）。
+
+### S2.2 设计
+
+- **放在 n42-execution**：新模块 `crates/n42-execution/src/sender_warmup.rs`，即 `SenderWarmup`。consensus-service 不直接依赖 reth-evm，经 n42-execution 再导出 `SenderRecoveryCache`、`SenderWarmup`、`WarmStats`。
+- **专用小线程池**：自建 rayon 池，线程名 `n42-sender-ahead-*`。`N42_RANGE_SENDER_THREADS` 默认取核数的 1/4，夹在 1–4，上限 16。工作不进 reth 的 `cpu_pool` 或全局 rayon 队列，不会让引擎的转换任务排在它后面。代价是操作系统层面多出几条线程争用 CPU。
+- **secp256k1**：`cache.recover_with(tx, SignedTransaction::try_recover)`，与 `SenderRecoveryCache::recover` 是同一条路径：low-s 等规则不变，只缓存按交易自身哈希恢复出的发送者，失败不写入。闭包只在 miss 时运行，借此区分 cached 和 recovered。
+- **Ed25519（0x50）**：先过滤掉已在 `AltSigSenderCache` 中的交易，余下的按 `ed25519_batch_size()`（默认 64）分块，在池上并行执行 `n42_tx_types::verify_batch`。该函数的逐笔结论与单笔 `verify` 相同，批失败时退回逐笔验证。只写入 `Ok`。如果链未开启 0x50（`alt_sig_enabled()` 为假），跳过这类交易，因为引擎无论发送者如何都会拒绝该块。
+- **接口**：`ExecutionLayer::sender_warmup() -> Option<Arc<SenderWarmup>>`，默认返回 `None`。`RethExecutionLayer::with_sender_warmup` 由 `bin/n42-node` 在参与者 EL 上用同一个 `evm_config.inner().sender_recovery_cache` 构建。observer 和 delegated EL 不接入。
+- **窗口（相对引擎）**：仅在流水线路径中启用。每批新增一个 warm-up 协调线程（`spawn_blocking`），与 prep worker 共享 `Arc<Vec<RLP>>`，自己再解码一次，因此可以领先引擎超过 prep 的 depth。
+  - 推进条件：块 `index` 只有在 `index < answered + window` 时才处理，`answered` 为引擎已回复的块数。submitter 在每次 `new_payload` 返回后更新 `answered` 并 notify（`EngineProgress`：Mutex + Condvar）。
+  - 引擎已越过的块跳过。
+  - 批结束时，或 future 被丢弃时（`StopWarmup` 的 Drop），停止协调线程。
+  - 因此，在引擎处理块 n 时，缓存中最多有 n .. n+W-1 这些块的预热条目。`N42_RANGE_SENDER_AHEAD` 默认 8，上限 32（`MAX_RANGE_SENDER_AHEAD`），`0` 关闭。批本身最多 32 块，即使回复有 256 块，也不会一次灌入缓存。
+- **跨批**：窗口不跨批。每批第一块的预热与 prep 同时开始，而 prep 约 2 ms 后引擎就拿到这块，所以第一块通常只有部分命中。考虑过从 range 缓冲区预读下一批的 RLP，但需要复制或改为 `Arc` 存储，本轮不做。
+- **未采用**：
+  - 把恢复放进 decode lane（设计说明原文的位置）：那里看不到引擎进度，窗口无法相对引擎设限。
+  - 在 prep worker 内同步预热：prep 是单线程，预热会直接拖慢 prep（1200 笔 ECDSA 单线程约 30 ms）。
+
+### S2.3 计时与计数
+
+- 新增 overlapped 分段 `warm`：`n42_range_catchup_stage_ms{stage="warm"}`，按块计，包含解码，不计入墙钟之和。
+- `n42_range_catchup_warmed_senders_total{outcome=recovered|cached|failed}`。
+- 引擎侧命中率：
+  - `recover_payload_transaction` 的 secp256k1 分支新增计数，导出为 `n42_secp256k1_payload_sender_total{cache=hit|miss}`（与已有的 `n42_alt_sig_payload_sender_total` 并列）；
+  - `n42_execution::PayloadSenderCounts::now()` 汇总两类 hit/miss；
+  - `drive_range_catchup` 在每批前后取差值，计入 `n42_range_catchup_engine_senders_total{cache}`。
+- 汇总日志 `range catch-up import timings` 新增 `engine_sender_hits`、`engine_sender_misses`、`warmed`、`warm_failed`。注意这些是进程级计数器，同时进行的其他导入（如 follower import）也会计入。
+
+### S2.4 测量（本机 254 核；另有 live round 在跑，负载约 5–10）
+
+`range_catchup_ms_per_block_bench`（release），300 块 × 1,200 笔转账，mock engine 每块 sleep 17 ms。新增 `N42_RANGE_BENCH_RECOVER`：
+- `serial`：引擎先用真实的 `N42EvmConfig::recover_payload_transactions`（同一转换器、同一缓存，在全局 rayon 池上）恢复全部发送者，再 sleep；这是收益的上界。
+- `overlap`：恢复与 sleep 并行，相当于恢复完全被执行掩盖；这是收益的下界。
+- `off`：不恢复。
+
+`N42_RANGE_BENCH_SENDER_AHEAD` 设定窗口。用 taskset 模拟 16 核和 8 核主机，此时预热池为 4 或 2 线程。
+
+| 主机 | 引擎恢复模型 | 流水线，无预热（之前） | 流水线 + 预热 W=4 | W=16 | 引擎命中率（W=4 / W=16） |
+|---|---|---|---|---|---|
+| 254 核 | off | 18.24 | — | 18.23 | —（不恢复） |
+| 254 核 | serial | 20.41 | 20.65 | 20.20 | 93.5% / 85.0% |
+| 254 核 | overlap | 18.27 | — | 18.25 | — / 86.4% |
+| 16 核 | serial | 21.03 | **18.78** | 19.27 | 93.5% / 85.0% |
+| 16 核 | overlap | 18.23 | 18.25 | 18.24 | 93.5% / 85.3% |
+| 8 核 | serial | 23.35 | **19.00** | 18.98 | 96.2% / 96.2% |
+| 8 核 | overlap | 18.18 | 18.20 | 18.20 | 91.7% / 92.1% |
+
+单位为 ms/块（墙钟）。串行路径（depth 0）作参照：254 核 serial 为 22.51，16 核为 22.87，8 核为 24.91。
+
+254 核、serial 模型下的窗口扫描：W=2 时 20.90 ms（命中 96.8%），W=4 时 20.65（93.5%），W=8 时 20.54（89.0%），W=32 时 20.16（84.9%）。差异在噪声范围内。
+
+结论（如实）：
+- **本机（254 核）没有可测收益**。1,200 笔 ECDSA 在 254 核上并行恢复本来就很便宜，mock 中 serial 模型约 2.2 ms/块的开销主要来自 spawn_blocking、解码和 rayon 扇出，而不是 ecrecover；命中后这部分开销仍在。
+- **核数少时收益明显，但只在恢复不能被执行掩盖时**：16 核约 −2.3 ms/块，8 核约 −4.3 ms/块（serial 模型）。overlap 模型下在任何核数都是 0。真实 reth 介于两者之间：执行与恢复重叠，只等第一个窗口，但两者争用 `cpu_pool`。所以 S1 节点上的实际收益取决于其核数，以及 `transaction_wait` 和 `await_convert` 的实测值。设计说明估计的 0–3 ms 仍然成立。
+- **开启预热不拖慢关键路径**：off 模型（引擎不读缓存）下 18.24 对 18.23 ms。预热池在后台每块耗时约 10 ms（4 线程）或约 18 ms（2 线程），始终在关键路径之外。
+- **窗口越大命中率越低**。这是直接映射缓存的冲突逐出，不是因为容量不够：W=16 时窗口内约 19k 条目，占 131072 个槽，某条目在被引擎读到之前被同槽后来者顶掉的概率约为 1−e^(−19200/131072) ≈ 14%。W=4 时约 4%。预热池的速度本来就是引擎的 2 倍左右，所以领先 4–8 块已经足够。**默认窗口据此从 16 降到 8**（评审决定；可配置）。
+
+### S2.5 测试
+
+n42-execution `sender_warmup::tests`：
+- `warms_valid_senders_and_never_caches_a_failure`：
+  - 40 笔有效交易全部恢复，写入缓存的发送者等于 `try_recover` 的结果；
+  - 零签名和 high-s（可塑）签名的交易计为 failed，不写入缓存；
+  - 第二次运行时，有效交易计为 cached。
+- `warms_ed25519_senders_in_batches_without_caching_a_bad_one`：10 笔 0x50 交易批量验证后写入缓存，用他人密钥伪签的 1 笔不写入。
+
+n42-consensus-service：
+- `sender_warmup_keeps_the_import_identical_to_the_serial_one`：引擎真实恢复，120 块 × 8 笔，三种配置（串行 / 流水线 / 流水线 + 预热 W=16）：
+  - 每个高度恰好一次且按序；
+  - head、hash、execution-validated view 三者一致；
+  - 缓存中的发送者都等于该交易自己恢复出的发送者；
+  - 预热路径的 warmed ≥ 一半。
+- `a_bad_signature_mid_range_is_refused_at_the_same_block_with_the_warmup`：第 10 块最后一笔为零签名，三种配置下：
+  - 引擎都在第 10 块返回 INVALID，之后的块不提交，head 停在 9；
+  - 坏交易从未进入缓存，预热侧记为 failed；
+  - 重试时同样在第 10 块被拒绝，直至客户端停止，没有任何更高的块到达引擎。
+- `the_sender_warmup_stays_inside_its_window`：96 块，engine 每块 3 ms，引擎本身不恢复，缓存中的条目全部来自预热。每当块 n 到达引擎时，探针统计缓存里 n+4 及以上各块的条目数：
+  - W=4 时为 0；
+  - W=32 时大于 0（对照组，证明探针有效）。
+- `range_catchup_ms_per_block_bench`：增加预热配置，并新增 `N42_RANGE_BENCH_RECOVER` 和 `N42_RANGE_BENCH_SENDER_AHEAD` 两个参数。
+
+结果：
+- `cargo clippy -p n42-consensus-service -p n42-node -p n42-network -p n42-execution -p n42-node-bin --all-targets -- -D warnings`：通过。
+- `cargo test -p n42-consensus-service -p n42-node -p n42-network -p n42-execution`：全部通过（consensus-service 370，n42-execution 159，n42-network 264，n42-node 315，以及各集成测试）。
+
+### S2.6 遇到的问题
+
+- **共享 target 目录串味**：`/data/n42-build/n42-26-follower` 由多个 worktree 共用。cargo 对 workspace 成员的 metadata 不含绝对路径，dep-info 用的又是相对路径，所以另一个 worktree 构建的 `n42-execution` 会被当成新鲜产物复用，表现为本次新增的符号"找不到"。处理办法：构建前先 `touch` 本次改动的文件。反过来，其他 worktree 也可能误用本 worktree 的产物，共用这个目录时需留意。
+- **直接映射缓存的冲突**：64 槽缓存放 40 条目时就会互相顶掉。测试改为只断言缓存中现存条目的正确性，并对命中数设下限。
+
+### S2.7 后续
+
+1. 在 S1 300 块重跑时比较 `transaction_wait`、`n42_import_stage_ms{await_convert}`、`engine_sender_hits/misses` 与 wall/块，确认真实收益；同时据此决定默认窗口（建议 4–8）。
+2. 若要消除批首块的部分 miss，可让下一批的预热提前开始，需要 range 缓冲区以 `Arc` 共享 RLP。
+3. 如果 reth 的转换在大量命中后仍偏重（解码加 rayon 扇出），可以考虑把 prep 已解码的交易直接交给引擎，属于 reth 补丁范畴。

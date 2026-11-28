@@ -404,6 +404,25 @@ fn resolve_observer_genesis_hash(
 /// holds a block from the moment it has validated it: the state the engine's
 /// own validation of the next block reads. A hash neither knows has no
 /// state here.
+/// Range catch-up (devlog-195 Stage 2): the pool that verifies senders
+/// ahead of the engine into the caches its payload conversion reads.
+/// `None` when the pool cannot be built; the engine then recovers them.
+fn range_sender_warmup(
+    cache: Option<n42_execution::SenderRecoveryCache>,
+) -> Option<std::sync::Arc<n42_execution::SenderWarmup>> {
+    let threads = n42_execution::SenderWarmup::threads_from_env();
+    match n42_execution::SenderWarmup::new(cache, threads) {
+        Ok(warmup) => {
+            info!(target: "n42::cli", threads, "range catch-up sender warm-up pool ready");
+            Some(std::sync::Arc::new(warmup))
+        }
+        Err(error) => {
+            warn!(target: "n42::cli", %error, "range catch-up sender warm-up pool unavailable");
+            None
+        }
+    }
+}
+
 fn follower_import<N>(
     config: n42_execution::N42EvmConfig,
     provider: reth_provider::providers::BlockchainProvider<N>,
@@ -4001,7 +4020,10 @@ fn main() {
                                     .with_sender_recovery_cache(
                                         full_node.evm_config.inner().sender_recovery_cache.clone(),
                                     )
-                            })),
+                            }))
+                            .with_sender_warmup(range_sender_warmup(
+                                full_node.evm_config.inner().sender_recovery_cache.clone(),
+                            )),
                         ),
                         Err(error) => {
                             eprintln!("ERROR: {error}");

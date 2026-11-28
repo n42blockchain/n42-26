@@ -89,7 +89,11 @@ impl RangeDecodeLane {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         tokio::task::spawn_blocking(move || {
-            let reply = RangeReply::Blocks(rlps.into_iter().map(|rlp| decode_range_block(rlp, profile1)).collect());
+            let reply = RangeReply::Blocks(
+                rlps.into_iter()
+                    .map(|rlp| decode_range_block(rlp, profile1))
+                    .collect(),
+            );
             let current = round
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -148,7 +152,8 @@ pub(super) fn range_qc_check(
 }
 
 fn decode_range_block(rlp: Vec<u8>, profile1: bool) -> Result<RangeBlock, String> {
-    let block = n42_network::decode_block_rlp_for(&rlp, profile1).map_err(|error| error.to_string())?;
+    let block =
+        n42_network::decode_block_rlp_for(&rlp, profile1).map_err(|error| error.to_string())?;
     let view = n42_network::gov5_header_view(&block.header).map_err(|error| error.to_string())?;
     Ok(RangeBlock {
         number: block.header.number,
@@ -413,11 +418,14 @@ impl ConsensusService {
         );
         if !ready.is_empty() {
             self.catchup_timings.begin_batch();
+            let senders = n42_execution::PayloadSenderCounts::now();
             let (end, imported) = if self.range_pipeline_depth == 0 {
                 self.import_range_batch_serial(ready, now).await
             } else {
                 self.import_range_batch_pipelined(ready, now).await
             };
+            self.catchup_timings
+                .note_engine_senders(n42_execution::PayloadSenderCounts::now().since(senders));
             self.catchup_timings.end_batch(imported);
             match end {
                 BatchEnd::Done => {}

@@ -27,6 +27,8 @@ pub struct RethExecutionLayer {
     last_built: std::sync::Mutex<Option<(alloy_primitives::B256, u64, usize)>>,
     /// Profile 1: the deferred proposal check (design 3.4).
     deferred: Option<super::deferred::DeferredChecker>,
+    /// Range catch-up: sender verification ahead of the engine.
+    sender_warmup: Option<std::sync::Arc<n42_execution::SenderWarmup>>,
 }
 
 impl RethExecutionLayer {
@@ -42,6 +44,7 @@ impl RethExecutionLayer {
             follower_import: None,
             last_built: std::sync::Mutex::new(None),
             deferred: None,
+            sender_warmup: None,
         }
     }
 
@@ -54,6 +57,7 @@ impl RethExecutionLayer {
             follower_import: None,
             last_built: std::sync::Mutex::new(None),
             deferred: None,
+            sender_warmup: None,
         }
     }
 }
@@ -77,15 +81,31 @@ impl RethExecutionLayer {
     }
 
     /// Profile 1: checks proposals before their import (design 3.4).
-    pub fn with_deferred_check(mut self, checker: Option<super::deferred::DeferredChecker>) -> Self {
+    pub fn with_deferred_check(
+        mut self,
+        checker: Option<super::deferred::DeferredChecker>,
+    ) -> Self {
         self.deferred = checker;
+        self
+    }
+
+    /// Range catch-up: verifies senders ahead of the engine into its caches.
+    pub fn with_sender_warmup(
+        mut self,
+        warmup: Option<std::sync::Arc<n42_execution::SenderWarmup>>,
+    ) -> Self {
+        self.sender_warmup = warmup;
         self
     }
 
     /// Returns once no import of `parent` is under way, when imports are
     /// kept in order.
     async fn parent_imported(&self, parent: alloy_primitives::B256) {
-        if let Some(gate) = self.import_gate.as_ref().filter(|_| self.follower_import.is_some()) {
+        if let Some(gate) = self
+            .import_gate
+            .as_ref()
+            .filter(|_| self.follower_import.is_some())
+        {
             let started = std::time::Instant::now();
             gate.settled(parent).await;
             record_parent_import_wait(started);
@@ -197,27 +217,24 @@ impl ExecutionLayer for RethExecutionLayer {
         };
         let builder = self.payload_builder.as_ref()?;
         let started = std::time::Instant::now();
-        let result = builder
-            .resolve_kind(id, reth_kind)
-            .await
-            .map(|r| {
-                r.map_err(|e| ElError(e.to_string())).map(|payload| {
-                    let block = payload.block();
-                    if let Ok(mut built) = self.last_built.lock() {
-                        *built = Some((
-                            block.header().parent_hash,
-                            block.header().number,
-                            block.body().transactions.len(),
-                        ));
-                    }
-                    super::own_block::remember_built(payload.block_arc());
-                    let convert_started = std::time::Instant::now();
-                    let built = to_built_block(payload);
-                    metrics::histogram!("n42_engine_boundary_duration_ms", "phase" => "payload_convert")
+        let result = builder.resolve_kind(id, reth_kind).await.map(|r| {
+            r.map_err(|e| ElError(e.to_string())).map(|payload| {
+                let block = payload.block();
+                if let Ok(mut built) = self.last_built.lock() {
+                    *built = Some((
+                        block.header().parent_hash,
+                        block.header().number,
+                        block.body().transactions.len(),
+                    ));
+                }
+                super::own_block::remember_built(payload.block_arc());
+                let convert_started = std::time::Instant::now();
+                let built = to_built_block(payload);
+                metrics::histogram!("n42_engine_boundary_duration_ms", "phase" => "payload_convert")
                         .record(convert_started.elapsed().as_secs_f64() * 1_000.0);
-                    built
-                })
-            });
+                built
+            })
+        });
         // Includes waiting for the pending build and converting its completed
         // output. This is a builder boundary, not a consensus seal timestamp.
         metrics::histogram!("n42_engine_boundary_duration_ms", "phase" => "payload_resolve")
@@ -244,6 +261,10 @@ impl ExecutionLayer for RethExecutionLayer {
         .unwrap_or_else(|error| {
             n42_consensus_service::deferred_check::DeferredCheck::Retry(error.to_string())
         })
+    }
+
+    fn sender_warmup(&self) -> Option<std::sync::Arc<n42_execution::SenderWarmup>> {
+        self.sender_warmup.clone()
     }
 
     async fn build_on_sealed(

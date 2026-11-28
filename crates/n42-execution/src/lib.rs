@@ -16,11 +16,16 @@ mod parallel_tests;
 pub mod precompile_random;
 pub mod read_log;
 pub mod restored_slots;
+pub mod sender_warmup;
 pub mod state_diff;
 pub mod witness;
 
-pub use evm_config::{N42EvmConfig, eip8282_builder_requests_active, profile1_amsterdam_execution_at};
+pub use evm_config::{
+    N42EvmConfig, PayloadSenderCounts, eip8282_builder_requests_active,
+    profile1_amsterdam_execution_at,
+};
 pub use evm_factory::N42EvmFactory;
+pub use sender_warmup::{SenderRecoveryCache, SenderWarmup, WarmStats};
 pub use execution_path::{EvmStrategy, ExecutionPath, ExecutionWorkload};
 pub use executor::{execute_block_full, execute_block_with_witness};
 pub use read_log::{ReadLogDatabase, ReadLogEntry};

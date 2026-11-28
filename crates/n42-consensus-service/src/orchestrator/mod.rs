@@ -1272,6 +1272,10 @@ pub struct ConsensusService {
     /// Payloads prepared ahead of the engine in range catch-up; 0 imports
     /// block by block (`N42_RANGE_PIPELINE`).
     range_pipeline_depth: usize,
+    /// Blocks ahead of the engine whose senders the pipelined range import
+    /// verifies into the engine's caches; 0 leaves them to the engine
+    /// (`N42_RANGE_SENDER_AHEAD`).
+    range_sender_ahead: usize,
     /// Peers that failed to serve an authenticated block hash during the
     /// current bounded retry round. A mixed Rust/Gov set may gossip a child
     /// from a Rust validator whose execution head is also behind; retrying
@@ -3596,6 +3600,7 @@ impl ConsensusService {
             range_decoded: range_sync::RangeDecodeLane::new(),
             catchup_timings: Default::default(),
             range_pipeline_depth: range_import::range_pipeline_depth_from_env(),
+            range_sender_ahead: range_import::range_sender_ahead_from_env(),
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
             gov5_execution_pull_rounds: 0,
@@ -3880,6 +3885,7 @@ impl ConsensusService {
             range_decoded: range_sync::RangeDecodeLane::new(),
             catchup_timings: Default::default(),
             range_pipeline_depth: range_import::range_pipeline_depth_from_env(),
+            range_sender_ahead: range_import::range_sender_ahead_from_env(),
             h2_v4_fetch_failed_peers: BTreeMap::new(),
             h2_v4_fetch_requested_at: HashMap::new(),
             gov5_execution_pull_rounds: 0,
@@ -11456,12 +11462,14 @@ mod tests {
     }
 
     /// A Gov5 block carrying `transactions` transfers (fixed test
-    /// signatures: nothing on these paths recovers senders).
-    fn test_gov5_block_rlp_with_txs(
+    /// signatures, which recover to some sender), the last one signed so
+    /// that no sender recovers from it when `bad_signature`.
+    fn test_gov5_block_rlp_with_signed_txs(
         parent_hash: B256,
         number: u64,
         view: u64,
         transactions: usize,
+        bad_signature: bool,
     ) -> (B256, Vec<u8>) {
         let mut extra_data = Vec::with_capacity(12);
         extra_data.extend_from_slice(b"N42H");
@@ -11478,10 +11486,12 @@ mod tests {
                     value: U256::from(1),
                     ..Default::default()
                 };
-                TxEnvelope::Eip1559(alloy_consensus::Signed::new_unhashed(
-                    tx,
-                    alloy_primitives::Signature::test_signature(),
-                ))
+                let signature = if bad_signature && nonce + 1 == transactions as u64 {
+                    alloy_primitives::Signature::new(U256::ZERO, U256::ZERO, false)
+                } else {
+                    alloy_primitives::Signature::test_signature()
+                };
+                TxEnvelope::Eip1559(alloy_consensus::Signed::new_unhashed(tx, signature))
             })
             .collect();
         let block = Block::<TxEnvelope> {
@@ -11521,6 +11531,53 @@ mod tests {
         /// Highest number of new_payload calls under way at once.
         concurrent: std::sync::atomic::AtomicUsize,
         max_concurrent: std::sync::atomic::AtomicUsize,
+        /// Recovers every sender as the engine's payload conversion does
+        /// (the same converter, cache and counters); a block whose sender
+        /// does not recover is Invalid.
+        recover: Option<n42_execution::N42EvmConfig>,
+        /// With `recover`: recovery runs alongside the delay (the engine
+        /// overlaps it with execution) instead of before it.
+        recover_overlapped: bool,
+        /// Offered to the range import as the layer's sender warm-up.
+        warmup: Option<Arc<n42_execution::SenderWarmup>>,
+        /// `(cache, transaction hashes per block number - 1, window)`: as
+        /// block `n` reaches the engine, counts the cached senders of
+        /// blocks `n + window` and above.
+        window_probe: Option<(n42_execution::SenderRecoveryCache, Vec<Vec<B256>>, u64)>,
+        window_violations: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TimedEngine {
+        fn probe_window(&self, number: u64) {
+            let Some((cache, hashes, window)) = &self.window_probe else {
+                return;
+            };
+            let beyond = hashes
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index as u64 + 1 >= number + window)
+                .flat_map(|(_, hashes)| hashes)
+                .filter(|hash| cache.get(hash).is_some())
+                .count();
+            self.window_violations
+                .fetch_add(beyond, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// The engine's sender recovery of `payload`: `false` when one
+        /// sender does not recover.
+        async fn recover_senders(&self, payload: &ExecutionData) -> bool {
+            let Some(config) = self.recover.clone() else {
+                return true;
+            };
+            let payload = payload.clone();
+            let recovery = tokio::task::spawn_blocking(move || {
+                config.recover_payload_transactions(&payload).is_ok()
+            });
+            if self.recover_overlapped && !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            recovery.await.unwrap_or(false)
+        }
     }
 
     #[async_trait::async_trait]
@@ -11535,10 +11592,17 @@ mod tests {
             let _busy = self.busy.lock().await;
             let hash = payload.payload.block_hash();
             self.payloads.lock().unwrap().push(hash);
-            if !self.delay.is_zero() {
+            self.probe_window(payload.payload.block_number());
+            let recovered = self.recover_senders(&payload).await;
+            if !self.delay.is_zero() && !(self.recover.is_some() && self.recover_overlapped) {
                 tokio::time::sleep(self.delay).await;
             }
             self.concurrent.fetch_sub(1, SeqCst);
+            if !recovered {
+                return Ok(PayloadStatus::from_status(PayloadStatusEnum::Invalid {
+                    validation_error: "sender recovery failed".into(),
+                }));
+            }
             let mut invalid = self.invalid.lock().unwrap();
             if *invalid == Some(hash) {
                 *invalid = None;
@@ -11572,6 +11636,10 @@ mod tests {
         ) -> Option<Result<crate::el::BuiltBlock, crate::el::ElError>> {
             None
         }
+
+        fn sender_warmup(&self) -> Option<Arc<n42_execution::SenderWarmup>> {
+            self.warmup.clone()
+        }
     }
 
     /// A fresh node (head at genesis) and a chain of `blocks` blocks of
@@ -11582,6 +11650,23 @@ mod tests {
         transactions: usize,
         engine: Arc<TimedEngine>,
         depth: usize,
+    ) -> (
+        ConsensusService,
+        MockConsensusNetwork,
+        n42_network::PeerId,
+        Vec<(B256, Vec<u8>)>,
+    ) {
+        range_pipeline_orchestrator_with(blocks, transactions, engine, depth, None).await
+    }
+
+    /// [`range_pipeline_orchestrator`] with one transaction of block
+    /// `bad_at` signed so that no sender recovers from it.
+    async fn range_pipeline_orchestrator_with(
+        blocks: u64,
+        transactions: usize,
+        engine: Arc<TimedEngine>,
+        depth: usize,
+        bad_at: Option<u64>,
     ) -> (
         ConsensusService,
         MockConsensusNetwork,
@@ -11611,7 +11696,13 @@ mod tests {
         let mut chain = Vec::new();
         let mut parent = genesis;
         for number in 1..=blocks {
-            let (hash, rlp) = test_gov5_block_rlp_with_txs(parent, number, number, transactions);
+            let (hash, rlp) = test_gov5_block_rlp_with_signed_txs(
+                parent,
+                number,
+                number,
+                transactions,
+                bad_at == Some(number),
+            );
             chain.push((hash, rlp));
             parent = hash;
         }
@@ -11734,6 +11825,191 @@ mod tests {
         assert_eq!(payloads, expected, "the refused block again, then the rest");
     }
 
+    /// The transaction hashes of each block of `chain`, by number - 1.
+    fn chain_tx_hashes(chain: &[(B256, Vec<u8>)]) -> Vec<Vec<B256>> {
+        use alloy_consensus::transaction::TxHashRef as _;
+        chain
+            .iter()
+            .map(|(_, rlp)| {
+                n42_network::decode_block_rlp_for(rlp, false)
+                    .expect("test block decodes")
+                    .transactions
+                    .iter()
+                    .map(|tx| *tx.tx_hash())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// An engine that recovers every sender through `cache`, with a
+    /// warm-up over the same cache.
+    fn recovering_engine(
+        cache: &n42_execution::SenderRecoveryCache,
+        delay: Duration,
+        overlapped: bool,
+    ) -> TimedEngine {
+        TimedEngine {
+            delay,
+            recover: Some(
+                n42_execution::N42EvmConfig::new(n42_chainspec::n42_dev_chainspec())
+                    .with_sender_recovery_cache(cache.clone()),
+            ),
+            recover_overlapped: overlapped,
+            warmup: Some(Arc::new(
+                n42_execution::SenderWarmup::new(Some(cache.clone()), 2).expect("warm-up pool"),
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sender_warmup_keeps_the_import_identical_to_the_serial_one() {
+        let mut outcomes = Vec::new();
+        for (depth, ahead) in [(0usize, 0usize), (4, 0), (4, 16)] {
+            let cache = n42_execution::SenderRecoveryCache::new(1 << 12);
+            // Slow enough for the warm-up to get ahead of the engine.
+            let engine = Arc::new(recovering_engine(&cache, Duration::from_millis(2), false));
+            let (mut orch, network, peer, chain) =
+                range_pipeline_orchestrator(120, 8, engine.clone(), depth).await;
+            orch.range_sender_ahead = ahead;
+            run_range_catchup(&mut orch, &network, peer, &chain, 120, 200).await;
+            let expected: Vec<B256> = chain.iter().map(|(hash, _)| *hash).collect();
+            assert_eq!(orch.head_block_number, 120, "depth {depth} ahead {ahead}");
+            assert_eq!(orch.head_block_hash, expected[119]);
+            assert_eq!(
+                *engine.payloads.lock().unwrap(),
+                expected,
+                "depth {depth} ahead {ahead}: each height once, in order"
+            );
+            let (warmed, failed) = orch.catchup_timings.warmed();
+            assert_eq!(failed, 0);
+            if ahead == 0 {
+                assert_eq!(warmed, 0, "no warm-up without a window");
+            } else {
+                // The engine may get to a batch's first block before the
+                // warm-up does; every later one is warmed.
+                assert!(warmed >= 120 * 8 / 2, "warmed {warmed}");
+            }
+            // What the cache holds (it is direct-mapped: a few entries
+            // displace each other) is each transaction's own sender.
+            let mut held = 0;
+            for (_, rlp) in &chain {
+                for tx in n42_network::decode_block_rlp_for(rlp, false)
+                    .expect("decodes")
+                    .transactions
+                {
+                    use alloy_consensus::transaction::TxHashRef as _;
+                    use alloy_consensus::transaction::SignerRecoverable as _;
+                    if let Some(sender) = cache.get(tx.tx_hash()) {
+                        assert_eq!(Some(sender), tx.recover_signer().ok());
+                        held += 1;
+                    }
+                }
+            }
+            assert!(held > 120 * 8 / 2, "held {held}");
+            outcomes.push((orch.execution_validated_head_view, orch.head_block_hash));
+        }
+        assert!(outcomes.windows(2).all(|pair| pair[0] == pair[1]), "{outcomes:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bad_signature_mid_range_is_refused_at_the_same_block_with_the_warmup() {
+        use alloy_consensus::transaction::TxHashRef as _;
+        for (depth, ahead) in [(0usize, 0usize), (4, 0), (4, 16)] {
+            let cache = n42_execution::SenderRecoveryCache::new(1 << 12);
+            // Slow enough for the warm-up to get ahead of the engine.
+            let engine = Arc::new(recovering_engine(&cache, Duration::from_millis(2), false));
+            let (mut orch, network, peer, chain) = range_pipeline_orchestrator_with(
+                100,
+                4,
+                engine.clone(),
+                depth,
+                Some(10),
+            )
+            .await;
+            orch.range_sender_ahead = ahead;
+            let bad = *n42_network::decode_block_rlp_for(&chain[9].1, false)
+                .expect("decodes")
+                .transactions
+                .last()
+                .expect("a transaction")
+                .tx_hash();
+            orch.drive_range_catchup().await;
+            let requests = network.range_requests.lock().unwrap().clone();
+            for (_, start, count) in requests {
+                let rlps = chain[(start - 1) as usize..(start - 1 + count) as usize]
+                    .iter()
+                    .map(|(_, rlp)| rlp.clone())
+                    .collect();
+                deliver_range_reply(&mut orch, peer, start, rlps).await;
+            }
+            let first: Vec<B256> = chain[..10].iter().map(|(hash, _)| *hash).collect();
+            assert_eq!(
+                *engine.payloads.lock().unwrap(),
+                first,
+                "depth {depth} ahead {ahead}: refused at block 10, nothing after it submitted"
+            );
+            assert_eq!(orch.head_block_number, 9, "depth {depth} ahead {ahead}");
+            assert_eq!(orch.head_block_hash, chain[8].0);
+            assert_eq!(cache.get(&bad), None, "a failed recovery is never cached");
+            if ahead > 0 {
+                let (warmed, failed) = orch.catchup_timings.warmed();
+                assert!(failed >= 1, "the warm-up met the bad signature");
+                assert!(warmed > 0);
+            }
+
+            // Every retry is refused at the same block.
+            run_range_catchup(&mut orch, &network, peer, &chain, 100, 20).await;
+            assert_eq!(orch.head_block_number, 9, "depth {depth} ahead {ahead}");
+            let payloads = engine.payloads.lock().unwrap().clone();
+            assert!(
+                payloads.iter().all(|hash| first.contains(hash)),
+                "nothing past block 10 reached the engine"
+            );
+            assert_eq!(cache.get(&bad), None);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_sender_warmup_stays_inside_its_window() {
+        let mut violations = Vec::new();
+        for ahead in [4usize, 32] {
+            let cache = n42_execution::SenderRecoveryCache::new(1 << 12);
+            let mut engine = TimedEngine {
+                // The warm-up is much faster than the engine: unbounded,
+                // it would run to the end of the batch.
+                delay: Duration::from_millis(3),
+                warmup: Some(Arc::new(
+                    n42_execution::SenderWarmup::new(Some(cache.clone()), 2).expect("pool"),
+                )),
+                ..Default::default()
+            };
+            let (_, _, _, chain) =
+                range_pipeline_orchestrator(96, 4, Arc::new(TimedEngine::default()), 4).await;
+            engine.window_probe = Some((cache.clone(), chain_tx_hashes(&chain), 4));
+            let engine = Arc::new(engine);
+            let (mut orch, network, peer, chain) =
+                range_pipeline_orchestrator(96, 4, engine.clone(), 4).await;
+            orch.range_sender_ahead = ahead;
+            run_range_catchup(&mut orch, &network, peer, &chain, 96, 200).await;
+            assert_eq!(orch.head_block_number, 96);
+            assert!(orch.catchup_timings.warmed().0 > 0);
+            violations.push(
+                engine
+                    .window_violations
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            );
+        }
+        assert_eq!(
+            violations[0], 0,
+            "window 4: nothing of block n + 4 or above is cached as block n reaches the engine"
+        );
+        assert!(
+            violations[1] > 0,
+            "window 32 runs further ahead, so the probe does see it: {violations:?}"
+        );
+    }
+
     /// After a start-up rewind below reth's persisted head (#59), the blocks
     /// reth already holds as persisted canonical take no forkchoice update
     /// on either path; the first block above them does.
@@ -11765,57 +12041,70 @@ mod tests {
         }
     }
 
-    /// Range catch-up wall time per block on this host, serial against
-    /// pipelined, with real 1,200-transfer blocks and an engine that takes a
-    /// fixed time per payload (`N42_RANGE_BENCH_ENGINE_MS`, default 17, the
-    /// S1 `new_payload` mean). Prints each run's stage breakdown.
+    /// Range catch-up wall time per block on this host: serial, pipelined,
+    /// and pipelined with the sender warm-up, with real 1,200-transfer
+    /// blocks and an engine that takes a fixed time per payload
+    /// (`N42_RANGE_BENCH_ENGINE_MS`, default 17, the S1 `new_payload`
+    /// mean). `N42_RANGE_BENCH_RECOVER=serial|overlap` makes the engine
+    /// recover every sender through the shared cache as its payload
+    /// conversion does, before the fixed time (`serial`) or alongside it
+    /// (`overlap`); `off` (default) leaves senders alone.
+    /// `N42_RANGE_BENCH_SENDER_AHEAD` (default 16) is the warm-up window.
+    /// Prints each run's stage breakdown.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     #[ignore = "bench"]
     async fn range_catchup_ms_per_block_bench() {
-        let engine_ms: u64 = std::env::var("N42_RANGE_BENCH_ENGINE_MS")
-            .ok()
+        let env = |name: &str| std::env::var(name).ok();
+        let engine_ms: u64 = env("N42_RANGE_BENCH_ENGINE_MS")
             .and_then(|value| value.parse().ok())
             .unwrap_or(17);
-        let blocks: u64 = std::env::var("N42_RANGE_BENCH_BLOCKS")
-            .ok()
+        let blocks: u64 = env("N42_RANGE_BENCH_BLOCKS")
             .and_then(|value| value.parse().ok())
             .unwrap_or(300);
-        for depth in [0usize, 4] {
-            let engine = Arc::new(TimedEngine {
-                delay: Duration::from_millis(engine_ms),
-                ..Default::default()
-            });
+        let recover = env("N42_RANGE_BENCH_RECOVER").unwrap_or_else(|| "off".into());
+        let ahead: usize = env("N42_RANGE_BENCH_SENDER_AHEAD")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(16);
+        let threads = n42_execution::SenderWarmup::threads_from_env();
+        for (depth, ahead) in [(0usize, 0usize), (4, 0), (4, ahead)] {
+            let cache = n42_execution::SenderRecoveryCache::default();
+            let delay = Duration::from_millis(engine_ms);
+            let mut engine = match recover.as_str() {
+                "serial" => recovering_engine(&cache, delay, false),
+                "overlap" => recovering_engine(&cache, delay, true),
+                _ => TimedEngine {
+                    delay,
+                    ..Default::default()
+                },
+            };
+            engine.warmup = Some(Arc::new(
+                n42_execution::SenderWarmup::new(Some(cache.clone()), threads).expect("pool"),
+            ));
+            let engine = Arc::new(engine);
             let (mut orch, network, peer, chain) =
                 range_pipeline_orchestrator(blocks, 1_200, engine.clone(), depth).await;
+            orch.range_sender_ahead = ahead;
             run_range_catchup(&mut orch, &network, peer, &chain, blocks - 1, 1_000).await;
             let (wall, attributed) = orch.catchup_timings.wall_and_attributed_ms();
             let imported = engine.payloads.lock().unwrap().len();
-            let stages = [
-                range_import::Stage::Decode,
-                range_import::Stage::Admit,
-                range_import::Stage::Build,
-                range_import::Stage::NewPayload,
-                range_import::Stage::Wait,
-                range_import::Stage::Fcu,
-                range_import::Stage::Post,
-                range_import::Stage::Other,
-                range_import::Stage::Gap,
-                range_import::Stage::Prep,
-                range_import::Stage::Engine,
-            ]
-            .iter()
-            .map(|stage| {
-                format!(
-                    "{}={:.2}",
-                    stage.as_str(),
-                    orch.catchup_timings.total_ms(*stage) / imported as f64
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
+            let stages = range_import::Stage::ALL
+                .iter()
+                .map(|stage| {
+                    format!(
+                        "{}={:.2}",
+                        stage.as_str(),
+                        orch.catchup_timings.total_ms(*stage) / imported as f64
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let (hits, misses) = orch.catchup_timings.engine_senders();
+            let (warmed, warm_failed) = orch.catchup_timings.warmed();
             println!(
-                "depth {depth}, engine {engine_ms} ms: {imported} blocks, {:.2} ms/block wall, \
-                 {:.2} attributed | per block: {stages} | updates {}",
+                "depth {depth}, ahead {ahead} (threads {threads}), engine {engine_ms} ms, \
+                 recover {recover}: {imported} blocks, {:.2} ms/block wall, {:.2} attributed | \
+                 per block: {stages} | updates {} | engine senders hit {hits} miss {misses} | \
+                 warmed {warmed} failed {warm_failed}",
                 wall / imported as f64,
                 attributed / imported as f64,
                 engine.fcu_heads.lock().unwrap().len()
