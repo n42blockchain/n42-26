@@ -39,7 +39,7 @@ EVM 为 evm2（reth v2.9.0 起取代 revm）：git `alloy-rs/evm2` rev
 EIP-8282 调用，见其 `N42-PROVENANCE.md`），evm2-macros / evm2-jit 经 `[patch]` 指向 `DaniPopes/evm2` 同一 rev，图中各只有一份；
 workspace 不再依赖 revm、alloy-evm、reth-revm。reth-primitives-traits 0.8.2 等 reth-core crate 经
 `[patch.crates-io]` 取自 `paradigmxyz/reth-core` rev `275ce4cf5befeb9f1e8acd935ff2882d2d25fc61`；
-Alloy 2.5.0、alloy-primitives 1.7.3。`vendor/dependency-repairs/evm2-inspectors-0.1.0` 取代原 revm-inspectors 修复。
+Alloy 2.6.1（Cargo.toml 下限 2.5.0）、alloy-primitives 1.7.3。`vendor/dependency-repairs/evm2-inspectors-0.1.0` 取代原 revm-inspectors 修复。
 不要为旧源码降低这些依赖。
 QMDB bin 状态读取、交易根缓存、缓存执行拒绝回退、原生导入路径、已执行块收件箱及 Engine 状态 provider
 补丁均须保留；原导入批处理两个补丁（`reth-import-batch`、`reth-import-batch-tail`）在 v2.11.0 不再迁移。
