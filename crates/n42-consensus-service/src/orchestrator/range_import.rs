@@ -711,6 +711,14 @@ impl ConsensusService {
                         continue;
                     }
                     blocks[index].timestamp = block.header.timestamp;
+                    // AM35: a catch-up block may be an unpersisted ancestor
+                    // of the next block this node commit-votes; keep it where
+                    // the journal finds it (as the serial path does).
+                    if let Some(journal) = self.block_journal.as_ref() {
+                        journal.note_lineage(block.block_hash, block.header.parent_hash, block.header.number);
+                        journal.stage_execution(block.block_hash, blocks[index].view, block.header.timestamp, &data);
+                        self.retry_held_commit_vote();
+                    }
                     drop(block);
                     if submit_tx.send((index, data)).await.is_err() {
                         failure = Some((index, Failure::NotExecuted));
@@ -741,18 +749,31 @@ impl ConsensusService {
         // batch), as the serial path decides block by block.
         let mut high = self.execution_validated_head_view;
         let mut advancing = vec![false; valid];
-        let mut last_advancing = None;
         for (index, block) in blocks[..valid].iter().enumerate() {
             if block.view > high {
                 high = block.view;
                 advancing[index] = true;
-                last_advancing = Some(index);
             }
         }
+        // Head-advancing blocks reth already holds as persisted canonical
+        // (after a start-up rewind below reth's persisted head) take no
+        // forkchoice update: one to an ancestor of reth's persisted head
+        // fails ("too deep reorg"). They form a prefix of the catch-up, so
+        // the update goes to the last head-advancing block after them.
+        let persisted: Vec<bool> = blocks[..valid]
+            .iter()
+            .enumerate()
+            .map(|(index, block)| {
+                advancing[index]
+                    && self.persisted_canonical_suffix.get(&block.hash) == Some(&block.number)
+            })
+            .collect();
+        let needs_fcu = |index: usize| advancing[index] && !persisted[index];
+        let last_fcu = (0..valid).rev().find(|index| needs_fcu(*index));
         // One forkchoice update for the batch, to its last head-advancing
         // block; it makes every block below it canonical.
         let mut released = valid;
-        if let Some(head) = last_advancing {
+        if let Some(head) = last_fcu {
             let hash = blocks[head].hash;
             let forkchoice = self.fcu_state(hash, hash);
             let started = Instant::now();
@@ -781,7 +802,7 @@ impl ConsensusService {
             if !canonical {
                 // Blocks before the first head-advancing one needed no
                 // update; that block fails as the serial path's would.
-                let first = advancing.iter().position(|advances| *advances).unwrap_or(0);
+                let first = (0..valid).find(|index| needs_fcu(*index)).unwrap_or(0);
                 released = first;
                 if failure.is_none() || failure.as_ref().is_some_and(|(index, _)| *index > first) {
                     failure = Some((first, Failure::NotExecuted));
@@ -800,6 +821,10 @@ impl ConsensusService {
                 block.number,
                 block.timestamp,
             );
+            if persisted[index] {
+                self.persisted_canonical_suffix.remove(&hash);
+                info!(target: "n42::interop::h2v4", block_hash = %hash, block_number = number, view, "authenticated Gov5 catch-up block is already reth's persisted canonical block; skipping its FCU");
+            }
             if advancing[index] {
                 self.last_committed_timestamp = self.last_committed_timestamp.max(timestamp);
                 self.advance_execution_validated_head(view, hash, "authenticated Gov5 catch-up");

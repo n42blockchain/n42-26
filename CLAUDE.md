@@ -24,8 +24,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Reth 稳定版基线
 
 当前基线为官方 **v2.11.0**，上游 commit
-`b9abbcc1b982755baa9021e6874e2e58936ca65f`，加十九个 N42 补丁后为
-`5a81f36296936cc9f1bda1142141861ced558bcf`。版本、补丁序列与直接依赖以
+`b9abbcc1b982755baa9021e6874e2e58936ca65f`，加二十个 N42 补丁后为
+`61b79664195f5ffe61870f612620085ac00358d8`。版本、补丁序列与直接依赖以
 [`reth-source.lock`](reth-source.lock) 为准；CI 检出官方源并应用 `patches/reth-*.patch`。
 
 本机原 `../reth` 是包含未提交改动的旧 checkout，不可直接作为当前构建源或覆盖修改。
@@ -39,7 +39,7 @@ EVM 为 evm2（reth v2.9.0 起取代 revm）：git `alloy-rs/evm2` rev
 EIP-8282 调用，见其 `N42-PROVENANCE.md`），evm2-macros / evm2-jit 经 `[patch]` 指向 `DaniPopes/evm2` 同一 rev，图中各只有一份；
 workspace 不再依赖 revm、alloy-evm、reth-revm。reth-primitives-traits 0.8.2 等 reth-core crate 经
 `[patch.crates-io]` 取自 `paradigmxyz/reth-core` rev `275ce4cf5befeb9f1e8acd935ff2882d2d25fc61`；
-Alloy 2.5.0、alloy-primitives 1.7.3。`vendor/dependency-repairs/evm2-inspectors-0.1.0` 取代原 revm-inspectors 修复。
+Alloy 2.6.1（Cargo.toml 下限 2.5.0）、alloy-primitives 1.7.3。`vendor/dependency-repairs/evm2-inspectors-0.1.0` 取代原 revm-inspectors 修复。
 不要为旧源码降低这些依赖。
 QMDB bin 状态读取、交易根缓存、缓存执行拒绝回退、原生导入路径、已执行块收件箱及 Engine 状态 provider
 补丁均须保留；原导入批处理两个补丁（`reth-import-batch`、`reth-import-batch-tail`）在 v2.11.0 不再迁移。

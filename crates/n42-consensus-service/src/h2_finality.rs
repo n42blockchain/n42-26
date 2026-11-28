@@ -1,7 +1,7 @@
 //! Read-only verification of chain-bound gov5 H2-v4 consensus traffic.
 
 use alloy_primitives::B256;
-use n42_consensus::{LeaderSchedule, ValidatorSet};
+use n42_consensus::{LeaderSchedule, ValidatorSet, certifiable_view};
 use n42_network::h2_v4::{
     H2V4Envelope, commit_signing_message, new_view_signing_message, proposal_signing_message,
     timeout_signing_message, vote_signing_message,
@@ -31,6 +31,8 @@ pub enum H2V4FinalityError {
     InsufficientQuorum { actual: usize, required: usize },
     #[error("H2-v4 CommitQC signature is invalid")]
     InvalidSignature,
+    #[error("H2-v4 CommitQC is for view 2^64-1, which no certificate may name (AM34)")]
+    LastView,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,6 +72,8 @@ pub enum H2V4ShadowError {
     InvalidSignature { component: &'static str },
     #[error("H2-v4 {component} is not the canonical genesis QC")]
     InvalidGenesisQc { component: &'static str },
+    #[error("H2-v4 {component} is for view 2^64-1, which no certificate may name (AM34)")]
+    LastView { component: &'static str },
 }
 
 /// Verifies an H2-v4 Decide as a finality proof. This function is deliberately
@@ -83,6 +87,9 @@ pub fn verify_h2_v4_decide(
         return Err(H2V4FinalityError::NotDecide);
     };
     verify_decide_fields(decide)?;
+    if !certifiable_view(decide.commit_qc.view) {
+        return Err(H2V4FinalityError::LastView);
+    }
 
     let signer_indices = signer_indices(&decide.commit_qc, validator_set.len() as usize)?;
     let required = validator_set.quorum_size();
@@ -144,7 +151,8 @@ pub fn verify_h2_v4_sync_anchor(
     identity: n42_network::h2_v4::H2V4ChainIdentity,
     validator_set: &ValidatorSet,
 ) -> H2V4AnchorVerdict {
-    if qc.view == 0 || qc.block_hash == B256::ZERO {
+    // AM34: no certificate names view 2^64-1.
+    if qc.view == 0 || !certifiable_view(qc.view) || qc.block_hash == B256::ZERO {
         return H2V4AnchorVerdict::Invalid;
     }
     let n = validator_set.len() as usize;
@@ -319,6 +327,12 @@ pub fn verify_h2_v4_shadow_message(
         }
         H2Message::NewView(new_view) => {
             verify_leader("NewView", new_view.view, new_view.leader, validator_set, schedule.tenure)?;
+            // AM34: the view after a TC for 2^64-1 is undefined.
+            if !certifiable_view(new_view.timeout_certificate.view) {
+                return Err(H2V4ShadowError::LastView {
+                    component: "NewView TimeoutCertificate",
+                });
+            }
             // The view a TC leads to: TC view + 1, or the next tenure window
             // under rotate-on-timeout (sync standard 10.2).
             if new_view.view == 0
@@ -472,6 +486,11 @@ fn verify_qc(
     messages: &[&[u8]],
     validator_set: &ValidatorSet,
 ) -> Result<(), H2V4ShadowError> {
+    // AM34: a QC or TC (checked here as a synthetic QC) for view 2^64-1 is
+    // invalid however it is signed.
+    if !certifiable_view(qc.view) {
+        return Err(H2V4ShadowError::LastView { component });
+    }
     let signer_indices = canonical_signer_indices(qc, validator_set.len() as usize).ok_or(
         H2V4ShadowError::InvalidBitmap {
             component,
@@ -559,7 +578,7 @@ mod tests {
         timeout_signing_message, vote_signing_message,
     };
     use n42_network::h2_wire::{
-        H2NewView, H2PrepareQc, H2Proposal, H2Timeout, H2TimeoutCertificate, H2Vote,
+        H2Decide, H2NewView, H2PrepareQc, H2Proposal, H2Timeout, H2TimeoutCertificate, H2Vote,
     };
     use n42_primitives::{BlsPublicKey, BlsSecretKey};
     use serde::Deserialize;
@@ -732,6 +751,112 @@ mod tests {
             verify_h2_v4_sync_anchor(&retired, identity, &set),
             H2V4AnchorVerdict::Invalid
         );
+    }
+
+    /// AM34 item 3 (v1.2): a QC or TC for view 2^64-1 is refused by every
+    /// H2-v4 check -- sync anchors (`commit_qc/1`, header QCs), Decide
+    /// finality and the shadow admission gate -- even with a valid quorum
+    /// signature; the view before it still verifies.
+    #[test]
+    fn am34_last_view_certificates_are_refused() {
+        let (keys, set) = shadow_validators();
+        let identity = H2V4ChainIdentity {
+            chain_id: 1143,
+            genesis_hash: B256::repeat_byte(0x34),
+        };
+        let hash = B256::repeat_byte(0x35);
+        let schedule = LeaderSchedule {
+            tenure: 1,
+            rotate_on_timeout_from: Some(0),
+        };
+        for view in [u64::MAX, u64::MAX - 1] {
+            let last = view == u64::MAX;
+            let commit = aggregate_qc(&keys, identity, B256::ZERO, view, hash, true);
+            let prepare = aggregate_qc(&keys, identity, B256::ZERO, view, hash, false);
+            assert_eq!(
+                verify_h2_v4_sync_anchor(&commit, identity, &set),
+                if last { H2V4AnchorVerdict::Invalid } else { H2V4AnchorVerdict::Verified },
+                "view {view}"
+            );
+            let envelope = |message| H2V4Envelope {
+                identity,
+                changes_hash: B256::ZERO,
+                message,
+            };
+            let decide = envelope(H2Message::Decide(H2Decide {
+                view,
+                block_hash: hash,
+                commit_qc: commit.clone(),
+            }));
+            let finality = verify_h2_v4_decide(&decide, &set);
+            let shadow_decide = verify_h2_v4_shadow_message(&decide, &set, schedule, 0);
+            let shadow_prepare = verify_h2_v4_shadow_message(
+                &envelope(H2Message::PrepareQc(H2PrepareQc {
+                    view,
+                    block_hash: hash,
+                    qc: prepare.clone(),
+                })),
+                &set,
+                schedule,
+                0,
+            );
+            let tc = aggregate_tc(&keys, identity, view);
+            // Under tenure 1 the TC leads to view + 1; for the last view the
+            // successor is undefined, so try the saturated one.
+            let nv_view = view.saturating_add(1);
+            let nv_leader = (nv_view % 4) as u32;
+            let shadow_new_view = verify_h2_v4_shadow_message(
+                &envelope(H2Message::NewView(H2NewView {
+                    view: nv_view,
+                    timeout_certificate: tc.clone(),
+                    leader: nv_leader,
+                    signature: keys[nv_leader as usize]
+                        .sign_h2_v4(&new_view_signing_message(identity, nv_view)),
+                })),
+                &set,
+                schedule,
+                0,
+            );
+            let sender = (view % 4) as u32;
+            let shadow_timeout_with_high_tc = verify_h2_v4_shadow_message(
+                &envelope(H2Message::Timeout(H2Timeout {
+                    view: 5,
+                    high_qc: H2QuorumCertificate {
+                        view: 0,
+                        block_hash: B256::ZERO,
+                        aggregate_signature: Vec::new(),
+                        signers_bitmap: vec![0, 0],
+                    },
+                    sender,
+                    signature: keys[sender as usize]
+                        .sign_h2_v4(&timeout_signing_message(identity, 5)),
+                    high_tc: Some(tc),
+                })),
+                &set,
+                schedule,
+                0,
+            );
+            if last {
+                assert_eq!(finality, Err(H2V4FinalityError::LastView));
+                for (what, result) in [
+                    ("Decide", shadow_decide),
+                    ("PrepareQC", shadow_prepare),
+                    ("NewView", shadow_new_view),
+                    ("Timeout HighTC", shadow_timeout_with_high_tc),
+                ] {
+                    assert!(
+                        matches!(result, Err(H2V4ShadowError::LastView { .. })),
+                        "{what}: {result:?}"
+                    );
+                }
+            } else {
+                assert_eq!(finality.unwrap().view, view);
+                shadow_decide.unwrap();
+                shadow_prepare.unwrap();
+                shadow_new_view.unwrap();
+                shadow_timeout_with_high_tc.unwrap();
+            }
+        }
     }
 
     #[test]

@@ -13,7 +13,11 @@
 //!
 //! `N42_MEM_LOG_SECS=<s>` logs an `N42_MEM` line every `s` seconds (0: off):
 //! resident memory, the allocator's counters when the binary registers them,
-//! the unpersisted backlog and the frame queue.
+//! RocksDB's memtables, the unpersisted backlog, the frame queue, and the
+//! sizes of the long-lived
+//! structures (`structures=`: entry counts and bytes by name; `_mib` names
+//! are MiB, the rest counts). Structures outside this crate's dependencies
+//! register through [`add_structure_source`].
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -30,6 +34,79 @@ type BacklogSource = Box<dyn Fn() -> Backlog + Send + Sync>;
 /// Allocator counters, in bytes, by name.
 type AllocatorSource = Box<dyn Fn() -> Vec<(&'static str, u64)> + Send + Sync>;
 
+/// Memtable memory of reth's RocksDB tables, in bytes.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RocksdbMemtables {
+    /// Every memtable still allocated, flushed ones RocksDB keeps as history
+    /// included (`rocksdb.size-all-mem-tables`).
+    pub all: u64,
+    /// The unflushed memtables only (`rocksdb.cur-size-all-mem-tables`).
+    pub unflushed: u64,
+}
+
+type RocksdbSource = Box<dyn Fn() -> RocksdbMemtables + Send + Sync>;
+
+/// Structure sizes by name.
+type StructureSource = Box<dyn Fn() -> Vec<(&'static str, u64)> + Send + Sync>;
+
+fn structure_sources() -> &'static std::sync::Mutex<Vec<StructureSource>> {
+    static SOURCES: std::sync::Mutex<Vec<StructureSource>> = std::sync::Mutex::new(Vec::new());
+    &SOURCES
+}
+
+/// Adds a source of structure sizes to the `N42_MEM` line. It is called on
+/// the memory-log thread and must not block on a hot lock.
+pub fn add_structure_source(source: impl Fn() -> Vec<(&'static str, u64)> + Send + Sync + 'static) {
+    structure_sources()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(Box::new(source));
+}
+
+/// Sizes of the structures this crate can see, then the registered ones.
+fn structures() -> Vec<(&'static str, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut sizes = vec![
+        (
+            "committed_blocks",
+            n42_consensus_service::mem_stats::COMMITTED_BLOCKS.load(Relaxed),
+        ),
+        (
+            "committed_block_mib",
+            mib(n42_consensus_service::mem_stats::COMMITTED_BLOCK_BYTES.load(Relaxed)),
+        ),
+        (
+            "served_blocks",
+            n42_network::mem_stats::SERVED_GOV5_BLOCKS.load(Relaxed),
+        ),
+        (
+            "served_block_mib",
+            mib(n42_network::mem_stats::SERVED_GOV5_BLOCK_BYTES.load(Relaxed)),
+        ),
+    ];
+    if let Some(store) = crate::payload::registered_qmdb_store()
+        && let Some(stats) = store.memory_stats()
+    {
+        sizes.extend([
+            ("qmdb_live_entries", stats.live_entries as u64),
+            ("qmdb_blocks", stats.blocks as u64),
+            ("qmdb_ops_mib", mib(stats.operations_bytes as u64)),
+            ("qmdb_undo", stats.undo_records as u64),
+            ("qmdb_undo_mib", mib(stats.undo_bytes as u64)),
+            ("qmdb_read_views", stats.read_views as u64),
+            ("qmdb_read_view_mib", mib(stats.read_view_bytes as u64)),
+        ]);
+    }
+    for source in structure_sources()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+    {
+        sizes.extend(source());
+    }
+    sizes
+}
+
 fn backlog_source() -> &'static OnceLock<BacklogSource> {
     static SOURCE: OnceLock<BacklogSource> = OnceLock::new();
     &SOURCE
@@ -37,6 +114,11 @@ fn backlog_source() -> &'static OnceLock<BacklogSource> {
 
 fn allocator_source() -> &'static OnceLock<AllocatorSource> {
     static SOURCE: OnceLock<AllocatorSource> = OnceLock::new();
+    &SOURCE
+}
+
+fn rocksdb_source() -> &'static OnceLock<RocksdbSource> {
+    static SOURCE: OnceLock<RocksdbSource> = OnceLock::new();
     &SOURCE
 }
 
@@ -50,6 +132,11 @@ pub fn set_backlog_source(source: impl Fn() -> Backlog + Send + Sync + 'static) 
 /// wins.
 pub fn set_allocator_source(source: impl Fn() -> Vec<(&'static str, u64)> + Send + Sync + 'static) {
     let _ = allocator_source().set(Box::new(source));
+}
+
+/// Registers how to read RocksDB's memtables; the first registration wins.
+pub fn set_rocksdb_source(source: impl Fn() -> RocksdbMemtables + Send + Sync + 'static) {
+    let _ = rocksdb_source().set(Box::new(source));
 }
 
 /// The unpersisted backlog, when a source is registered.
@@ -159,6 +246,12 @@ fn log_memory() {
         .map(|(name, bytes)| format!("{name}={}", mib(*bytes)))
         .collect::<Vec<_>>()
         .join(" ");
+    let memtables = rocksdb_source()
+        .get()
+        .map(|source| source())
+        .unwrap_or_default();
+    metrics::gauge!("n42_mem_rocksdb_memtable_bytes").set(memtables.all as f64);
+    metrics::gauge!("n42_mem_rocksdb_memtable_unflushed_bytes").set(memtables.unflushed as f64);
     let backlog = backlog().unwrap_or_default();
     metrics::gauge!("n42_unpersisted_blocks").set(backlog.blocks as f64);
     metrics::gauge!("n42_unpersisted_transactions").set(backlog.transactions as f64);
@@ -172,14 +265,26 @@ fn log_memory() {
     } else {
         0
     };
+    let structures = structures();
+    for (name, value) in &structures {
+        metrics::gauge!("n42_mem_structure", "name" => *name).set(*value as f64);
+    }
+    let structures = structures
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     tracing::info!(
         target: "n42::mem",
         rss_mib = mib(rss),
         allocator_mib = %allocator_mib,
+        rocksdb_memtable_mib = mib(memtables.all),
+        rocksdb_memtable_unflushed_mib = mib(memtables.unflushed),
         unpersisted_blocks = backlog.blocks,
         unpersisted_txs = backlog.transactions,
         frame_queue_pending,
         frame_store_frames,
+        structures = %structures,
         "N42_MEM"
     );
 }

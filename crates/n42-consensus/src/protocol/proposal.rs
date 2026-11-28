@@ -132,6 +132,13 @@ impl ConsensusEngine {
     ) -> ConsensusResult<()> {
         let view = self.round_state.current_view();
 
+        // AM34 item 3: no certificate can exist for the last view, so nothing
+        // is proposed in it.
+        if !crate::validator::certifiable_view(view) {
+            tracing::error!(target: "n42::cl::proposal", view, %block_hash, "view 2^64-1 reached, not proposing (AM34)");
+            return Ok(());
+        }
+
         if !self.is_current_leader() {
             tracing::debug!(target: "n42::cl::proposal", view, "not leader, ignoring block ready");
             return Ok(());
@@ -260,6 +267,14 @@ impl ConsensusEngine {
             return Err(ConsensusError::ViewMismatch {
                 current: view,
                 received: proposal.view,
+            });
+        }
+        // AM34 item 3: a proposal for the last view could only lead to a QC
+        // for it, which is invalid.
+        if !crate::validator::certifiable_view(view) {
+            return Err(ConsensusError::InvalidQC {
+                view,
+                reason: super::quorum::AM34_LAST_VIEW.to_string(),
             });
         }
 
@@ -527,11 +542,18 @@ impl ConsensusEngine {
                 "suppressed duplicate commit vote (already commit-voted in this view)");
             return Ok(());
         }
+        // AM35: the block (and its unpersisted ancestors) is durable here
+        // before the lock that names it, and both before the R2 signature. A
+        // whole-set power loss can then never leave a durable lock on a block
+        // that no member can produce.
         // Persist before signing for the same crash-safety reason as R1. The
-        // lock goes first: losing it is what a restart must not be able to do.
-        self.vote_log.record_lock(self.round_state.locked_qc())?;
-        self.round_state.record_commit_vote(view);
-        self.vote_log.record_commit_vote(view)?;
+        // lock goes before the R2 record: losing it is what a restart must
+        // not be able to do.
+        if let Some(missing) = self.persist_before_commit_vote(view, pqc.block_hash, "follower")? {
+            tracing::info!(target: "n42::cl::proposal", view, block_hash = %pqc.block_hash, %missing, "holding the commit vote until the block can be made durable");
+            self.held_prepare_qc = Some(pqc);
+            return Ok(());
+        }
 
         // Bind this R2 commit-vote signature to the same changes_hash the
         // leader's proposal carried.
@@ -561,6 +583,11 @@ impl ConsensusEngine {
     /// Checks `last_voted_view` to prevent double-voting after crash recovery
     /// (fundamental BFT safety invariant).
     pub(super) fn send_vote(&mut self, view: ViewNumber, block_hash: B256) -> ConsensusResult<()> {
+        // AM34 item 3: no vote is signed for the last view.
+        if !crate::validator::certifiable_view(view) {
+            tracing::error!(target: "n42::cl::proposal", view, "view 2^64-1 reached, not voting (AM34)");
+            return Ok(());
+        }
         if !self.is_local_validator_active_for_view(view) {
             tracing::debug!(
                 target: "n42::cl::proposal",
@@ -663,6 +690,34 @@ impl ConsensusEngine {
         {
             tracing::info!(target: "n42::interop::h2v4", view = held.view, %block_hash, "block executed, casting the held commit vote");
             self.process_prepare_qc(held)?;
+        }
+        Ok(())
+    }
+
+    /// AM35: the data of `block_hash` is now staged where the vote log can
+    /// make it durable. Retries an R2 vote held for it: the follower's
+    /// PrepareQC (which re-holds while Profile 1 still waits for the import)
+    /// or the leader's self-vote.
+    pub(super) fn on_block_data_staged(&mut self, block_hash: B256) -> ConsensusResult<()> {
+        let view = self.round_state.current_view();
+        if self.held_self_commit_vote == Some((view, block_hash)) {
+            self.held_self_commit_vote = None;
+            tracing::info!(target: "n42::cl::proposal", view, %block_hash, "block data staged, casting the held leader commit self-vote");
+            return self.cast_leader_commit_self_vote(view, block_hash);
+        }
+        // A commit vote still waiting for this node's execution (Profile 1)
+        // is released by the import, not by data.
+        let awaits_execution = self.vote_rules.commit_vote_needs_own_execution()
+            && !self.imported_blocks.contains(&block_hash);
+        if !awaits_execution
+            && self
+                .held_prepare_qc
+                .as_ref()
+                .is_some_and(|held| held.block_hash == block_hash && held.view == view)
+            && let Some(held) = self.held_prepare_qc.take()
+        {
+            tracing::debug!(target: "n42::cl::proposal", view, %block_hash, "block data staged, retrying the held commit vote");
+            return self.process_prepare_qc(held);
         }
         Ok(())
     }

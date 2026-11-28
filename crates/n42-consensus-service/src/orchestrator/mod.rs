@@ -2,6 +2,7 @@ mod ahead;
 pub(crate) mod bad_block_cache;
 mod consensus_loop;
 mod execution_bridge;
+mod journal_replay;
 pub mod frame_ref;
 pub use execution_bridge::{compact_block_enabled, shared_execution_enabled};
 mod range_import;
@@ -50,6 +51,8 @@ const MAX_DECOMPRESSED_BLOCK_COMPONENT_SIZE: usize = 512 * 1024 * 1024;
 /// TX forwarding batches are latency-bounded by a 50ms flush timer, so we can
 /// use a larger batch target to reduce cross-task and cross-peer overhead.
 const TX_FORWARD_BATCH_TARGET: usize = 512;
+/// AM35: how often a held R2 (commit) vote is retried while held.
+const HELD_COMMIT_VOTE_RETRY: Duration = Duration::from_millis(200);
 // Gov5 serves block-by-hash from its local database. A healthy local validator
 // responds well inside this deadline; waiting for the ten-second transport
 // timeout makes a long reverse ancestry effectively serial at one block per
@@ -320,6 +323,39 @@ pub(super) fn encode_execution_payload(
         header_bytes: header.len(),
         transaction_bytes,
     })
+}
+
+/// AM35 block journal: the execution parent and number of the block that
+/// serialized block data `data` carries, if it is the block `hash`.
+pub(crate) fn block_data_lineage(hash: B256, data: &[u8]) -> Option<(B256, u64)> {
+    let broadcast = bincode::deserialize::<BlockDataBroadcast>(data).ok()?;
+    if broadcast.block_hash != hash {
+        return None;
+    }
+    ConsensusService::execution_parent_and_number(data)
+}
+
+/// AM35 block journal: block data (bincode `BlockDataBroadcast`, payload in
+/// the uncompressed binary wire image) for a block held only as an execution
+/// payload, such as a catch-up import.
+pub(crate) fn block_data_from_execution(
+    hash: B256,
+    view: u64,
+    timestamp: u64,
+    execution: &ExecutionData,
+) -> std::io::Result<Vec<u8>> {
+    let mut execution = execution.clone();
+    let encoded = encode_execution_payload(&mut execution)?;
+    bincode::serialize(&BlockDataBroadcast {
+        block_hash: hash,
+        view,
+        payload_json: encoded.bytes,
+        timestamp,
+        execution_output: None,
+        leader_ready_unix_ms: 0,
+        native_header_rlp: n42_consensus::gov5_native_header_rlp(&hash).map(|raw| raw.to_vec()),
+    })
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))
 }
 
 pub(super) fn execution_payload_wire_format(payload: &[u8]) -> &'static str {
@@ -605,7 +641,7 @@ pub(super) fn ahead_step(
     output_enabled: bool,
     child_covered: bool,
 ) -> AheadStep {
-    if ready.context.view >= current_view + depth.max(1) {
+    if ready.context.view >= current_view.saturating_add(depth.max(1)) {
         // `depth` blocks ahead at most: wait for a later view.
         return AheadStep::Hold;
     }
@@ -613,7 +649,7 @@ pub(super) fn ahead_step(
         return AheadStep::Skip;
     }
     let child = PayloadBuildContext {
-        view: ready.context.view + 1,
+        view: ready.context.view.saturating_add(1),
         parent_hash: ready.block_hash,
     };
     match ready.kind {
@@ -1130,6 +1166,19 @@ pub struct CommittedBlock {
 }
 
 impl CommittedBlock {
+    /// Bytes of block data this entry keeps alive: its payload, its envelope
+    /// (shared with the short pending caches while the block is fresh) and
+    /// any raw execution lineage.
+    fn retained_bytes(&self) -> usize {
+        self.payload.len()
+            + self.block_data.as_ref().map_or(0, |data| data.len())
+            + self
+                .execution_lineage
+                .iter()
+                .map(|payload| payload.block_data.len())
+                .sum::<usize>()
+    }
+
     fn retained_payload(&self) -> Vec<u8> {
         if !self.payload.is_empty() {
             return self.payload.clone();
@@ -1206,6 +1255,12 @@ pub struct ConsensusService {
     /// incoming ancestors.
     h2_v4_last_pruned_head_block_number: Option<u64>,
     h2_v4_catchup_active: bool,
+    /// Blocks reth already holds as persisted canonical above the recovered
+    /// consensus head (hash -> number), set once at start-up. Startup can
+    /// rewind the consensus head below reth's persisted head (a stale
+    /// snapshot); catch-up must then not FCU to these blocks, since an FCU to
+    /// an ancestor of reth's persisted head fails with "too deep reorg".
+    persisted_canonical_suffix: HashMap<B256, u64>,
     /// Range catch-up client over gov5 bodies-by-range (`range_sync.rs`).
     /// Idle unless an authenticated block reveals a gap above its threshold.
     range_catchup: crate::range_catchup::RangeCatchup,
@@ -1508,6 +1563,10 @@ pub struct ConsensusService {
     /// ([`Self::drop_rejected_block_data`]) before it lets the entry stand in
     /// for the block.
     rejected_block_data: Arc<std::sync::Mutex<HashSet<B256>>>,
+    /// AM35 block journal (shared with the vote log): block data is staged
+    /// here as it arrives, made durable before an R2 vote, and replayed into
+    /// the execution layer on restart.
+    block_journal: Option<Arc<crate::block_journal::BlockJournal>>,
     /// Fast propose mode: skip slot boundary alignment, build immediately after
     /// ViewChanged/BlockCommitted. Consensus voting naturally paces block production.
     /// Enabled by `N42_FAST_PROPOSE=1`. Default: false (grid-aligned slots).
@@ -2193,6 +2252,13 @@ impl ConsensusService {
                 return false;
             }
         };
+        // AM35: a catch-up block may be an unpersisted ancestor of the next
+        // block this node commit-votes; keep it where the journal finds it.
+        if let Some(journal) = self.block_journal.as_ref() {
+            journal.note_lineage(block_hash, block.header.parent_hash, block_number);
+            journal.stage_execution(block_hash, view, block_timestamp, &execution_data);
+            self.retry_held_commit_vote();
+        }
 
         let started = Instant::now();
         let status = el
@@ -2232,6 +2298,21 @@ impl ConsensusService {
             return true;
         }
 
+        // Already reth's persisted canonical block at this height: new_payload
+        // above proved the parent chain, and an FCU here would point reth at an
+        // ancestor of its persisted head ("too deep reorg"). The first block
+        // that differs from reth's chain still takes the FCU (a sibling reorg).
+        if self.persisted_canonical_suffix.get(&block_hash) == Some(&block_number) {
+            self.persisted_canonical_suffix.remove(&block_hash);
+            info!(target: "n42::interop::h2v4", %block_hash, block_number, view, "authenticated Gov5 catch-up block is already reth's persisted canonical block; skipping its FCU");
+            let started = Instant::now();
+            let finished = self
+                .finish_h2_v4_catchup_block(block_hash, block_number, block_timestamp, block.header.parent_hash, view)
+                .await;
+            self.catchup_timings.record(Stage::Post, started.elapsed());
+            return finished;
+        }
+
         let forkchoice = self.fcu_state(block_hash, block_hash);
         let started = Instant::now();
         let result = el
@@ -2242,44 +2323,11 @@ impl ConsensusService {
         let started = Instant::now();
         match result {
             Ok(result) if matches!(result.payload_status.status, PayloadStatusEnum::Valid) => {
-                self.last_committed_timestamp = self.last_committed_timestamp.max(block_timestamp);
-                self.advance_execution_validated_head(
-                    view,
-                    block_hash,
-                    "authenticated Gov5 catch-up",
-                );
-                self.head_block_number = self.head_block_number.max(block_number);
-                // The FCU above already made this exact hash canonical. Close
-                // matching lifecycle entries so they cannot block the next
-                // live commit behind a redundant execution-ready notification.
-                self.mark_catchup_commits_finalized(block_hash);
-                self.prune_executed_h2_v4_catchup_history();
-                crate::qualification_abort_at("execution_validated");
-                // This synchronous catch-up path bypasses handle_valid_import,
-                // which normally releases the H2 execution-gated vote and
-                // closes a matching deferred finalization. Omitting these
-                // notifications leaves the consensus state machine waiting
-                // forever even though Reth is already canonical at this hash.
-                let imported = BlockDataBroadcast {
-                    block_hash,
-                    view,
-                    payload_json: Vec::new(),
-                    timestamp: block_timestamp,
-                    execution_output: None,
-                    leader_ready_unix_ms: 0,
-                    native_header_rlp: None,
-                };
-                self.complete_deferred_finalization(&imported).await;
-                if let Err(error) = self.engine.process_event(
-                    n42_consensus::ConsensusEvent::BlockImportedWithParent {
-                        block_hash,
-                        parent_hash: block.header.parent_hash,
-                    },
-                ) {
-                    error!(target: "n42::interop::h2v4", %block_hash, view, %error, "could not release execution-gated vote for Gov5 catch-up block");
-                }
+                let finished = self
+                    .finish_h2_v4_catchup_block(block_hash, block_number, block_timestamp, block.header.parent_hash, view)
+                    .await;
                 self.catchup_timings.record(Stage::Post, started.elapsed());
-                true
+                finished
             }
             Ok(result) => {
                 error!(target: "n42::interop::h2v4", %source, %block_hash, block_number, view, status = ?result.payload_status.status, "authenticated Gov5 catch-up FCU was not Valid");
@@ -2290,6 +2338,55 @@ impl ConsensusService {
                 false
             }
         }
+    }
+
+    /// The bookkeeping after a catch-up block became canonical in reth, by
+    /// its FCU or because reth already held it as persisted canonical.
+    async fn finish_h2_v4_catchup_block(
+        &mut self,
+        block_hash: B256,
+        block_number: u64,
+        block_timestamp: u64,
+        parent_hash: B256,
+        view: u64,
+    ) -> bool {
+        self.last_committed_timestamp = self.last_committed_timestamp.max(block_timestamp);
+        self.advance_execution_validated_head(
+            view,
+            block_hash,
+            "authenticated Gov5 catch-up",
+        );
+        self.head_block_number = self.head_block_number.max(block_number);
+        // Reth is canonical at this exact hash now. Close
+        // matching lifecycle entries so they cannot block the next
+        // live commit behind a redundant execution-ready notification.
+        self.mark_catchup_commits_finalized(block_hash);
+        self.prune_executed_h2_v4_catchup_history();
+        crate::qualification_abort_at("execution_validated");
+        // This synchronous catch-up path bypasses handle_valid_import,
+        // which normally releases the H2 execution-gated vote and
+        // closes a matching deferred finalization. Omitting these
+        // notifications leaves the consensus state machine waiting
+        // forever even though Reth is already canonical at this hash.
+        let imported = BlockDataBroadcast {
+            block_hash,
+            view,
+            payload_json: Vec::new(),
+            timestamp: block_timestamp,
+            execution_output: None,
+            leader_ready_unix_ms: 0,
+            native_header_rlp: None,
+        };
+        self.complete_deferred_finalization(&imported).await;
+        if let Err(error) = self.engine.process_event(
+            n42_consensus::ConsensusEvent::BlockImportedWithParent {
+                block_hash,
+                parent_hash,
+            },
+        ) {
+            error!(target: "n42::interop::h2v4", %block_hash, view, %error, "could not release execution-gated vote for Gov5 catch-up block");
+        }
+        true
     }
 
     async fn process_h2_v4_gov5_block(
@@ -2582,6 +2679,11 @@ impl ConsensusService {
             return;
         }
         counter!("n42_block_data_rejected_dropped_total").increment(rejected.len() as u64);
+        if let Some(journal) = self.block_journal.as_ref() {
+            for hash in &rejected {
+                journal.unstage(hash);
+            }
+        }
         self.pending_block_data
             .retain(|hash, _| !rejected.contains(hash));
         self.recent_block_data
@@ -2641,6 +2743,7 @@ impl ConsensusService {
             "site" => "recent_cache"
         )
         .increment(data.len() as u64);
+        self.stage_journal_block_data(hash, view, &data);
         self.recent_block_data.push_back(RecentBlockData {
             view,
             block_hash: hash,
@@ -3056,9 +3159,9 @@ impl ConsensusService {
                     ahead::tip_capacity(depth, execution_bridge::finalize_on_tip_chain()),
                 );
         }
-        let leads_next = self.engine.is_leader_for_view(ready.context.view + 1);
+        let leads_next = self.engine.is_leader_for_view(ready.context.view.saturating_add(1));
         let child = PayloadBuildContext {
-            view: ready.context.view + 1,
+            view: ready.context.view.saturating_add(1),
             parent_hash: ready.block_hash,
         };
         let on_output = self.ahead.output_build(child).is_some();
@@ -3489,6 +3592,7 @@ impl ConsensusService {
             h2_v4_catchup_buffer_blocks: h2_v4_catchup_buffer_blocks(),
             h2_v4_last_pruned_head_block_number: None,
             h2_v4_catchup_active: false,
+            persisted_canonical_suffix: HashMap::new(),
             range_catchup: crate::range_catchup::RangeCatchup::new(
                 crate::range_catchup::RangeCatchupConfig::default(),
                 range_sync::range_anchor_mode(),
@@ -3600,6 +3704,7 @@ impl ConsensusService {
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             eager_imports_in_flight: Arc::default(),
             rejected_block_data: Arc::default(),
+            block_journal: None,
             fast_propose: std::env::var("N42_FAST_PROPOSE")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
@@ -3772,6 +3877,7 @@ impl ConsensusService {
             h2_v4_catchup_buffer_blocks,
             h2_v4_last_pruned_head_block_number: None,
             h2_v4_catchup_active: false,
+            persisted_canonical_suffix: HashMap::new(),
             range_catchup: crate::range_catchup::RangeCatchup::new(
                 crate::range_catchup::RangeCatchupConfig::default(),
                 range_sync::range_anchor_mode(),
@@ -3883,6 +3989,7 @@ impl ConsensusService {
             eager_import_block_guard: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             eager_imports_in_flight: Arc::default(),
             rejected_block_data: Arc::default(),
+            block_journal: None,
             fast_propose,
             async_finalize_fcu,
             defer_state_root: false,
@@ -3944,6 +4051,35 @@ impl ConsensusService {
 
     /// E12: halts import, voting and producing on proof that the committed
     /// chain and this node's execution disagree (see [`crate::halt`]).
+    /// AM35: stages block data in `journal` (the one the vote log makes R2
+    /// blocks durable in) and replays it into the execution layer on start.
+    pub fn with_block_journal(mut self, journal: Arc<crate::block_journal::BlockJournal>) -> Self {
+        self.block_journal = Some(journal);
+        self
+    }
+
+    /// AM35: hands `data` of `hash` to the block journal, and retries an R2
+    /// vote the engine holds because that data was missing.
+    fn stage_journal_block_data(&mut self, hash: B256, view: u64, data: &SharedBlockData) {
+        let Some(journal) = self.block_journal.as_ref() else {
+            return;
+        };
+        journal.stage_data(hash, view, Arc::clone(data));
+        self.retry_held_commit_vote();
+    }
+
+    /// AM35: newly staged block data (the held block's own, or a missing
+    /// ancestor's) may let a held R2 vote go now.
+    pub(super) fn retry_held_commit_vote(&mut self) {
+        if let Some(hash) = self.engine.held_commit_vote_block()
+            && let Err(error) = self
+                .engine
+                .process_event(n42_consensus::ConsensusEvent::BlockDataStaged(hash))
+        {
+            error!(target: "n42::cl::block_journal", %hash, %error, "failed to retry the held commit vote");
+        }
+    }
+
     pub fn with_halt(mut self, halt: Arc<crate::halt::Halt>) -> Self {
         self.halt = Some(halt);
         self
@@ -4260,6 +4396,14 @@ impl ConsensusService {
         self
     }
 
+    /// Hands over the blocks reth holds as persisted canonical above the
+    /// recovered consensus head (hash -> number). See
+    /// `persisted_canonical_suffix`.
+    pub fn with_persisted_canonical_suffix(mut self, suffix: HashMap<B256, u64>) -> Self {
+        self.persisted_canonical_suffix = suffix;
+        self
+    }
+
     /// Installs the admin command receiver for RPC-originated validator reconfig requests.
     pub fn with_admin_rx(
         mut self,
@@ -4296,6 +4440,17 @@ impl ConsensusService {
             head = %self.head_block_hash,
             "N42 consensus layer initialized"
         );
+
+        // AM35: hand journalled blocks the execution layer lost back to it
+        // before this node builds, votes or serves (the leader's first build
+        // is scheduled just below).
+        if !self.halted()
+            && let Err(failure) = self.replay_block_journal().await
+        {
+            // Never serve, vote or build without the locked/committed block:
+            // the orchestrator is a critical task, so this stops the node.
+            panic!("{failure}; restore the execution layer or the journal before restarting");
+        }
 
         if !self.halted() {
             self.initialize_startup_schedule().await;
@@ -4350,6 +4505,19 @@ impl ConsensusService {
                 }
             };
             tokio::pin!(vote_resend_timer);
+
+            // AM35: a held R2 vote is retried on a tick, not only when new
+            // block data is staged (an ancestor may have arrived on a path
+            // that does not stage, or the import may have finished since).
+            let held_commit_vote = self.engine.held_commit_vote_block().is_some();
+            let held_commit_retry_timer = async {
+                if held_commit_vote {
+                    tokio::time::sleep(HELD_COMMIT_VOTE_RETRY).await
+                } else {
+                    std::future::pending::<()>().await
+                }
+            };
+            tokio::pin!(held_commit_retry_timer);
 
             let sync_request_deadline = self
                 .sync_started_at
@@ -4441,6 +4609,10 @@ impl ConsensusService {
                 // a collector's direct or gossip receive path was transiently lost.
                 _ = &mut vote_resend_timer => {
                     self.resend_pending_vote();
+                }
+
+                _ = &mut held_commit_retry_timer => {
+                    self.retry_held_commit_vote();
                 }
 
                 // Recovery deadlines are independent of new consensus/network
@@ -5673,6 +5845,8 @@ mod tests {
         fcu_states: Arc<Mutex<Vec<(B256, B256, B256)>>>,
         /// Every new_payload block hash.
         new_payload_hashes: Arc<Mutex<Vec<B256>>>,
+        /// new_payload and build requests in call order.
+        calls: Arc<Mutex<Vec<(&'static str, B256)>>>,
     }
 
     impl MockExecutionLayer {
@@ -5686,6 +5860,7 @@ mod tests {
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
                 fcu_states: Arc::new(Mutex::new(Vec::new())),
                 new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
+                calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -5707,6 +5882,7 @@ mod tests {
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
                 fcu_states: Arc::new(Mutex::new(Vec::new())),
                 new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
+                calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -5728,6 +5904,7 @@ mod tests {
                 fcu_heads: Arc::new(Mutex::new(Vec::new())),
                 fcu_states: Arc::new(Mutex::new(Vec::new())),
                 new_payload_hashes: Arc::new(Mutex::new(Vec::new())),
+                calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -5759,6 +5936,10 @@ mod tests {
                 .clone()
         }
 
+        fn calls(&self) -> Vec<(&'static str, B256)> {
+            self.calls.lock().expect("mock execution-layer lock").clone()
+        }
+
         fn build_parents(&self) -> Vec<B256> {
             self.build_parents
                 .lock()
@@ -5784,6 +5965,10 @@ mod tests {
                 .lock()
                 .expect("mock execution-layer lock")
                 .push(payload.payload.block_hash());
+            self.calls
+                .lock()
+                .expect("mock execution-layer lock")
+                .push(("new_payload", payload.payload.block_hash()));
             let mut statuses = self
                 .new_payload_statuses
                 .lock()
@@ -5841,6 +6026,10 @@ mod tests {
                 .lock()
                 .expect("mock execution-layer lock")
                 .push(state.head_block_hash);
+            self.calls
+                .lock()
+                .expect("mock execution-layer lock")
+                .push(("build", state.head_block_hash));
             Ok(ForkchoiceUpdated::from_status(PayloadStatusEnum::Valid))
         }
 
@@ -7357,6 +7546,42 @@ mod tests {
     }
 
     #[test]
+    fn committed_block_ring_is_bounded_by_bytes_after_the_newest_blocks() {
+        let entry = |view: u64, bytes: usize| CommittedBlock {
+            view,
+            block_hash: B256::from(U256::from(view)),
+            commit_qc: QuorumCertificate::genesis(),
+            payload: Vec::new(),
+            payload_len: 0,
+            block_data: Some(Arc::new(vec![0u8; bytes])),
+            validator_changes: None,
+            execution_lineage: Vec::new(),
+        };
+        let mut ring = VecDeque::new();
+        for view in 0..200 {
+            ring.push_back(entry(view, 1_000));
+            state_mgmt::trim_committed_blocks(&mut ring, 10_000, 100_000);
+        }
+        // 100 entries of 1,000 bytes fit the budget; the oldest left first.
+        assert_eq!(ring.len(), 100);
+        assert_eq!(ring.front().map(|block| block.view), Some(100));
+        assert_eq!(ring.back().map(|block| block.view), Some(199));
+
+        // Blocks larger than the whole budget still keep the newest 64.
+        for view in 200..300 {
+            ring.push_back(entry(view, 1_000_000));
+            state_mgmt::trim_committed_blocks(&mut ring, 10_000, 100_000);
+        }
+        assert_eq!(ring.len(), 64);
+        assert_eq!(ring.back().map(|block| block.view), Some(299));
+
+        // The entry cap still applies to small blocks.
+        let retained = state_mgmt::trim_committed_blocks(&mut ring, 10, usize::MAX);
+        assert_eq!(ring.len(), 10);
+        assert_eq!(retained, 10 * 1_000_000);
+    }
+
+    #[test]
     fn leader_payload_drain_backfills_committed_sync_payload() {
         let mut orch = make_test_orchestrator_with_state(None);
         let parent_hash = B256::repeat_byte(0x31);
@@ -8734,6 +8959,71 @@ mod tests {
             orch.async_commit_states[&203].stage,
             AsyncCommitStage::Finalized
         );
+    }
+
+    /// E9 kill 10: a stale snapshot rewound the consensus head below reth's
+    /// persisted head. A catch-up block reth already holds as persisted
+    /// canonical must not get an FCU (reth answers "too deep reorg"), yet it
+    /// must still advance the execution head and release the gated vote.
+    #[tokio::test(flavor = "current_thread")]
+    async fn catchup_skips_fcu_for_reth_persisted_canonical_block() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+        orch.async_finalize_fcu = false;
+        orch.head_block_number = 100;
+        orch.head_block_hash = B256::repeat_byte(0x70);
+        orch.execution_validated_head_view = 200;
+        let (hash, rlp) = test_gov5_block_rlp(orch.head_block_hash, 101, 201);
+        orch = orch.with_persisted_canonical_suffix(HashMap::from([(hash, 101)]));
+        assert!(
+            orch.import_h2_v4_catchup_block(
+                n42_network::PeerId::random(),
+                n42_network::decode_gov5_block_rlp(&rlp).unwrap(),
+                201,
+            )
+            .await
+        );
+        assert!(mock.fcu_heads().is_empty(), "no FCU to reth's own persisted block");
+        assert_eq!(orch.head_block_number, 101);
+        assert_eq!(orch.execution_validated_head_view, 201);
+        assert!(orch.persisted_canonical_suffix.is_empty());
+    }
+
+    /// A block at the same height as a persisted one but with another hash is
+    /// a sibling reorg; it keeps its FCU.
+    #[tokio::test(flavor = "current_thread")]
+    async fn catchup_keeps_fcu_for_block_off_reth_persisted_chain() {
+        let (engine, output_rx) = make_test_engine();
+        let (network, _cmd_rx, _prx) = make_test_network();
+        let (_net_event_tx, net_event_rx) = mpsc::channel(8192);
+        let mock = Arc::new(MockExecutionLayer::new(
+            PayloadStatusEnum::Valid,
+            PayloadStatusEnum::Valid,
+        ));
+        let mut orch = ConsensusService::new(engine, Arc::new(network), net_event_rx, output_rx);
+        orch.el = Some(mock.clone());
+        orch.async_finalize_fcu = false;
+        orch.head_block_number = 100;
+        orch.head_block_hash = B256::repeat_byte(0x70);
+        orch.execution_validated_head_view = 200;
+        let (hash, rlp) = test_gov5_block_rlp(orch.head_block_hash, 101, 201);
+        orch = orch.with_persisted_canonical_suffix(HashMap::from([(B256::repeat_byte(0x99), 101)]));
+        assert!(
+            orch.import_h2_v4_catchup_block(
+                n42_network::PeerId::random(),
+                n42_network::decode_gov5_block_rlp(&rlp).unwrap(),
+                201,
+            )
+            .await
+        );
+        assert_eq!(mock.fcu_heads(), vec![hash]);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11720,6 +12010,37 @@ mod tests {
         );
     }
 
+    /// After a start-up rewind below reth's persisted head (#59), the blocks
+    /// reth already holds as persisted canonical take no forkchoice update
+    /// on either path; the first block above them does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn range_import_skips_the_update_for_reth_persisted_blocks_on_both_paths() {
+        for depth in [0usize, 4] {
+            let engine = Arc::new(TimedEngine::default());
+            let (mut orch, network, peer, chain) =
+                range_pipeline_orchestrator(100, 1, engine.clone(), depth).await;
+            // Blocks 1..=40: a whole first batch and part of the second.
+            let suffix: HashMap<B256, u64> = chain[..40]
+                .iter()
+                .enumerate()
+                .map(|(index, (hash, _))| (*hash, index as u64 + 1))
+                .collect();
+            orch = orch.with_persisted_canonical_suffix(suffix);
+            run_range_catchup(&mut orch, &network, peer, &chain, 100, 200).await;
+            assert_eq!(orch.head_block_number, 100, "depth {depth}");
+            assert_eq!(orch.head_block_hash, chain[99].0, "depth {depth}");
+            let fcus = engine.fcu_heads.lock().unwrap().clone();
+            assert!(
+                fcus.iter().all(|head| chain[..40].iter().all(|(hash, _)| hash != head)),
+                "depth {depth}: no update to a persisted block"
+            );
+            assert_eq!(fcus.last(), Some(&chain[99].0), "depth {depth}");
+            assert!(orch.persisted_canonical_suffix.is_empty(), "depth {depth}");
+            let expected: Vec<B256> = chain.iter().map(|(hash, _)| *hash).collect();
+            assert_eq!(*engine.payloads.lock().unwrap(), expected, "depth {depth}");
+        }
+    }
+
     /// Range catch-up wall time per block on this host: serial, pipelined,
     /// and pipelined with the sender warm-up, with real 1,200-transfer
     /// blocks and an engine that takes a fixed time per payload
@@ -12047,4 +12368,7 @@ mod tests {
 
     /// Profile 1: the V1 header vectors through the real import entry points.
     mod profile1;
+
+    /// AM35: the block journal through the vote path and restart replay.
+    mod am35_block_journal;
 }

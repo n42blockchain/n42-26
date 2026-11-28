@@ -1081,3 +1081,286 @@ n42-26 此前只返回前五个字段，证据仅存内存（500 条环形队列
 - [x] AM28 RPC 形状、`equivocations.jsonl` 落盘与重启加载
 - [x] 单元测试（证据可独立验证）
 - [ ] 混合轮次中的跨客户端验证：需要一个故意双签的节点，目前三方都没有作恶注入工具，暂以单元测试为准。
+
+### 17.6 跨视图边界的迟到作恶证据（2026-11-26 追加）
+
+**问题**：
+- leader 在 CommitQC 形成的那一刻就推进 view（`try_form_commit_qc`），而 `advance_to_view` 每次推进都会清空三个 equivocation tracker。
+- 之后到达的旧 view 消息，在 `process_message_inner` 里被当作过期消息直接丢弃，根本到不了 `process_commit_vote_inner` 的 `check_equivocation`。
+- 结果有两类双签漏检：
+  - 一个 commit vote 已被计入 QC，冲突的另一个在 QC 之后才到；
+  - quorum 之外的成员，两个 commit vote 都迟到。
+- R1 vote 和 proposal 同理。
+- n42-rs 在 d0d01fe7b（"late commit votes"）发现并修复了同一问题，见其 `docs/P1_EQUIVOCATION_INJECTOR.md`。
+
+**设计**（与 n42-rs 一致）：
+- 新模块 `protocol/late_evidence.rs`：
+  - `LateEvidence` 在推进 view 时接收被关闭 view 的三个 tracker，只保留最近 `LATE_EVIDENCE_VIEWS = 3` 个 view；
+  - 同时保存这些 view 内迟到的消息：每个（kind, view, signer）一条，按到达原样存放、不验签。
+- 迟到消息由 `note_late_message` 处理，只做取证：不进 collector，不改共识状态。
+  - vote 和 commit vote 只在本节点担任该 view leader 时检查，与当前 view 的规则一致（投票只发给 leader）；不是 leader 的 view，tracker 本来就是空的。
+  - proposal 所有节点都检查：proposer 必须是该 view 的 leader；gov5 下带非空 validator changes 的 proposal 被拒，与当前 view 的规则一致。
+- 只在冲突时验签：
+  - 与已关闭 tracker 中的同一 commitment 相同的消息，或与已存的迟到消息相同的消息（例如 vote resend），直接返回，不做 BLS 运算。
+  - 冲突时才验签。先验已存的未验证消息：如果它是伪造的，就用新消息替换它，不出证据。再验新消息。
+  - 两边都验证通过才发 `EquivocationDetected`。
+  - 已经被批量验签认证过的 vote 或 commit vote（proof 匹配当前 changes hash）不再重复验签。
+- 证据形状与当前 view 相同（AM28）：
+  - hash1/hash2 取两边的块哈希；
+  - 两个 proposal 块哈希相同、只有 validator changes 不同时，取两边签名消息的 commitment。
+- 内存上限：3 个 view × n 个签名者 × 3 种消息，view 推进时裁剪。
+
+**实施**：
+- `state_machine.rs`：
+  - 新增 `late_evidence` 字段；
+  - `advance_to_view` 改为 `mem::take` 三个 tracker 并调用 `close_view(closing, new_view, ..)`；
+  - 过期消息分支先调用 `note_late_message`，再走原来的 `recover_late_committed_proposal`；
+  - `EquivocationKind` 增加 `Hash` derive，`AuthenticatedVoteProof` 改为 `pub(super)`。
+- 检查编排层：过去 view 的 vote 不经批量验签（只有当前 view 的才进批），直接进引擎的过期分支，所以会走到新逻辑。
+
+**测试**（`n42-consensus` 新增 6 个）：
+- `a_conflicting_commit_vote_after_the_commit_qc_is_evidence`：两种情况都能检出：计入 QC 的投票之后才到的冲突 commit vote；quorum 外成员两次都迟到的 commit vote。
+- `a_conflicting_r1_vote_after_the_view_closed_is_evidence`
+- `a_conflicting_proposal_after_the_view_closed_is_evidence`：follower 侧。
+- `honest_late_messages_produce_nothing`
+- `a_forged_late_message_is_never_evidence`：伪造的先到消息被替换，伪造的后到消息被忽略，都不产生证据。
+- `late_messages_outside_the_window_are_ignored_and_dropped`：超出窗口的 view 被忽略，且内存清零。
+
+去掉 `note_late_message` 调用后，其中 4 个测试失败，确认它们覆盖了这个缺口。
+
+**状态**：
+- [x] 修复与测试；clippy -D warnings 通过；n42-consensus、n42-consensus-service 全部测试通过。
+- [ ] 与 n42-rs 注入器（`N42_TEST_EQUIVOCATE=commit_vote:every-1`）做混合轮次验证：n42-26 作为 leader 时，应在 `n42_equivocations` 中记录对方的 commit_vote 双签对。
+
+## 18. AM33：连续缺席 leader 的超时退避（v1.2）（2026-11-26 追加）
+
+### 18.1 背景与标准文本
+
+gate 5d（n = 100，base 24 s / max 96 s）中 6 个连续缺席 leader（view 57..62）造成一次 464 s 断档：旧规则每个 TC 都翻倍
+（24/48/96/96/96/96 s）。gov5、n42-rs、n42-26 于 2026-11-26 21:10 EST 商定 AM33（n42-rs `docs/AM33_DRAFT_CONSECUTIVE_ABSENT_LEADERS.md`
+"Agreed" 节；gov5 向量 `vectors/AM33/README.md`）：
+
+    timeout(c) = min(base_eff * 2^floor(c / g), max),   g = min(f + 1, 3),   f = floor((n - 1) / 3)
+
+- `c` 每次本地 view 超时加 1；在 commit QC（Decide）与基于 QC 的 view 跳转时清零；TC 从不清零（含 SyncInfo 中携带的 TC，gov5 已去掉该清零）。
+- 一个 view 的计时器为进入该 view 时的 `timeout(c)`。
+- `base_eff` 为本地自适应基准 `max(base, 2 * p95 commit latency)`，上限 max；分组只除指数。
+- n 为引擎启动 view 计时器时持有的验证者集大小。
+
+向量：gov5 `internal/testdata/profile1/vectors/AM33/timeout_backoff.json`（gov5 a64a7947，SHA-256 `dd23ae8d…b222`），
+逐字节复制到 `crates/n42-consensus/testdata/profile1/gov5/AM33/`（含 README）。内容：groups（n = 1..7, 10, 100, 512）、
+timeouts（n = 4/7/100，24 s/96 s 与 6 s/30 s，c = 0..12，含旧规则列）、29 条 runs（gate-5d、n{4,7,100}-T1-k{1..6}、n100-T1-k33、
+n{4,7,100}-T8-k3、AM32 边界钳制及其 -p1 / -next-dead 变体）。n42-rs main d8a5e54d2 已通过同一向量。
+
+### 18.2 设计决策
+
+- **计数方式不变**：n42-26 原本就是"本地超时 +1、commit 与 QC 跳转清零、TC 不清零"，与商定规则一致。n42-26 没有 SyncInfo；
+  对应的"携带 TC"路径是 NewView（TC 内嵌），它只推进 view，不动 `c`。他人 TC 让本节点离开 view 而本地计时器未触发时，`c` 不变
+  （只计本地超时）。f+1 弱同步路径（`collect_future_timeout`）推进后会调用 `on_timeout`，属于本地超时，照常 +1。
+- **只改指数**：`Pacemaker::timeout_duration` 指数改为 `floor(c / g)`；自适应基准不动（与 gov5/n42-rs 相同：分组只作用于指数）。
+- **仅 Profile 1 生效**：AM33 是混合生产标准 v1.2 对 SYNC §10.2 的修订，三方针对 Profile 1 商定。原生 0x50 路线与 ETH 路线不属于该标准，
+  按 CLAUDE.md "保留各自协议配置与验收口径"，这些链不设委员会规模（n = 0 → g = 1），行为与之前完全一致。开关沿用 `VoteRules::profile1`。
+  （n42-rs 是无条件启用；其仓库只有 H2 主线，不涉及此取舍。）
+- **API 对齐 n42-rs/gov5**：`Pacemaker::backoff_group_size(n)`（gov5 `BackoffGroupSize`）、`set_committee_size`（gov5 `SetCommitteeSize`）、
+  `with_committee_size`、`backoff_group()`，便于三方对照。
+
+### 18.3 实施细节
+
+- `protocol/pacemaker.rs`：新增 `committee_size` 字段（0 = 无，g = 1）与上述方法；新增 `armed_timeout()`（上次 `reset_for_view` 设定的时长，
+  确定性，测试用），`reset_for_view` 日志带 `backoff_group`。
+- `protocol/state_machine.rs`：
+  - `sync_backoff_group()`：Profile 1 取当前持有的验证者集大小，其他路线取 0；在两个构造函数末尾与 `set_vote_rules` 中调用。
+  - `arm_view_timer(view)`：先 `sync_backoff_group()` 再 `reset_for_view(view, c)`。`advance_to_view` 在跨 epoch 处理之后调用它，
+    所以 n 是新 view 所在 epoch 的集合大小。
+- `protocol/timeout.rs`：`on_timeout` 中三处 `reset_for_view`（观察者分支、重复超时、首次超时）改为 `arm_view_timer`。
+- 编排层 `reset_for_view(view, 0)`（启动 view ≤ 1 的检查）c = 0，不受影响，未改动。
+
+### 18.4 测试
+
+- `pacemaker.rs` 单元测试（6 个）：g 表（n = 0..7, 10, 100, 512）；n = 4（g = 2）24/24/48/48/96…；n = 7 与 n = 100（g = 3）6/6/6/12/12/12/24/24/24/30；
+  上限与指数饱和（c 到 `u32::MAX`）；`set_committee_size` 切换；与自适应基准组合（p95 = 3 s → base_eff 6 s，6/6/12/12/24/24）。
+- `tests/profile1_am33.rs`（3 个，先校验 SHA-256）：groups、timeouts（含旧规则列）、29 条 runs 在 pacemaker + `leader_index` + `view_after_tc` 上重放，
+  逐步核对 leader、进入时的 c、计时器、下一 view 与 `gapMs` / `previousRuleGapMs`。
+- `state_machine.rs` 引擎测试（4 个）：
+  - `am33_vector_runs_on_engine`：29 条 runs 全部在真实引擎上重放（Profile 1 用 H2-v4 签名；非缺席的观察者节点；缺席 view 由本地超时 + 其他验证者超时形成 TC，
+    存活 view 由 Decide 提交）。逐步核对 view、leader、g、进入时的 c、实际装填的计时器、下一 view，存活 view 后 c = 0 且计时器回到 base；
+    同一批 runs 在非 Profile-1 引擎上得到 `previousRuleGapMs`。覆盖 n = 4/7/100、上限、AM32 边界钳制、rotate-on-timeout（T = 8）。
+  - `am33_a_tc_in_a_new_view_keeps_the_timeout_count`：NewView 携带的 TC 不清零 c；未本地超时而被他人 TC 带走的 view 不计数；n = 7 时第三次超时才翻倍。
+  - `am33_a_qc_view_jump_resets_the_backoff`：n = 4 三次超时后（c = 3，计时器 2·base）QC 跳转到 view 100，c = 0、计时器回到 base。
+  - `am33_other_lines_keep_one_doubling_per_timeout`：非 Profile 1 每次超时翻倍（g = 1）。
+- clippy `-p n42-consensus -p n42-consensus-service --all-targets -D warnings` 通过；n42-consensus（lib 294、integration 67 等）与
+  n42-consensus-service（365 + 19）全部通过。
+
+### 18.5 遇到的问题
+
+- Profile 1 只允许 H2-v4 签名（A14），用 Native 签名的测试消息会被 `SigningProfileUnreachable` 拒绝；测试改为按引擎的 signing profile 构造 QC/TC/NewView/Proposal。
+- 引擎构造后、首次 `advance_to_view` 前，pacemaker 尚未拿到委员会规模；在构造函数与 `set_vote_rules` 中同步一次。
+
+### 18.6 状态与后续
+
+- [x] AM33 实现、gov5 向量全部通过（pacemaker 级与引擎级）、devlog。
+- [ ] 混合 5d 式重跑：6 个连续缺席 leader，base 24 s 下断档 ≤ 216 s（加出块间隔）。
+- 未处理（沿用现状）：从快照恢复且 c > 0 的节点，首个 view 的计时器仍是 base（`Pacemaker::new` 的初始 deadline），直到第一次 `arm_view_timer`。
+
+## 19. 混合生产标准 v1.2 补齐（计划 F1：V2、V7、V9、AM34 第 3-5 项）（2026-11-27 追加）
+
+分支 `feat/profile1-v12-f1`（基于 origin/main b64f650）。向量均从 gov5 main 08ecf671 `internal/testdata/profile1/vectors/` 逐字节复制
+（与 qs-scratch 副本一致），按 AM33 的做法放 `testdata/profile1/gov5/<V>/`，测试先校验 SHA-256。gov5 没有单独的 AM34 向量目录。
+
+| 向量 | 文件 | SHA-256 | 位置 |
+| --- | --- | --- | --- |
+| V2 | `roots.json` | `deff5a4736778ef0b70aedc30f747d7ccd89422479393d37cba04fc541cdef18` | `crates/n42-node/testdata/profile1/gov5/V2/` |
+| V7 | `leader_schedule.json` | `a08180b1fc9625c0b6cd6128b775e40dcdf04a900b9ba3bf45aa9210340fd445` | `crates/n42-consensus/testdata/profile1/gov5/V7/` |
+| V9 | `gossipsub_parameters.json` | `b315f30b8b9682486ab750f7aa7ab3bbaa84bd62f8941c74492208479fad8716` | `crates/n42-network/testdata/profile1/gov5/V9/` |
+
+### 19.1 V7 leader 调度（无 2^64-1 行）— 已满足，补测试（4ea2dff）
+
+- `crates/n42-consensus/tests/profile1_v7.rs`（6 个）：profiles、leader 表、tenure 窗口、epoch、51 行 `view_after_tc`、11 条序列，
+  全部与 gov5 一致，调度代码未改。
+
+### 19.2 AM34 第 3 项：view 2^64-1 的 QC/TC 无效（425bbe6）— 实际缺口
+
+- 修复前：`view_after_tc(MAX)` 用 `wrapping_add` 回绕到 view 0；签名正确的 view = MAX 的 QC/TC 会被接受。
+- 设计：拒绝点放在所有入口的公共底层，而不是逐个调用点：
+  - `validator/selection.rs`：`MAX_CERTIFIED_VIEW`、`certifiable_view()`；`view_after_tc` 只对 MAX 以下有定义，MAX 饱和不回绕。
+  - `protocol/quorum.rs`：`collect_signer_keys` 拒绝 MAX（覆盖 verify_qc、commit、any-domain、TC），构建 QC/TC 同样拒绝。
+  - 引擎：`on_block_ready` / `send_vote` / `on_timeout` 在 MAX 不提议、不签名；proposal、timeout、future timeout、NewView 携带的 TC 均拒绝；
+    `current_view + FUTURE_VIEW_WINDOW` 与编排层 build-ahead 的加法改 `saturating_add`。
+  - `n42-consensus-service/src/h2_finality.rs`：Decide、sync anchor、shadow 校验与 NewView 分支新增 `LastView` 错误。
+  - `n42-network/src/sync_v11.rs`：`check_commit_qc_reply` 拒绝 view = MAX 的 commit_qc。
+- 测试：选择层、quorum（Native 与 H2V4，MAX 与 MAX-1）、引擎、h2_finality、sync_v11 各一个。
+
+### 19.3 V2 收据根含 EIP-7708 转账日志（AM34 第 5 项）— 已满足，补测试（131f229）
+
+- n42-26 经 evm2 Amsterdam（`amsterdamTime`）已产出来自 `0xff…fe` 的 7708 日志，无需开关；`fast_transfer` 路径（默认关闭）同样产出。
+- `n42-consensus` 新增 `gov5_native_receipt_rlp`（收据根共用编码）；`crates/n42-node/tests/profile1_vectors.rs` 新增 4 个 V2 测试：
+  收据与收据根、转账日志属于收据根、withdrawals 根、committee evidence，全部等于 gov5。
+
+### 19.4 V9 GossipSub 参数与 AM34 第 4-5 项：只订阅 G2 主题（85111b1）
+
+修复前（Profile 1 节点）：
+
+| 项 | n42-26 原值 | V9 / gov5 |
+| --- | --- | --- |
+| heartbeat / 初始延迟 | 1 s / 5 s | 700 ms / 100 ms |
+| history length | 5 | 6 |
+| seen TTL | 60 s | 30 s |
+| IDONTWANT 阈值 | 1000 | 1024 |
+| mesh D/Dlo/Dhi | 按网络规模缩放（环境变量可调） | 8 / 6 / 12 |
+| 校验模式 | Permissive | Anonymous（StrictNoSign + 无 author） |
+| max transmit size | 16 MiB | 78 293 706（32 + n + n/6，n = 64 MiB） |
+| gov5 块 gossip 解码上限 | 1 MiB | maxBlockBytes = 64 MiB |
+| 订阅主题 | G2 之外还订阅 `/n42/{consensus,blocks,verification,mempool,blobs}/1` | 只 G2 |
+
+设计与实现：
+
+- 新模块 `n42-network/src/gossipsub/profile1.rs`：V9 常量、`gossipsub_config(genesis, max_block_bytes)`、`max_gossip_wire_size`、`g2_topics`。
+  线上契约（主题串、G3 消息 id、大小上限）必须相等；mesh/history 等属于本地路由行为，但同样取 gov5 值，使 Rust 成员 graft/prune 行为与 Go 一致。
+  peer scoring 按 AM34 属本地选择，保留原有参数。
+- `TransportConfig::profile1_max_block_bytes`：设置时 swarm 用 profile-1 配置；非 gov5 传输（无匿名信封）直接报错。
+- `NetworkService::new_profile1_participant` / `new_profile1_observer`：只订阅 G2（gov5 block、hotstuff_consensus、H2-v4，participant 另加
+  `transaction_v2`）；`gossipsub_publish` 丢弃 G2 之外的发布（计数 `n42_profile1_non_g2_publish_dropped_total`）；gov5 块 gossip 的解码上限与
+  原始上限改为 maxBlockBytes 及其 snappy 上界（`validate_message_with_gov5_block_cap`）。
+- `bin/n42-node/src/main.rs`：验证者与观察者两条路径按 `profile1_config().max_block_bytes` 选择上述构造。
+- 请求-响应协议（sync v1.1 range/commit_qc、block-by-hash、bodies-by-range、status、direct H2、block_direct）不受影响；
+  n42-26 之间的原生块数据仍经 block_direct 推送，gov5 `block` 主题携带完整块，原生 `/n42/blocks/1` gossip 后备在 Profile 1 上被丢弃不损失路径。
+- G2 中的 `mobileverify_{packet,registration}` 暂不加入：n42-26 尚无 mobileverify 服务（I1），加入一个无法校验的主题只会成为转发方。
+  cohort 主题（`mobileverify_cohort_{index,reveal,cert}`）永不订阅。
+
+测试：
+
+- `crates/n42-network/tests/profile1_v9.rs`（4 个，先校验 SHA-256）：11 个主题串、inG2 列表与本节点订阅集合的关系（不含 cohort）、
+  4 条消息 id、router 选项（大小上限、Anonymous、seen TTL）、`gossipSubParams` 逐字段比较；rust-libp2p 无对应项的字段
+  （ConnectionTimeout、Connectors、MaxPendingConnections、DirectConnectInitialDelay、SlowHeartbeatWarning、IDontWantMessageTTL、
+  MaxIDontWantLength、MaxIDontWantMessages）列入 `NO_COUNTERPART`，向量新增字段未归类即失败（与 n42-rs 测试相同做法）。
+- `service::tests`（4 个）：participant 与 observer 只订阅 G2；G2 之外的发布被丢弃、非 Profile-1 服务仍订阅原生主题；profile-1 swarm 需要 gov5 传输。
+
+### 19.5 问题与解决
+
+- rustfmt 会顺带重排 `main.rs` 中原本未格式化的代码；回退后只重放本次改动。
+- `new_with_options` 增加参数后触发 clippy `too_many_arguments`，按现有写法加 allow。
+
+### 19.6 状态与后续
+
+- [x] V7、V2 已满足（补向量测试）；AM34 第 3 项修复；V9 与 AM34 第 4-5 项实现。
+- [x] clippy `-p n42-network -p n42-consensus -p n42-consensus-service -p n42-node -p n42-node-bin --all-targets -D warnings` 通过；
+  `cargo test -p n42-consensus -p n42-consensus-service -p n42-network -p n42-node -p n42-execution`：1565 通过、0 失败、29 忽略（既有 #[ignore] 基准）。
+- [ ] 混合集群实跑确认：700 ms heartbeat 与 G2-only 下 n42-26 与 gov5 成员的 mesh 形成、64 MiB 块 gossip。
+- [ ] mobileverify G2 主题（I1）落地后加入订阅集合。
+- 待与 gov5/rs 确认：gov5 是否在 validate 之后才转发（rust-libp2p Anonymous 模式下本节点仍是立即转发，未启用 `validate_messages()`）。
+
+### 19.7 追加：先校验后转发（AM36，n42-rs 提议稿 18fa2d68b）（2026-11-27）
+
+背景：F1 报告指出 n42-26 收到即转发。rs 据此提议 AM36（Profile 1 全部 G2 主题）：
+1. 消息解码为主题对应类型且字段在范围内（含 AM34 第 3 项的 view 上限）才转发，否则 Reject；
+2. 转发前验 BLS 可选；
+3. 已离开 view 的消息或重复消息 Ignore；
+4. mobileverify 主题在服务上线后按同一规则解码。
+
+实现（仅 Profile 1；其他路线不变，仍是 Permissive、无 `validate_messages`）：
+
+- `gossipsub::profile1::gossipsub_config` 打开 `validate_messages()`；V9 测试断言之。
+- `NetworkService::handle_gossipsub_message` 拆成两步：`classify_gossipsub_message` 返回 `(MessageAcceptance, Option<NetworkEvent>)`，
+  原先每个 `return;` 都改成带判定的返回；外层在 Profile 1 上对每条消息恰好调用一次 `report_message_validation_result`，
+  且只有 Accept 才把事件交给节点。不存在不上报的路径（router 在 `validate_messages` 下会一直持有未上报消息直到 mcache 轮换）。
+- 判定（全部无状态或只读本地 committed view，不验签、不执行）：
+
+| 主题 | Accept | Reject | Ignore |
+| --- | --- | --- | --- |
+| gov5 `block` | snappy 解压长度一致、≤ maxBlockBytes、整块按 Profile-1 24 元素布局 RLP 解码成功 | 其余 | — |
+| `hotstuff_consensus` | 解码成功且所有 view（消息本身与内含 QC/TC/highQC/highTC）≠ 2^64-1 | 解码失败或 view 越界 | view < 本地最新 CommitQC 的 view |
+| H2-v4 | 同上，另需信封链身份一致 | 同上 | 同上 |
+| `transaction_v2` | 批次解码且每条都是本链已知交易 | 批次解码失败或任一条不可解码 | 空批次 |
+
+- 新增 `GossipValidationStats`（received/accepted/rejected/ignored/unreported），`NetworkService::gossip_validation_stats()` 取得；
+  指标 `n42_profile1_gossip_validation_total{verdict}`、`n42_profile1_h2_out_of_range_total`、`n42_profile1_h2_stale_total`。
+- 陈旧判定的 view 下限来自 `NetworkCommand::NoteCommittedQc`（consensus_loop 每次提交时发送），取最大值；
+  只忽略严格低于已提交 view 的 H2 消息，已提交 view 本身及未来 view 照常转发。
+- BLS 仍在 Accept 之后由共识处理器验证（AM36 第 2 条允许），因此不存在重复验签。
+
+测试：
+
+- `service::tests::profile1_validates_before_forwarding`：真实三节点线形拓扑（发布者 → Profile-1 服务 → 观察者，两端不直连），
+  4 个 G2 主题各发一条合法消息与一条畸形消息，另加 view = 2^64-1 的 gov5 H2 与 H2-v4 消息、含不可解码条目的交易批次、
+  低于已提交 view 的 H2 消息。断言：Accept 4、Reject 7、Ignore 1、unreported 0；观察者只收到 4 条合法消息。
+  变异检查：去掉 `validate_messages()` 后观察者收到全部 12 条，测试失败。
+- `tests/profile1_v9.rs`：配置断言 `validate_messages()`。
+
+对 AM36 文本的意见（转 rs）见 F1 追加报告。
+
+状态：
+- [x] 实现、测试；clippy（n42-network、n42-consensus-service、n42-node、n42-node-bin，-D warnings）通过；n42-network + n42-consensus-service + n42-node 测试 1017 通过、0 失败、20 忽略。
+- [ ] 混合集群实跑：确认 gov5 不在 HotStuff/H2-v4 主题上注册校验器时，n42-26 的 Reject 不会误罚 gov5 成员（gov5 不会发送畸形消息，应无影响）。
+
+### 19.8 追加：对齐 AM36 第 5-9 项（n42-rs 741d71ed7）（2026-11-27）
+
+rs 根据本节 19.7 的意见把 AM36 补成第 5-9 项。与 PR #58 的差异及处理：
+
+- 第 5 项（无状态字段检查）新增两条，失败即 Reject：proposal 的 justify QC view 必须小于 proposal view；Decide 的 commit QC view 必须等于 Decide view
+  （`gossipsub::profile1::h2_fields_in_range`）。签名者编号与委员会规模、头部 view/slot、BLS 仍在处理器，不在转发前检查。
+- 第 8 项（`transaction_v2`）：新增 `tx_batch_verdict`。任一条字节不能解码为交易（空条目、非法 legacy 前缀、已知类型但字节损坏）→ Reject；
+  全部可解码但有类型不在 Profile-1 集合（`check_profile1_tx_type`：0x00/0x01/0x02/0x04；Profile 1 无 `altSigTx`，0x50 不在内）→ Ignore，
+  不转发、不交给交易池、不惩罚。本客户端没有解码器的类型字节（如 0x05）按"集合外类型"处理为 Ignore，不按"不可解码"Reject，
+  以符合第 8 项"多认识一种类型的客户端不受罚"的本意。空批次 Ignore。
+- 第 3 项新增说明：Ignore 会同时阻止本地交付，因此过期 H2 消息要先交给迟到消息存储。原实现过期消息直接丢弃；现在过期的 gov5 H2 / H2-v4 消息
+  上报 Ignore（不转发、不惩罚），但仍以事件交给共识处理器（AM28/§17.6 的迟到消息与作恶证据路径照常工作）。外层改为：判定不是 Reject 且有事件就交付。
+- 已一致、无需改动：第 6 项过期 = 严格低于最新 CommitQC 的 view，已提交 view 本身不过期；未来 view 无上限 Accept；第 7 项 block 与
+  `transaction_v2` 没有过期规则，合法即 Accept，重复由 message id 去重。
+
+测试：
+
+- `gossipsub::profile1::tests`（3 个）：proposal / Decide 的 view 关系；过期边界（49 过期、50 不过期、远期不过期）；交易批次判定的 Accept / Reject / Ignore 各情形。
+- `service::tests::profile1_validates_before_forwarding` 扩展为 21 条消息：
+  - Accept 7（含已提交 view 50、未来 view 1 000 000 / 1 000 001）；
+  - Reject 10（新增 commit QC view 不符的 Decide ×2、justify QC view 不小于 view 的 proposal、类型内容损坏的交易条目）；
+  - Ignore 4（过期 gov5 H2 与 H2-v4、blob 交易批次、含 0x05 类型条目的批次）。
+  - 断言 unreported = 0；观察者只收到 7 条 Accept；节点收到的 H2 view 为 {10, 20, 50, 100, 101, 1 000 000, 1 000 001}（两条过期消息仍交付）；交易批次只交付 1 个。
+
+状态：clippy（n42-network、n42-consensus-service、n42-node、n42-node-bin，-D warnings）通过；n42-network + n42-consensus-service + n42-node 测试 1020 通过、0 失败、20 忽略。
+
+### 19.9 Start-up refusal of altSigTx / frameBlocks on a Profile-1 genesis (2026-11-27)
+
+- **Decision**: A11/C4 (decision O3) keeps 0x50 out of Profile 1 everywhere, and A12 keeps frame blocks out. The standard also requires that a Profile-1 genesis enabling `altSigTx` be refused at start-up. n42-26 already refused 0x50 in the pool, in blocks and in execution (`check_profile1_tx_type`), but it started on such a genesis.
+- **Change**: `Profile1Config::from_genesis` now rejects `altSigTx: true` and `frameBlocks: true`. An explicit `false` stays valid. `resolve_genesis_profile` propagates the error, and `install_genesis_profile` then refuses to start.
+- **Test**: `a_profile1_genesis_with_alt_sig_tx_or_frame_blocks_is_refused` in crates/n42-chainspec/tests/profile1_vectors.rs.
+- **Note**: rs first suggested that 0x50 is valid when the genesis has altSigTx, then corrected it. fleet7 is an all-Rust bench chain outside Profile 1. AM36 item 8 uses the fixed set {0x00, 0x01, 0x02, 0x04}.

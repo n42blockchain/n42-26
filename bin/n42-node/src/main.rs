@@ -247,6 +247,51 @@ where
     Ok(reader)
 }
 
+/// AM35: opens the block journal beside the vote log. Profile 1 always
+/// journals; elsewhere `N42_BLOCK_JOURNAL=0` turns it off (with a warning).
+/// Observers cast no votes and keep none.
+fn open_block_journal(
+    data_dir: &Path,
+    profile1_node: bool,
+    observer_mode: bool,
+    db_sync_durable: bool,
+) -> eyre::Result<Option<Arc<n42_consensus_service::block_journal::BlockJournal>>> {
+    if observer_mode {
+        return Ok(None);
+    }
+    let disabled = std::env::var("N42_BLOCK_JOURNAL")
+        .is_ok_and(|value| matches!(value.as_str(), "0" | "false" | "off"));
+    if disabled {
+        if profile1_node {
+            return Err(eyre::eyre!(
+                "N42_BLOCK_JOURNAL=0 is refused on Profile 1: AM35 requires every R2 vote's block to be durable before the vote"
+            ));
+        }
+        warn!(target: "n42::cli", "N42_BLOCK_JOURNAL=0: R2 votes no longer wait for their block to be durable; a whole-set power loss can halt the chain");
+        return Ok(None);
+    }
+    if !db_sync_durable {
+        return Err(eyre::eyre!(
+            "--db.sync-mode other than Durable is refused: AM35 counts a block persisted by reth as durable only under a synced commit"
+        ));
+    }
+    let path = data_dir.join(n42_consensus_service::block_journal::BLOCK_JOURNAL_FILE);
+    let (journal, report) = n42_consensus_service::block_journal::BlockJournal::open(path.clone())
+        .map_err(|error| eyre::eyre!("failed to open the block journal {}: {error}", path.display()))?;
+    if report.truncated_bytes > 0 {
+        warn!(
+            target: "n42::cli",
+            path = %path.display(),
+            records = report.records,
+            truncated_bytes = report.truncated_bytes,
+            reason = report.truncation_reason.as_deref().unwrap_or_default(),
+            "block journal: dropped a torn or damaged tail (an append that never returned)"
+        );
+    }
+    info!(target: "n42::cli", path = %path.display(), records = report.records, "AM35 block journal opened");
+    Ok(Some(Arc::new(journal)))
+}
+
 fn env_bool(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -1557,6 +1602,14 @@ fn install_genesis_leader_schedule(genesis: &alloy_genesis::Genesis) -> eyre::Re
     Ok(())
 }
 
+/// Default size of reth's cross-block execution cache, in MiB.
+const N42_CROSS_BLOCK_CACHE_MIB: usize = 1024;
+
+/// Upper bound on how many of reth's persisted canonical blocks above a
+/// rewound consensus head are handed to catch-up (see
+/// `ConsensusService::with_persisted_canonical_suffix`).
+const PERSISTED_SUFFIX_MAX_BLOCKS: u64 = 4096;
+
 fn main() {
     // Install a global panic hook so that panics in ANY thread or tokio task
     // produce visible output on stderr.  Without this, panics in non-critical
@@ -1628,11 +1681,16 @@ fn main() {
     // Parallel state-root computation currently falls back repeatedly on this workload,
     // so make the synchronous path the default unless the operator overrides it explicitly.
     // Keep Reth 2.6+'s persistence window and state masking disabled for N42/QMDB.
+    // The cross-block execution cache defaults to 4 GiB of lazily touched
+    // slots, so its resident share grows with every distinct account and slot
+    // the chain executes; 1 GiB bounds it (`--engine.cross-block-cache-size`
+    // still overrides).
     let engine_defaults = DefaultEngineValues::default()
         .with_persistence_threshold(0)
         .with_num_state_masking_blocks(0)
         .with_memory_block_buffer_target(0)
-        .with_state_root_fallback(true);
+        .with_state_root_fallback(true)
+        .with_cross_block_cache_size(N42_CROSS_BLOCK_CACHE_MIB);
     if let Err(error) = engine_defaults.try_init() {
         warn!(
             target: "n42::cli",
@@ -1649,6 +1707,14 @@ fn main() {
             engine_config.memory_block_buffer_target(),
         )
         .map_err(eyre::Report::msg)?;
+        // AM35: a block persisted by reth counts as durable only under a
+        // fully synced commit; `--db.sync-mode` SafeNoSync / UtterlyNoSync
+        // does not qualify.
+        let db_sync_durable = builder
+            .config()
+            .db
+            .sync_mode
+            .is_none_or(|mode| mode == reth_db::mdbx::SyncMode::Durable);
         info!(target: "n42::cli", "Launching N42 node");
         let profile1 = install_genesis_profile(&builder.config().chain.genesis)?;
         install_genesis_leader_schedule(&builder.config().chain.genesis)?;
@@ -2229,14 +2295,26 @@ fn main() {
         // after signing cannot drop the recorded view (HotStuff-2 paper
         // safety invariant — see crates/n42-consensus/src/vote_log.rs).
         let vote_log_path = data_dir.join("vote_log.bin");
-        let vote_log: std::sync::Arc<dyn n42_consensus::VoteLogWriter> = std::sync::Arc::new(
-            persistence::FileVoteLog::open(vote_log_path.clone()).map_err(|e| {
+        // AM35: every R2 vote's block (and its unpersisted ancestors) is
+        // fdatasynced into this journal before the lock and the vote.
+        let block_journal = open_block_journal(
+            &data_dir,
+            profile1_node,
+            observer_mode,
+            db_sync_durable,
+        )?;
+        let vote_log: std::sync::Arc<dyn n42_consensus::VoteLogWriter> = {
+            let log = persistence::FileVoteLog::open(vote_log_path.clone()).map_err(|e| {
                 eyre::eyre!(
                     "failed to open crash-safe vote log {}: {e}",
                     vote_log_path.display()
                 )
-            })?,
-        );
+            })?;
+            std::sync::Arc::new(match block_journal.as_ref() {
+                Some(journal) => log.with_block_journal(Arc::clone(journal)),
+                None => log,
+            })
+        };
         let (last_voted_view_from_disk, last_commit_voted_view_from_disk) =
             persistence::load_last_vote_views(&vote_log_path).map_err(|e| {
                 eyre::eyre!(
@@ -2652,6 +2730,18 @@ fn main() {
                         backlog
                     });
                 }
+                {
+                    // All memtables, the flushed ones RocksDB still holds included.
+                    use reth_provider::RocksDBProviderFactory;
+                    let rocksdb = full_node.provider.rocksdb_provider();
+                    n42_node::memory_watch::set_rocksdb_source(move || {
+                        let usage = rocksdb.memtable_usage();
+                        n42_node::memory_watch::RocksdbMemtables {
+                            all: usage.all_bytes,
+                            unflushed: usage.unflushed_bytes,
+                        }
+                    });
+                }
                 let best_block_number = full_node.provider.best_block_number().unwrap_or(0);
                 let head_block_hash = {
                     if best_block_number > 0 {
@@ -2806,6 +2896,7 @@ fn main() {
                 // its exact hash is independently retained in the
                 // authenticated QMDB lineage, and derive its block number
                 // from parent edges rather than guessing from its view.
+                let mut persisted_canonical_suffix = std::collections::HashMap::new();
                 if bootstrap_replay_plan.is_none()
                     && h2_v4_participant
                     && let (Some(snap), Some(store), Some((base_number, _, _))) = (
@@ -2838,6 +2929,15 @@ fn main() {
                                 recovered_hash = %candidate,
                                 "persisted canonical marker differs from the QMDB-proven execution snapshot; starting catch-up from their highest retained common ancestor"
                             );
+                            // Reth keeps its persisted blocks above the recovered
+                            // head; catch-up must not FCU back to them.
+                            let suffix_end = best_block_number
+                                .min(candidate_number.saturating_add(PERSISTED_SUFFIX_MAX_BLOCKS));
+                            for number in candidate_number + 1..=suffix_end {
+                                if let Some(hash) = full_node.provider.block_hash(number)? {
+                                    persisted_canonical_suffix.insert(hash, number);
+                                }
+                            }
                             consensus_head_number = candidate_number;
                             consensus_head_hash = candidate;
                             break;
@@ -3142,6 +3242,10 @@ fn main() {
 
                     let mut transport_config =
                         TransportConfig::for_network_size(startup_validator_set.len() as usize);
+                    // Profile 1: V9's router values, G2 topics only (AM34).
+                    let profile1_max_block_bytes = n42_chainspec::profile1::profile1_config()
+                        .map(|config| config.max_block_bytes);
+                    transport_config.profile1_max_block_bytes = profile1_max_block_bytes;
                     transport_config.enable_mdns = env_bool("N42_ENABLE_MDNS");
                     transport_config.enable_kademlia = env_bool("N42_ENABLE_DHT");
 
@@ -3152,12 +3256,21 @@ fn main() {
                     )
                         .map_err(|e| eyre::eyre!("failed to build observer libp2p swarm: {e}"))?;
 
+                    let chain_id = full_node.provider.chain_spec().chain().id();
                     let (mut net_service, net_handle, _consensus_event_rx, net_event_rx) =
-                        NetworkService::new_gov5_h2_observer(
-                            swarm,
-                            full_node.provider.chain_spec().chain().id(),
-                            interop_genesis_hash,
-                        )
+                        match profile1_max_block_bytes {
+                            Some(max_block_bytes) => NetworkService::new_profile1_observer(
+                                swarm,
+                                chain_id,
+                                interop_genesis_hash,
+                                max_block_bytes,
+                            ),
+                            None => NetworkService::new_gov5_h2_observer(
+                                swarm,
+                                chain_id,
+                                interop_genesis_hash,
+                            ),
+                        }
                             .map_err(|e| eyre::eyre!("failed to create observer network service: {e}"))?;
                     net_service.set_gov5_canonical_block_reader(gov5_canonical_block_reader(
                         full_node.provider.clone(),
@@ -3283,6 +3396,11 @@ fn main() {
 
                 let mut transport_config =
                     TransportConfig::for_network_size(startup_validator_set.len() as usize);
+                // Profile 1: gov5's GossipSub values and the size cap after
+                // maxBlockBytes (G4, B15, vector V9); G2 topics only (AM34).
+                let profile1_max_block_bytes = n42_chainspec::profile1::profile1_config()
+                    .map(|config| config.max_block_bytes);
+                transport_config.profile1_max_block_bytes = profile1_max_block_bytes;
                 transport_config.enable_mdns = env_bool("N42_ENABLE_MDNS");
                 transport_config.enable_kademlia = env_bool("N42_ENABLE_DHT");
                 if transport_config.enable_mdns {
@@ -3317,7 +3435,16 @@ fn main() {
                 .map_err(|e| eyre::eyre!("failed to build consensus libp2p swarm: {e}"))?;
 
                 let (mut net_service, net_handle, consensus_event_rx, net_event_rx) =
-                    if h2_v4_participant {
+                    if let Some(max_block_bytes) = profile1_max_block_bytes {
+                        NetworkService::new_profile1_participant(
+                            swarm,
+                            expected_validator_peer_ids.clone(),
+                            allow_deterministic_validator_peers,
+                            full_node.provider.chain_spec().chain().id(),
+                            interop_genesis_hash,
+                            max_block_bytes,
+                        )
+                    } else if h2_v4_participant {
                         NetworkService::new_gov5_h2_participant(
                             swarm,
                             expected_validator_peer_ids.clone(),
@@ -3945,6 +4072,30 @@ fn main() {
                 ))
                 .with_committed_block_count(restored_block_count);
 
+                if let Some(journal) = block_journal.as_ref() {
+                    // reth's persisted head: blocks at or below it are durable
+                    // under a synced commit and need no journal entry.
+                    let number_provider = full_node.provider.clone();
+                    let hash_provider = full_node.provider.clone();
+                    let startup_persisted = best_block_number;
+                    journal.set_persisted_chain(Arc::new(
+                        n42_consensus_service::block_journal::FnPersistedChain::new(
+                            move || {
+                                Some(
+                                    number_provider
+                                        .canonical_in_memory_state()
+                                        .get_persisted_num_hash()
+                                        .map_or(startup_persisted, |persisted| {
+                                            persisted.number.max(startup_persisted)
+                                        }),
+                                )
+                            },
+                            move |number| hash_provider.block_hash(number).ok().flatten(),
+                        ),
+                    ));
+                    orchestrator = orchestrator.with_block_journal(Arc::clone(journal));
+                }
+
                 if let Some(header) = full_node.provider.header(consensus_head_hash)? {
                     orchestrator = orchestrator.with_recovered_head_timestamp(header.timestamp);
                 }
@@ -4129,6 +4280,17 @@ fn main() {
                         orchestrator.with_recovered_execution_validated_head(seeded_view);
                 }
 
+                if !persisted_canonical_suffix.is_empty() {
+                    info!(
+                        target: "n42::cli",
+                        blocks = persisted_canonical_suffix.len(),
+                        recovered_head = consensus_head_number,
+                        reth_head = best_block_number,
+                        "reth holds persisted canonical blocks above the recovered head; catch-up will not FCU back to them"
+                    );
+                    orchestrator = orchestrator
+                        .with_persisted_canonical_suffix(std::mem::take(&mut persisted_canonical_suffix));
+                }
                 if let Some(schedule) = epoch_schedule {
                     orchestrator = orchestrator.with_epoch_schedule(schedule);
                 }
