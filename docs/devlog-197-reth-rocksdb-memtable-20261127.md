@@ -126,3 +126,26 @@ n42-26：
 ## Merge with main (2026-11-27)
 
 - Main (#51) had meanwhile added a `structures=` source named `rocksdb_memtable_mib`, which summed `table_stats().memtable_size_bytes`. This branch logs `rocksdb_memtable_mib` and `rocksdb_memtable_unflushed_mib` as fields of their own, from `memtable_usage()`. Keeping both would print two fields with the same name, so the merge drops main's structure source and keeps this branch's, because it separates flushed history from unflushed memtables.
+
+## 本地 96 分钟 A/B（2026-11-27）
+
+- 设置：两组各 4 节点同时运行，A = main `ffb6f4a`，B = 本分支 `716981d`；am35e2e 参数（含
+  `--engine.persistence-threshold 0`），`N42_MEM_LOG_SECS=60`。负载窗口 98.0 分钟，每 8 秒 slot 8000 笔转账
+  （约为 harness 默认负载的 66 倍，每组约 590 万笔）。第一次运行被断电截断（约 30 分钟，数据保留在 `*.cut-0523/`），
+  此为从头重跑的结果。数据与脚本：`/data/n42-build/reth20ab-n42-26/`。
+- 结果（4 节点最大值）：
+
+  | 指标 | A main | B 补丁 20 |
+  |---|---|---|
+  | RocksDB memtable 最大 / 结束 | 192 / 144 MiB | 20 / 14 MiB（全程 18–20 平稳） |
+  | RSS 96 分钟 | 2700–2755 MiB | 2568–2600 MiB |
+  | 持久化耗时 p50 / p95 / p99 | 22.6 / 31.7 / 35.2 ms | 17.8 / 26.5 / 30.4 ms |
+  | memtable flush 次数 / 节点 | 5 | 20 |
+  | write stall | 0 | 0 |
+  | L0 文件（TransactionHashNumbers）最大 | 2 | 2 |
+  | 提交块数 / ERROR | 736 / 0 | 736 / 0 |
+
+- 结论：memtable 有界，持久化未变慢（反而快约 20%），flush 增加 4 倍但无 stall，L0 健康。
+- 注意：A 的 memtable 在约 190 MiB 停止增长，因为该负载只重写一个列族；多列族重写时 A 会继续增长。
+  两组 RSS 在运行中都增长约 1.6 GiB，幅度相同，不是 RocksDB 造成的，需另查。
+- 另发现：在 m3d Profile-1 genesis 上普通转账都会被打包但执行回退（status 0，21000 gas），值得单独查看。
