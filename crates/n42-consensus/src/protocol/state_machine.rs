@@ -39,6 +39,9 @@ pub struct ViewTiming {
     pub prepare_vote_count: u32,
     /// Number of Round 2 votes collected when CommitQC formed.
     pub commit_vote_count: u32,
+    /// Time spent making the R2 vote durable before signing it (AM35 block
+    /// journal + lock + R2 vote-log fsyncs), in microseconds.
+    pub r2_persist_us: Option<u64>,
 }
 
 impl ViewTiming {
@@ -53,6 +56,7 @@ impl ViewTiming {
             commit_qc_formed: None,
             prepare_vote_count: 0,
             commit_vote_count: 0,
+            r2_persist_us: None,
         }
     }
 
@@ -84,26 +88,32 @@ impl ViewTiming {
             opt.map(|v| format!("{v}ms"))
                 .unwrap_or_else(|| "-".to_string())
         };
+        let r2_persist = self
+            .r2_persist_us
+            .map(|us| format!("{:.2}ms", us as f64 / 1000.0))
+            .unwrap_or_else(|| "-".to_string());
 
         if self.proposal_sent.is_some() {
             // Leader view
             format!(
-                "leader proposal=@{} R1_collect={} R2_collect={} total={} votes={}+{}",
+                "leader proposal=@{} R1_collect={} R2_collect={} total={} votes={}+{} r2_persist={}",
                 ms(self.proposal_sent),
                 d(prepare_delta),
                 d(commit_delta),
                 d(total),
                 self.prepare_vote_count,
                 self.commit_vote_count,
+                r2_persist,
             )
         } else {
             // Follower view
             format!(
-                "follower proposal=@{} vote_delay={} commit_vote=@{} total=@{}",
+                "follower proposal=@{} vote_delay={} commit_vote=@{} total=@{} r2_persist={}",
                 ms(self.proposal_received),
                 d(vote_delta),
                 ms(self.commit_vote_sent),
                 ms(self.commit_qc_formed),
+                r2_persist,
             )
         }
     }
@@ -147,6 +157,10 @@ pub enum ConsensusEvent {
     /// vote is withheld even if its import later succeeds (gov5 votes on the
     /// check, not on the import).
     BlockRefused(B256),
+    /// AM35: the orchestrator now holds the data of this block where the
+    /// vote log can make it durable. Retries an R2 vote (follower commit vote
+    /// or leader self-vote) held because the block data was unavailable.
+    BlockDataStaged(B256),
 }
 
 /// A vote message whose single-validator BLS signature was verified by the
@@ -391,6 +405,15 @@ pub struct ConsensusEngine {
     /// A PrepareQC whose commit vote waits for this node's own execution of
     /// the block (Profile 1, A13/AM19); `on_block_imported` releases it.
     pub(super) held_prepare_qc: Option<PrepareQC>,
+    /// AM35: the leader's R2 self-vote `(view, block_hash)` held because the
+    /// block could not yet be made durable here.
+    pub(super) held_self_commit_vote: Option<(ViewNumber, B256)>,
+    /// AM35: the highest lock this node has made durable through
+    /// `VoteLogWriter::record_lock`, which runs only after the locked block
+    /// is durable. The in-memory lock (`round_state.locked_qc()`) moves as
+    /// soon as a QC is seen, possibly onto a block no member journalled; the
+    /// consensus snapshot stores this one instead.
+    pub(super) durable_locked_qc: QuorumCertificate,
     /// Profile 1, Phase B: the parent of every block that passed the
     /// deferred proposal check here, before its import.
     pub(super) checked_parents: BoundedFifoMap<B256, B256>,
@@ -484,6 +507,8 @@ impl ConsensusEngine {
             leader_schedule: crate::validator::leader_schedule(),
             vote_rules: crate::VoteRules::installed(),
             held_prepare_qc: None,
+            held_self_commit_vote: None,
+            durable_locked_qc: QuorumCertificate::genesis(),
             checked_parents: BoundedFifoMap::new(64),
             refused_blocks: BoundedFifoMap::new(64),
         };
@@ -561,6 +586,9 @@ impl ConsensusEngine {
             );
         }
         let local_public_key = secret_key.public_key();
+        // A recovered lock was durable before the restart: the snapshot only
+        // stores durable locks, and `locked_qc.bin` is written by record_lock.
+        let durable_locked_qc = locked_qc.clone();
         let mut engine = Self {
             my_index,
             secret_key,
@@ -600,6 +628,8 @@ impl ConsensusEngine {
             leader_schedule: crate::validator::leader_schedule(),
             vote_rules: crate::VoteRules::installed(),
             held_prepare_qc: None,
+            held_self_commit_vote: None,
+            durable_locked_qc,
             checked_parents: BoundedFifoMap::new(64),
             refused_blocks: BoundedFifoMap::new(64),
         };
@@ -624,6 +654,12 @@ impl ConsensusEngine {
     /// The vote rules this engine runs.
     pub fn vote_rules(&self) -> crate::VoteRules {
         self.vote_rules
+    }
+
+    /// Replaces the durable vote sink. Call before the engine processes its
+    /// first event (tests that build an engine with [`Self::new`]).
+    pub fn set_vote_log(&mut self, vote_log: Arc<dyn VoteLogWriter>) {
+        self.vote_log = vote_log;
     }
 
     /// Replaces the vote rules. A chain constant: call before the engine
@@ -1001,6 +1037,88 @@ impl ConsensusEngine {
         self.round_state.locked_qc()
     }
 
+    /// AM35: the highest lock already made durable by `record_lock` (after
+    /// its block was made durable). Snapshots persist this, never the
+    /// in-memory [`Self::locked_qc`], so a restart can only adopt a lock
+    /// whose block this node can re-import.
+    pub fn durable_locked_qc(&self) -> &QuorumCertificate {
+        &self.durable_locked_qc
+    }
+
+    /// AM35: after a commit, raise the durable lock to the CommitQC when it is
+    /// higher. A node that imports slowly may hold its R2 votes for several
+    /// views while the others commit; without this its durable lock stays
+    /// behind `last_committed_qc` and every snapshot is refused
+    /// (`last_committed_qc.view > locked_qc.view`).
+    ///
+    /// The CommitQC is a safe durable lock even when this node never
+    /// journalled the block: it carries 2f+1 R2 votes, and every R2 voter
+    /// made the block durable before signing, so after a whole-set power loss
+    /// at least 2f+1 members can re-import and serve it. `Round::commit`
+    /// already treats the CommitQC as the in-memory lock.
+    pub(super) fn advance_durable_lock_on_commit(&mut self, commit_qc: &QuorumCertificate) {
+        if commit_qc.view <= self.durable_locked_qc.view {
+            return;
+        }
+        match self.vote_log.record_lock(commit_qc) {
+            Ok(()) => self.durable_locked_qc = commit_qc.clone(),
+            Err(error) => tracing::warn!(
+                target: "n42::am35",
+                view = commit_qc.view,
+                %error,
+                "could not persist the CommitQC as the durable lock"
+            ),
+        }
+    }
+
+    /// AM35: the R2 prologue shared by the follower commit vote and the
+    /// leader self-vote: make the voted block (and the locked block, should
+    /// it differ) durable, then the lock, then the R2 vote-log record. Returns
+    /// `Ok(Some(missing))` when block data is not here yet: nothing was
+    /// written and the caller holds the vote.
+    ///
+    /// On success it emits the fixed AM35 line (target `n42::am35`, message
+    /// "commit vote released after durable lock") that external kill tools
+    /// match; the caller signs and sends the R2 vote right after. `role` is
+    /// "follower" or "leader".
+    pub(super) fn persist_before_commit_vote(
+        &mut self,
+        view: ViewNumber,
+        block_hash: B256,
+        role: &'static str,
+    ) -> ConsensusResult<Option<B256>> {
+        let started = Instant::now();
+        let lock = self.round_state.locked_qc().clone();
+        let mut targets = vec![block_hash];
+        if lock.block_hash != block_hash && lock.view > 0 {
+            targets.push(lock.block_hash);
+        }
+        for hash in targets {
+            if let crate::BlockDurability::Unavailable { missing } =
+                self.vote_log.ensure_block_durable(view, hash)?
+            {
+                return Ok(Some(missing));
+            }
+        }
+        self.vote_log.record_lock(&lock)?;
+        if lock.view > self.durable_locked_qc.view {
+            self.durable_locked_qc = lock;
+        }
+        self.round_state.record_commit_vote(view);
+        self.vote_log.record_commit_vote(view)?;
+        self.view_timing.r2_persist_us = Some(started.elapsed().as_micros() as u64);
+        // Stable text: the mixed-gate kill tool (E9) regex-matches this line.
+        tracing::info!(
+            target: "n42::am35",
+            view,
+            block_hash = %block_hash,
+            // Debug renders the quoted form `role="follower"`.
+            role = ?role,
+            "commit vote released after durable lock"
+        );
+        Ok(None)
+    }
+
     pub fn last_committed_qc(&self) -> &QuorumCertificate {
         self.round_state.last_committed_qc()
     }
@@ -1017,6 +1135,28 @@ impl ConsensusEngine {
         self.round_state.last_commit_voted_view()
     }
 
+    /// Whether an R2 vote for `block_hash` is held in the current view (for
+    /// this node's execution or for the block's durability).
+    pub fn holds_commit_vote_for(&self, block_hash: B256) -> bool {
+        self.held_commit_vote_block() == Some(block_hash)
+    }
+
+    /// The block of the R2 vote held in the current view, if any. Staging
+    /// block data (the block's own or a missing ancestor's) is a reason to
+    /// retry it with [`ConsensusEvent::BlockDataStaged`].
+    pub fn held_commit_vote_block(&self) -> Option<B256> {
+        let view = self.round_state.current_view();
+        if let Some((held_view, block_hash)) = self.held_self_commit_vote
+            && held_view == view
+        {
+            return Some(block_hash);
+        }
+        self.held_prepare_qc
+            .as_ref()
+            .filter(|held| held.view == view)
+            .map(|held| held.block_hash)
+    }
+
     // ── Event processing ──
 
     /// Processes a consensus event and generates outputs.
@@ -1029,6 +1169,7 @@ impl ConsensusEngine {
             }
             ConsensusEvent::BlockChecked { .. } => "block_checked",
             ConsensusEvent::BlockRefused(_) => "block_refused",
+            ConsensusEvent::BlockDataStaged(_) => "block_data_staged",
         };
         let _span = tracing::info_span!(
             target: "n42.cl.consensus.event",
@@ -1056,6 +1197,7 @@ impl ConsensusEngine {
                 self.on_block_refused(block_hash);
                 Ok(())
             }
+            ConsensusEvent::BlockDataStaged(block_hash) => self.on_block_data_staged(block_hash),
         }
     }
 
@@ -1353,6 +1495,7 @@ impl ConsensusEngine {
         // A commit vote held for this node's execution belongs to the view
         // being left.
         self.held_prepare_qc = None;
+        self.held_self_commit_vote = None;
 
         // Epoch numbers follow fixed view ranges even when validator membership
         // is unchanged. Advance every crossed boundary so live execution,
@@ -3327,6 +3470,225 @@ mod tests {
             self.0.lock().unwrap().push(format!("lock:{}", qc.view));
             Ok(())
         }
+
+        fn ensure_block_durable(
+            &self,
+            view: u64,
+            _block_hash: B256,
+        ) -> ConsensusResult<crate::BlockDurability> {
+            self.0.lock().unwrap().push(format!("block:{view}"));
+            Ok(crate::BlockDurability::Durable)
+        }
+    }
+
+    /// A vote log standing in for the AM35 block journal. It owns the
+    /// engine's output receiver and drains it on every call, so the event
+    /// list shows exactly which outputs left the engine before each durable
+    /// write: an R2 vote emitted before the journal fsync would appear before
+    /// `block:durable`.
+    #[derive(Debug)]
+    struct OrderingVoteLog {
+        events: std::sync::Mutex<Vec<String>>,
+        outputs: std::sync::Mutex<mpsc::Receiver<EngineOutput>>,
+        available: std::sync::atomic::AtomicBool,
+    }
+
+    impl OrderingVoteLog {
+        fn new(outputs: mpsc::Receiver<EngineOutput>, available: bool) -> Self {
+            Self {
+                events: Default::default(),
+                outputs: std::sync::Mutex::new(outputs),
+                available: std::sync::atomic::AtomicBool::new(available),
+            }
+        }
+
+        fn push(&self, event: String) {
+            self.drain();
+            self.events.lock().unwrap().push(event);
+        }
+
+        fn drain(&self) {
+            let mut outputs = self.outputs.lock().unwrap();
+            while let Ok(output) = outputs.try_recv() {
+                let label = match output {
+                    EngineOutput::SendToValidator(_, ConsensusMessage::CommitVote(cv)) => {
+                        format!("out:commit_vote:{}", cv.view)
+                    }
+                    EngineOutput::BroadcastMessage(ConsensusMessage::PrepareQC(pqc)) => {
+                        format!("out:prepare_qc:{}", pqc.view)
+                    }
+                    EngineOutput::BroadcastMessage(ConsensusMessage::Decide(d)) => {
+                        format!("out:decide:{}", d.view)
+                    }
+                    _ => continue,
+                };
+                self.events.lock().unwrap().push(label);
+            }
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.drain();
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl VoteLogWriter for OrderingVoteLog {
+        fn record_vote(&self, view: u64) -> ConsensusResult<()> {
+            self.push(format!("vote:{view}"));
+            Ok(())
+        }
+
+        fn record_commit_vote(&self, view: u64) -> ConsensusResult<()> {
+            self.push(format!("commit:{view}"));
+            Ok(())
+        }
+
+        fn record_lock(&self, qc: &QuorumCertificate) -> ConsensusResult<()> {
+            self.push(format!("lock:{}", qc.view));
+            Ok(())
+        }
+
+        fn ensure_block_durable(
+            &self,
+            view: u64,
+            block_hash: B256,
+        ) -> ConsensusResult<crate::BlockDurability> {
+            if self.available.load(std::sync::atomic::Ordering::SeqCst) {
+                self.push(format!("block:durable:{view}"));
+                Ok(crate::BlockDurability::Durable)
+            } else {
+                self.push(format!("block:unavailable:{view}"));
+                Ok(crate::BlockDurability::Unavailable { missing: block_hash })
+            }
+        }
+    }
+
+    /// AM35: a follower's R2 vote leaves the engine only after the block is
+    /// durable, then the lock, then the R2 vote-log record. While the block
+    /// data is missing the vote is held; staging the data releases it.
+    #[test]
+    fn test_follower_r2_never_leaves_before_block_journal_fsync() {
+        let (_fresh_engine, sks, vs, _fresh_rx) = make_engine(4, 0);
+        let (output_tx, output_rx) = mpsc::channel(64);
+        let log = Arc::new(OrderingVoteLog::new(output_rx, false));
+        let mut engine = ConsensusEngine::with_recovered_state_and_vote_log(
+            0,
+            sks[0].clone(),
+            EpochManager::new(vs.clone()),
+            60_000,
+            120_000,
+            output_tx,
+            1,
+            QuorumCertificate::genesis(),
+            QuorumCertificate::genesis(),
+            0,
+            0,
+            0,
+            log.clone(),
+        );
+        let block_hash = B256::repeat_byte(0xD1);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::PrepareQC(
+                n42_primitives::consensus::PrepareQC {
+                    view: 1,
+                    block_hash,
+                    qc: build_test_prepare_qc(1, block_hash, &sks, &vs, &[0, 1, 2]),
+                },
+            )))
+            .unwrap();
+        assert_eq!(log.events(), ["block:unavailable:1"]);
+        assert!(engine.holds_commit_vote_for(block_hash));
+        assert_eq!(engine.last_commit_voted_view(), 0, "no R2 recorded while held");
+
+        // Staging another block's data changes nothing.
+        engine
+            .process_event(ConsensusEvent::BlockDataStaged(B256::repeat_byte(0xEE)))
+            .unwrap();
+        assert_eq!(log.events(), ["block:unavailable:1"]);
+
+        log.available.store(true, std::sync::atomic::Ordering::SeqCst);
+        engine
+            .process_event(ConsensusEvent::BlockDataStaged(block_hash))
+            .unwrap();
+        assert_eq!(
+            log.events(),
+            [
+                "block:unavailable:1",
+                "block:durable:1",
+                "lock:1",
+                "commit:1",
+                "out:commit_vote:1"
+            ]
+        );
+        assert!(!engine.holds_commit_vote_for(block_hash));
+        assert!(engine.view_timing.r2_persist_us.is_some());
+    }
+
+    /// AM35: the leader's own R2 counts toward the CommitQC quorum, so it is
+    /// gated exactly like a follower's: no lock, no R2 record and no self
+    /// signature until the block is durable.
+    #[test]
+    fn test_leader_r2_self_vote_is_gated_on_block_durability() {
+        use crate::protocol::quorum::signing_message;
+
+        let (_fresh_engine, sks, vs, _fresh_rx) = make_engine(4, 0);
+        let (output_tx, output_rx) = mpsc::channel(64);
+        let log = Arc::new(OrderingVoteLog::new(output_rx, false));
+        let mut engine = ConsensusEngine::with_recovered_state_and_vote_log(
+            1,
+            sks[1].clone(),
+            EpochManager::new(vs.clone()),
+            60_000,
+            120_000,
+            output_tx,
+            1,
+            QuorumCertificate::genesis(),
+            QuorumCertificate::genesis(),
+            0,
+            0,
+            0,
+            log.clone(),
+        );
+        let block_hash = B256::repeat_byte(0xD2);
+        engine
+            .process_event(ConsensusEvent::BlockReady(block_hash, None))
+            .unwrap();
+        for voter in [0u32, 2] {
+            let vote = Vote {
+                view: 1,
+                block_hash,
+                voter,
+                signature: sks[voter as usize].sign(&signing_message(1, &block_hash)),
+            };
+            engine
+                .process_event(ConsensusEvent::Message(ConsensusMessage::Vote(vote)))
+                .unwrap();
+        }
+        assert_eq!(
+            log.events(),
+            ["vote:1", "out:prepare_qc:1", "block:unavailable:1"],
+            "PrepareQC goes out, the self R2 waits"
+        );
+        assert!(engine.holds_commit_vote_for(block_hash));
+        assert_eq!(engine.last_commit_voted_view(), 0);
+
+        log.available.store(true, std::sync::atomic::Ordering::SeqCst);
+        engine
+            .process_event(ConsensusEvent::BlockDataStaged(block_hash))
+            .unwrap();
+        assert_eq!(
+            log.events(),
+            [
+                "vote:1",
+                "out:prepare_qc:1",
+                "block:unavailable:1",
+                "block:durable:1",
+                "lock:1",
+                "commit:1"
+            ]
+        );
+        assert_eq!(engine.last_commit_voted_view(), 1);
+        assert!(!engine.holds_commit_vote_for(block_hash));
     }
 
     /// A CommitVote can help commit a block, so the lock it rests on must be
@@ -3362,7 +3724,7 @@ mod tests {
             )))
             .unwrap();
 
-        assert_eq!(*log.0.lock().unwrap(), ["lock:1", "commit:1"]);
+        assert_eq!(*log.0.lock().unwrap(), ["block:1", "lock:1", "commit:1"]);
         assert!(output_rx.try_recv().is_ok());
     }
 
@@ -3404,8 +3766,49 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(*log.0.lock().unwrap(), ["vote:1", "lock:1", "commit:1"]);
+        assert_eq!(*log.0.lock().unwrap(), ["vote:1", "block:1", "lock:1", "commit:1"]);
         assert!(output_rx.try_recv().is_ok());
+    }
+
+    /// A follower that never sent R2 (its import was too slow) still commits
+    /// on the Decide; its durable lock must follow the CommitQC, or every
+    /// snapshot is refused for `last_committed_qc.view > locked_qc.view`.
+    #[test]
+    fn test_decide_without_own_commit_vote_advances_durable_lock() {
+        let (_fresh_engine, sks, vs, _fresh_rx) = make_engine(4, 0);
+        let (output_tx, _output_rx) = mpsc::channel(32);
+        let log = Arc::new(RecordingVoteLog::default());
+        let mut engine = ConsensusEngine::with_recovered_state_and_vote_log(
+            3,
+            sks[3].clone(),
+            EpochManager::new(vs.clone()),
+            60_000,
+            120_000,
+            output_tx,
+            1,
+            QuorumCertificate::genesis(),
+            QuorumCertificate::genesis(),
+            0,
+            0,
+            0,
+            log.clone(),
+        );
+        let block_hash = B256::repeat_byte(0xDA);
+        let commit_qc = build_test_commit_qc(1, block_hash, &sks, &vs, &[0, 1, 2]);
+        engine
+            .process_event(ConsensusEvent::Message(ConsensusMessage::Decide(Decide {
+                view: 1,
+                block_hash,
+                commit_qc,
+                validator_changes_hash: B256::ZERO,
+            })))
+            .unwrap();
+
+        assert_eq!(engine.last_committed_qc().view, 1);
+        assert_eq!(engine.durable_locked_qc().view, 1);
+        assert_eq!(engine.durable_locked_qc().block_hash, block_hash);
+        // Persisted as the durable lock; no R2 was recorded for this node.
+        assert_eq!(*log.0.lock().unwrap(), ["lock:1"]);
     }
 
     #[test]

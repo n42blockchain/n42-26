@@ -764,6 +764,7 @@ impl ConsensusService {
         // Profile 1: the built block is sealed into its 24-element header.
         let profile1_seal_key = self.profile1.as_ref().and_then(|gate| gate.seal_key());
         let profile1 = self.profile1.is_some();
+        let block_journal = self.block_journal.clone();
 
         let handle = tokio::spawn(async move {
             let build_el = el.clone();
@@ -815,6 +816,7 @@ impl ConsensusService {
                         build_context,
                         header_qc,
                         profile1.then_some(profile1_seal_key),
+                        block_journal,
                     )
                     .await;
                 }
@@ -1030,9 +1032,10 @@ impl ConsensusService {
             }
         }
 
-        // Follower eager import: start new_payload + fcu in parallel with consensus voting.
-        // By the time finalize_committed_block runs after consensus commit, the block is
-        // likely already in reth (Case A), eliminating the ~200ms background import stall.
+        // Follower eager import: start new_payload in parallel with consensus voting. No
+        // forkchoice update runs here; finalize_committed_block moves forkchoice after the
+        // commit, by which time the block is likely already in reth (Case A), avoiding the
+        // ~200ms background import stall.
         if let Some(ref el) = self.el {
             let eh = el.clone();
             let payload_compressed = broadcast.payload_json;
@@ -1478,6 +1481,21 @@ impl ConsensusService {
         }
         let execution_parent_hash = execution_data.parent_hash();
         let payload_timestamp = execution_data.payload.timestamp();
+        // AM35: a synced block may be an unpersisted ancestor of the next
+        // block this node commit-votes; keep it where the journal finds it.
+        if let Some(journal) = self.block_journal.as_ref() {
+            journal.note_lineage(
+                broadcast.block_hash,
+                execution_parent_hash,
+                execution_data.block_number(),
+            );
+            if !journal.holds(&broadcast.block_hash)
+                && let Ok(data) = bincode::serialize(&broadcast)
+            {
+                journal.stage_data(broadcast.block_hash, broadcast.view, Arc::new(data));
+                self.retry_held_commit_vote();
+            }
+        }
         if self
             .bad_blocks
             .should_skip(broadcast.block_hash, "sync_import_pre_submit")
@@ -1986,6 +2004,7 @@ async fn handle_built_payload(
     header_qc: Option<n42_network::Gov5HeaderQc>,
     // `Some` on a Profile-1 chain: the key the block is sealed with (B2).
     profile1_seal: Option<Option<Arc<n42_primitives::BlsSecretKey>>>,
+    block_journal: Option<Arc<crate::block_journal::BlockJournal>>,
 ) {
     let BuiltBlock {
         mut hash,
@@ -2323,6 +2342,11 @@ async fn handle_built_payload(
     } else {
         None
     };
+    // AM35: the leader's own block reaches the journal through its payload
+    // feedback; record its lineage so the R2 self-vote does not decode it.
+    if let Some(journal) = block_journal.as_ref() {
+        journal.note_lineage(hash, execution_data.parent_hash(), block_number);
+    }
     // 1. Broadcast block data + blob sidecars to followers. Native peers start
     //    validating now; the Gov5 copy below costs ~130 ms per full block and
     //    used to run first.
