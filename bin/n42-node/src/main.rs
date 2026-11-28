@@ -247,6 +247,51 @@ where
     Ok(reader)
 }
 
+/// AM35: opens the block journal beside the vote log. Profile 1 always
+/// journals; elsewhere `N42_BLOCK_JOURNAL=0` turns it off (with a warning).
+/// Observers cast no votes and keep none.
+fn open_block_journal(
+    data_dir: &Path,
+    profile1_node: bool,
+    observer_mode: bool,
+    db_sync_durable: bool,
+) -> eyre::Result<Option<Arc<n42_consensus_service::block_journal::BlockJournal>>> {
+    if observer_mode {
+        return Ok(None);
+    }
+    let disabled = std::env::var("N42_BLOCK_JOURNAL")
+        .is_ok_and(|value| matches!(value.as_str(), "0" | "false" | "off"));
+    if disabled {
+        if profile1_node {
+            return Err(eyre::eyre!(
+                "N42_BLOCK_JOURNAL=0 is refused on Profile 1: AM35 requires every R2 vote's block to be durable before the vote"
+            ));
+        }
+        warn!(target: "n42::cli", "N42_BLOCK_JOURNAL=0: R2 votes no longer wait for their block to be durable; a whole-set power loss can halt the chain");
+        return Ok(None);
+    }
+    if !db_sync_durable {
+        return Err(eyre::eyre!(
+            "--db.sync-mode other than Durable is refused: AM35 counts a block persisted by reth as durable only under a synced commit"
+        ));
+    }
+    let path = data_dir.join(n42_consensus_service::block_journal::BLOCK_JOURNAL_FILE);
+    let (journal, report) = n42_consensus_service::block_journal::BlockJournal::open(path.clone())
+        .map_err(|error| eyre::eyre!("failed to open the block journal {}: {error}", path.display()))?;
+    if report.truncated_bytes > 0 {
+        warn!(
+            target: "n42::cli",
+            path = %path.display(),
+            records = report.records,
+            truncated_bytes = report.truncated_bytes,
+            reason = report.truncation_reason.as_deref().unwrap_or_default(),
+            "block journal: dropped a torn or damaged tail (an append that never returned)"
+        );
+    }
+    info!(target: "n42::cli", path = %path.display(), records = report.records, "AM35 block journal opened");
+    Ok(Some(Arc::new(journal)))
+}
+
 fn env_bool(name: &str) -> bool {
     std::env::var(name)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -1643,6 +1688,14 @@ fn main() {
             engine_config.memory_block_buffer_target(),
         )
         .map_err(eyre::Report::msg)?;
+        // AM35: a block persisted by reth counts as durable only under a
+        // fully synced commit; `--db.sync-mode` SafeNoSync / UtterlyNoSync
+        // does not qualify.
+        let db_sync_durable = builder
+            .config()
+            .db
+            .sync_mode
+            .is_none_or(|mode| mode == reth_db::mdbx::SyncMode::Durable);
         info!(target: "n42::cli", "Launching N42 node");
         let profile1 = install_genesis_profile(&builder.config().chain.genesis)?;
         install_genesis_leader_schedule(&builder.config().chain.genesis)?;
@@ -2223,14 +2276,26 @@ fn main() {
         // after signing cannot drop the recorded view (HotStuff-2 paper
         // safety invariant — see crates/n42-consensus/src/vote_log.rs).
         let vote_log_path = data_dir.join("vote_log.bin");
-        let vote_log: std::sync::Arc<dyn n42_consensus::VoteLogWriter> = std::sync::Arc::new(
-            persistence::FileVoteLog::open(vote_log_path.clone()).map_err(|e| {
+        // AM35: every R2 vote's block (and its unpersisted ancestors) is
+        // fdatasynced into this journal before the lock and the vote.
+        let block_journal = open_block_journal(
+            &data_dir,
+            profile1_node,
+            observer_mode,
+            db_sync_durable,
+        )?;
+        let vote_log: std::sync::Arc<dyn n42_consensus::VoteLogWriter> = {
+            let log = persistence::FileVoteLog::open(vote_log_path.clone()).map_err(|e| {
                 eyre::eyre!(
                     "failed to open crash-safe vote log {}: {e}",
                     vote_log_path.display()
                 )
-            })?,
-        );
+            })?;
+            std::sync::Arc::new(match block_journal.as_ref() {
+                Some(journal) => log.with_block_journal(Arc::clone(journal)),
+                None => log,
+            })
+        };
         let (last_voted_view_from_disk, last_commit_voted_view_from_disk) =
             persistence::load_last_vote_views(&vote_log_path).map_err(|e| {
                 eyre::eyre!(
@@ -3987,6 +4052,30 @@ fn main() {
                     },
                 ))
                 .with_committed_block_count(restored_block_count);
+
+                if let Some(journal) = block_journal.as_ref() {
+                    // reth's persisted head: blocks at or below it are durable
+                    // under a synced commit and need no journal entry.
+                    let number_provider = full_node.provider.clone();
+                    let hash_provider = full_node.provider.clone();
+                    let startup_persisted = best_block_number;
+                    journal.set_persisted_chain(Arc::new(
+                        n42_consensus_service::block_journal::FnPersistedChain::new(
+                            move || {
+                                Some(
+                                    number_provider
+                                        .canonical_in_memory_state()
+                                        .get_persisted_num_hash()
+                                        .map_or(startup_persisted, |persisted| {
+                                            persisted.number.max(startup_persisted)
+                                        }),
+                                )
+                            },
+                            move |number| hash_provider.block_hash(number).ok().flatten(),
+                        ),
+                    ));
+                    orchestrator = orchestrator.with_block_journal(Arc::clone(journal));
+                }
 
                 if let Some(header) = full_node.provider.header(consensus_head_hash)? {
                     orchestrator = orchestrator.with_recovered_head_timestamp(header.timestamp);

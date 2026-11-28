@@ -1286,6 +1286,80 @@ fn phase_b_round1_on_the_check_commit_vote_on_the_execution() {
     assert!(votes(&out).is_empty(), "no second Round 1");
 }
 
+/// AM35 on Profile 1: the commit vote waits for this node's execution AND
+/// for the block to be durable (the block journal). With the import done but
+/// the block data not yet stageable, nothing is locked or sent; staging the
+/// data then releases the commit vote, after the journal write and the lock.
+#[test]
+fn am35_commit_vote_waits_for_the_block_journal_after_the_execution() {
+    #[derive(Debug, Default)]
+    struct Journal {
+        events: std::sync::Mutex<Vec<String>>,
+        available: std::sync::atomic::AtomicBool,
+    }
+    impl n42_consensus::VoteLogWriter for Journal {
+        fn record_vote(&self, view: u64) -> n42_consensus::error::ConsensusResult<()> {
+            self.events.lock().unwrap().push(format!("vote:{view}"));
+            Ok(())
+        }
+        fn record_commit_vote(&self, view: u64) -> n42_consensus::error::ConsensusResult<()> {
+            self.events.lock().unwrap().push(format!("commit:{view}"));
+            Ok(())
+        }
+        fn record_lock(&self, qc: &QuorumCertificate) -> n42_consensus::error::ConsensusResult<()> {
+            self.events.lock().unwrap().push(format!("lock:{}", qc.view));
+            Ok(())
+        }
+        fn ensure_block_durable(
+            &self,
+            view: u64,
+            block_hash: B256,
+        ) -> n42_consensus::error::ConsensusResult<n42_consensus::BlockDurability> {
+            if self.available.load(std::sync::atomic::Ordering::SeqCst) {
+                self.events.lock().unwrap().push(format!("block:{view}"));
+                Ok(n42_consensus::BlockDurability::Durable)
+            } else {
+                Ok(n42_consensus::BlockDurability::Unavailable { missing: block_hash })
+            }
+        }
+    }
+
+    let v6 = load();
+    let (mut engine, mut rx) = v6.engine(0);
+    let journal = std::sync::Arc::new(Journal::default());
+    engine.set_vote_log(journal.clone());
+    let proposal = v6.engine_message(v6.wire("proposal_v2")).expect("bridged");
+    let ConsensusMessage::Proposal(p) = &proposal else {
+        panic!("a proposal")
+    };
+    let (block, parent) = (p.block_hash, p.justify_qc.block_hash);
+    engine.process_event(ConsensusEvent::Message(proposal)).expect("accepted");
+    engine
+        .process_event(ConsensusEvent::BlockChecked { block_hash: block, parent_hash: parent })
+        .expect("checked");
+    let pqc = v6.engine_message(v6.wire("prepare_qc_v2")).expect("bridged");
+    engine.process_event(ConsensusEvent::Message(pqc)).expect("prepare_qc_v2");
+    engine.process_event(executed(block, parent)).expect("the execution");
+    assert!(
+        commit_votes(&outputs(&mut rx)).is_empty(),
+        "executed but not durable: no commit vote"
+    );
+    assert!(engine.holds_commit_vote_for(block));
+
+    journal.available.store(true, std::sync::atomic::Ordering::SeqCst);
+    engine
+        .process_event(ConsensusEvent::BlockDataStaged(block))
+        .expect("staged");
+    let out = outputs(&mut rx);
+    assert_eq!(commit_votes(&out).len(), 1, "the commit vote once the block is durable");
+    let events = journal.events.lock().unwrap().clone();
+    let view = commit_votes(&out)[0].view;
+    assert_eq!(
+        events[events.len() - 3..],
+        [format!("block:{view}"), format!("lock:{view}"), format!("commit:{view}")]
+    );
+}
+
 /// A check that names another parent than the justify block releases
 /// nothing (AM19), and the check before the proposal counts on arrival.
 #[test]

@@ -12,7 +12,20 @@
 //! See `Plan #1` in `~/.claude/plans/atomic-dreaming-hare.md`.
 
 use crate::error::{ConsensusError, ConsensusResult};
+use alloy_primitives::B256;
 use n42_primitives::consensus::QuorumCertificate;
+
+/// Outcome of [`VoteLogWriter::ensure_block_durable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockDurability {
+    /// The block and every ancestor above the execution layer's persisted
+    /// head are durable on this node: the R2 vote may be signed.
+    Durable,
+    /// This node does not yet hold the data of `missing` (the block or one of
+    /// its unpersisted ancestors). The R2 vote must wait; the engine holds it
+    /// and retries on `ConsensusEvent::BlockDataStaged` or an import.
+    Unavailable { missing: B256 },
+}
 
 /// A sink that durably records the highest R1 and R2 views this validator has
 /// signed. Implementations must `fsync` (or equivalent) before returning
@@ -32,6 +45,26 @@ pub trait VoteLogWriter: Send + Sync + std::fmt::Debug {
     /// later view after CommitVotes it already cast helped commit a block.
     fn record_lock(&self, _qc: &QuorumCertificate) -> ConsensusResult<()> {
         Ok(())
+    }
+
+    /// AM35: make the block an R2 vote is about to certify durable on this
+    /// node before the vote is signed. Called on every R2 path (follower
+    /// commit vote and leader self-vote) immediately before
+    /// [`Self::record_lock`].
+    ///
+    /// A whole-set power loss after the R2 votes but before any execution
+    /// layer persisted the block would otherwise leave a durable lock on a
+    /// block no member can produce, and the chain halts for good. On `Ok
+    /// (Durable)` the block and every ancestor above the execution layer's
+    /// persisted head are durable (persisted by the EL, or in a synced block
+    /// journal that is re-imported on restart). On `Err` the engine aborts
+    /// the vote.
+    fn ensure_block_durable(
+        &self,
+        _view: u64,
+        _block_hash: B256,
+    ) -> ConsensusResult<BlockDurability> {
+        Ok(BlockDurability::Durable)
     }
 }
 
